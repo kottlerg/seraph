@@ -382,6 +382,8 @@ pub mod log_record;
 
 pub mod recv_guard;
 
+pub mod serve;
+
 pub mod bootstrap_errors;
 
 // ── Typed error codes per service ───────────────────────────────────────────

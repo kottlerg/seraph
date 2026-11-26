@@ -33,6 +33,7 @@
 mod arch;
 
 use driver_binding::resources::{self, PlatformDelivery};
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, serial_errors, serial_labels};
 use std::os::seraph::startup_info;
 
@@ -97,7 +98,7 @@ const MAX_READ_BYTES: usize = 512;
 /// reply, so no request leaves a slot of the driver's `CSpace` taken.
 /// `rx_notify` is the notification the UART interrupt is bound to (0 when
 /// none is).
-fn handle_request(msg: &IpcMessage, irq: Irq, rx_notify: &mut u64, ipc_buf: *mut u64)
+fn handle_request(msg: &IpcMessage, irq: Irq, rx_notify: &mut u64, out: &mut Reply)
 {
     // Label encoding mirrors `stream_labels::STREAM_BYTES`: opcode in bits
     // 0-15, payload byte length in bits 16-31.
@@ -173,8 +174,7 @@ fn handle_request(msg: &IpcMessage, irq: Irq, rx_notify: &mut u64, ipc_buf: *mut
     {
         IpcMessage::new(serial_errors::UNKNOWN_OPCODE)
     };
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    out.set(reply);
 }
 
 /// Bind the UART interrupt to `notification` and arm it, replacing the
@@ -218,10 +218,11 @@ fn service_loop(service_ep: u64, irq: Irq, ipc_buf: *mut u64) -> !
     // this loop (see the module doc). The kernel's rate-limited recv-failure
     // line and the guard's exit remain the signal.
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -231,7 +232,7 @@ fn service_loop(service_ep: u64, irq: Irq, ipc_buf: *mut u64) -> !
             }
         };
         guard.on_success();
-        handle_request(&msg, irq, &mut rx_notify, ipc_buf);
+        handle_request(&msg, irq, &mut rx_notify, &mut reply);
     }
 }
 

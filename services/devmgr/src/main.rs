@@ -44,6 +44,7 @@ use firmware::restart::{Decline, Teardown};
 use firmware::roster::{DeathPost, DriverState, Roster};
 use firmware::served::{Lookup, Served};
 use ipc::IpcMessage;
+use ipc::serve::Reply;
 use std::os::seraph::{reserve_pages, startup_info, unreserve_pages};
 use syscall_abi::PAGE_SIZE;
 
@@ -353,8 +354,8 @@ fn start_registry_workers(registry: &Arc<Registry>)
 {
     let pool = {
         let shared = Arc::clone(registry);
-        recv_pool::RecvPool::new(registry.endpoint, recv_diag, move |msg, buf| {
-            shared.handle(msg, buf.as_ptr());
+        recv_pool::RecvPool::new(registry.endpoint, recv_diag, move |msg, buf, reply| {
+            shared.handle(msg, buf.as_ptr(), reply);
         })
     };
     match pool.spawn("devmgr-registry", REGISTRY_WORKERS)
@@ -1276,7 +1277,7 @@ impl Registry
     /// `CSpace` headroom ([`headroom::hold`]); when that is refused, a
     /// request that would keep slots is refused
     /// (`firmware::headroom::registry_refusal`).
-    fn handle(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    fn handle(&self, msg: &IpcMessage, ipc_buf: *mut u64, reply: &mut Reply)
     {
         let held = headroom::hold();
         let badge = msg.badge;
@@ -1298,7 +1299,7 @@ impl Registry
         // A refused label keeps no cap it was sent (`kept` is 0 for it).
         if !held && let Some(code) = firmware::headroom::registry_refusal(msg.label)
         {
-            reply_status(code, ipc_buf);
+            reply.set_status(code);
             return;
         }
         match msg.label
@@ -1316,12 +1317,12 @@ impl Registry
                 let Some((slot, verbs)) = class
                 else
                 {
-                    reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+                    reply.set_status(ipc::devmgr_errors::UNAUTHORIZED);
                     return;
                 };
                 if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
                 {
-                    reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+                    reply.set_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
                     return;
                 }
                 let ordinal = instance_ordinal(msg);
@@ -1332,24 +1333,24 @@ impl Registry
                     state.served.slot_lookup(slot, ordinal),
                     verbs,
                     ipc::devmgr_errors::NO_DEVICE,
-                    ipc_buf,
+                    reply,
                 );
             }
-            ipc::devmgr_labels::MINT_CLASS_SEND => self.mint_class_send(msg, ipc_buf),
-            ipc::devmgr_labels::SET_DRIVERS_DIR => self.set_drivers_dir(msg, ipc_buf),
+            ipc::devmgr_labels::MINT_CLASS_SEND => self.mint_class_send(msg, reply),
+            ipc::devmgr_labels::SET_DRIVERS_DIR => self.set_drivers_dir(msg, ipc_buf, reply),
             ipc::devmgr_labels::QUERY_ACPI_TABLE =>
             {
-                handle_query_acpi_table(&self.firmware, msg, badge, ipc_buf);
+                handle_query_acpi_table(&self.firmware, msg, badge, reply);
             }
             ipc::devmgr_labels::QUERY_SHUTDOWN_DEVICE =>
             {
-                handle_query_shutdown_device(&self.firmware, msg, badge, ipc_buf);
+                handle_query_shutdown_device(&self.firmware, msg, badge, reply);
             }
             ipc::devmgr_labels::QUERY_ACPI_RESOURCES if !acpi::on_control(msg.word(1)) =>
             {
-                if Self::admits(msg, ipc::devmgr_labels::ACPI_AUTHORITY, ipc_buf)
+                if Self::admits(msg, ipc::devmgr_labels::ACPI_AUTHORITY, reply)
                 {
-                    acpi::query_resources(&self.firmware, msg, ipc_buf);
+                    acpi::query_resources(&self.firmware, msg, reply);
                 }
             }
             // The `QUERY_ACPI_RESOURCES` of the SCI, of `RESET_REG` and of
@@ -1363,35 +1364,35 @@ impl Registry
             | ipc::devmgr_labels::PRT_TABLE
             | ipc::devmgr_labels::ACPI_HOTPLUG =>
             {
-                self.acpi_request(msg, ipc::devmgr_labels::ACPI_AUTHORITY, ipc_buf);
+                self.acpi_request(msg, ipc::devmgr_labels::ACPI_AUTHORITY, reply);
             }
             ipc::devmgr_labels::QUERY_HOST_BRIDGE =>
             {
-                self.acpi_request(msg, ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY, ipc_buf);
+                self.acpi_request(msg, ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY, reply);
             }
-            ipc::devmgr_labels::BIND_DRIVERS => self.bind_drivers(msg, ipc_buf),
-            ipc::devmgr_labels::WATCH_CLASS => self.watch_class(msg, ipc_buf),
-            ipc::devmgr_labels::DECLINE_RESTART => self.decline_restart(msg, ipc_buf),
-            ipc::devmgr_labels::QUERY_DEVICE_LOCATION => self.query_device_location(msg, ipc_buf),
+            ipc::devmgr_labels::BIND_DRIVERS => self.bind_drivers(msg, ipc_buf, reply),
+            ipc::devmgr_labels::WATCH_CLASS => self.watch_class(msg, reply),
+            ipc::devmgr_labels::DECLINE_RESTART => self.decline_restart(msg, reply),
+            ipc::devmgr_labels::QUERY_DEVICE_LOCATION => self.query_device_location(msg, reply),
             // QUERY_DEVICE_INFO and DRIVER_READY included: drivers send both
             // on their settle batch's private endpoint, never here.
-            _ => reply_status(ipc::devmgr_errors::UNKNOWN_OPCODE, ipc_buf),
+            _ => reply.set_status(ipc::devmgr_errors::UNKNOWN_OPCODE),
         }
     }
 
     /// Whether `msg`'s badge carries `authority` and `msg` the compiled
     /// labels version; replies `UNAUTHORIZED` or `LABEL_VERSION_MISMATCH`
     /// otherwise.
-    fn admits(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64) -> bool
+    fn admits(msg: &IpcMessage, authority: u64, reply: &mut Reply) -> bool
     {
         if msg.badge & authority == 0
         {
-            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::UNAUTHORIZED);
             return false;
         }
         if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
         {
-            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
             return false;
         }
         true
@@ -1400,9 +1401,9 @@ impl Registry
     /// An acpid request the control thread runs, gated on `authority`:
     /// decoded here, run there ([`acpi::run_on_control`]), and replied to
     /// from here.
-    fn acpi_request(&self, msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
+    fn acpi_request(&self, msg: &IpcMessage, authority: u64, reply: &mut Reply)
     {
-        if !Self::admits(msg, authority, ipc_buf)
+        if !Self::admits(msg, authority, reply)
         {
             return;
         }
@@ -1410,9 +1411,9 @@ impl Registry
         {
             Ok(request) =>
             {
-                acpi::run_on_control(&self.acpi, || self.signal_jobs(), request, ipc_buf);
+                acpi::run_on_control(&self.acpi, || self.signal_jobs(), request, reply);
             }
-            Err(code) => reply_status(code, ipc_buf),
+            Err(code) => reply.set_status(code),
         }
     }
 
@@ -1425,7 +1426,7 @@ impl Registry
     /// `CSpace` before it replies, and a re-send keeps the first caps and
     /// releases the new ones; a request with no path is refused with
     /// `INVALID_REQUEST`; the job is posted at most once per boot.
-    fn set_drivers_dir(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    fn set_drivers_dir(&self, msg: &IpcMessage, ipc_buf: *mut u64, reply: &mut Reply)
     {
         let delivered_cap = msg.caps().first().copied();
         let tables_cap = msg.caps().get(1).copied().unwrap_or(0);
@@ -1441,26 +1442,26 @@ impl Registry
                 warn: "SET_DRIVERS_DIR rejected: badge lacks DRIVERS_DIR_AUTHORITY"
             );
             release();
-            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::UNAUTHORIZED);
             return;
         }
         if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
         {
             release();
-            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
             return;
         }
         let Some(new_cap) = delivered_cap
         else
         {
-            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::INVALID_REQUEST);
             return;
         };
         let Some(path) = DirPath::of(msg)
         else
         {
             release();
-            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::INVALID_REQUEST);
             return;
         };
         let installed = self.lock().install_drivers_dir(new_cap, tables_cap, &path);
@@ -1488,7 +1489,7 @@ impl Registry
     /// call memmgr. A reply that fails deletes the copy, so the watch is
     /// found gone and dropped at the next sweep ([`release_if_gone`]).
     /// Logs nothing, as `QUERY_DEVICE` does not.
-    fn watch_class(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    fn watch_class(&self, msg: &IpcMessage, reply: &mut Reply)
     {
         let class = ipc::devmgr_labels::class_badge::decode(msg.badge)
             .map(|(slot, _)| slot)
@@ -1496,12 +1497,12 @@ impl Registry
         let Some(slot) = class
         else
         {
-            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::UNAUTHORIZED);
             return;
         };
         if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
         {
-            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
             return;
         }
         let Some(note) = std::os::seraph::object_slab_retype(
@@ -1510,14 +1511,14 @@ impl Registry
         )
         else
         {
-            reply_status(ipc::devmgr_errors::OUT_OF_RESOURCES, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::OUT_OF_RESOURCES);
             return;
         };
         let Ok(copy) = syscall::cap_derive(note, syscall::RIGHTS_NTF_WAIT)
         else
         {
             let _ = syscall::cap_delete(note);
-            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::INVALID_REQUEST);
             return;
         };
         let watched = self
@@ -1530,18 +1531,14 @@ impl Registry
         {
             let _ = syscall::cap_delete(copy);
             let _ = syscall::cap_delete(note);
-            reply_status(ipc::devmgr_errors::WATCHERS_FULL, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::WATCHERS_FULL);
             return;
         };
-        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+        let answer = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
             .word(0, u64::try_from(ordinals).unwrap_or(u64::MAX))
             .cap(copy)
             .build();
-        // SAFETY: ipc_buf is this worker's registered IPC buffer.
-        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-        {
-            let _ = syscall::cap_delete(copy);
-        }
+        reply.set_or_delete_caps(answer);
     }
 
     /// `MINT_CLASS_SEND`: past its gate (`CLASS_AUTHORITY`) and version
@@ -1549,16 +1546,16 @@ impl Registry
     /// derives, or its refusal. A reply that fails moves no cap: the SEND is
     /// devmgr's still, and deleted, so no slot leaks. Logs nothing, as
     /// `QUERY_DEVICE` does not.
-    fn mint_class_send(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    fn mint_class_send(&self, msg: &IpcMessage, reply: &mut Reply)
     {
         if msg.badge & ipc::devmgr_labels::CLASS_AUTHORITY == 0
         {
-            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::UNAUTHORIZED);
             return;
         }
         if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
         {
-            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
             return;
         }
         let minted = self.lock().mint_class_send(self.endpoint, msg);
@@ -1566,16 +1563,13 @@ impl Registry
         {
             Ok(send) =>
             {
-                let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-                    .cap(send)
-                    .build();
-                // SAFETY: ipc_buf is this worker's registered IPC buffer.
-                if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-                {
-                    let _ = syscall::cap_delete(send);
-                }
+                reply.set_or_delete_caps(
+                    IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                        .cap(send)
+                        .build(),
+                );
             }
-            Err(code) => reply_status(code, ipc_buf),
+            Err(code) => reply.set_status(code),
         }
     }
 
@@ -1585,7 +1579,7 @@ impl Registry
     /// has arrived, from which point a restart can read the mark, so marks
     /// are sealed and the request refused. Logs nothing, as `QUERY_DEVICE`
     /// does not.
-    fn decline_restart(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    fn decline_restart(&self, msg: &IpcMessage, reply: &mut Reply)
     {
         let class = ipc::devmgr_labels::class_badge::decode(msg.badge)
             .map(|(slot, _)| slot)
@@ -1593,12 +1587,12 @@ impl Registry
         let Some(slot) = class
         else
         {
-            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::UNAUTHORIZED);
             return;
         };
         if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
         {
-            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
             return;
         }
         let ordinal = instance_ordinal(msg);
@@ -1613,16 +1607,14 @@ impl Registry
                     firmware::restart::decline(served, ordinal, sealed, |d| d.declined = true)
                 })
         };
-        reply_status(
-            match outcome
-            {
-                Decline::Declined => ipc::devmgr_errors::SUCCESS,
-                Decline::Sealed => ipc::devmgr_errors::REFUSED,
-                Decline::Withdrawn => ipc::devmgr_errors::WITHDRAWN,
-                Decline::Absent => ipc::devmgr_errors::NO_DEVICE,
-            },
-            ipc_buf,
-        );
+        let code = match outcome
+        {
+            Decline::Declined => ipc::devmgr_errors::SUCCESS,
+            Decline::Sealed => ipc::devmgr_errors::REFUSED,
+            Decline::Withdrawn => ipc::devmgr_errors::WITHDRAWN,
+            Decline::Absent => ipc::devmgr_errors::NO_DEVICE,
+        };
+        reply.set_status(code);
     }
 
     /// `QUERY_DEVICE_LOCATION`: reply where the device of the driver at the
@@ -1630,7 +1622,7 @@ impl Registry
     /// the address of the PCI function devmgr bound it to, or why there is
     /// none. A query whose answer would name no driver waits as
     /// `QUERY_DEVICE`'s does. Logs nothing, as `QUERY_DEVICE` does not.
-    fn query_device_location(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    fn query_device_location(&self, msg: &IpcMessage, reply: &mut Reply)
     {
         let class = ipc::devmgr_labels::class_badge::decode(msg.badge)
             .map(|(slot, _)| slot)
@@ -1638,12 +1630,12 @@ impl Registry
         let Some(slot) = class
         else
         {
-            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::UNAUTHORIZED);
             return;
         };
         if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
         {
-            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            reply.set_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
             return;
         }
         let ordinal = instance_ordinal(msg);
@@ -1665,16 +1657,15 @@ impl Registry
         {
             Ok((segment, bus, device, function)) =>
             {
-                let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                let answer = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
                     .word(
                         0,
                         ipc::devmgr_labels::pci_function(segment, bus, device, function),
                     )
                     .build();
-                // SAFETY: ipc_buf is this worker's registered IPC buffer.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                reply.set(answer);
             }
-            Err(code) => reply_status(code, ipc_buf),
+            Err(code) => reply.set_status(code),
         }
     }
 
@@ -1685,15 +1676,15 @@ impl Registry
     /// has delivered the drivers directory, whose pass binds first, and while
     /// no earlier request's pass is posted; every rejection, including a request
     /// with no path, releases the cap before it replies.
-    fn bind_drivers(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    fn bind_drivers(&self, msg: &IpcMessage, ipc_buf: *mut u64, reply: &mut Reply)
     {
         let delivered_cap = msg.caps().first().copied();
-        let refuse = |code| {
+        let mut refuse = |code| {
             if let Some(c) = delivered_cap
             {
                 let _ = syscall::cap_delete(c);
             }
-            reply_status(code, ipc_buf);
+            reply.set_status(code);
         };
         if msg.badge & ipc::devmgr_labels::BIND_AUTHORITY == 0
         {
@@ -1765,28 +1756,25 @@ const IOMMU_DRIVERS: usize = 1;
 /// that driver was withdrawn, `absent` when no driver is served there, and
 /// `INVALID_REQUEST` when the derivation fails. A reply that fails moves no
 /// cap, so the derived one is deleted.
-fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, ipc_buf: *mut u64)
+fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, reply: &mut Reply)
 {
     let driver = match lookup
     {
         Lookup::Live(driver) => driver,
-        Lookup::Withdrawn => return reply_status(ipc::devmgr_errors::WITHDRAWN, ipc_buf),
-        Lookup::Absent => return reply_status(absent, ipc_buf),
+        Lookup::Withdrawn => return reply.set_status(ipc::devmgr_errors::WITHDRAWN),
+        Lookup::Absent => return reply.set_status(absent),
     };
     let Ok(derived) =
         syscall::cap_derive_badge(driver.ep, syscall::RIGHTS_EP_SEND_GRANT, verb_bits)
     else
     {
-        return reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+        return reply.set_status(ipc::devmgr_errors::INVALID_REQUEST);
     };
-    let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-        .cap(derived)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-    {
-        let _ = syscall::cap_delete(derived);
-    }
+    reply.set_or_delete_caps(
+        IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+            .cap(derived)
+            .build(),
+    );
 }
 
 /// The instance ordinal a `QUERY_DEVICE` request selects: `data[1]` when sent, else 0, the first instance.
@@ -1886,43 +1874,39 @@ fn handle_query_acpi_table(
     firmware: &caps::Firmware,
     msg: &IpcMessage,
     badge: u64,
-    ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
     {
-        reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+        reply.set_status(ipc::devmgr_errors::UNAUTHORIZED);
         return;
     }
     if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
     {
-        reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+        reply.set_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
         return;
     }
     let Some((region, table_phys)) =
         tables::locate_acpi_table(firmware, msg.word(1), msg.word(2), msg.word(3))
     else
     {
-        reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+        reply.set_status(ipc::devmgr_errors::NO_DEVICE);
         return;
     };
     let Ok(memory_cap) = syscall::cap_derive(region.slot, syscall::RIGHTS_ALL)
     else
     {
-        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+        reply.set_status(ipc::devmgr_errors::INVALID_REQUEST);
         return;
     };
-    let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+    let answer = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
         .word(0, region.base)
         .word(1, region.size)
         .word(2, table_phys)
         .cap(memory_cap)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-    {
-        let _ = syscall::cap_delete(memory_cap);
-    }
+    reply.set_or_delete_caps(answer);
 }
 
 /// `QUERY_SHUTDOWN_DEVICE` handler: serve pwrmgr the platform's firmware
@@ -1935,21 +1919,21 @@ fn handle_query_shutdown_device(
     firmware: &caps::Firmware,
     msg: &IpcMessage,
     badge: u64,
-    ipc_buf: *mut u64,
+    reply: &mut Reply,
 )
 {
     if badge & ipc::devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY == 0
     {
-        reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+        reply.set_status(ipc::devmgr_errors::UNAUTHORIZED);
         return;
     }
     if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
     {
-        reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+        reply.set_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
         return;
     }
 
-    arch::current::reply_shutdown_device(firmware, msg, ipc_buf);
+    arch::current::reply_shutdown_device(firmware, msg, reply);
 }
 
 // ── ECAM enumeration ────────────────────────────────────────────────────────

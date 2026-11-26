@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use driver_binding::resources::{self, PlatformDelivery, Resource};
 use hwrng_protocol::{MAX_READ_BYTES, errors as hwrng_errors};
 use ipc::IpcMessage;
+use ipc::serve::{Reply, next_request};
 use std::os::seraph::{reserve_pages, startup_info};
 use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE};
 use tpm::crb::Crb;
@@ -301,27 +302,25 @@ fn open(window: Window, phys: u64) -> Device
 // ── Service loop ───────────────────────────────────────────────────────────
 
 /// Reply `label` with no data.
-fn reply_status(label: u64, ipc_buf: *mut u64)
+fn reply_status(label: u64, reply: &mut Reply)
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(label), ipc_buf) };
+    reply.set_status(label);
 }
 
 /// Reply `SUCCESS` carrying `bytes` ([`hwrng_protocol::encode_reply`]).
-fn reply_bytes(bytes: &[u8], ipc_buf: *mut u64)
+fn reply_bytes(bytes: &[u8], reply: &mut Reply)
 {
     let mut words = [0u64; MSG_DATA_WORDS_MAX];
     let Some(used) = hwrng_protocol::encode_reply(bytes, &mut words)
     else
     {
-        reply_status(hwrng_errors::NOT_READY, ipc_buf);
+        reply_status(hwrng_errors::NOT_READY, reply);
         return;
     };
-    let reply = IpcMessage::builder(hwrng_errors::SUCCESS)
+    let msg = IpcMessage::builder(hwrng_errors::SUCCESS)
         .words(0, words.get(..used).unwrap_or_default())
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(msg);
 }
 
 /// The read path's state across requests.
@@ -340,13 +339,13 @@ impl Reader
     /// Handle `READ` of `asked` bytes: `TPM2_GetRandom` until they are read
     /// or [`READ_WAIT`] passes, then reply with what arrived, or
     /// `NOT_READY` when nothing did.
-    fn read(&mut self, asked: usize, ipc_buf: *mut u64)
+    fn read(&mut self, asked: usize, reply: &mut Reply)
     {
         let mut bytes = [0u8; MAX_READ_BYTES];
         let Some(out) = bytes.get_mut(..asked)
         else
         {
-            reply_status(hwrng_errors::NOT_READY, ipc_buf);
+            reply_status(hwrng_errors::NOT_READY, reply);
             return;
         };
         match self.session.get_random(out, &mut Deadline::new(READ_WAIT))
@@ -363,7 +362,7 @@ impl Reader
                     std::os::seraph::log!("TPM reads again");
                     self.failing = false;
                 }
-                reply_bytes(out.get(..n).unwrap_or_default(), ipc_buf);
+                reply_bytes(out.get(..n).unwrap_or_default(), reply);
             }
             Err(fault) =>
             {
@@ -372,7 +371,7 @@ impl Reader
                     std::os::seraph::log!(warn: "READ failed ({fault:?}); answering NOT_READY");
                     self.failing = true;
                 }
-                reply_status(hwrng_errors::NOT_READY, ipc_buf);
+                reply_status(hwrng_errors::NOT_READY, reply);
             }
         }
     }
@@ -399,10 +398,11 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, reader: &mut Reader) -> !
 {
     std::os::seraph::log!("ready, entering service loop");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -421,15 +421,15 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, reader: &mut Reader) -> !
         }
         if !tpm::authorized(msg.label, msg.badge)
         {
-            reply_status(hwrng_errors::UNAUTHORIZED, ipc_buf);
+            reply_status(hwrng_errors::UNAUTHORIZED, &mut reply);
         }
         else if msg.label == hwrng_protocol::READ
         {
-            reader.read(hwrng_protocol::requested_len(msg.words()), ipc_buf);
+            reader.read(hwrng_protocol::requested_len(msg.words()), &mut reply);
         }
         else
         {
-            reply_status(hwrng_errors::UNKNOWN_OPCODE, ipc_buf);
+            reply_status(hwrng_errors::UNKNOWN_OPCODE, &mut reply);
         }
     }
 }

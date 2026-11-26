@@ -17,6 +17,7 @@
 
 mod io;
 
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, blk_labels, devmgr_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::time::Instant;
@@ -668,10 +669,11 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 {
     std::os::seraph::log!("ready, entering service loop");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -686,26 +688,24 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
         {
             blk_labels::BLK_READ_INTO_MEMORY =>
             {
-                handle_transfer(&msg, ipc_buf, rt, io::IoDirection::Read);
+                handle_transfer(&msg, ipc_buf, rt, io::IoDirection::Read, &mut reply);
             }
             blk_labels::BLK_WRITE_FROM_MEMORY =>
             {
-                handle_transfer(&msg, ipc_buf, rt, io::IoDirection::Write);
+                handle_transfer(&msg, ipc_buf, rt, io::IoDirection::Write, &mut reply);
             }
             blk_labels::REGISTER_PARTITION =>
             {
-                handle_register_partition(&msg, ipc_buf, rt);
+                handle_register_partition(&msg, rt, &mut reply);
             }
             blk_labels::BLK_GET_GEOMETRY =>
             {
-                handle_get_geometry(&msg, ipc_buf, rt);
+                handle_get_geometry(&msg, rt, &mut reply);
             }
             _ =>
             {
                 drop_caps(msg.caps());
-                let reply = IpcMessage::new(ipc::blk_errors::UNKNOWN_OPCODE);
-                // SAFETY: ipc_buf is the registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                reply.set_status(ipc::blk_errors::UNKNOWN_OPCODE);
             }
         }
     }
@@ -738,43 +738,42 @@ fn drop_caps(caps: &[u64])
 /// for the request's duration (`virtio_core::dma`). Every reply moves the
 /// Memory cap back to the caller in `caps[0]`; leaving it in the driver's
 /// `CSpace` would leak it and keep the frame out of memmgr's pool, so a reply
-/// the caller cannot take (it died, or its `CSpace` is full) deletes it. A
+/// the caller cannot take (it died, or its `CSpace` is full) deletes it
+/// ([`Reply::set_or_delete_caps`]): every reply follows the transfer's
+/// completion or the device's acknowledged reset, so the device no longer
+/// reaches the frame. A
 /// request the device loses (see
 /// [`io::submit_and_wait`]) is answered only after [`quiesce_device`] has
 /// stopped the device, so the returned cap is free of device DMA
 /// ([`run_transfer`]).
-fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir: io::IoDirection)
+fn handle_transfer(
+    msg: &IpcMessage,
+    ipc_buf: *mut u64,
+    rt: &mut BlkRuntime,
+    dir: io::IoDirection,
+    out: &mut Reply,
+)
 {
     let mem_cap = msg.caps().first().copied().unwrap_or(0);
     drop_caps(msg.caps().get(1..).unwrap_or(&[]));
 
-    let reply_with = |code: u64, ipc_buf: *mut u64| {
+    let reply_with = |code: u64, out: &mut Reply| {
         let mut builder = IpcMessage::builder(code);
         if mem_cap != 0
         {
             builder = builder.cap(mem_cap);
         }
-        let reply = builder.build();
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err() && mem_cap != 0
-        {
-            // The caller is gone, or its `CSpace` cannot take the cap, so the
-            // cap stayed here. Every reply follows the transfer's completion
-            // or the device's acknowledged reset, so the device no longer
-            // reaches the frame: drop the reference, which would otherwise
-            // keep the frame out of memmgr's pool for the boot.
-            let _ = syscall::cap_delete(mem_cap);
-        }
+        out.set_or_delete_caps(builder.build());
     };
 
     if rt.device_faulted
     {
-        reply_with(ipc::blk_errors::DEVICE_FAULT, ipc_buf);
+        reply_with(ipc::blk_errors::DEVICE_FAULT, out);
         return;
     }
     if mem_cap == 0
     {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, out);
         return;
     }
 
@@ -799,12 +798,12 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
     let Some(data_len) = rt.geometry.transfer_len(block_count)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, out);
         return;
     };
     if let Err(code) = validate_memory_cap(mem_cap, dir, data_len)
     {
-        reply_with(code, ipc_buf);
+        reply_with(code, out);
         return;
     }
     // The run's first LBA is below the capacity, so its sector fits.
@@ -818,7 +817,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
         Ok(s) => s,
         Err(code) =>
         {
-            reply_with(code, ipc_buf);
+            reply_with(code, out);
             return;
         }
     };
@@ -831,7 +830,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
         badge: msg.badge,
     };
     let code = run_transfer(rt, &transfer, mem_cap, ipc_buf);
-    reply_with(code, ipc_buf);
+    reply_with(code, out);
 }
 
 /// A checked transfer request: its direction, its first `VirtIO` sector, its
@@ -1052,32 +1051,28 @@ fn resolve_lba(badge: u64, lba: u64, rt: &BlkRuntime) -> Result<u64, u64>
 /// [`MOUNT_AUTHORITY`] caps are badged and the kernel rejects
 /// re-badging of a badged source — the caller cannot mint partition
 /// caps itself.
-fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+fn handle_register_partition(msg: &IpcMessage, rt: &mut BlkRuntime, out: &mut Reply)
 {
     // REGISTER_PARTITION takes no cap; one a request carries is deleted.
     drop_caps(msg.caps());
-    let reject = |ipc_buf: *mut u64| {
-        let reply = IpcMessage::new(ipc::blk_errors::REGISTER_REJECTED);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    let reject = |out: &mut Reply| {
+        out.set_status(ipc::blk_errors::REGISTER_REJECTED);
     };
 
     if msg.badge & ipc::blk_labels::MOUNT_AUTHORITY == 0
     {
-        reject(ipc_buf);
+        reject(out);
         return;
     }
 
     if msg.word_count() < 3
     {
-        reject(ipc_buf);
+        reject(out);
         return;
     }
     if msg.word(0) != u64::from(ipc::BLK_LABELS_VERSION)
     {
-        let reply = IpcMessage::new(ipc::blk_errors::LABEL_VERSION_MISMATCH);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        out.set_status(ipc::blk_errors::LABEL_VERSION_MISMATCH);
         return;
     }
     let base_lba = msg.word(1);
@@ -1087,14 +1082,14 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
     let end = base_lba.saturating_add(length_lba);
     if end > rt.geometry.capacity
     {
-        reject(ipc_buf);
+        reject(out);
         return;
     }
 
     let Some(badge) = rt.partitions.register(base_lba, length_lba)
     else
     {
-        reject(ipc_buf);
+        reject(out);
         return;
     };
 
@@ -1105,15 +1100,14 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
         syscall::cap_derive_badge(rt.service_ep, syscall::RIGHTS_EP_SEND_GRANT, badge)
     else
     {
-        reject(ipc_buf);
+        reject(out);
         return;
     };
 
     let reply = IpcMessage::builder(ipc::blk_errors::SUCCESS)
         .cap(partition_cap)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    out.set(reply);
 }
 
 /// Handle a `BLK_GET_GEOMETRY` request: reply the logical block size and
@@ -1126,7 +1120,7 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
 /// device's life, so a client reads it once.
 ///
 /// [`MOUNT_AUTHORITY`]: ipc::blk_labels::MOUNT_AUTHORITY
-fn handle_get_geometry(msg: &IpcMessage, ipc_buf: *mut u64, rt: &BlkRuntime)
+fn handle_get_geometry(msg: &IpcMessage, rt: &BlkRuntime, out: &mut Reply)
 {
     // BLK_GET_GEOMETRY takes no cap; one a request carries is deleted.
     drop_caps(msg.caps());
@@ -1153,8 +1147,7 @@ fn handle_get_geometry(msg: &IpcMessage, ipc_buf: *mut u64, rt: &BlkRuntime)
     {
         IpcMessage::new(ipc::blk_errors::LABEL_VERSION_MISMATCH)
     };
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    out.set(reply);
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────

@@ -34,6 +34,7 @@ mod worker_pool;
 use std::os::seraph::startup_info;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, blk_labels, ns_labels};
 use namespace_protocol::{GateError, NsError, compose_forward_lookup_rights, gate};
 use root_backend::{Mount, VfsdRootBackend};
@@ -613,10 +614,11 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
     }
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-        let recv = match unsafe { ipc::ipc_recv(rt.caps.service_ep, ipc_buf) }
+        let recv = match unsafe { next_request(rt.caps.service_ep, &mut reply, ipc_buf) }
         {
             Ok(recv) => recv,
             Err(e) =>
@@ -626,13 +628,18 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
             }
         };
         guard.on_success();
-        dispatch_service_request(&recv, ipc_buf, rt);
+        dispatch_service_request(&recv, ipc_buf, rt, &mut reply);
     }
 }
 
 /// Serves one request received on the service endpoint: gates it on its
 /// badge's verb bit, then hands it to its label's handler, which replies.
-fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
+fn dispatch_service_request(
+    recv: &IpcMessage,
+    ipc_buf: *mut u64,
+    rt: &VfsdRuntime,
+    reply: &mut Reply,
+)
 {
     let opcode = recv.label & 0xFFFF;
     let badge = recv.badge;
@@ -647,13 +654,11 @@ fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRunti
             if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
             {
                 std::os::seraph::log!(warn: "MOUNT rejected: badge lacks MOUNT_AUTHORITY");
-                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                reply.set_status(ipc::vfsd_errors::UNAUTHORIZED);
             }
             else
             {
-                handle_mount_request(recv, ipc_buf, rt);
+                handle_mount_request(recv, ipc_buf, rt, reply);
             }
         }
         ipc::vfsd_labels::UNMOUNT =>
@@ -662,13 +667,11 @@ fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRunti
             if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
             {
                 std::os::seraph::log!(warn: "UNMOUNT rejected: badge lacks MOUNT_AUTHORITY");
-                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                reply.set_status(ipc::vfsd_errors::UNAUTHORIZED);
             }
             else
             {
-                handle_unmount_request(recv, ipc_buf, rt);
+                handle_unmount_request(recv, ipc_buf, rt, reply);
             }
         }
         ipc::vfsd_labels::GET_SYSTEM_ROOT_CAP =>
@@ -678,9 +681,7 @@ fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRunti
                 std::os::seraph::log!(
                     warn: "GET_SYSTEM_ROOT_CAP rejected: badge lacks SEED_AUTHORITY"
                 );
-                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                reply.set_status(ipc::vfsd_errors::UNAUTHORIZED);
             }
             else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
             {
@@ -690,13 +691,11 @@ fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRunti
                     recv.word(0),
                     ipc::VFSD_LABELS_VERSION
                 );
-                let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
-                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                reply.set_status(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
             }
             else
             {
-                handle_get_system_root_cap(ipc_buf, rt);
+                handle_get_system_root_cap(rt, reply);
             }
         }
         ipc::vfsd_labels::GET_SWAP_PARTITION =>
@@ -709,9 +708,7 @@ fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRunti
                 std::os::seraph::log!(
                     warn: "GET_SWAP_PARTITION rejected: badge lacks SWAP_AUTHORITY"
                 );
-                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                reply.set_status(ipc::vfsd_errors::UNAUTHORIZED);
             }
             else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
             {
@@ -721,20 +718,16 @@ fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRunti
                     recv.word(0),
                     ipc::VFSD_LABELS_VERSION
                 );
-                let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
-                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                reply.set_status(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
             }
             else
             {
-                handle_get_swap_partition(ipc_buf, rt);
+                handle_get_swap_partition(ipc_buf, rt, reply);
             }
         }
         _ =>
         {
-            let err = IpcMessage::new(ipc::vfsd_errors::UNKNOWN_OPCODE);
-            // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            reply.set_status(ipc::vfsd_errors::UNKNOWN_OPCODE);
         }
     }
 }
@@ -768,10 +761,11 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
     }
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-        let recv = match unsafe { ipc::ipc_recv(rt.namespace_ep, ipc_buf) }
+        let recv = match unsafe { next_request(rt.namespace_ep, &mut reply, ipc_buf) }
         {
             Ok(recv) => recv,
             Err(e) =>
@@ -800,7 +794,7 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
         // filesystem, captured at install time. This preserves the
         // namespace-model invariant that root-fs entries remain
         // reachable unless explicitly shadowed by a registered mount.
-        if try_forward_lookup_fallthrough(rt, &recv, ipc_buf)
+        if try_forward_lookup_fallthrough(rt, &recv, ipc_buf, &mut reply)
         {
             continue;
         }
@@ -809,7 +803,7 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
         // with a `fallthrough_cap` lists its local children first, then
         // the underlying root-fs directory's entries, so a listing shows
         // both mounts and root-fs contents (mirroring lookup fall-through).
-        if try_forward_readdir_fallthrough(rt, &recv, ipc_buf)
+        if try_forward_readdir_fallthrough(rt, &recv, ipc_buf, &mut reply)
         {
             continue;
         }
@@ -818,12 +812,9 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
             .root_backend
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: ipc_buf invariant carried through; rt.namespace_ep is
-        // the un-badged source for child caps minted by the protocol
-        // crate's `cap_derive_badge` calls.
-        unsafe {
-            namespace_protocol::dispatch_request(&mut *backend, &recv, rt.namespace_ep, ipc_buf);
-        }
+        // rt.namespace_ep is the un-badged source for child caps minted by
+        // the protocol crate's `cap_derive_badge` calls.
+        namespace_protocol::dispatch_request(&mut *backend, &recv, rt.namespace_ep, &mut reply);
     }
 }
 
@@ -861,6 +852,7 @@ fn try_forward_lookup_fallthrough(
     rt: &'static VfsdRuntime,
     recv: &IpcMessage,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 ) -> bool
 {
     let opcode = recv.label & 0xFFFF;
@@ -930,13 +922,12 @@ fn try_forward_lookup_fallthrough(
         .bytes(1, path)
         .build();
 
-    let Some(reply) = fallthrough_call(fallthrough, &forward, ipc_buf)
+    let Some(answer) = fallthrough_call(fallthrough, &forward, ipc_buf)
     else
     {
         return false;
     };
-    // SAFETY: ipc_buf is the thread-registered IPC buffer.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(answer);
     true
 }
 
@@ -992,6 +983,7 @@ fn try_forward_readdir_fallthrough(
     rt: &'static VfsdRuntime,
     recv: &IpcMessage,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
 ) -> bool
 {
     let opcode = recv.label & 0xFFFF;
@@ -1017,8 +1009,7 @@ fn try_forward_readdir_fallthrough(
     else
     {
         let end = IpcMessage::new(ipc::fs_labels::END_OF_DIR);
-        // SAFETY: ipc_buf is the thread-registered IPC buffer.
-        let _ = unsafe { ipc::ipc_reply(&end, ipc_buf) };
+        reply.set(end);
         return true;
     };
 
@@ -1053,17 +1044,16 @@ fn try_forward_readdir_fallthrough(
         let req = IpcMessage::builder(ns_labels::NS_READDIR)
             .word(0, u64::from(probe))
             .build();
-        let Some(reply) = fallthrough_call(fallthrough, &req, ipc_buf)
+        let Some(answer) = fallthrough_call(fallthrough, &req, ipc_buf)
         else
         {
             return false;
         };
         // `END_OF_DIR` or any upstream error terminates the merged
         // enumeration; forward it verbatim as the client's terminator.
-        if reply.label != 0
+        if answer.label != 0
         {
-            // SAFETY: ipc_buf is the thread-registered IPC buffer.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            reply.set(answer);
             return true;
         }
         #[expect(
@@ -1071,8 +1061,8 @@ fn try_forward_readdir_fallthrough(
             reason = "cast is range-safe: name_len rides word 1, bounded by the protocol's max \
                       name length"
         )]
-        let name_len = reply.word(1) as usize;
-        let data = reply.data_bytes();
+        let name_len = answer.word(1) as usize;
+        let data = answer.data_bytes();
         // Reply layout: word 0 = kind, word 1 = name_len, name at byte 16.
         let name = if name_len == 0
         {
@@ -1087,8 +1077,7 @@ fn try_forward_readdir_fallthrough(
         {
             // Malformed upstream reply: terminate enumeration cleanly.
             let end = IpcMessage::new(ipc::fs_labels::END_OF_DIR);
-            // SAFETY: ipc_buf is the thread-registered IPC buffer.
-            let _ = unsafe { ipc::ipc_reply(&end, ipc_buf) };
+            reply.set(end);
             return true;
         };
         let shadowed = {
@@ -1102,8 +1091,7 @@ fn try_forward_readdir_fallthrough(
         {
             if matched == target
             {
-                // SAFETY: ipc_buf is the thread-registered IPC buffer.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                reply.set(answer);
                 return true;
             }
             matched = matched.saturating_add(1);
@@ -1130,7 +1118,7 @@ fn try_forward_readdir_fallthrough(
 /// this fires only when the self-mount failed (no `SERAPH_ROOT`
 /// partition, or fatfs bring-up failed); init then FATALs instead of
 /// receiving a system-root cap that resolves against an empty root.
-fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
+fn handle_get_system_root_cap(rt: &VfsdRuntime, reply: &mut Reply)
 {
     if rt
         .root_backend
@@ -1140,9 +1128,7 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
         == 0
     {
         std::os::seraph::log!(warn: "GET_SYSTEM_ROOT_CAP rejected: root not mounted");
-        let err = IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
-        // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+        reply.set_status(ipc::vfsd_errors::NO_MOUNT);
         return;
     }
 
@@ -1150,7 +1136,7 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
         namespace_protocol::NodeId::ROOT,
         namespace_protocol::NamespaceRights::ALL,
     );
-    let reply = if let Ok(cap) =
+    let answer = if let Ok(cap) =
         syscall::cap_derive_badge(rt.namespace_ep, syscall::RIGHTS_EP_SEND, badge)
     {
         IpcMessage::builder(ipc::vfsd_errors::SUCCESS)
@@ -1162,8 +1148,7 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
         std::os::seraph::log!(warn: "GET_SYSTEM_ROOT_CAP derive failed");
         IpcMessage::new(ipc::vfsd_errors::IO_ERROR)
     };
-    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(answer);
 }
 
 // ── Swap-partition hand-out ─────────────────────────────────────────────────
@@ -1235,14 +1220,14 @@ impl swap::SwapOps for SwapIo<'_>
 /// named partition that is no swap partition.
 /// A failed registration, revoke or derivation replies
 /// [`vfsd_errors::IO_ERROR`].
-fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime)
+fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime, reply: &mut Reply)
 {
     let handed = rt
         .swap
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .hand_out(&mut SwapIo { rt, ipc_buf });
-    let reply = match handed
+    let answer = match handed
     {
         Ok(cap) => IpcMessage::builder(ipc::vfsd_errors::SUCCESS)
             .cap(cap)
@@ -1263,8 +1248,7 @@ fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime)
             IpcMessage::new(label)
         }
     };
-    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(answer);
 }
 
 // ── MOUNT handler ──────────────────────────────────────────────────────────
@@ -1712,29 +1696,25 @@ fn decline_root_disk_restart(rt: &VfsdRuntime, ipc_buf: *mut u64)
     reason = "the role byte is the low byte of data[0] by wire contract, so the `as` keeps the \
               whole value the handler accepts"
 )]
-fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
+fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime, reply: &mut Reply)
 {
     let role_byte = recv.word(0) as u8;
     let Some(role) = MountRole::from_wire(role_byte)
     else
     {
         std::os::seraph::log!(warn: "MOUNT: unknown role byte {role_byte}");
-        let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+        reply.set_status(ipc::vfsd_errors::NOT_FOUND);
         return;
     };
 
     let Some(path) = request_path(recv, "MOUNT")
     else
     {
-        let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+        reply.set_status(ipc::vfsd_errors::NOT_FOUND);
         return;
     };
 
-    let reply = match do_mount(rt, ipc_buf, role, path)
+    let answer = match do_mount(rt, ipc_buf, role, path)
     {
         Ok(0) => IpcMessage::new(ipc::vfsd_errors::SUCCESS),
         Ok(cap) => IpcMessage::builder(ipc::vfsd_errors::SUCCESS)
@@ -1746,13 +1726,12 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
     // Once a root is up, read the storage statement and auto-mount the ESP
     // and the data partitions, as the self-mount does. Best-effort: a
     // failure does not propagate into the root mount's reply.
-    if matches!(role, MountRole::Root) && reply.label == ipc::vfsd_errors::SUCCESS
+    if matches!(role, MountRole::Root) && answer.label == ipc::vfsd_errors::SUCCESS
     {
         after_root_mount(rt, ipc_buf);
     }
 
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(answer);
 }
 
 /// The path a `MOUNT` or `UNMOUNT` request names: `data[1]` bytes from
@@ -1796,9 +1775,9 @@ fn request_path<'a>(recv: &'a IpcMessage, what: &str) -> Option<&'a [u8]>
 /// - `data[1]`: mount path length
 /// - `data[2..]`: mount path bytes (packed into u64 words)
 /// - label bit 16: `vfsd_labels::UNMOUNT_FORCE`
-fn handle_unmount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
+fn handle_unmount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime, reply: &mut Reply)
 {
-    let reply = if recv.word(0) == u64::from(ipc::VFSD_LABELS_VERSION)
+    let answer = if recv.word(0) == u64::from(ipc::VFSD_LABELS_VERSION)
     {
         if let Some(path) = request_path(recv, "UNMOUNT")
         {
@@ -1826,8 +1805,7 @@ fn handle_unmount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime
         );
         IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH)
     };
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(answer);
 }
 
 /// Bound on the driver's answer to `FS_UNMOUNT`. The driver's single

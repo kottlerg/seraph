@@ -43,6 +43,7 @@ mod arch;
 use boot_protocol::FramebufferInfo;
 use driver_binding::resources::{self, PlatformDelivery, Resource};
 use framebuffer::{authority, render};
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, devmgr_labels, fb_errors, fb_labels};
 use std::os::seraph::startup_info;
 use text::{DecodeOutcome, Utf8Decoder};
@@ -128,7 +129,7 @@ fn handle_request(
     msg: &IpcMessage,
     writer: &mut render::FramebufferWriter,
     decoder: &mut Utf8Decoder,
-    ipc_buf: *mut u64,
+    out: &mut Reply,
 )
 {
     // Label encoding mirrors `serial_labels::SERIAL_WRITE_BYTES` and
@@ -221,8 +222,7 @@ fn handle_request(
     {
         IpcMessage::new(fb_errors::UNKNOWN_OPCODE)
     };
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    out.set(reply);
 }
 
 /// Render one Unicode codepoint at the writer's cursor. Multi-glyph
@@ -247,10 +247,11 @@ fn service_loop(service_ep: u64, mut writer: render::FramebufferWriter, ipc_buf:
     // this loop (see the module doc). The kernel's rate-limited recv-failure
     // line and the guard's exit remain the signal.
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -267,7 +268,7 @@ fn service_loop(service_ep: u64, mut writer: render::FramebufferWriter, ipc_buf:
         {
             let _ = syscall::cap_delete(cap);
         }
-        handle_request(&msg, &mut writer, &mut decoder, ipc_buf);
+        handle_request(&msg, &mut writer, &mut decoder, &mut reply);
     }
 }
 

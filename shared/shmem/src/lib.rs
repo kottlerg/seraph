@@ -428,6 +428,25 @@ unsafe fn checked_mask(region_vaddr: u64, capacity: u32) -> Option<u32>
     (shared == capacity).then_some(capacity.saturating_sub(1))
 }
 
+/// Split a copy of `len` bytes at ring index `index` into the ring body's two
+/// contiguous segments: `(slot, first, second)`, the copy's first `first` bytes
+/// at body offset `slot` up to the body's end, and its last `second` bytes at
+/// the body's start.
+///
+/// The caller bounds `len` by the capacity (`mask + 1`), so `slot + first <=
+/// capacity` and `second <= slot`: both segments lie in the body and do not
+/// overlap. `index` may be any value the peer wrote; only its slot is used.
+fn segments(index: u32, len: u32, mask: u32) -> (usize, usize, usize)
+{
+    let slot = index & mask;
+    // `slot <= mask <= 2^31 - 1`, so neither operation saturates.
+    let to_end = mask.saturating_sub(slot).saturating_add(1);
+    let first = len.min(to_end);
+    // `first <= len`, so the subtraction does not saturate.
+    let second = len.saturating_sub(first);
+    (slot as usize, first as usize, second as usize)
+}
+
 impl SpscWriter<'_>
 {
     /// Wrap a pre-initialised shared region as a writer.
@@ -473,18 +492,25 @@ impl SpscWriter<'_>
         {
             return 0;
         }
+        // `n <= free <= capacity`, whatever the peer wrote into `head`.
         let n = free.min(u32::try_from(data.len()).unwrap_or(u32::MAX));
-        for (offset, &byte) in (0..n).zip(data)
-        {
-            let slot = tail.wrapping_add(offset) & self.mask;
-            // SAFETY: `slot <= mask < capacity`, and buf..buf+capacity is the
-            // ring body, so the offset stays inside it.
-            let dst = unsafe { self.buf.add(slot as usize) };
-            // SAFETY: `from_raw`'s contract keeps the ring body mapped and
-            // writable for `'a`, and `dst` lies inside it.
-            unsafe {
-                *dst = byte;
-            }
+        let (slot, first, second) = segments(tail, n, self.mask);
+        // The first segment runs from `tail`'s slot toward the body's end, the
+        // second from the body's start; `first + second = n <= data.len()`.
+        // SAFETY: `data` holds `first` bytes; `slot + first <= capacity`
+        // (`segments`), so the destination lies in the ring body, which
+        // `from_raw`'s contract keeps mapped and writable for `'a`. The caller's
+        // live `&[u8]` forbids any store into its own bytes, so the body bytes
+        // stored here are not `data`'s and the two do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.buf.wrapping_add(slot), first);
+        }
+        // SAFETY: `data` holds `first + second` bytes, so the source lies in it;
+        // `second <= slot < capacity` (`segments`), so the destination lies in
+        // the ring body's start, apart from the first segment; no overlap with
+        // `data`, as above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr().wrapping_add(first), self.buf, second);
         }
         self.header
             .tail
@@ -583,18 +609,24 @@ impl SpscReader<'_>
         {
             return 0;
         }
+        // `n <= used <= capacity`, whatever the peer wrote into `tail`.
         let n = used.min(u32::try_from(dst.len()).unwrap_or(u32::MAX));
-        for (offset, out) in (0..n).zip(dst.iter_mut())
-        {
-            let slot = head.wrapping_add(offset) & self.mask;
-            // SAFETY: `slot <= mask < capacity`, and buf..buf+capacity is the
-            // ring body, so the offset stays inside it.
-            let src = unsafe { self.buf.add(slot as usize) };
-            // SAFETY: `from_raw`'s contract keeps the ring body mapped and
-            // readable for `'a`, and `src` lies inside it.
-            unsafe {
-                *out = *src;
-            }
+        let (slot, first, second) = segments(head, n, self.mask);
+        // Each byte of the body is copied once, into memory the peer cannot
+        // reach, and nothing here reads the body again.
+        // SAFETY: `slot + first <= capacity` (`segments`), so the source lies in
+        // the ring body, which `from_raw`'s contract keeps mapped and readable
+        // for `'a`; `dst` holds `first + second = n` bytes. The caller's live
+        // `&mut [u8]` forbids any other access to its bytes, so the body bytes
+        // read here are not `dst`'s and the two do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.buf.wrapping_add(slot), dst.as_mut_ptr(), first);
+        }
+        // SAFETY: `second <= slot < capacity` (`segments`), so the source lies
+        // at the ring body's start; `dst` holds `first + second` bytes, so the
+        // destination lies in it; no overlap, as above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.buf, dst.as_mut_ptr().wrapping_add(first), second);
         }
         self.header
             .head
@@ -787,12 +819,18 @@ mod tests
         assert_eq!(total_pages(&[region(u64::MAX / PAGE_SIZE)], 0x1000), None);
     }
 
-    /// A ring region in ordinary memory: header plus a `CAP`-byte body.
+    /// What a test region's guard holds: a copy that runs past the body's end
+    /// overwrites it, or reads it into the caller's buffer.
+    const GUARD: [u8; 16] = [0x5A; 16];
+
+    /// A ring region in ordinary memory: header plus a `CAP`-byte body, and
+    /// the guard after the body.
     #[repr(C, align(8))]
     struct Region
     {
         header: SpscHeader,
         body: [u8; CAP as usize],
+        guard: [u8; 16],
     }
 
     fn region(header_capacity: u32) -> Region
@@ -807,8 +845,18 @@ mod tests
                 writer_waiting: AtomicU32::new(0),
             },
             body: [0; CAP as usize],
+            guard: GUARD,
         };
         r.header.capacity.store(header_capacity, Ordering::Relaxed);
+        r
+    }
+
+    /// A region of capacity `CAP` whose indices stand at `head` and `tail`.
+    fn region_at(head: u32, tail: u32) -> Region
+    {
+        let r = region(CAP);
+        r.header.head.store(head, Ordering::Relaxed);
+        r.header.tail.store(tail, Ordering::Relaxed);
         r
     }
 
@@ -854,6 +902,120 @@ mod tests
         assert_eq!(rd.read(&mut out), CAP as usize);
         assert!(out.iter().all(|&b| b == 0xAB));
         assert!(rd.is_empty());
+    }
+
+    // Defect guarded: a split that runs the first segment past the body's end,
+    // a second segment that reaches back over the first, or a pair that copies
+    // more or fewer bytes than asked, at any slot, any length up to the
+    // capacity, and any index, a peer-written one past `u32::MAX`'s wrap
+    // included.
+    #[test]
+    fn copy_segments_stay_in_the_body_and_cover_the_copy_once()
+    {
+        for capacity in [1u32, 2, 8, 64]
+        {
+            let mask = capacity - 1;
+            for index in (0..capacity * 3).chain(u32::MAX - capacity * 2..=u32::MAX)
+            {
+                for len in 0..=capacity
+                {
+                    let (slot, first, second) = segments(index, len, mask);
+                    assert_eq!(slot, (index % capacity) as usize);
+                    assert_eq!(first + second, len as usize);
+                    assert!(slot + first <= capacity as usize, "{index} {len}");
+                    assert!(second <= slot, "{index} {len}");
+                    // The second segment starts only once the first reached the end.
+                    assert!(second == 0 || slot + first == capacity as usize);
+                }
+            }
+        }
+    }
+
+    // Defect guarded: a write split at the wrong byte, or whose second segment
+    // lands anywhere but the body's start, scrambling the stream or storing
+    // past the body.
+    #[test]
+    fn a_write_that_wraps_stores_its_rest_at_the_body_start()
+    {
+        let start = CAP - 3;
+        let mut r = region_at(start, start);
+        let va = &raw mut r as u64;
+        // SAFETY: `r` is a live, aligned header plus `CAP` body bytes and
+        // outlives both halves.
+        let (mut w, _rd) = unsafe { spsc_pair(va, CAP) }.expect("matching capacity");
+        assert_eq!(w.write(&[1, 2, 3, 4, 5, 6, 7, 8]), 8);
+        let cap = CAP as usize;
+        assert_eq!(r.body[cap - 3..], [1, 2, 3]);
+        assert_eq!(r.body[..5], [4, 5, 6, 7, 8]);
+        assert!(r.body[5..cap - 3].iter().all(|&b| b == 0));
+        assert_eq!(r.guard, GUARD);
+        assert_eq!(r.header.tail.load(Ordering::Relaxed), start + 8);
+    }
+
+    // Defect guarded: a read split at the wrong byte, or whose second segment
+    // comes from anywhere but the body's start, scrambling the stream or
+    // reading past the body.
+    #[test]
+    fn a_read_that_wraps_takes_the_body_start_after_its_end()
+    {
+        let start = CAP - 3;
+        let mut r = region_at(start, start + 8);
+        let cap = CAP as usize;
+        r.body[cap - 3..].copy_from_slice(&[1, 2, 3]);
+        r.body[..5].copy_from_slice(&[4, 5, 6, 7, 8]);
+        let va = &raw mut r as u64;
+        // SAFETY: `r` is a live, aligned header plus `CAP` body bytes and
+        // outlives both halves.
+        let (_w, mut rd) = unsafe { spsc_pair(va, CAP) }.expect("matching capacity");
+        let mut out = [0u8; 16];
+        assert_eq!(rd.read(&mut out), 8);
+        assert_eq!(out, [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(r.header.head.load(Ordering::Relaxed), start + 8);
+    }
+
+    // Defect guarded: a full ring that takes bytes over unread ones, or an
+    // empty ring that hands out stale body bytes.
+    #[test]
+    fn a_full_ring_takes_no_write_and_an_empty_ring_gives_no_read()
+    {
+        // Off slot 0, so filling and draining the ring each wrap.
+        let mut r = region_at(5, 5);
+        let va = &raw mut r as u64;
+        // SAFETY: `r` is a live, aligned header plus `CAP` body bytes and
+        // outlives both halves.
+        let (mut w, mut rd) = unsafe { spsc_pair(va, CAP) }.expect("matching capacity");
+        let mut out = [0xEEu8; CAP as usize];
+        assert_eq!(rd.read(&mut out), 0);
+        assert!(out.iter().all(|&b| b == 0xEE));
+        let data: Vec<u8> = (0..CAP).map(|i| i.to_le_bytes()[0] ^ 0x80).collect();
+        assert_eq!(w.write(&data), CAP as usize);
+        assert_eq!(w.write(&[0xFF]), 0);
+        assert_eq!(rd.read(&mut out), CAP as usize);
+        assert_eq!(out[..], data[..]);
+        assert_eq!(rd.read(&mut out), 0);
+        assert_eq!(r.guard, GUARD);
+    }
+
+    // Defect guarded: a write that stores more than the free space, over bytes
+    // the reader has not taken, or returns a count other than what it stored.
+    #[test]
+    fn a_write_larger_than_the_free_space_stores_only_what_fits()
+    {
+        // Ten bytes free, from slot 60 across the body's end to slot 6.
+        let (head, tail) = (6, 6 + CAP - 10);
+        let mut r = region_at(head, tail);
+        r.body = [0xAA; CAP as usize];
+        let va = &raw mut r as u64;
+        // SAFETY: `r` is a live, aligned header plus `CAP` body bytes and
+        // outlives both halves.
+        let (mut w, _rd) = unsafe { spsc_pair(va, CAP) }.expect("matching capacity");
+        assert_eq!(w.write(&[0x11; 32]), 10);
+        let cap = CAP as usize;
+        assert!(r.body[cap - 4..].iter().all(|&b| b == 0x11));
+        assert!(r.body[..6].iter().all(|&b| b == 0x11));
+        assert!(r.body[6..cap - 4].iter().all(|&b| b == 0xAA));
+        assert_eq!(r.guard, GUARD);
+        assert_eq!(r.header.tail.load(Ordering::Relaxed), tail + 10);
     }
 
     // ── Doorbell protocol model ──────────────────────────────────────────────
@@ -1345,8 +1507,8 @@ mod tests
         // A peer that pushes `tail` more than a capacity past `head` must
         // not make the writer underflow its free count or the reader take
         // more than one ring's worth of bytes.
-        let mut r = region(CAP);
-        r.header.tail.store(CAP * 3, Ordering::Relaxed);
+        // Off slot 0, so the reader's one ring's worth wraps.
+        let mut r = region_at(5, 5 + CAP * 3);
         let va = &raw mut r as u64;
         // SAFETY: `r` is a live, aligned header plus `CAP` body bytes and
         // outlives both halves.
@@ -1354,5 +1516,7 @@ mod tests
         assert_eq!(w.write(&[1, 2, 3]), 0);
         let mut out = [0u8; CAP as usize * 2];
         assert_eq!(rd.read(&mut out), CAP as usize);
+        assert!(out[CAP as usize..].iter().all(|&b| b == 0));
+        assert_eq!(r.guard, GUARD);
     }
 }

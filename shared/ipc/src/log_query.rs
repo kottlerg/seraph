@@ -384,7 +384,8 @@ pub struct HistoryEntryView<'a>
     pub us: u64,
     /// The sender's badge.
     pub badge: u64,
-    /// An `ipc::stream_labels::LEVEL_*` code.
+    /// The entry's level, an `ipc::stream_labels::LEVEL_*` code: its RFC 5424
+    /// severity, 0 to 7.
     pub level: u8,
     /// [`ENTRY_TEXT`] or [`ENTRY_RECORD`].
     pub kind: u8,
@@ -710,7 +711,7 @@ mod tests
             seq,
             us: seq * 10,
             badge: seq + 1000,
-            level: 3,
+            level: crate::stream_labels::LEVEL_ERROR as u8,
             kind,
             bytes,
         }
@@ -733,6 +734,27 @@ mod tests
         let read: Vec<_> = HistoryEntries::new(&reply).collect();
         assert_eq!(read, [a, b, c, d]);
         assert!(!reply_more(reply.label));
+    }
+
+    // Defect caught: an entry's severity lost or moved to another level on
+    // its way through a query reply.
+    #[test]
+    fn each_severity_round_trips_through_a_history_page()
+    {
+        let mut page = HistoryPage::default();
+        let entries: Vec<_> = (0u8..=7)
+            .map(|level| HistoryEntryView {
+                level,
+                ..view(u64::from(level), ENTRY_TEXT, b"x")
+            })
+            .collect();
+        for e in &entries
+        {
+            assert!(page.push(e));
+        }
+        let reply = page.reply(false);
+        let read: Vec<_> = HistoryEntries::new(&reply).collect();
+        assert_eq!(read, entries);
     }
 
     #[test]

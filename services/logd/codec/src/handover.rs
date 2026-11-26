@@ -15,7 +15,7 @@
 
 use ipc::IpcMessage;
 use ipc::log_record::RECORD_MAX_BYTES;
-use ipc::stream_labels::{LEVEL_MASK, LEVEL_SHIFT, level_of};
+use ipc::stream_labels::{level_bits, level_of};
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
 /// `HANDOVER_PULL` reply status: more chunks follow.
@@ -217,7 +217,7 @@ pub fn encode_slot(badge: u64, name: &[u8]) -> IpcMessage
 pub fn encode_line(badge: u64, us: u64, level: u64, line: &[u8]) -> IpcMessage
 {
     let line = clip_to_payload(line, LINE_BYTES_WORD);
-    let label = with_length(REPLY_MORE, line.len()) | ((level & LEVEL_MASK) << LEVEL_SHIFT);
+    let label = with_length(REPLY_MORE, line.len()) | level_bits(level);
     IpcMessage::builder(label)
         .word(0, KIND_LINE)
         .word(1, badge)
@@ -241,7 +241,7 @@ pub fn encode_line(badge: u64, us: u64, level: u64, line: &[u8]) -> IpcMessage
 pub fn encode_record(badge: u64, us: u64, level: u64, record: &[u8]) -> IpcMessage
 {
     let record = clip_to_payload(record, RECORD_BYTES_WORD);
-    let label = with_length(REPLY_MORE, record.len()) | ((level & LEVEL_MASK) << LEVEL_SHIFT);
+    let label = with_length(REPLY_MORE, record.len()) | level_bits(level);
     IpcMessage::builder(label)
         .word(0, KIND_RECORD)
         .word(1, badge)
@@ -615,6 +615,30 @@ mod tests
         assert_eq!(rec.message(), b"reclaim:");
         let field = rec.fields().next().expect("its field");
         assert_eq!(field.key, b"name");
+    }
+
+    // Defect caught: a line's or a record's severity lost or moved to another
+    // level across the handover.
+    #[test]
+    fn each_severity_round_trips_through_line_and_record_chunks()
+    {
+        let record = ipc::log_record::RecordWriter::new(format_args!("m"));
+        for severity in 0..=ipc::stream_labels::LEVEL_DEBUG
+        {
+            let Chunk::Line { level, .. } = decode(&encode_line(1, 0, severity, b"x"))
+            else
+            {
+                panic!("expected a line chunk");
+            };
+            assert_eq!(level, severity);
+            let Chunk::Record { level, .. } =
+                decode(&encode_record(1, 0, severity, record.as_bytes()))
+            else
+            {
+                panic!("expected a record chunk");
+            };
+            assert_eq!(level, severity);
+        }
     }
 
     #[test]

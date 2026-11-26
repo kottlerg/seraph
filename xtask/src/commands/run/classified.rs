@@ -594,7 +594,7 @@ fn default_pass(harnesses: &[ImageHarness]) -> Result<String>
 }
 
 /// The text before the service name of svcmgr's line for a service's death,
-/// `[<seconds>] [svcmgr] service died: <name>`
+/// `[<seconds>] INFO   [svcmgr] service died: <name>`
 /// (`services/svcmgr/src/restart.rs` `log_death`), after its log name.
 const DEATH_LINE: &str = "service died: ";
 
@@ -627,25 +627,17 @@ fn harness_death(log: &str, markers: &Markers) -> Option<String>
 }
 
 /// Whether `line` is svcmgr's line for the death of a service named in
-/// `names`: svcmgr's log name, then, after a level tag if the line has one,
-/// [`DEATH_LINE`] and the name, ended by the line's end or a character no
-/// service name holds.
+/// `names`: svcmgr's log name, then [`DEATH_LINE`] and the name, ended by
+/// the line's end or a character no service name holds.
 fn names_death(line: &str, names: &[&str]) -> bool
 {
-    let Some((_, rest)) = line.split_once("[svcmgr] ")
+    let Some(died) = line
+        .split_once("[svcmgr] ")
+        .and_then(|(_, rest)| rest.strip_prefix(DEATH_LINE))
     else
     {
         return false;
     };
-    let Some((tag, died)) = rest.split_once(DEATH_LINE)
-    else
-    {
-        return false;
-    };
-    if !tag.bytes().all(|b| b.is_ascii_uppercase() || b == b' ')
-    {
-        return false;
-    }
     names.iter().any(|name| {
         died.strip_prefix(name).is_some_and(|after| {
             !after.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -1126,15 +1118,16 @@ fn console_lost_after_handover(log: &str) -> Option<String>
 }
 
 /// Whether `line` is a log line as init-logd and logd write it,
-/// `[<seconds>] [<name>] <text>`, the kernel's lines they read from the
-/// kernel log (`[<seconds>] [kernel] <text>`) among them, rather than a line
-/// the kernel wrote itself (`[<seconds>] kernel: <text>`).
+/// `[<seconds>] <LEVEL> [<name>] <text>`, the kernel's lines they read from
+/// the kernel log (`[<seconds>] <LEVEL> [kernel] <text>`) among them, rather
+/// than a line the kernel wrote itself (`[<seconds>] kernel: <text>`).
 fn is_userspace_line(line: &str) -> bool
 {
     line.trim_start()
         .strip_prefix('[')
-        .and_then(|rest| rest.split_once(']'))
-        .is_some_and(|(_, rest)| rest.trim_start().starts_with('['))
+        .and_then(|rest| rest.split_once("] "))
+        .and_then(|(_, rest)| crate::whole_lines::strip_level_tag(rest))
+        .is_some_and(|rest| rest.starts_with('['))
 }
 
 fn line_containing(text: &str, byte_offset: usize) -> String
@@ -1583,7 +1576,7 @@ mod tests
         // is a PASS.
         let log = "[2.16] kernel: USERSPACE FAULT: tid=27 cpu=1 cause=store/AMO page fault (scause=0xf)\n\
                    [2.17] kernel:   rip=0x0000000000012bf8  fs_base=0x0000000000000000\n\
-                   [4.27] [svctest] ALL TESTS PASSED\n";
+                   [4.27] INFO   [svctest] ALL TESTS PASSED\n";
         assert!(matches!(classify_log(log), Status::Pass));
     }
 
@@ -1593,8 +1586,8 @@ mod tests
     #[test]
     fn console_lost_after_the_handover_classifies_fail()
     {
-        let log = "[46.520887] [svcmgr] svcmgr: launching: svctest\n\
-                   [46.540540] [init-logd] handover complete; init-logd thread exiting\n\
+        let log = "[46.520887] INFO   [svcmgr] svcmgr: launching: svctest\n\
+                   [46.540540] INFO   [init-logd] handover complete; init-logd thread exiting\n\
                    [47.331494] kernel: USERSPACE FAULT: tid=2589005658 cpu=0 cause=store/AMO page fault (scause=0xf)\n\
                    [47.332085] kernel:   sepc=0x0000003133369ef0  stval=0x0000000000000000\n";
         let markers = default_markers();
@@ -1612,7 +1605,7 @@ mod tests
     #[test]
     fn a_qemu_crash_after_the_handover_stays_a_qemu_crash()
     {
-        let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n\
+        let log = "[46.540540] INFO   [init-logd] handover complete; init-logd thread exiting\n\
                    qemu-system-riscv64: ../tcg/tcg.c:1234: tcg_gen_code: Assertion failed.\n";
         let markers = default_markers();
         for rc in [RC_SIGABRT, RC_SIGSEGV]
@@ -1627,24 +1620,24 @@ mod tests
     #[test]
     fn a_userspace_line_after_the_handover_keeps_the_console()
     {
-        let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n\
+        let log = "[46.540540] INFO   [init-logd] handover complete; init-logd thread exiting\n\
                    [47.331494] kernel: USERSPACE FAULT: tid=2589005658 cpu=0\n\
-                   [47.500000] [logd] resolved the serial driver\n";
+                   [47.500000] INFO   [logd] resolved the serial driver\n";
         assert!(matches!(classify_log(log), Status::Ok));
     }
 
     #[test]
     fn a_kernel_line_logd_wrote_after_the_handover_keeps_the_console()
     {
-        let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n\
-                   [47.331494] [kernel] USERSPACE FAULT: tid=2589005658 cpu=0\n";
+        let log = "[46.540540] INFO   [init-logd] handover complete; init-logd thread exiting\n\
+                   [47.331494] INFO   [kernel] USERSPACE FAULT: tid=2589005658 cpu=0\n";
         assert!(matches!(classify_log(log), Status::Ok));
     }
 
     #[test]
     fn a_hang_right_at_the_handover_stays_a_hang()
     {
-        let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n";
+        let log = "[46.540540] INFO   [init-logd] handover complete; init-logd thread exiting\n";
         let markers = default_markers();
         assert!(matches!(classify(0, true, log, &markers).0, Status::Hang));
         // A boot with no handover (ktest) is not judged by it.
@@ -1710,19 +1703,19 @@ mod tests
             std::env::temp_dir().join(format!("seraph-harness-death-{}.log", std::process::id()));
         let markers = markers(&[ImageHarness::Svctest]);
         let mut last_len = 0u64;
-        std::fs::write(&path, "[9.0] [svctest] phase=vfsd passed\n").unwrap();
+        std::fs::write(&path, "[9.0] INFO   [svctest] phase=vfsd passed\n").unwrap();
         assert!(!failure_present(&path, &mut last_len, &markers));
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
-        f.write_all(b"[9.1] [svcmgr] service died: svctest\n")
+        f.write_all(b"[9.1] INFO   [svcmgr] service died: svctest\n")
             .unwrap();
         assert!(failure_present(&path, &mut last_len, &markers));
 
         std::fs::write(
             &path,
-            "[9.0] [svctest] ALL TESTS PASSED\n[9.1] [svcmgr] service died: svctest\n",
+            "[9.0] INFO   [svctest] ALL TESTS PASSED\n[9.1] INFO   [svcmgr] service died: svctest\n",
         )
         .unwrap();
         last_len = 0;
@@ -1738,33 +1731,33 @@ mod tests
     fn a_harness_death_before_its_marker_fails_the_run_naming_the_death()
     {
         let markers = markers(&[ImageHarness::Svctest]);
-        let died = "[9.0] [svctest] phase=vfsd starting\n\
+        let died = "[9.0] INFO   [svctest] phase=vfsd starting\n\
                     [9.1] kernel: USERSPACE FAULT: tid=27 cpu=1\n\
-                    [9.2] [svcmgr] service died: svctest\n\
-                    [9.2] [svcmgr]   exit_reason=0x0000000000001001\n";
+                    [9.2] INFO   [svcmgr] service died: svctest\n\
+                    [9.2] INFO   [svcmgr]   exit_reason=0x0000000000001001\n";
         for hung in [false, true]
         {
             let (status, reason) = classify(0, hung, died, &markers);
             assert!(matches!(status, Status::Fail), "hung={hung}: {status:?}");
             let reason = reason.unwrap();
             assert!(
-                reason.contains("[9.2] [svcmgr] service died: svctest"),
+                reason.contains("[9.2] INFO   [svcmgr] service died: svctest"),
                 "{reason}"
             );
         }
-        let restarted = format!("{died}[20.0] [svctest] ALL TESTS PASSED\n");
+        let restarted = format!("{died}[20.0] INFO   [svctest] ALL TESTS PASSED\n");
         assert!(matches!(
             classify(0, false, &restarted, &markers).0,
             Status::Fail
         ));
-        // A level tag between the log name and the line is read through.
-        let tagged = "[9.2] [svcmgr] WARN service died: svctest\n";
+        // A death line at another level is read as one.
+        let tagged = "[9.2] WARN   [svcmgr] service died: svctest\n";
         assert!(matches!(
             classify(0, true, tagged, &markers).0,
             Status::Fail
         ));
-        let passed = "[9.0] [svctest] ALL TESTS PASSED\n\
-                      [9.1] [svcmgr] service died: svctest\n";
+        let passed = "[9.0] INFO   [svctest] ALL TESTS PASSED\n\
+                      [9.1] INFO   [svcmgr] service died: svctest\n";
         assert!(matches!(
             classify(0, true, passed, &markers).0,
             Status::Pass
@@ -1782,7 +1775,7 @@ mod tests
             classify(
                 0,
                 true,
-                "[9.2] [svcmgr] service died: ktest\n",
+                "[9.2] INFO   [svcmgr] service died: ktest\n",
                 &markers(&[ImageHarness::Ktest])
             )
             .0,
@@ -1790,11 +1783,11 @@ mod tests
         ));
         let markers = markers(&[ImageHarness::Usertest]);
         for log in [
-            "[9.2] [svcmgr] service died: logd\n",
-            "[9.2] [svcmgr] service died: usertest-fixture\n",
-            "[9.2] [svcmgr] service died: svctest\n",
-            "[9.2] [crasher] service died: usertest\n",
-            "[9.2] [svcmgr] restart of usertest; service died: usertest\n",
+            "[9.2] INFO   [svcmgr] service died: logd\n",
+            "[9.2] INFO   [svcmgr] service died: usertest-fixture\n",
+            "[9.2] INFO   [svcmgr] service died: svctest\n",
+            "[9.2] INFO   [crasher] service died: usertest\n",
+            "[9.2] INFO   [svcmgr] restart of usertest; service died: usertest\n",
         ]
         {
             assert!(
@@ -1806,7 +1799,7 @@ mod tests
             classify(
                 0,
                 true,
-                "[9.2] [svcmgr] service died: usertest\r\n",
+                "[9.2] INFO   [svcmgr] service died: usertest\r\n",
                 &markers
             )
             .0,
@@ -1847,12 +1840,18 @@ mod tests
             ..markers(&[ImageHarness::Svctest])
         };
         assert!(matches!(
-            classify(0, true, "[30.1] [svctest] ALL TESTS PASSED\n", &markers).0,
+            classify(
+                0,
+                true,
+                "[30.1] INFO   [svctest] ALL TESTS PASSED\n",
+                &markers
+            )
+            .0,
             Status::Pass
         ));
         for log in [
-            "[30.1] [usertest] ALL TESTS PASSED\n",
-            "[30.1] [vfsd] note: ALL TESTS PASSED\n",
+            "[30.1] INFO   [usertest] ALL TESTS PASSED\n",
+            "[30.1] INFO   [vfsd] note: ALL TESTS PASSED\n",
             "ALL TESTS PASSED\n",
         ]
         {
@@ -1876,8 +1875,8 @@ mod tests
     fn qemu_sigsegv_no_marker_classifies_qemu_crash()
     {
         let markers = default_markers();
-        let log = "[0.12] [init] requesting procmgr to create vfsd (with caps)\n\
-                   [0.13] [devmgr] devmgr: ECAM phys=0xe0000000 size=0x10000000 buses 0..=255\n";
+        let log = "[0.12] INFO   [init] requesting procmgr to create vfsd (with caps)\n\
+                   [0.13] INFO   [devmgr] devmgr: ECAM phys=0xe0000000 size=0x10000000 buses 0..=255\n";
         let (status, matched) = classify(RC_SIGSEGV, false, log, &markers);
         assert!(matches!(status, Status::QemuCrash(c) if c == RC_SIGSEGV));
         assert!(matched.unwrap().contains("ECAM phys="));
@@ -2004,7 +2003,8 @@ mod tests
     fn sigkill_is_not_qemu_crash()
     {
         let markers = default_markers();
-        let log = "[0.13] [devmgr] devmgr: ECAM phys=0xe0000000 size=0x10000000 buses 0..=255\n";
+        let log =
+            "[0.13] INFO   [devmgr] devmgr: ECAM phys=0xe0000000 size=0x10000000 buses 0..=255\n";
         assert!(matches!(
             classify(128 + 9, false, log, &markers).0,
             Status::Err(c) if c == 128 + 9
@@ -2042,12 +2042,17 @@ mod tests
     fn a_pass_without_a_required_line_is_a_fail_naming_the_pattern()
     {
         let checks = PassChecks::new(&["mapredo knob present".to_owned()], None, None).unwrap();
-        let log = "[0.1] boot: memory map: mapredo knob present\n[2.0] [ktest] ALL TESTS PASSED\n";
+        let log =
+            "[0.1] boot: memory map: mapredo knob present\n[2.0] INFO   [ktest] ALL TESTS PASSED\n";
         assert!(matches!(
             checks.judge(Status::Pass, None, log).0,
             Status::Pass
         ));
-        let (status, reason) = checks.judge(Status::Pass, None, "[2.0] [ktest] ALL TESTS PASSED\n");
+        let (status, reason) = checks.judge(
+            Status::Pass,
+            None,
+            "[2.0] INFO   [ktest] ALL TESTS PASSED\n",
+        );
         assert!(matches!(status, Status::Fail));
         assert!(reason.unwrap().contains("mapredo knob present"));
     }
@@ -2057,18 +2062,18 @@ mod tests
     {
         let checks = PassChecks::new(
             &[
-                "\\[vfsd\\] DEBUG ".to_owned(),
-                "\\[fatfs\\] DEBUG ".to_owned(),
+                "DEBUG  \\[vfsd\\] ".to_owned(),
+                "DEBUG  \\[fatfs\\] ".to_owned(),
             ],
             None,
             None,
         )
         .unwrap();
-        let one = "[1.0] [vfsd] DEBUG mounted\n[2.0] [usertest] ALL TESTS PASSED\n";
+        let one = "[1.0] DEBUG  [vfsd] mounted\n[2.0] INFO   [usertest] ALL TESTS PASSED\n";
         let (status, reason) = checks.judge(Status::Pass, None, one);
         assert!(matches!(status, Status::Fail));
         assert!(reason.unwrap().contains("fatfs"));
-        let both = "[1.0] [vfsd] DEBUG mounted\n[1.1] [fatfs] DEBUG read\n";
+        let both = "[1.0] DEBUG  [vfsd] mounted\n[1.1] DEBUG  [fatfs] read\n";
         assert!(matches!(
             checks.judge(Status::Pass, None, both).0,
             Status::Pass
@@ -2079,7 +2084,7 @@ mod tests
     fn the_crash_report_check_fails_a_pass_and_leaves_other_verdicts()
     {
         let checks = PassChecks::new(&[], Some(CrashReportExpect::Reports), None).unwrap();
-        let no_reports = "[2.0] [usertest] ALL TESTS PASSED\n";
+        let no_reports = "[2.0] INFO   [usertest] ALL TESTS PASSED\n";
         let (status, reason) = checks.judge(Status::Pass, None, no_reports);
         assert!(matches!(status, Status::Fail));
         assert!(reason.unwrap().starts_with("--crash-reports: "));

@@ -20,7 +20,10 @@ surviving peer reads (Acquire) to tell an empty or full ring from a gone peer (r
 protocol below. `capacity` bytes of ring storage follow at offset `SpscHeader::SIZE` (24). Each
 end supplies the capacity it mapped when it builds its half; a half is refused when that is not a
 power of two or the header's `capacity` disagrees, so a peer that rewrites the shared field
-cannot steer the local end past its mapping. The crate holds the mechanism and the doorbell
+cannot steer the local end past its mapping. A write or a read moves its bytes as at most two
+contiguous copies, split where the body ends, its length bounded by the capacity the end mapped
+whatever the peer wrote into the indices; a read copies each body byte once, into the caller's
+buffer, and reads the body no further. The crate holds the mechanism and the doorbell
 protocol; blocking and wake-up use a notification per direction out of band, which the user of
 the ring rings and waits on.
 

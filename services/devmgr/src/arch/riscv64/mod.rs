@@ -6,9 +6,10 @@
 //! RISC-V arch-dispatch surface for devmgr.
 
 use ipc::IpcMessage;
+use ipc::serve::Reply;
 
+use crate::IrqRangeAllocator;
 use crate::caps::{DevmgrCaps, Firmware};
-use crate::{IrqRangeAllocator, reply_status};
 use firmware_tables::EcamLocation;
 
 /// Arch-specific authority caps devmgr holds after bootstrap.
@@ -172,26 +173,23 @@ pub fn platform_line(_irq_range: &IrqRangeAllocator, line: u32, mode: u64, _isa:
 /// (`msg` is unused; the request carries no RISC-V parameter). Replies
 /// `NO_DEVICE` when devmgr holds no `SbiControl` cap and
 /// `INVALID_REQUEST` when the derivation fails.
-pub fn reply_shutdown_device(firmware: &Firmware, _msg: &IpcMessage, ipc_buf: *mut u64)
+pub fn reply_shutdown_device(firmware: &Firmware, _msg: &IpcMessage, reply: &mut Reply)
 {
     if firmware.arch.sbi_control_cap == 0
     {
-        reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+        reply.set_status(ipc::devmgr_errors::NO_DEVICE);
         return;
     }
     // pwrmgr needs only system reset (SRST); attenuate to the minimum.
     let Ok(sbi) = syscall::cap_derive(firmware.arch.sbi_control_cap, syscall::RIGHTS_SBI_RESET)
     else
     {
-        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+        reply.set_status(ipc::devmgr_errors::INVALID_REQUEST);
         return;
     };
-    let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-        .cap(sbi)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-    {
-        let _ = syscall::cap_delete(sbi);
-    }
+    reply.set_or_delete_caps(
+        IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+            .cap(sbi)
+            .build(),
+    );
 }

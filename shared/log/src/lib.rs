@@ -59,8 +59,9 @@ use ipc::{
     log_query::SLOT_NAME_MAX,
     log_record::RecordWriter,
     stream_labels::{
-        LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_MASK, LEVEL_SHIFT, LEVEL_TRACE, LEVEL_WARN,
-        NAME_UNKNOWN, SENDER_NAMED, STREAM_BYTES, STREAM_RECORD, STREAM_REGISTER_NAME,
+        LEVEL_ALERT, LEVEL_CRITICAL, LEVEL_DEBUG, LEVEL_EMERGENCY, LEVEL_ERROR, LEVEL_INFO,
+        LEVEL_NOTICE, LEVEL_WARN, NAME_UNKNOWN, SENDER_NAMED, STREAM_BYTES, STREAM_RECORD,
+        STREAM_REGISTER_NAME, level_bits, level_or_info,
     },
 };
 use syscall_abi::{MSG_DATA_WORDS_MAX, SyscallError};
@@ -532,24 +533,28 @@ pub fn enabled(level: u64) -> bool
     rank(level) <= MAX_LEVEL.load(Ordering::Relaxed)
 }
 
-/// The level a `SERAPH_LOG` value names: `error`, `warn`, `info`, `debug`,
-/// or `trace`; `None` for any other value.
+/// The level a `SERAPH_LOG` value names, one of the eight RFC 5424
+/// severities: `emergency`, `alert`, `critical`, `error`, `warn`,
+/// `notice`, `info`, or `debug`; `None` for any other value.
 #[must_use]
 pub fn parse_level(name: &[u8]) -> Option<u64>
 {
     match name
     {
+        b"emergency" => Some(LEVEL_EMERGENCY),
+        b"alert" => Some(LEVEL_ALERT),
+        b"critical" => Some(LEVEL_CRITICAL),
         b"error" => Some(LEVEL_ERROR),
         b"warn" => Some(LEVEL_WARN),
+        b"notice" => Some(LEVEL_NOTICE),
         b"info" => Some(LEVEL_INFO),
         b"debug" => Some(LEVEL_DEBUG),
-        b"trace" => Some(LEVEL_TRACE),
         _ => None,
     }
 }
 
 /// The process's level: the most verbose level [`emit`] sends, an
-/// `ipc::stream_labels::LEVEL_*` code from [`LEVEL_ERROR`] to [`LEVEL_TRACE`].
+/// `ipc::stream_labels::LEVEL_*` code from [`LEVEL_EMERGENCY`] to [`LEVEL_DEBUG`].
 #[must_use]
 pub fn max_level() -> u64
 {
@@ -557,23 +562,26 @@ pub fn max_level() -> u64
 }
 
 /// The [`parse_level`] name of `level`; `None` for a code outside
-/// [`LEVEL_ERROR`] to [`LEVEL_TRACE`].
+/// [`LEVEL_EMERGENCY`] to [`LEVEL_DEBUG`].
 fn level_name(level: u64) -> Option<&'static [u8]>
 {
     match level
     {
+        LEVEL_EMERGENCY => Some(b"emergency"),
+        LEVEL_ALERT => Some(b"alert"),
+        LEVEL_CRITICAL => Some(b"critical"),
         LEVEL_ERROR => Some(b"error"),
         LEVEL_WARN => Some(b"warn"),
+        LEVEL_NOTICE => Some(b"notice"),
         LEVEL_INFO => Some(b"info"),
         LEVEL_DEBUG => Some(b"debug"),
-        LEVEL_TRACE => Some(b"trace"),
         _ => None,
     }
 }
 
-/// The longest entry [`level_entry`] writes: `SERAPH_LOG=error`, the longest
-/// name, and its terminating NUL.
-pub const LEVEL_ENTRY_MAX: usize = LEVEL_ENV_KEY.len() + 1 + b"error".len() + 1;
+/// The longest entry [`level_entry`] writes: `SERAPH_LOG=emergency`, the
+/// longest name, and its terminating NUL.
+pub const LEVEL_ENTRY_MAX: usize = LEVEL_ENV_KEY.len() + 1 + b"emergency".len() + 1;
 
 /// Write the environment entry that sets a process's level to `level`,
 /// `SERAPH_LOG=<name>` and its terminating NUL, the form of one entry of an
@@ -593,25 +601,19 @@ pub fn level_entry(level: u64, out: &mut [u8]) -> Option<usize>
     Some(len)
 }
 
-/// `level` as an order of verbosity: the codes [`LEVEL_ERROR`] to
-/// [`LEVEL_TRACE`] are already in that order, and any other code reads as
-/// [`LEVEL_INFO`], as a receiver reads it.
+/// `level` as an order of verbosity: the codes [`LEVEL_EMERGENCY`] to
+/// [`LEVEL_DEBUG`], the RFC 5424 severities, are already in that order, and
+/// any other code reads as [`LEVEL_INFO`], as a receiver reads it.
 fn rank(level: u64) -> u64
 {
-    if (LEVEL_ERROR..=LEVEL_TRACE).contains(&level)
-    {
-        level
-    }
-    else
-    {
-        LEVEL_INFO
-    }
+    level_or_info(level)
 }
 
 // ── Wire-format primitives ──────────────────────────────────────────────────
 
 /// The `STREAM_BYTES` label of a chunk of `len` bytes at `level`, a
-/// `ipc::stream_labels::LEVEL_*` code (bits above the level field dropped).
+/// `ipc::stream_labels::LEVEL_*` code (a code past the eight sent as none,
+/// which a receiver reads as informational).
 fn stream_label(len: usize, level: u64) -> u64
 {
     labelled(STREAM_BYTES, len, level)
@@ -623,10 +625,11 @@ fn record_label(len: usize, level: u64) -> u64
     labelled(STREAM_RECORD, len, level)
 }
 
-/// `id` with a payload length in bits 16-31 and `level` in the level field.
+/// `id` with a payload length in bits 16-31 and `level` in the level field
+/// (`ipc::stream_labels::level_bits`).
 fn labelled(id: u64, len: usize, level: u64) -> u64
 {
-    id | ((len as u64 & 0xFFFF) << 16) | ((level & LEVEL_MASK) << LEVEL_SHIFT)
+    id | ((len as u64 & 0xFFFF) << 16) | level_bits(level)
 }
 
 /// Send `bytes` at `level` (an `ipc::stream_labels::LEVEL_*` code) as one or
@@ -1055,24 +1058,31 @@ mod tests
     #[test]
     fn a_chunk_label_carries_its_length_and_level()
     {
-        use ipc::stream_labels::{LEVEL_INFO, LEVEL_WARN, level_of};
+        use ipc::stream_labels::{LEVEL_SHIFT, level_of};
         let label = stream_label(CHUNK_SIZE, LEVEL_WARN);
         assert_eq!(label & 0xFFFF, STREAM_BYTES);
         assert_eq!((label >> 16) & 0xFFFF, CHUNK_SIZE as u64);
         assert_eq!(level_of(label), LEVEL_WARN);
-        // A code wider than the level field cannot reach the bits above it.
-        assert_eq!(stream_label(1, u64::MAX) >> (LEVEL_SHIFT + 3), 0);
-        assert_eq!(level_of(stream_label(1, LEVEL_INFO)), LEVEL_INFO);
+        // A code past the eight is sent as none, read as info, and cannot
+        // reach the bits above the level field.
+        assert_eq!(level_of(stream_label(1, u64::MAX)), LEVEL_INFO);
+        assert_eq!(stream_label(1, u64::MAX) >> LEVEL_SHIFT, 0);
+        assert_eq!(level_of(stream_label(1, LEVEL_EMERGENCY)), LEVEL_EMERGENCY);
     }
 
     #[test]
-    fn a_level_name_parses_and_anything_else_does_not()
+    fn the_eight_level_names_parse_and_anything_else_does_not()
     {
+        assert_eq!(parse_level(b"emergency"), Some(LEVEL_EMERGENCY));
+        assert_eq!(parse_level(b"alert"), Some(LEVEL_ALERT));
+        assert_eq!(parse_level(b"critical"), Some(LEVEL_CRITICAL));
         assert_eq!(parse_level(b"error"), Some(LEVEL_ERROR));
         assert_eq!(parse_level(b"warn"), Some(LEVEL_WARN));
+        assert_eq!(parse_level(b"notice"), Some(LEVEL_NOTICE));
         assert_eq!(parse_level(b"info"), Some(LEVEL_INFO));
         assert_eq!(parse_level(b"debug"), Some(LEVEL_DEBUG));
-        assert_eq!(parse_level(b"trace"), Some(LEVEL_TRACE));
+        // The scale has no level past debug.
+        assert_eq!(parse_level(b"trace"), None);
         assert_eq!(parse_level(b"WARN"), None);
         assert_eq!(parse_level(b""), None);
     }
@@ -1083,11 +1093,14 @@ mod tests
     fn a_level_entry_parses_back_to_its_level()
     {
         for level in [
+            LEVEL_EMERGENCY,
+            LEVEL_ALERT,
+            LEVEL_CRITICAL,
             LEVEL_ERROR,
             LEVEL_WARN,
+            LEVEL_NOTICE,
             LEVEL_INFO,
             LEVEL_DEBUG,
-            LEVEL_TRACE,
         ]
         {
             let mut out = [0xAAu8; LEVEL_ENTRY_MAX + 4];
@@ -1106,8 +1119,11 @@ mod tests
             assert!(out[n..].iter().all(|&b| b == 0xAA));
         }
         let mut out = [0u8; LEVEL_ENTRY_MAX];
-        assert_eq!(level_entry(LEVEL_ERROR, &mut out), Some(LEVEL_ENTRY_MAX));
-        assert_eq!(&out[..], b"SERAPH_LOG=error\0");
+        assert_eq!(
+            level_entry(LEVEL_EMERGENCY, &mut out),
+            Some(LEVEL_ENTRY_MAX)
+        );
+        assert_eq!(&out[..], b"SERAPH_LOG=emergency\0");
     }
 
     // Defect caught: an entry written past a short buffer, or for a code that
@@ -1116,15 +1132,15 @@ mod tests
     fn a_level_entry_needs_room_and_a_level()
     {
         let mut short = [0u8; LEVEL_ENTRY_MAX - 1];
-        assert_eq!(level_entry(LEVEL_ERROR, &mut short), None);
+        assert_eq!(level_entry(LEVEL_EMERGENCY, &mut short), None);
         assert!(short.iter().all(|&b| b == 0));
         let mut out = [0u8; LEVEL_ENTRY_MAX];
-        assert_eq!(level_entry(0, &mut out), None);
-        assert_eq!(level_entry(6, &mut out), None);
+        assert_eq!(level_entry(LEVEL_DEBUG + 1, &mut out), None);
+        assert_eq!(level_entry(u64::MAX, &mut out), None);
         // A shorter name fits a buffer the longest does not.
-        let mut warn = [0u8; LEVEL_ENTRY_MAX - 1];
+        let mut critical = [0u8; LEVEL_ENTRY_MAX - 1];
         assert_eq!(
-            level_entry(LEVEL_WARN, &mut warn),
+            level_entry(LEVEL_CRITICAL, &mut critical),
             Some(LEVEL_ENTRY_MAX - 1)
         );
     }
@@ -1135,20 +1151,22 @@ mod tests
     fn the_filter_sends_its_level_and_every_less_verbose_one()
     {
         // The default is info.
-        assert!(enabled(LEVEL_INFO) && enabled(LEVEL_ERROR));
+        assert!(enabled(LEVEL_INFO) && enabled(LEVEL_NOTICE) && enabled(LEVEL_EMERGENCY));
         assert!(!enabled(LEVEL_DEBUG));
         assert_eq!(max_level(), LEVEL_INFO);
         set_max_level(LEVEL_WARN);
         assert_eq!(max_level(), LEVEL_WARN);
-        assert!(enabled(LEVEL_ERROR) && enabled(LEVEL_WARN));
-        assert!(!enabled(LEVEL_INFO) && !enabled(LEVEL_TRACE));
-        // An unassigned code reads as info, as the receivers read it.
-        assert!(!enabled(0) && !enabled(7));
-        // An unassigned code sets info.
-        set_max_level(0);
+        assert!(enabled(LEVEL_EMERGENCY) && enabled(LEVEL_ERROR) && enabled(LEVEL_WARN));
+        assert!(!enabled(LEVEL_NOTICE) && !enabled(LEVEL_INFO) && !enabled(LEVEL_DEBUG));
+        // A code past the eight reads as info, as the receivers read it.
+        assert!(!enabled(LEVEL_DEBUG + 1) && !enabled(u64::MAX));
+        // A code past the eight sets info.
+        set_max_level(LEVEL_DEBUG + 1);
         assert_eq!(max_level(), LEVEL_INFO);
-        set_max_level(LEVEL_TRACE);
-        assert!(enabled(LEVEL_TRACE) && enabled(0));
+        set_max_level(LEVEL_DEBUG);
+        assert!(enabled(LEVEL_DEBUG) && enabled(LEVEL_DEBUG + 1));
+        set_max_level(LEVEL_EMERGENCY);
+        assert!(enabled(LEVEL_EMERGENCY) && !enabled(LEVEL_ALERT));
         set_max_level(LEVEL_INFO);
     }
 

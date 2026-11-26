@@ -34,6 +34,7 @@ use death_set::OverflowWatch;
 use ipc::log_labels::{LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS};
 use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal};
 use ipc::log_record::{RECORD_MAX_BYTES, Record};
+use ipc::serve::Reply;
 use ipc::stream_labels::{
     LEVEL_INFO, LEVEL_WARN, NAME_UNKNOWN, RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES,
     STREAM_RECORD, STREAM_REGISTER_NAME, level_of, sender_named,
@@ -233,8 +234,8 @@ fn main() -> !
     let pool = RecvPool::new(
         caps.log_ep_recv,
         recv_diag,
-        move |msg: &IpcMessage, buf: IpcBuf| {
-            serve_request(logd, msg, buf);
+        move |msg: &IpcMessage, _: IpcBuf, reply: &mut Reply| {
+            serve_request(logd, msg, reply);
         },
     );
     match pool.spawn("logd-recv", RECV_WORKERS)
@@ -794,42 +795,37 @@ fn drain_deaths(logd: &Logd)
 }
 
 /// The receive workers' handler (`services/logd/docs/ipc-interface.md`
-/// § Receive pool): drain the death queue, then serve `msg` and reply on
-/// `buf`, the worker's own IPC buffer page.
-fn serve_request(logd: &Logd, msg: &IpcMessage, buf: IpcBuf)
+/// § Receive pool): drain the death queue, then serve `msg` and leave its
+/// reply for the worker to send with its next receive.
+fn serve_request(logd: &Logd, msg: &IpcMessage, reply: &mut Reply)
 {
     drain_deaths(logd);
-    let ipc_buf = buf.as_ptr();
     let label_id = msg.label & 0xFFFF;
     let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
     if label_id == STREAM_BYTES
     {
         let status = consume_bytes(logd, msg.badge, msg, byte_len);
-        // SAFETY: ipc_buf is this worker's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(status), ipc_buf) };
+        reply.set_status(status);
     }
     else if label_id == STREAM_RECORD
     {
         let status = consume_record(logd, msg.badge, msg, byte_len);
-        // SAFETY: ipc_buf is this worker's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(status), ipc_buf) };
+        reply.set_status(status);
     }
     else if label_id == STREAM_REGISTER_NAME
     {
         register_name(logd, msg.badge, msg, byte_len);
-        reply_ack(ipc_buf);
+        reply.set_status(0);
     }
     else if label_id == QUERY_SLOTS || label_id == QUERY_HISTORY
     {
-        let reply = answer_query(&logd.lock().table, msg);
-        // SAFETY: ipc_buf is this worker's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set(answer_query(&logd.lock().table, msg));
     }
     else
     {
         // Unknown / legacy label (e.g. GET_LOG_CAP from a hypothetical
         // pre-pivot caller). Reply empty so the sender unblocks.
-        reply_ack(ipc_buf);
+        reply.set_status(0);
     }
 }
 
@@ -868,12 +864,6 @@ fn answer_query(table: &SlotTable, msg: &IpcMessage) -> IpcMessage
             Err(status) => refusal(status),
         }
     }
-}
-
-fn reply_ack(ipc_buf: *mut u64)
-{
-    // SAFETY: ipc_buf is the calling worker's registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(0), ipc_buf) };
 }
 
 /// Append `byte_len` bytes from the IPC payload onto the slot for
@@ -1792,11 +1782,9 @@ fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u3
     unsafe { ipc::ipc_call_timeout(cap, &msg, ipc_buf, timeout_ms) }.is_ok()
 }
 
-/// Longest prefix [`LineBuf::push_prefix`] writes, CRLF included: the
-/// `[sec.usfrac] ` timestamp (at most 20 + 1 + 6 digits and 3 more bytes), a
-/// `[name] ` of at most [`MAX_NAME_LEN`] bytes, the longest level tag and its
-/// space (`ERROR `), and the line's `\r\n`.
-const LINE_FRAME_MAX: usize = 30 + (MAX_NAME_LEN + 3) + 6 + 2;
+/// Longest frame of a line: the prefix [`LineBuf::push_prefix`] writes
+/// (`logd_codec::prefix::PREFIX_MAX`) and the line's `\r\n`.
+const LINE_FRAME_MAX: usize = logd_codec::prefix::PREFIX_MAX + 2;
 
 /// Bytes of a [`LineBuf`]: the frame of any logd line with its longest body,
 /// a rendered record ([`RENDERED_MAX_BYTES`]), which is longer than any text
@@ -1845,74 +1833,7 @@ impl LineBuf
         self.push(b);
     }
 
-    fn push_decimal(&mut self, value: u64)
-    {
-        let mut digits = [0u8; 20];
-        let mut n = value;
-        let mut idx = digits.len();
-        if n == 0
-        {
-            idx = idx.saturating_sub(1);
-            if let Some(d) = digits.get_mut(idx)
-            {
-                *d = b'0';
-            }
-        }
-        else
-        {
-            while n > 0
-            {
-                // A `u64` has at most 20 digits, so `idx` stays in bounds.
-                idx = idx.saturating_sub(1);
-                if let Some(d) = digits.get_mut(idx)
-                {
-                    *d = b'0'.saturating_add((n % 10) as u8);
-                }
-                n /= 10;
-            }
-        }
-        for &d in digits.get(idx..).unwrap_or_default()
-        {
-            self.push(d);
-        }
-    }
-
-    fn push_decimal_padded(&mut self, value: u64, width: usize)
-    {
-        let mut digits = [b'0'; 20];
-        let mut n = value;
-        let mut idx = digits.len();
-        while n > 0 && idx > 0
-        {
-            // The loop condition keeps `idx` above zero.
-            idx = idx.saturating_sub(1);
-            if let Some(d) = digits.get_mut(idx)
-            {
-                *d = b'0'.saturating_add((n % 10) as u8);
-            }
-            n /= 10;
-        }
-        let start = digits.len().saturating_sub(width);
-        for &d in digits.get(start..).unwrap_or_default()
-        {
-            self.push(d);
-        }
-    }
-
-    /// Push `[sec.usfrac] ` for `us` microseconds of the monotonic clock.
-    fn push_timestamp(&mut self, us: u64)
-    {
-        self.push(b'[');
-        self.push_decimal(us / 1_000_000);
-        self.push(b'.');
-        self.push_decimal_padded(us % 1_000_000, 6);
-        self.push(b']');
-        self.push(b' ');
-    }
-
-    /// Push a line's `[sec.usfrac] [name] ` prefix stamped now, `[?]` for an
-    /// empty `name`, then the level's tag and a space for any level but info
-    /// (`logd_codec::level::tag`).
+    /// Push a line's prefix (`logd_codec::prefix::write`) stamped now.
     fn push_prefix(&mut self, name: &[u8], level: u64)
     {
         self.push_prefix_at(name, level, elapsed_us());
@@ -1922,30 +1843,7 @@ impl LineBuf
     /// clock.
     fn push_prefix_at(&mut self, name: &[u8], level: u64, us: u64)
     {
-        self.push_timestamp(us);
-        self.push(b'[');
-        let name = if name.is_empty()
-        {
-            logd_codec::reclaim::UNNAMED.as_bytes()
-        }
-        else
-        {
-            name
-        };
-        for &b in name
-        {
-            self.push(b);
-        }
-        self.push(b']');
-        self.push(b' ');
-        if let Some(tag) = logd_codec::level::tag(level)
-        {
-            for &b in tag.as_bytes()
-            {
-                self.push(b);
-            }
-            self.push(b' ');
-        }
+        logd_codec::prefix::write(us, level, name, |b| self.push(b));
     }
 
     /// Push a text line: the prefix stamped `us`, the line's bytes with each
@@ -2009,7 +1907,7 @@ fn panic_to_serial(bytes: &[u8])
     }
 }
 
-/// Emit `[sec.usfrac] [logd] <payload>\r\n` to the serial driver, stamped
+/// Emit `[sec.usfrac] INFO   [logd] <payload>\r\n` to the serial driver, stamped
 /// when called. Used for logd's own diagnostics in place of `seraph::log!`
 /// (which would self-IPC into the endpoint logd serves). Until
 /// [`open_self_log`], the line is held in [`SELF_LOG_HOLD`] instead; a payload

@@ -414,9 +414,9 @@ from there into the boot bundle as the module of that name, so an edit needs no 
 `no_std` and has no level.
 
 - **Format.** Text, one setting per line, `<service> = <level>`: a service
-  of the four above and a level `log::parse_level` accepts (`error`, `warn`,
-  `info`, `debug`, `trace`). A `#` starts a comment to the end of its line;
-  blank lines and the whitespace around each field are ignored. A later
+  of the four above and a level `log::parse_level` accepts (`emergency`, `alert`,
+  `critical`, `error`, `warn`, `notice`, `info`, `debug`). A `#` starts a comment to the end of
+  its line; blank lines and the whitespace around each field are ignored. A later
   setting of a service replaces an earlier one. The parser is the
   host-tested `init-log-levels` crate (`../log-levels/`).
 - **Default.** The committed file holds comments only, and a bundle without

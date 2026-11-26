@@ -18,6 +18,7 @@
 //! authority. A consumer of the class decides what the bytes are for.
 
 use hwrng_protocol::{MAX_READ_BYTES, errors as hwrng_errors};
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, devmgr_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::time::{Duration, Instant};
@@ -521,55 +522,53 @@ impl RngRuntime
 }
 
 /// Reply `label` with no data.
-fn reply_status(label: u64, ipc_buf: *mut u64)
+fn reply_status(label: u64, reply: &mut Reply)
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(label), ipc_buf) };
+    reply.set_status(label);
 }
 
 /// Handle `READ`: post the request buffer (or keep the one an earlier read
 /// left posted), wait for the device to fill it, and reply with at most
 /// `asked` of its bytes, or `NOT_READY` when the device fills nothing in
 /// time.
-fn handle_read(ipc_buf: *mut u64, rt: &mut RngRuntime, asked: usize)
+fn handle_read(rt: &mut RngRuntime, asked: usize, reply: &mut Reply)
 {
     if asked == 0
     {
-        reply_bytes(&[], ipc_buf);
+        reply_bytes(&[], reply);
         return;
     }
     if !rt.post(asked)
     {
-        reply_status(hwrng_errors::NOT_READY, ipc_buf);
+        reply_status(hwrng_errors::NOT_READY, reply);
         return;
     }
     let Some((written, posted)) = rt.wait_completion()
     else
     {
-        reply_status(hwrng_errors::NOT_READY, ipc_buf);
+        reply_status(hwrng_errors::NOT_READY, reply);
         return;
     };
     let len = virtio_rng::delivered_len(written, posted, asked);
     let mut bytes = [0u8; MAX_READ_BYTES];
     rt.take_bytes(&mut bytes, len);
-    reply_bytes(bytes.get(..len).unwrap_or_default(), ipc_buf);
+    reply_bytes(bytes.get(..len).unwrap_or_default(), reply);
 }
 
 /// Reply `SUCCESS` carrying `bytes` ([`hwrng_protocol::encode_reply`]).
-fn reply_bytes(bytes: &[u8], ipc_buf: *mut u64)
+fn reply_bytes(bytes: &[u8], reply: &mut Reply)
 {
     let mut words = [0u64; MSG_DATA_WORDS_MAX];
     let Some(used) = hwrng_protocol::encode_reply(bytes, &mut words)
     else
     {
-        reply_status(hwrng_errors::NOT_READY, ipc_buf);
+        reply_status(hwrng_errors::NOT_READY, reply);
         return;
     };
-    let reply = IpcMessage::builder(hwrng_errors::SUCCESS)
+    let msg = IpcMessage::builder(hwrng_errors::SUCCESS)
         .words(0, words.get(..used).unwrap_or_default())
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(msg);
 }
 
 /// Bind `interrupt` to a fresh notification and start the interrupt-service
@@ -664,10 +663,11 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut RngRuntime) -> !
 {
     std::os::seraph::log!("ready, entering service loop");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -686,15 +686,15 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut RngRuntime) -> !
         }
         if !virtio_rng::authorized(msg.label, msg.badge)
         {
-            reply_status(hwrng_errors::UNAUTHORIZED, ipc_buf);
+            reply_status(hwrng_errors::UNAUTHORIZED, &mut reply);
         }
         else if msg.label == hwrng_protocol::READ
         {
-            handle_read(ipc_buf, rt, hwrng_protocol::requested_len(msg.words()));
+            handle_read(rt, hwrng_protocol::requested_len(msg.words()), &mut reply);
         }
         else
         {
-            reply_status(hwrng_errors::UNKNOWN_OPCODE, ipc_buf);
+            reply_status(hwrng_errors::UNKNOWN_OPCODE, &mut reply);
         }
     }
 }

@@ -3,30 +3,37 @@
 
 // services/logd/codec/src/level.rs
 
-//! The log level both receivers render: the tag a line of each level carries
-//! after its `[name]` prefix
-//! ([ipc-interface.md](../../docs/ipc-interface.md)
-//! § `stream_labels::STREAM_BYTES`).
+//! The level tag both log receivers render in a console line's prefix
+//! ([`crate::prefix`]; [ipc-interface.md](../../docs/ipc-interface.md)
+//! § Levels).
 //!
-//! A level is an `ipc::stream_labels::LEVEL_*` code, read from a
-//! `STREAM_BYTES` label with `ipc::stream_labels::level_of`.
+//! A level is an `ipc::stream_labels::LEVEL_*` code, one of the eight RFC 5424
+//! severities, read from a label with `ipc::stream_labels::level_of`.
 
-use ipc::stream_labels::{LEVEL_DEBUG, LEVEL_ERROR, LEVEL_TRACE, LEVEL_WARN};
+use ipc::stream_labels::{
+    LEVEL_ALERT, LEVEL_CRITICAL, LEVEL_DEBUG, LEVEL_EMERGENCY, LEVEL_ERROR, LEVEL_NOTICE,
+    LEVEL_WARN, level_or_info,
+};
 
-/// The tag rendered between a line's `[name] ` prefix and its text, followed
-/// by one space; `None` for the info level and any code `level_of` does not
-/// return, whose lines render untagged, as every line did before levels
-/// existed.
+/// Columns a tag is padded to: the longest tag, `NOTICE`.
+pub const TAG_WIDTH: usize = 6;
+
+/// The tag of `level`: `EMERG`, `ALERT`, `CRIT`, `ERROR`, `WARN`,
+/// `NOTICE`, `INFO`, or `DEBUG`; any other code is tagged `INFO`, as a
+/// receiver reads it ([`level_or_info`]). At most [`TAG_WIDTH`] bytes.
 #[must_use]
-pub fn tag(level: u64) -> Option<&'static str>
+pub fn tag(level: u64) -> &'static str
 {
-    match level
+    match level_or_info(level)
     {
-        LEVEL_ERROR => Some("ERROR"),
-        LEVEL_WARN => Some("WARN"),
-        LEVEL_DEBUG => Some("DEBUG"),
-        LEVEL_TRACE => Some("TRACE"),
-        _ => None,
+        LEVEL_EMERGENCY => "EMERG",
+        LEVEL_ALERT => "ALERT",
+        LEVEL_CRITICAL => "CRIT",
+        LEVEL_ERROR => "ERROR",
+        LEVEL_WARN => "WARN",
+        LEVEL_NOTICE => "NOTICE",
+        LEVEL_DEBUG => "DEBUG",
+        _ => "INFO",
     }
 }
 
@@ -34,22 +41,36 @@ pub fn tag(level: u64) -> Option<&'static str>
 mod tests
 {
     use super::*;
-    use ipc::stream_labels::{LEVEL_INFO, LEVEL_UNSPECIFIED, STREAM_BYTES, level_of};
+    use ipc::stream_labels::{LEVEL_INFO, STREAM_BYTES, level_of};
 
+    // Defect caught: a level rendered with another's tag, or a tag wider
+    // than the column the prefix pads to.
     #[test]
-    fn every_level_but_info_is_tagged()
+    fn each_level_has_its_own_tag_within_the_column()
     {
-        assert_eq!(tag(LEVEL_ERROR), Some("ERROR"));
-        assert_eq!(tag(LEVEL_WARN), Some("WARN"));
-        assert_eq!(tag(LEVEL_DEBUG), Some("DEBUG"));
-        assert_eq!(tag(LEVEL_TRACE), Some("TRACE"));
-        assert_eq!(tag(LEVEL_INFO), None);
+        let tags = [
+            (LEVEL_EMERGENCY, "EMERG"),
+            (LEVEL_ALERT, "ALERT"),
+            (LEVEL_CRITICAL, "CRIT"),
+            (LEVEL_ERROR, "ERROR"),
+            (LEVEL_WARN, "WARN"),
+            (LEVEL_NOTICE, "NOTICE"),
+            (LEVEL_INFO, "INFO"),
+            (LEVEL_DEBUG, "DEBUG"),
+        ];
+        for (level, want) in tags
+        {
+            assert_eq!(tag(level), want);
+            assert!(want.len() <= TAG_WIDTH);
+        }
     }
 
+    // Defect caught: a line whose sender gave no level, or a code past the
+    // eight, rendered as anything but informational.
     #[test]
-    fn a_label_without_a_level_renders_untagged()
+    fn a_label_without_a_level_and_an_unknown_code_are_tagged_info()
     {
-        assert_eq!(tag(level_of(STREAM_BYTES | (5 << 16))), None);
-        assert_eq!(tag(LEVEL_UNSPECIFIED), None);
+        assert_eq!(tag(level_of(STREAM_BYTES | (5 << 16))), "INFO");
+        assert_eq!(tag(LEVEL_DEBUG + 1), "INFO");
     }
 }

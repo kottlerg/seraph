@@ -50,6 +50,7 @@ pub mod idle_past_watchdog_threshold;
 pub mod idle_pull_starved_ready;
 pub mod ipc_call_interrupted_stop_start;
 pub mod ipc_call_timeout_stop;
+pub mod ipc_receiver_order;
 pub mod irq_preserves_user_regs;
 pub mod irq_shared_line;
 pub mod mem_map_retyped_refused;
@@ -227,6 +228,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::sync_ipc_placement",
         sync_ipc_placement::run(ctx)
+    );
+    run_integration_test!(
+        "integration::ipc_receiver_order",
+        ipc_receiver_order::run(ctx)
     );
     run_integration_test!(
         "integration::shared_memory_two_aspaces",

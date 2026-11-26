@@ -969,14 +969,14 @@ pub struct ThreadControlBlock
     #[cfg(debug_assertions)]
     pub deposit_episode: core::sync::atomic::AtomicU32,
 
-    /// Intrusive IPC wait-queue link: the successor on an endpoint queue, or
-    /// on an [`ipc::WaitQueue`](crate::ipc::WaitQueue). Owned by the lock of
+    /// Intrusive IPC wait-queue link: the successor on an
+    /// [`ipc::WaitQueue`](crate::ipc::WaitQueue). Owned by the lock of
     /// the source whose queue links this TCB (`ep.lock` for an endpoint queue;
     /// the bare-field exception of docs/coding-standards.md § Concurrency).
     pub ipc_wait_next: Option<*mut ThreadControlBlock>,
 
     /// Predecessor on an [`ipc::WaitQueue`](crate::ipc::WaitQueue) (null off
-    /// one; endpoint queues do not use it). Owned by the lock of the source
+    /// one). Owned by the lock of the source
     /// whose queue links this TCB (the bare-field exception of
     /// docs/coding-standards.md § Concurrency).
     pub ipc_wait_prev: *mut ThreadControlBlock,
@@ -986,6 +986,16 @@ pub struct ThreadControlBlock
     /// while the TCB is on it, so a holder of one source lock can test
     /// membership of its own queue without walking it.
     pub ipc_wait_queue: core::sync::atomic::AtomicPtr<crate::ipc::WaitQueue>,
+
+    /// The receiver word of the parked-receiver table slot that recorded this
+    /// thread's park on an endpoint's receive queue
+    /// ([`RecvQueue`](crate::ipc::recv_park::RecvQueue)), or null off one. Set
+    /// by that park and cleared by the removal from the queue, both under the
+    /// lock of the endpoint whose receive queue links the TCB (the bare-field
+    /// exception of docs/coding-standards.md § Concurrency). A later park on
+    /// the same CPU can take the slot over, and the removal's clear of it then
+    /// does nothing.
+    pub recv_park_slot: *const core::sync::atomic::AtomicPtr<ThreadControlBlock>,
 
     // === Fault-handler binding ===
     /// Bound fault-handler endpoint object per fault class (`null` = none).

@@ -14,6 +14,8 @@
 //! - [`wait_set`]: multiplexed blocking on any combination of the above.
 //! - [`message`]: the `Message` struct carried by endpoint call/reply and
 //!   fault delivery.
+//! - [`recv_park`]: an endpoint's receive queue and the per-CPU table of
+//!   parked receivers through which a call prefers one parked on its CPU.
 //!
 //! This module also defines [`WaitQueue`], the FIFO of threads parked on an
 //! endpoint, a notification, an event queue, or a wait set, the claims every
@@ -23,9 +25,9 @@
 
 use crate::sched::thread::ThreadControlBlock;
 
-/// FIFO of the threads parked on an endpoint (its send queue and its receive
-/// queue), a notification, an event queue, or a wait set: a circular doubly
-/// linked list through each TCB's `ipc_wait_next` and
+/// FIFO of the threads parked on an endpoint (its send queue, and the list
+/// under its receive queue), a notification, an event queue, or a wait set:
+/// a circular doubly linked list through each TCB's `ipc_wait_next` and
 /// `ipc_wait_prev` (a parked thread waits on one object, so the links are
 /// free), storing only its tail, so the queue is pointer-sized and the source
 /// states keep their retype sizes. Each queued TCB's `ipc_wait_queue` tag
@@ -632,6 +634,7 @@ pub mod event_queue;
 pub mod fault;
 pub mod message;
 pub mod notification;
+pub mod recv_park;
 pub mod upcall;
 pub mod wait_set;
 

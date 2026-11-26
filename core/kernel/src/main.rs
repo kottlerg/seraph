@@ -1709,6 +1709,7 @@ unsafe fn kernel_entry_post_rebase(
                         ipc_wait_next: None,
                         ipc_wait_prev: core::ptr::null_mut(),
                         ipc_wait_queue: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                        recv_park_slot: core::ptr::null(),
                         fault_handlers: [const {
                             core::sync::atomic::AtomicPtr::new(core::ptr::null_mut())
                         };

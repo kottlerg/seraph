@@ -2474,7 +2474,6 @@ and build. The whole set runs as 21 jobs side by side. In that run, the 19 jobs 
 split took 22.5 minutes from the first start to the last end, as runners came free beside the rest
 of the run, which ended a minute later.
 
-
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
 tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches
 one; its loops are bounded; and it does not detect every aliasing or provenance violation

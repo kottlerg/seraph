@@ -343,6 +343,45 @@ and ktest's this way, and every image's (`all`) for the userspace rows
 ([xtask/README.md](../xtask/README.md#cargo-xtask-path-account)).
 A component `--debug` also names takes `--debug`.
 
+### Opt-level overrides
+
+`cargo xtask build --opt-level <package>=<level>[,...]` builds the named workspace packages at
+another opt-level within the active profile
+([xtask/README.md](../xtask/README.md#cargo-xtask-build)); a package `--debug` also names is
+refused, since `--debug` builds it at `opt-level = 1`. A package is any of the workspace, a
+library included, and the override reaches it wherever the build compiles it, in the `-Z
+build-std` crates too: an override of `shmem` changes every image that links the standard
+library, whose stdio pipe is `shmem`'s ring. Under `--release` the merged module of a binary is
+optimized again at that binary's level, so whether a library's override survives into an image is
+read with `cargo xtask compare-images`.
+
+No package carries an override: the root `Cargo.toml` has no `[profile.<p>.package.<crate>]`
+table, and every package builds at the profiles' `opt-level = 2`. A package earns an override
+only by a win past `bench-check`'s band on a benchmark of its own hot path, with its binaries'
+`.text` growing by at most 5% and its largest stack frame by at most 256 bytes, and both
+architectures reaching the pass marker. The candidates were measured at `opt-level = 3` against
+`opt-level = 2` in the release profile, the one the `bench` cell gates and hardware runs, after
+the ring and the renderer gained their bulk copies, five ubench boots of each build at one CPU
+([testing.md](testing.md#benchmarks-bench-cell) § Benchmarks):
+
+| Package | Images that change | Icount, x86_64 | Icount, riscv64 | Host time, x86_64 | Cost |
+|---|---|---|---|---|---|
+| `framebuffer` | The driver alone | `console_write` 5.7% fewer instructions at both sizes | `console_write` 0.56% fewer, inside the band | `console_write` within the boot-to-boot spread (lowest p50 0.7% above `opt-level = 2`'s at 4096 bytes; the five boots of one build spread by 10% to 20%) | `.text` 9.4% larger on x86_64 and 7.4% on riscv64; on riscv64 the service loop's frame gains vector register spills, a size that grows with the hardware's vector length |
+| `shmem` | Every image that links `std`, and those that link `shmem` directly | No `shmem_ring` or `console_write` row moves | No row moves | `shmem_ring` no faster (4096 and 65536 bytes 1% to 6% slower) | None needed: no win |
+
+Neither is kept. `framebuffer`'s win is past the band on x86_64 alone, does not show as time,
+and costs more `.text` than the bound allows. `shmem`'s ring copies are calls to `memcpy`, whose
+code is not `shmem`'s, so its level does not reach the measured copy. The rows these rest on are
+`console_write` at both sizes and `shmem_ring` at 4096 and 65536 bytes; the rows of 64 and 512
+bytes measure less than the transfer they name (#1690) and decide nothing here.
+
+`kernel` is not a candidate. The override's unit is the package, so `opt-level = 3` on
+`kernel` would raise the whole kernel; its targets have no vector unit to use
+(`x86_64-seraph-none.json` turns SSE and AVX off and floats in software;
+`riscv64imac-seraph-none.json` has no V), which leaves `opt-level = 3` loop unrolling alone,
+and its framebuffer (`core/kernel/src/framebuffer.rs`) draws only its own direct console lines,
+no hot path.
+
 ---
 
 ## Build Output: the Sysroot

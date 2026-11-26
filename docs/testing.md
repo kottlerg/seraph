@@ -2431,8 +2431,8 @@ s, a count `SHARDS` in `xtask/src/commands/kani.rs` lists; every other crate is 
 crate's test build, sorted by path, every n-th from the k-th, so the n shards of a crate take each
 harness exactly once, and a harness added to the crate joins a shard with no change to the table.
 Every run closes with each crate's sum of verification times, a shard job's labelled with its shard
-(`<package> k/n`), so a split crate's sum is the total over its shard jobs. The sums keep the table: a
-run that shows a shard or a whole crate past the 10 minutes, or a split crate whose sum one shard
+(`<package> k/n`), so a split crate's sum is the total over its shard jobs. The sums keep the table:
+a run that shows a shard or a whole crate past the 10 minutes, or a split crate whose sum one shard
 fewer would hold under them, moves its count. Each `prove` job has a `timeout-minutes` of 40, the
 backstop beside the time limit below.
 

@@ -1068,7 +1068,7 @@ fn start_kernel_reader(cap: u64, logd: &'static Logd)
     }
 }
 
-/// The kernel log reader (`docs/console-model.md` item 3): read the records
+/// The kernel log reader (`docs/console-model.md` item 4): read the records
 /// the kernel appended, write each as a `[kernel]` line through the sinks
 /// as a sender's line is written, and keep it in the kernel's slot
 /// (`LOG_BADGE_KERNEL`); then wait for the kernel's signal. Each read

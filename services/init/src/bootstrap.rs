@@ -245,8 +245,9 @@ pub(crate) fn fund_own_cspace(info: &InitInfo, arena_cap: u64) -> Result<(), i64
 
 /// Front region of init's own arena reserved for its kernel-object retypes.
 ///
-/// Unlike a tier-1 service, init retypes only endpoints (byte-granular) and
-/// one log thread from this arena, besides its own `CSpace`'s fund; it reuses
+/// Unlike a tier-1 service, init retypes only endpoints (byte-granular), one
+/// log thread, and that thread's kernel-log notification and wait set from
+/// this arena, besides its own `CSpace`'s fund; it reuses
 /// the kernel-supplied `AddressSpace`/`CSpace` rather than creating its own.
 /// The reserve is:
 ///
@@ -257,9 +258,11 @@ pub(crate) fn fund_own_cspace(info: &InitInfo, arena_cap: u64) -> Result<(), i64
 /// * [`crate::thread_retype_pages`] (seven or more) for the log thread, which
 ///   page-aligns the bump upward — splitting endpoint packing across a page
 ///   boundary, and
-/// * 1 page for endpoints created after the log-thread retype, so they never
-///   bump into the offset-mapped backing region even without relying on the
-///   allocator reusing the first page's recovered slack.
+/// * 1 page for the endpoints created after the log-thread retype and the
+///   log thread's notification and two-member wait set (184 bytes, about
+///   three endpoints' worth), so they never bump into the offset-mapped
+///   backing region even without relying on the allocator reusing the first
+///   page's recovered slack.
 ///
 /// Sound for up to ~32 endpoints on each side of the log-thread retype; init
 /// creates roughly a dozen total. [`finalize_memmgr`] asserts the front bump

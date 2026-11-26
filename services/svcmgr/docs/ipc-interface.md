@@ -99,15 +99,16 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 | caps[..] | the present slots, in slot order |
 | slot 0 | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch, and the handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`) on the first launch and on a restart until procmgr reports init reaped (see [`log_sink`](service-definitions.md#log_sink)), and the `LOG_QUERY_AUTHORITY` SEND it publishes as `logd.query`; holding it keeps the log endpoint alive across a logd crash (absent if its derive fails) |
 | slot 1 | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap from it per launch (absent if its derive fails), and the `DEBUG_AUTHORITY` `SEND\|GRANT` cap of a `debug_authority = yes` service |
+| slot 2 | `kernel_log_source`: `KernelLog` source carrying `Read`, derived by init from the root `KernelLog` capability the kernel mints into it; svcmgr mints real-logd's slot-5 `KernelLog` cap (`RIGHTS_KLOG_READ`) from it per launch (absent if init holds none or its derive fails) |
 | data[0] | `3` (`LOGD_SOURCES`) |
-| data[1] | presence word: bit 0 `MASTER_LOG`, bit 1 `PROCMGR_DEATH_AUTH` |
+| data[1] | presence word: bit 0 `MASTER_LOG`, bit 1 `PROCMGR_DEATH_AUTH`, bit 2 `KERNEL_LOG` (`logd_present::KERNEL_LOG`) |
 
 After a failed `CAPS` round init ends the endowment with an empty
 `LOGD_SOURCES` round (no caps, presence `0`), so svcmgr leaves its round
 loop and exits. svcmgr logs a malformed `LOGD_SOURCES` round, deletes the
-caps it delivered, and continues with both sources absent.
+caps it delivered, and continues with every source absent.
 
-svcmgr holds both sources for the system's life and mints real-logd's
+svcmgr holds the sources for the system's life and mints real-logd's
 [`log_sink`](service-definitions.md#log_sink) bootstrap round from them on
 every (re)launch. An absent source leaves the matching slot of logd's round
 absent, which the round's presence word records (see

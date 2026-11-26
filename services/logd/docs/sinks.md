@@ -179,6 +179,11 @@ each in its format, and writes it to its output.
   written.
 - A `skip` sink holds no sender and keeps no entry: what the history evicts before it is read is
   counted as dropped.
+- A sink whose level is `off` takes part in none of the above, whatever its pace: it counts toward
+  no window, keeps no entry from eviction, is never stalled, and neither `LOG_FLUSH` nor the kernel
+  reader waits on it. Its cursor follows the newest entry and it counts no drops, so when `SINK_SET`
+  turns it on it starts after the entry newest then, as a `skip` sink with no backlog does, and
+  shows nothing of the time it was off.
 
 ### Drops
 
@@ -488,7 +493,8 @@ waits on no sink's progress for a sender.
 ```
 
 - The pstore sink closes the loss #928 accepts: the entries retained but not yet written to serial,
-  or to any sink, when the kernel panics are on the next boot's console.
+  or to any sink, when the kernel panics reach the next boot: its history holds them, for `log` and
+  the external sinks, and its serial console shows them when it has one.
 
 ---
 

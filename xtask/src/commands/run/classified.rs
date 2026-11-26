@@ -20,10 +20,10 @@
 //! ([`crate::sysroot::recorded_image_harnesses`]): the default `--pass` is the
 //! terminal marker of the one harness the image boots, and svcmgr's line for
 //! the death of a harness it launches, before the run's pass marker, fails
-//! the run ([`harness_death`]). An image whose ktest a focused build made
-//! (`crate::sysroot::recorded_ktest_selection`) runs only with
-//! `--ktest-only-ok`, and then passes on the focused run's marker
-//! ([`check_focus`]).
+//! the run ([`harness_death`]). An image whose ktest a focused build made, as
+//! its pack recorded it (`crate::sysroot::recorded_image_ktest_selection`),
+//! runs only with `--ktest-only-ok`, and then passes on the focused run's
+//! marker ([`check_focus`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -145,7 +145,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
     let display = validate_args(args, runs)?;
     validate_sysroot_for_launch(ctx, args.launch.arch)?;
     let harnesses = crate::sysroot::recorded_image_harnesses(ctx)?;
-    let recorded = crate::sysroot::recorded_ktest_selection(&ctx.sysroot)?;
+    let recorded = crate::sysroot::recorded_image_ktest_selection(ctx)?;
     let accepted = if args.ktest_only_ok
     {
         KtestFocus::Selected
@@ -595,8 +595,8 @@ enum KtestFocus
 const KTEST_SELECTED_PASS: &str = r"\[ktest\] SELECTED TESTS PASSED";
 
 /// The selection of the focused ktest the image boots: `recorded`, the
-/// sysroot's record of the installed ktest's selection, when `harnesses`
-/// include ktest, and `None` when the image boots no ktest or a full one.
+/// selection the image's pack recorded, when `harnesses` include ktest, and
+/// `None` when the image boots no ktest or a full one.
 fn image_selection<'a>(harnesses: &[ImageHarness], recorded: Option<&'a str>) -> Option<&'a str>
 {
     recorded.filter(|_| harnesses.contains(&ImageHarness::Ktest))

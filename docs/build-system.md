@@ -403,8 +403,9 @@ image it packed boots in `sysroot/.image-harness` (`ktest` for the ktest bundle,
 `cargo xtask run --runs` binds its default pass marker and its reading of a harness's death to
 ([xtask/README.md § `cargo xtask run`](../xtask/README.md#cargo-xtask-run)). A focused ktest build
 (`cargo xtask build --ktest-only`) records its test-name prefixes in `sysroot/.ktest-selection`,
-which a build of the full ktest removes, and `run --runs` refuses an image of that ktest without
-`--ktest-only-ok`.
+which a build of the full ktest removes; a pack of the ktest bundle copies them onto the `ktest`
+line of `sysroot/.image-harness`, and `run --runs` refuses the image of a focused ktest, as that
+record names it, without `--ktest-only-ok`.
 
 Cargo's own output stays in `target/`. The builds of the std-user programs compile `std`, with
 `core` and `alloc`, from the seraph toolchain mirror, `target/seraph-toolchain/`, which carries
@@ -453,7 +454,7 @@ no xtask of another format writes into, and xtask removes the directories of old
 sysroot/
   .arch                   # "x86_64" or "riscv64"
   .harness                # "init" or "ktest": the bundle every pack composes
-  .image-harness          # The test harnesses the packed image boots
+  .image-harness          # The test harnesses the packed image boots, and its ktest's selection
   .ktest-selection        # A focused ktest build's test-name prefixes (build --ktest-only)
   boot/                   # The installed kernel and bootloader
     kernel                # Microkernel, signed here

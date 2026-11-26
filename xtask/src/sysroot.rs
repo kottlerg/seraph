@@ -10,10 +10,11 @@
 //! recorded in `sysroot/.arch`. Switching architectures requires `cargo xtask
 //! clean` first to avoid mixing binaries. The harness whose bundle every pack
 //! composes is recorded in `sysroot/.harness` ([`record_harness`]), and the
-//! harnesses the image of the last complete pack boots in
-//! `sysroot/.image-harness` ([`record_image_harnesses`]), and the selection
-//! of a focused ktest build in `sysroot/.ktest-selection`
-//! ([`record_ktest_selection`]).
+//! harnesses the image of the last complete pack boots, with the selection of
+//! a focused ktest it holds, in `sysroot/.image-harness`
+//! ([`record_image_harnesses`]). The selection of the installed ktest, a
+//! focused build's, is in `sysroot/.ktest-selection`
+//! ([`record_ktest_selection`]), which a pack reads into its record.
 
 use std::collections::HashSet;
 use std::fs;
@@ -71,7 +72,8 @@ pub fn recorded_harness(ctx: &BuildContext) -> Result<Harness>
 }
 
 /// The sysroot file that records the harnesses the image of the last complete
-/// pack boots ([`record_image_harnesses`]).
+/// pack boots, and the selection of a focused ktest it holds
+/// ([`record_image_harnesses`]).
 const IMAGE_HARNESS_FILE: &str = ".image-harness";
 
 /// A harness an image boots: a test or benchmark program whose boot ends with
@@ -134,7 +136,8 @@ impl ImageHarness
 /// The sysroot file that records the selection of the installed ktest, a
 /// focused build's comma-separated test-name prefixes
 /// ([`record_ktest_selection`]); absent when the installed ktest runs every
-/// test.
+/// test. A pack reads it into the image's record ([`record_image_harnesses`]),
+/// and a run reads only that record, since a build of ktest does not repack.
 pub const KTEST_SELECTION_FILE: &str = ".ktest-selection";
 
 /// Check a ktest selection (`cargo xtask build --ktest-only`): one or more
@@ -235,11 +238,16 @@ pub fn forget_image_harnesses(sysroot: &Path) -> Result<()>
 }
 
 /// Record `harnesses` as those the image a pack has just written boots, one
-/// name a line, none for an image that boots no harness.
+/// name a line, none for an image that boots no harness. The ktest line
+/// carries, after a space, the selection of the installed ktest
+/// ([`recorded_ktest_selection`]) when a focused build made it: the pack has
+/// just signed that ktest into the image, so the record names what the image
+/// runs whatever ktest a later build installs.
 ///
 /// # Errors
 ///
-/// On an I/O failure.
+/// On an I/O failure, or when the installed ktest's selection record cannot
+/// be read.
 pub fn record_image_harnesses(sysroot: &Path, harnesses: &[ImageHarness]) -> Result<()>
 {
     let path = sysroot.join(IMAGE_HARNESS_FILE);
@@ -247,6 +255,12 @@ pub fn record_image_harnesses(sysroot: &Path, harnesses: &[ImageHarness]) -> Res
     for harness in harnesses
     {
         text.push_str(harness.name());
+        if *harness == ImageHarness::Ktest
+            && let Some(selection) = recorded_ktest_selection(sysroot)?
+        {
+            text.push(' ');
+            text.push_str(&selection);
+        }
         text.push('\n');
     }
     fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
@@ -261,6 +275,26 @@ pub fn record_image_harnesses(sysroot: &Path, harnesses: &[ImageHarness]) -> Res
 /// was introduced, or the last one failed), the record cannot be read, or a
 /// line names no harness.
 pub fn recorded_image_harnesses(ctx: &BuildContext) -> Result<Vec<ImageHarness>>
+{
+    Ok(recorded_image(ctx)?.0)
+}
+
+/// The selection of the focused ktest the image the last complete pack wrote
+/// boots, as [`record_image_harnesses`] recorded it; `None` for an image that
+/// boots no ktest or a full one.
+///
+/// # Errors
+///
+/// As [`recorded_image_harnesses`], and when a recorded selection is not a
+/// valid one ([`check_ktest_selection`]).
+pub fn recorded_image_ktest_selection(ctx: &BuildContext) -> Result<Option<String>>
+{
+    Ok(recorded_image(ctx)?.1)
+}
+
+/// The image record [`record_image_harnesses`] wrote: its harnesses, and the
+/// selection its ktest line carries.
+fn recorded_image(ctx: &BuildContext) -> Result<(Vec<ImageHarness>, Option<String>)>
 {
     let path = ctx.sysroot.join(IMAGE_HARNESS_FILE);
     let text = match fs::read_to_string(&path)
@@ -277,12 +311,33 @@ pub fn recorded_image_harnesses(ctx: &BuildContext) -> Result<Vec<ImageHarness>>
         }
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    text.lines()
-        .map(|line| {
-            ImageHarness::parse(line.trim())
-                .ok_or_else(|| crate::error::err!("{}: {line:?} names no harness", path.display()))
-        })
-        .collect()
+    let mut harnesses = Vec::new();
+    let mut selection = None;
+    for line in text.lines()
+    {
+        let (name, focus) = match line.trim().split_once(' ')
+        {
+            Some((name, focus)) => (name, Some(focus)),
+            None => (line.trim(), None),
+        };
+        let harness = ImageHarness::parse(name)
+            .ok_or_else(|| crate::error::err!("{}: {line:?} names no harness", path.display()))?;
+        if let Some(focus) = focus
+        {
+            if harness != ImageHarness::Ktest
+            {
+                bail!(
+                    "{}: {line:?}: only ktest carries a selection",
+                    path.display()
+                );
+            }
+            check_ktest_selection(focus)
+                .map_err(|e| crate::error::err!("{}: {e}", path.display()))?;
+            selection = Some(focus.to_string());
+        }
+        harnesses.push(harness);
+    }
+    Ok((harnesses, selection))
 }
 
 /// A file of the repository that the sysroot installs at `install`, outside
@@ -924,6 +979,102 @@ mod tests
         fs::remove_dir_all(&base).unwrap();
     }
 
+    // A sysroot with the image record of a ktest image, packed while the
+    // installed ktest had `packed` as its selection, and `installed` the
+    // selection of the ktest a later build installed without repacking.
+    fn ktest_image_then_build(
+        name: &str,
+        packed: Option<&str>,
+        installed: Option<&str>,
+    ) -> (PathBuf, BuildContext)
+    {
+        let base = scratch(name);
+        let ctx = BuildContext {
+            root: base.clone(),
+            sysroot: base.join("sysroot"),
+            target_dir: base.join("target"),
+        };
+        fs::create_dir_all(&ctx.sysroot).unwrap();
+        record_ktest_selection(&ctx.sysroot, packed).unwrap();
+        record_image_harnesses(&ctx.sysroot, &[ImageHarness::Ktest]).unwrap();
+        record_ktest_selection(&ctx.sysroot, installed).unwrap();
+        (base, ctx)
+    }
+
+    // Defect caught: a run that reads the build's selection record rather
+    // than the pack's refuses a full image once a focused ktest is built
+    // without repacking.
+    #[test]
+    fn a_full_image_stays_full_after_a_focused_build_without_a_repack()
+    {
+        let (base, ctx) = ktest_image_then_build("image-full", None, Some("stress::stop_"));
+        assert_eq!(recorded_image_ktest_selection(&ctx).unwrap(), None);
+        assert_eq!(
+            recorded_image_harnesses(&ctx).unwrap(),
+            [ImageHarness::Ktest]
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // Defect caught: a run that reads the build's selection record rather
+    // than the pack's takes a focused image for a full one, and judges it
+    // on the full run's marker, once the full ktest is built without
+    // repacking.
+    #[test]
+    fn a_focused_image_stays_focused_after_a_full_build_without_a_repack()
+    {
+        let (base, ctx) = ktest_image_then_build("image-focused", Some("stress::stop_"), None);
+        assert_eq!(
+            recorded_image_ktest_selection(&ctx).unwrap().as_deref(),
+            Some("stress::stop_")
+        );
+        assert_eq!(
+            recorded_image_harnesses(&ctx).unwrap(),
+            [ImageHarness::Ktest]
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // Defect caught: a run that reads the build's selection record rather
+    // than the pack's names an image focused on X by a later build's
+    // selection Y, so its passes read as Y's tests passing.
+    #[test]
+    fn a_focused_image_keeps_its_selection_after_another_focused_build()
+    {
+        let (base, ctx) =
+            ktest_image_then_build("image-other", Some("stress::stop_"), Some("cap::"));
+        assert_eq!(
+            recorded_image_ktest_selection(&ctx).unwrap().as_deref(),
+            Some("stress::stop_")
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // Defect caught: a selection recorded on a harness other than ktest, or
+    // an invalid one, read as the image's focus.
+    #[test]
+    fn an_image_record_selection_is_ktest_s_and_valid()
+    {
+        let base = scratch("image-selection-shape");
+        let ctx = BuildContext {
+            root: base.clone(),
+            sysroot: base.join("sysroot"),
+            target_dir: base.join("target"),
+        };
+        fs::create_dir_all(&ctx.sysroot).unwrap();
+        // A focused ktest installed beside an image of no ktest is not the
+        // image's.
+        record_ktest_selection(&ctx.sysroot, Some("cap::")).unwrap();
+        record_image_harnesses(&ctx.sysroot, &[ImageHarness::Svctest]).unwrap();
+        assert_eq!(recorded_image_ktest_selection(&ctx).unwrap(), None);
+        for bad in ["svctest cap::\n", "ktest cap::,\n", "ktest cap:: x\n"]
+        {
+            fs::write(ctx.sysroot.join(IMAGE_HARNESS_FILE), bad).unwrap();
+            recorded_image_harnesses(&ctx).unwrap_err();
+        }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
     // Defect caught: an empty item (`--ktest-only stress::,`), which ktest
     // would read as a prefix of every name, or a character no test name holds
     // (a space, a typo'd separator), accepted into a focused build that then
@@ -950,8 +1101,8 @@ mod tests
 
     // Defect caught: a focused build's selection that does not read back, a
     // build of the full ktest that leaves the previous selection recorded (so
-    // `run` would refuse or mislabel a full image), or a tampered record read
-    // as a valid selection.
+    // the next pack would record a full image as focused), or a tampered
+    // record read as a valid selection.
     #[test]
     fn the_ktest_selection_record_reads_back_and_a_full_build_clears_it()
     {

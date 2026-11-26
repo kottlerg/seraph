@@ -52,7 +52,8 @@ answers reads and writes, and reports `REGISTER_FAILED` to `SERIAL_REGISTER_RX_N
 client's bounded wait polls.
 
 The driver is debuggable, and a fault of it reaches the crash service like any driver's. logd
-writes every log line to it with `SERIAL_WRITE_SENT` from its serial sink's writer thread, the
+writes every log line to it, each ending with a zero-length `SERIAL_WRITE_SENT` write, from its
+serial sink's writer thread, the
 only logd thread that waits on the driver; a debug-authority holder that stops it holds the log
 stream for at most logd's
 `SINK_STALL_MS` once, after which logd queues and then drops and counts the lines meant for

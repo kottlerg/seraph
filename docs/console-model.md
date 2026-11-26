@@ -112,8 +112,9 @@ direct console paths remain as fallbacks for the life of the system.
    rather than the log endpoint logd serves (logd deletes its seeded `log_send_cap` at startup so a
    fault cannot self-IPC into it). Every line reaches the driver through logd's serial sink: a
    bounded queue drained by one writer thread, the only logd thread that waits on the driver. The
-   writer writes each line with `serial_labels::SERIAL_WRITE_SENT`, which the driver answers once
-   the line's bytes have left the UART, so a line counts as written when it is on the wire, before
+   writer writes each line's bytes, then a zero-length `serial_labels::SERIAL_WRITE_SENT` write,
+   which the driver answers once the line's bytes have left the UART, so a line counts as written
+   when it is on the wire, before
    its sender goes on, a power-off included; a write without the flag, such as the terminal's, is
    answered once its bytes are in the driver's transmit ring. A
    line's producer waits for its write for at most `SINK_STALL_MS`, so a driver that is stopped

@@ -13,9 +13,9 @@
 //! has written its line, or for space when the queue is full, so a sink whose
 //! driver answers shows a line before its sender's log call returns, as a
 //! synchronous write would; a producer that waits out the bound stalls the
-//! sink. While it is stalled, producers wait for nothing: a line is queued
-//! when it fits and dropped, counted, when it does not, until the writer next
-//! completes a write. The count travels with the queue, so the writer reports
+//! sink, as does a write the writer gives up. While it is stalled, producers
+//! wait for nothing: a line is queued when it fits and dropped, counted, when
+//! it does not, until the writer next completes a write. The count travels with the queue, so the writer reports
 //! it at the point in the stream where the lines went missing. A sink with no
 //! driver to write to is unserved: its producers wait for nothing, as for a
 //! stalled one, and the writer holds the queued lines, and the count of those
@@ -44,9 +44,10 @@ pub const SINK_QUEUE_BYTES: usize = 16 * 1024;
 /// for less than half its own bound (`log::LOG_CALL_TIMEOUT_MS`, 5000).
 pub const SINK_STALL_MS: u32 = 1000;
 
-/// Bytes of the header each queued line carries: its length (`u16`) and the
-/// count of lines dropped just before it was queued (`u32`).
-pub const HEADER_BYTES: usize = 6;
+/// Bytes of the header each queued line carries: its length (`u16`), the
+/// count of lines dropped just before it was queued (`u32`), and its
+/// [`LineKind`] (`u8`).
+pub const HEADER_BYTES: usize = 7;
 
 /// The longest line a [`SinkQueue`] takes: its header's length field.
 pub const LINE_MAX_BYTES: usize = u16::MAX as usize;
@@ -66,15 +67,55 @@ pub enum Offer
     Dropped,
 }
 
+/// What a queued line is, which decides whether the writer counts it as
+/// dropped when it gives its write up ([`SinkQueue::not_written`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineKind
+{
+    /// A line a sender logged, or one of logd's own: counted when given up.
+    Logged,
+    /// logd's other sink's drop line, naming lines that sink did not write:
+    /// not counted when given up, so two sinks whose drivers both refuse do
+    /// not count and report each other's drop lines without end.
+    PeerDrops,
+}
+
+impl LineKind
+{
+    const fn to_byte(self) -> u8
+    {
+        match self
+        {
+            Self::Logged => 0,
+            Self::PeerDrops => 1,
+        }
+    }
+
+    const fn from_byte(byte: u8) -> Self
+    {
+        if byte == 1
+        {
+            Self::PeerDrops
+        }
+        else
+        {
+            Self::Logged
+        }
+    }
+}
+
 /// One line taken from a [`SinkQueue`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Popped
 {
     /// Bytes of the line copied out.
     pub len: usize,
-    /// Lines dropped just before this one was queued, for the writer to
-    /// report ahead of it.
+    /// Lines dropped just before this one was queued, and lines the writer
+    /// gave up since it took the line before ([`SinkQueue::not_written`]),
+    /// for the writer to report ahead of it.
     pub dropped_before: u32,
+    /// What the line is.
+    pub kind: LineKind,
 }
 
 /// A FIFO of whole lines in a fixed `N`-byte ring, each behind a
@@ -83,8 +124,10 @@ pub struct Popped
 ///
 /// A line is queued whole or not at all. Lines dropped since the last queued
 /// one are counted at the tail and attached to the next line queued
-/// ([`Popped::dropped_before`]); the writer takes a count still at the tail
-/// once it has written every queued line ([`Self::take_tail_drops`]).
+/// ([`Popped::dropped_before`]); lines the writer gave up are counted at the
+/// head and reported ahead of the next line it takes; the writer takes a count
+/// still at the tail or the head once it has written every queued line
+/// ([`Self::take_tail_drops`]).
 pub struct SinkQueue<const N: usize>
 {
     buf: [u8; N],
@@ -94,8 +137,12 @@ pub struct SinkQueue<const N: usize>
     used: usize,
     /// Lines dropped since the last one queued.
     dropped: u32,
-    /// Set when a producer waits out the stall bound; cleared when the writer
-    /// completes a write ([`Self::written`]).
+    /// Lines the writer gave up since it last took one: they went missing
+    /// ahead of every queued line.
+    given_up: u32,
+    /// Set when a producer waits out the stall bound, or the writer gives a
+    /// write up ([`Self::not_written`]); cleared when the writer completes a
+    /// write ([`Self::written`]).
     stalled: bool,
     /// Lines queued since the queue was made: the number of the last one.
     queued: u64,
@@ -118,6 +165,7 @@ impl<const N: usize> SinkQueue<N>
             head: 0,
             used: 0,
             dropped: 0,
+            given_up: 0,
             stalled: false,
             queued: 0,
             taken: 0,
@@ -139,7 +187,7 @@ impl<const N: usize> SinkQueue<N>
         self.stalled
     }
 
-    /// Offer `line` to the queue. Queued when it fits; otherwise
+    /// Offer `line`, of `kind`, to the queue. Queued when it fits; otherwise
     /// [`Offer::Wait`] while the sink is not stalled and `waited_out` is
     /// false, and [`Offer::Dropped`], counted, when the sink is stalled or the
     /// producer has waited out the stall bound (`waited_out`), which stalls
@@ -150,7 +198,7 @@ impl<const N: usize> SinkQueue<N>
         reason = "`waited_out` is the outcome of the producer's bounded wait, which the queue \
                   records as the sink's stall mark"
     )]
-    pub fn offer(&mut self, line: &[u8], waited_out: bool) -> Offer
+    pub fn offer(&mut self, line: &[u8], kind: LineKind, waited_out: bool) -> Offer
     {
         let need = HEADER_BYTES.saturating_add(line.len());
         if line.len() > LINE_MAX_BYTES || need > N
@@ -160,7 +208,7 @@ impl<const N: usize> SinkQueue<N>
         }
         if need <= N.saturating_sub(self.used)
         {
-            self.push(line);
+            self.push(line, kind);
             self.queued = self.queued.wrapping_add(1);
             return Offer::Queued(self.queued);
         }
@@ -176,27 +224,28 @@ impl<const N: usize> SinkQueue<N>
         Offer::Wait
     }
 
-    /// Offer `line` to the queue of a sink that has no driver to write to:
-    /// queued when it fits, and otherwise dropped and counted at once, which
-    /// stalls the sink, as for a producer that waited out the stall bound
-    /// ([`Self::offer`]); never [`Offer::Wait`], since no writer frees space
-    /// until a driver is resolved. The writer writes the queued lines and the
-    /// count to that driver, and its first completed write ends the stall
+    /// Offer `line`, of `kind`, to the queue of a sink that has no driver to
+    /// write to: queued when it fits, and otherwise dropped and counted at
+    /// once, which stalls the sink, as for a producer that waited out the stall
+    /// bound ([`Self::offer`]); never [`Offer::Wait`], since no writer frees
+    /// space until a driver is resolved. The writer writes the queued lines and
+    /// the count to that driver, and its first completed write ends the stall
     /// ([`Self::written`]).
-    pub fn offer_unserved(&mut self, line: &[u8]) -> Offer
+    pub fn offer_unserved(&mut self, line: &[u8], kind: LineKind) -> Offer
     {
-        self.offer(line, true)
+        self.offer(line, kind, true)
     }
 
     /// Queue `line`, which fits, carrying the tail's drop count.
-    fn push(&mut self, line: &[u8])
+    fn push(&mut self, line: &[u8], kind: LineKind)
     {
         let mut header = [0u8; HEADER_BYTES];
         // `offer` admits no line longer than `LINE_MAX_BYTES`.
         let len = u16::try_from(line.len()).unwrap_or(u16::MAX);
-        let (len_bytes, drop_bytes) = header.split_at_mut(2);
-        len_bytes.copy_from_slice(&len.to_le_bytes());
-        drop_bytes.copy_from_slice(&core::mem::take(&mut self.dropped).to_le_bytes());
+        let [l0, l1, d0, d1, d2, d3, k] = &mut header;
+        [*l0, *l1] = len.to_le_bytes();
+        [*d0, *d1, *d2, *d3] = core::mem::take(&mut self.dropped).to_le_bytes();
+        *k = kind.to_byte();
         let tail = Self::wrap(self.head, self.used);
         self.write_at(tail, &header);
         self.write_at(Self::wrap(tail, HEADER_BYTES), line);
@@ -206,7 +255,8 @@ impl<const N: usize> SinkQueue<N>
     }
 
     /// Take the oldest line into `out`, cut to `out`'s length, with the
-    /// count of lines dropped just before it; `None` when the queue is empty.
+    /// count of lines dropped just before it, the lines given up since the
+    /// last pop among them; `None` when the queue is empty.
     pub fn pop(&mut self, out: &mut [u8]) -> Option<Popped>
     {
         if self.used == 0
@@ -215,9 +265,10 @@ impl<const N: usize> SinkQueue<N>
         }
         let mut header = [0u8; HEADER_BYTES];
         self.read_at(self.head, &mut header);
-        let [l0, l1, d0, d1, d2, d3] = header;
+        let [l0, l1, d0, d1, d2, d3, k] = header;
         let len = usize::from(u16::from_le_bytes([l0, l1]));
-        let dropped_before = u32::from_le_bytes([d0, d1, d2, d3]);
+        let dropped_before = u32::from_le_bytes([d0, d1, d2, d3])
+            .saturating_add(core::mem::take(&mut self.given_up));
         let copied = len.min(out.len());
         let body = Self::wrap(self.head, HEADER_BYTES);
         self.read_at(body, out.get_mut(..copied).unwrap_or_default());
@@ -228,16 +279,18 @@ impl<const N: usize> SinkQueue<N>
         Some(Popped {
             len: copied,
             dropped_before,
+            kind: LineKind::from_byte(k),
         })
     }
 
-    /// The count of lines dropped after every queued line, taken once the
-    /// queue is empty (0 while a line is queued, which will carry it).
+    /// The count of lines dropped after every queued line, and of lines
+    /// given up, taken once the queue is empty (0 while a line is queued,
+    /// which will carry them).
     pub fn take_tail_drops(&mut self) -> u32
     {
         if self.used == 0
         {
-            core::mem::take(&mut self.dropped)
+            core::mem::take(&mut self.dropped).saturating_add(core::mem::take(&mut self.given_up))
         }
         else
         {
@@ -253,16 +306,20 @@ impl<const N: usize> SinkQueue<N>
         self.stalled = false;
     }
 
-    /// The writer gave up a write: the driver answered it with anything but
-    /// success, or the call failed. No producer waits any longer for a line
-    /// the writer has taken, and `lost` lines, those of the write that were
-    /// not written, are counted as dropped, for the writer to report as it
-    /// reports any. The sink's stall stays as it is: only a completed write
-    /// ([`Self::written`]) shows that the driver takes lines again.
+    /// The writer gave up a write: the driver did not take all of it, or took
+    /// it but did not complete it. No producer waits any longer for a line
+    /// the writer has taken, and `lost` lines, those of the write the driver
+    /// did not take, are counted as dropped where they went missing: ahead of
+    /// the next line the writer takes ([`Popped::dropped_before`]), or at
+    /// the tail once none is queued. The sink is stalled, as when a producer
+    /// waits out the stall bound, since the driver did not complete the write:
+    /// only a completed write ([`Self::written`]) shows that it takes lines
+    /// again.
     pub fn not_written(&mut self, lost: u32)
     {
         self.done = self.taken;
-        self.dropped = self.dropped.saturating_add(lost);
+        self.given_up = self.given_up.saturating_add(lost);
+        self.stalled = true;
     }
 
     /// Whether line number `line` ([`Offer::Queued`]) is written, or given
@@ -346,14 +403,17 @@ mod tests
     #[test]
     fn lines_come_out_whole_and_in_order_across_the_ring_end()
     {
-        // 6-byte header + 4-byte line = 10 bytes per line; 25 bytes hold two,
+        // Two lines of 4 bytes and their headers fit, with 5 bytes to spare,
         // so the third and later lines wrap the end.
-        let mut q: SinkQueue<25> = SinkQueue::new();
+        let mut q: SinkQueue<{ 2 * (HEADER_BYTES + 4) + 5 }> = SinkQueue::new();
         let mut buf = [0u8; 8];
         for i in 0u8..20
         {
             let line = [i, i.wrapping_add(1), i.wrapping_add(2), i.wrapping_add(3)];
-            assert!(matches!(q.offer(&line, false), Offer::Queued(_)));
+            assert!(matches!(
+                q.offer(&line, LineKind::Logged, false),
+                Offer::Queued(_)
+            ));
             let p = q.pop(&mut buf).unwrap();
             assert_eq!((&buf[..p.len], p.dropped_before), (&line[..], 0));
         }
@@ -364,29 +424,45 @@ mod tests
     // Defect caught: a write the driver refused (the serial driver's
     // `STALLED` on a wedged UART) taken as written, which loses the line
     // uncounted and ends the stall, so every later line holds its producer
-    // for the bound again.
+    // for the bound again; or its count reported behind the lines queued
+    // after it rather than where it went missing.
     #[test]
-    fn a_write_given_up_counts_its_line_and_leaves_the_stall()
+    fn a_write_given_up_counts_its_line_ahead_of_the_next_and_leaves_the_stall()
     {
         let mut q: SinkQueue<64> = SinkQueue::new();
-        let Offer::Queued(first) = q.offer(b"line", false)
+        let Offer::Queued(first) = q.offer(b"line", LineKind::Logged, false)
         else
         {
             panic!("an empty queue takes a line");
         };
+        assert!(matches!(
+            q.offer(b"next", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
         let mut buf = [0u8; 8];
         q.pop(&mut buf).unwrap();
-        // The producer waited out the bound while the driver held the write.
-        q.stall();
+        assert!(!q.is_stalled());
         q.not_written(1);
         assert!(q.is_written(first), "no producer waits on a write given up");
-        assert!(q.is_stalled());
-        assert_eq!(q.take_tail_drops(), 1);
-        // A line queued after a write given up carries its count instead.
+        assert!(
+            q.is_stalled(),
+            "no later line holds its producer for the bound"
+        );
+        // A line queued after the one given up carries none of its count.
+        assert!(matches!(
+            q.offer(b"late", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
+        assert_eq!(q.take_tail_drops(), 0, "a queued line carries the count");
+        assert_eq!(
+            drain(&mut q),
+            [(b"next".to_vec(), 1), (b"late".to_vec(), 0)],
+            "the count comes out where the line went missing"
+        );
+        // With nothing queued, the count is taken at the tail.
         q.not_written(1);
-        assert!(matches!(q.offer(b"next", false), Offer::Queued(_)));
-        assert_eq!(drain(&mut q), [(b"next".to_vec(), 1)]);
-        // A write given up with nothing of its own lost counts nothing.
+        assert_eq!(q.take_tail_drops(), 1);
+        // A write given up that lost no line counts nothing.
         q.not_written(0);
         assert_eq!(q.take_tail_drops(), 0);
         assert!(q.is_stalled());
@@ -395,20 +471,48 @@ mod tests
         assert!(!q.is_stalled());
     }
 
+    // Defect caught: the other sink's drop line queued as an ordinary line,
+    // so a writer that gives it up counts it and reports it back without end.
+    #[test]
+    fn a_line_keeps_its_kind_through_the_queue()
+    {
+        let mut q: SinkQueue<64> = SinkQueue::new();
+        assert!(matches!(
+            q.offer(b"peer", LineKind::PeerDrops, false),
+            Offer::Queued(_)
+        ));
+        assert!(matches!(
+            q.offer_unserved(b"own", LineKind::Logged),
+            Offer::Queued(_)
+        ));
+        let mut buf = [0u8; 8];
+        assert_eq!(q.pop(&mut buf).unwrap().kind, LineKind::PeerDrops);
+        assert_eq!(q.pop(&mut buf).unwrap().kind, LineKind::Logged);
+    }
+
     // Defect caught: a full queue that drops a line while the writer still
     // makes progress (serial output lost under mere load), or that overwrites
     // a queued line.
     #[test]
     fn a_full_queue_makes_the_producer_wait_until_the_writer_frees_space()
     {
-        let mut q: SinkQueue<20> = SinkQueue::new();
-        assert!(matches!(q.offer(b"aaaa", false), Offer::Queued(_)));
-        assert!(matches!(q.offer(b"bbbb", false), Offer::Queued(_)));
-        assert_eq!(q.offer(b"cccc", false), Offer::Wait);
+        let mut q: SinkQueue<{ 2 * (HEADER_BYTES + 4) }> = SinkQueue::new();
+        assert!(matches!(
+            q.offer(b"aaaa", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
+        assert!(matches!(
+            q.offer(b"bbbb", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
+        assert_eq!(q.offer(b"cccc", LineKind::Logged, false), Offer::Wait);
         assert!(!q.is_stalled());
         let mut buf = [0u8; 8];
         q.pop(&mut buf).unwrap();
-        assert!(matches!(q.offer(b"cccc", false), Offer::Queued(_)));
+        assert!(matches!(
+            q.offer(b"cccc", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
         assert_eq!(
             drain(&mut q),
             [(b"bbbb".to_vec(), 0), (b"cccc".to_vec(), 0)]
@@ -420,22 +524,31 @@ mod tests
     #[test]
     fn a_waited_out_bound_stalls_the_sink_until_the_writer_next_writes()
     {
-        let mut q: SinkQueue<20> = SinkQueue::new();
-        assert!(matches!(q.offer(b"aaaa", false), Offer::Queued(_)));
-        assert!(matches!(q.offer(b"bbbb", false), Offer::Queued(_)));
-        assert_eq!(q.offer(b"cccc", true), Offer::Dropped);
+        let mut q: SinkQueue<{ 2 * (HEADER_BYTES + 4) }> = SinkQueue::new();
+        assert!(matches!(
+            q.offer(b"aaaa", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
+        assert!(matches!(
+            q.offer(b"bbbb", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
+        assert_eq!(q.offer(b"cccc", LineKind::Logged, true), Offer::Dropped);
         assert!(q.is_stalled());
         // Stalled: a full queue drops at once, without a wait.
-        assert_eq!(q.offer(b"dddd", false), Offer::Dropped);
+        assert_eq!(q.offer(b"dddd", LineKind::Logged, false), Offer::Dropped);
         let mut buf = [0u8; 8];
         q.pop(&mut buf).unwrap();
         // Space alone does not end the stall's drops of lines that fit: they
         // are queued, since the ring has room.
-        assert!(matches!(q.offer(b"eeee", false), Offer::Queued(_)));
-        assert_eq!(q.offer(b"ffff", false), Offer::Dropped);
+        assert!(matches!(
+            q.offer(b"eeee", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
+        assert_eq!(q.offer(b"ffff", LineKind::Logged, false), Offer::Dropped);
         q.written();
         assert!(!q.is_stalled());
-        assert_eq!(q.offer(b"gggg", false), Offer::Wait);
+        assert_eq!(q.offer(b"gggg", LineKind::Logged, false), Offer::Wait);
     }
 
     // Defect caught: lines dropped from a sink without a count, a count
@@ -443,17 +556,26 @@ mod tests
     #[test]
     fn drops_are_reported_before_the_next_queued_line_or_at_the_tail()
     {
-        let mut q: SinkQueue<20> = SinkQueue::new();
-        assert!(matches!(q.offer(b"aaaa", false), Offer::Queued(_)));
-        assert!(matches!(q.offer(b"bbbb", false), Offer::Queued(_)));
-        assert_eq!(q.offer(b"xxxx", true), Offer::Dropped);
-        assert_eq!(q.offer(b"yyyy", false), Offer::Dropped);
+        let mut q: SinkQueue<{ 2 * (HEADER_BYTES + 4) }> = SinkQueue::new();
+        assert!(matches!(
+            q.offer(b"aaaa", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
+        assert!(matches!(
+            q.offer(b"bbbb", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
+        assert_eq!(q.offer(b"xxxx", LineKind::Logged, true), Offer::Dropped);
+        assert_eq!(q.offer(b"yyyy", LineKind::Logged, false), Offer::Dropped);
         // Two lines queued: the tail's count is not taken yet.
         assert_eq!(q.take_tail_drops(), 0);
         let mut buf = [0u8; 8];
         q.pop(&mut buf).unwrap();
-        assert!(matches!(q.offer(b"cccc", false), Offer::Queued(_)));
-        assert_eq!(q.offer(b"zzzz", false), Offer::Dropped);
+        assert!(matches!(
+            q.offer(b"cccc", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
+        assert_eq!(q.offer(b"zzzz", LineKind::Logged, false), Offer::Dropped);
         assert_eq!(
             drain(&mut q),
             [(b"bbbb".to_vec(), 0), (b"cccc".to_vec(), 2)]
@@ -469,12 +591,18 @@ mod tests
     #[test]
     fn an_unserved_sink_queues_without_a_wait_and_counts_the_overflow()
     {
-        let mut q: SinkQueue<20> = SinkQueue::new();
-        assert!(matches!(q.offer_unserved(b"aaaa"), Offer::Queued(_)));
+        let mut q: SinkQueue<{ 2 * (HEADER_BYTES + 4) }> = SinkQueue::new();
+        assert!(matches!(
+            q.offer_unserved(b"aaaa", LineKind::Logged),
+            Offer::Queued(_)
+        ));
         assert!(!q.is_stalled());
-        assert!(matches!(q.offer_unserved(b"bbbb"), Offer::Queued(_)));
-        assert_eq!(q.offer_unserved(b"cccc"), Offer::Dropped);
-        assert_eq!(q.offer_unserved(b"dddd"), Offer::Dropped);
+        assert!(matches!(
+            q.offer_unserved(b"bbbb", LineKind::Logged),
+            Offer::Queued(_)
+        ));
+        assert_eq!(q.offer_unserved(b"cccc", LineKind::Logged), Offer::Dropped);
+        assert_eq!(q.offer_unserved(b"dddd", LineKind::Logged), Offer::Dropped);
         assert!(q.is_stalled());
         // A driver is resolved: the writer takes the held lines in order, and
         // its first completed write ends the stall, so a served sink's
@@ -483,7 +611,10 @@ mod tests
         q.pop(&mut buf).unwrap();
         q.written();
         assert!(!q.is_stalled());
-        assert!(matches!(q.offer(b"eeee", false), Offer::Queued(_)));
+        assert!(matches!(
+            q.offer(b"eeee", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
         assert_eq!(
             drain(&mut q),
             [(b"bbbb".to_vec(), 0), (b"eeee".to_vec(), 2)]
@@ -496,10 +627,13 @@ mod tests
     #[test]
     fn a_line_longer_than_the_ring_is_dropped_without_a_wait()
     {
-        let mut q: SinkQueue<16> = SinkQueue::new();
-        assert_eq!(q.offer(&[0u8; 11], false), Offer::Dropped);
+        let mut q: SinkQueue<{ HEADER_BYTES + 10 }> = SinkQueue::new();
+        assert_eq!(q.offer(&[0u8; 11], LineKind::Logged, false), Offer::Dropped);
         assert!(!q.is_stalled());
-        assert!(matches!(q.offer(&[0u8; 10], false), Offer::Queued(_)));
+        assert!(matches!(
+            q.offer(&[0u8; 10], LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
         assert_eq!(q.take_tail_drops(), 0);
         assert_eq!(drain(&mut q), [(vec![0u8; 10], 1)]);
     }
@@ -512,12 +646,12 @@ mod tests
     fn a_line_is_written_once_the_writer_completes_a_write_after_taking_it()
     {
         let mut q: SinkQueue<64> = SinkQueue::new();
-        let Offer::Queued(first) = q.offer(b"aaaa", false)
+        let Offer::Queued(first) = q.offer(b"aaaa", LineKind::Logged, false)
         else
         {
             panic!("not queued");
         };
-        let Offer::Queued(second) = q.offer(b"bbbb", false)
+        let Offer::Queued(second) = q.offer(b"bbbb", LineKind::Logged, false)
         else
         {
             panic!("not queued");
@@ -544,8 +678,14 @@ mod tests
     fn a_pop_into_a_short_buffer_cuts_the_line_and_keeps_the_next()
     {
         let mut q: SinkQueue<32> = SinkQueue::new();
-        assert!(matches!(q.offer(b"abcdef", false), Offer::Queued(_)));
-        assert!(matches!(q.offer(b"gh", false), Offer::Queued(_)));
+        assert!(matches!(
+            q.offer(b"abcdef", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
+        assert!(matches!(
+            q.offer(b"gh", LineKind::Logged, false),
+            Offer::Queued(_)
+        ));
         let mut short = [0u8; 3];
         let p = q.pop(&mut short).unwrap();
         assert_eq!(&short[..p.len], b"abc");

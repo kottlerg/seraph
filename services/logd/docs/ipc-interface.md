@@ -521,11 +521,12 @@ logd's waits on it for longer than `SINK_STALL_MS` (1000 ms,
   the producer goes on, and a sender's log call returns with its line written, as with a
   synchronous write. A producer that finds the queue full waits, within the same bound, for the
   writer to free space.
-- **Stall.** A producer whose bound passes before its line is written, or before the queue has
-  room for it, stalls the sink. While a sink is stalled, producers wait for nothing: a line is
-  queued when it fits and dropped, counted, when it does not. The writer's next completed write
-  ends the stall. A stopped driver thus holds the log stream for `SINK_STALL_MS` once, and
-  every line stays in its sender's history (§ History) whatever its sinks do.
+- **Stall.** A producer whose bound passes before its line is written, or before the queue has room
+  for it, stalls the sink, and so does a write the writer gives up (§ Writer below). While a sink is
+  stalled, producers wait for nothing: a line is queued when it fits and dropped, counted, when it
+  does not. The writer's next completed write ends the stall. A stopped driver thus holds the log
+  stream for `SINK_STALL_MS` once, and every line stays in its sender's history (§ History) whatever
+  its sinks do.
 - **Unserved.** While devmgr serves no driver of the sink's class (none has started yet, one
   whose start failed, one that died and is not yet restarted, a headless boot's framebuffer),
   producers wait for nothing, as for a stalled sink: a line is queued when it fits and dropped,
@@ -536,26 +537,31 @@ logd's waits on it for longer than `SINK_STALL_MS` (1000 ms,
 - **Writer.** The writer takes the lines in order and writes each with `SERIAL_CHUNK`-byte calls
   that have no bound, so a line queued for a stopped driver is written once, when the driver
   answers again. A call that fails, or that the driver answers with anything but success, ends
-  the line: the line is counted as dropped, a stall stays in place (only a completed write ends
-  it), and the next line goes to the driver resolved then, or to the next one resolved while none
-  is. A drop line the driver does not take is not counted again. A call to a dead driver fails
+  the line and stalls the sink. The line is counted as dropped when the driver did not take all of
+  its bytes; a line it took but did not see leave (§ Serial writes below) is not, and neither is a
+  drop line, the sink's own or the other sink's, since its count is already reported. The next
+  line goes to the driver resolved then, or to the next one resolved while none is. A call to a
+  dead driver fails
   only once devmgr withdraws the driver and revokes its endpoint
   ([devmgr responsibilities](../../devmgr/docs/responsibilities.md)); until then the writer waits
   in it and the sink stalls as for a stopped driver. The writers are spawned beside the receive
   workers, before the handover pull.
-- **Serial writes.** The serial sink writes with `serial_labels::SERIAL_WRITE_SENT`, so the driver
-  answers a call once its bytes have left the UART, not once they are in its transmit ring, and a
-  line counts as written when it is on the wire
+- **Serial writes.** The serial sink writes a line's chunks as plain writes, then one zero-length
+  write with `serial_labels::SERIAL_WRITE_SENT`, a barrier the driver answers once every byte
+  before it has left the UART, not once it is in its transmit ring, so a line counts as written
+  when it is on the wire
   ([serial driver](../../drivers/serial/README.md#label-1-serial_write_bytes)
   § Label 1). The driver answers a call that waited on a transmitter making no progress for its
-  `TX_STALL_MS` (1000 ms) with `STALLED`, which ends the line as any refused write does
-  (§ Writer above).
+  `TX_STALL_MS` (1000 ms) with `STALLED`. A chunk answered `STALLED` was not put in the ring,
+  so its line is counted as dropped; a barrier answered `STALLED` ends a line that is in the ring
+  and leaves when the transmitter moves again, so it is not. The barrier costs each serial line
+  one call more than its chunks.
 - **Inline.** Until a sink's writer runs, or when it cannot be spawned, a line's producer writes
   the line itself, one producer at a time so a line stays whole. Its wait for its turn and its
   calls end `SINK_STALL_MS` after it took the line, so no producer waits on the sink for longer;
-  a line not written whole by then, or found with no driver resolved, is counted, and the count is
-  written, as the writer's drop line is, ahead of the next line an inline write starts, to that
-  sink alone.
+  a line the driver has not taken whole by then, or found with no driver resolved, is counted,
+  and the count is written, as the writer's drop line is, ahead of the next line an inline write
+  starts, to that sink alone.
 - **Drops.** Where a sink dropped lines, its writer writes one warning-level logd line naming the
   count, `<n> lines dropped from the <sink> output: it had no driver, or its driver took none
   within 1000 ms`, to its

@@ -6,7 +6,8 @@ Shared IPC helpers for Seraph userspace: the stack-owned `IpcMessage` snapshot t
 the time left to a deadline (`call_timeout`; `WouldBlock` without a call once none is left;
 [runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Call deadline), that keep the
 kernel's per-thread IPC buffer as scratch at the syscall boundary, the generic bootstrap protocol,
-the `RecvGuard` receive-failure policy for blocking receive loops, the per-service IPC label and
+the `RecvGuard` receive-failure policy for blocking receive loops, the `serve` reply slot that
+sends a server's reply with its next receive (§ Serving), the per-service IPC label and
 error-code modules, the shared policy tables (`sched_policy`, `published_names`, `log_badges`), the
 `keysym` codes and event packing, the `memmgr_bootstrap`, `device_info_kind`, and
 `procmgr_process_state` constants, the `vfsd_bootstrap` layout of init's round 1 to vfsd, the create
@@ -33,6 +34,7 @@ shared/ipc/
     ├── log_query.rs            # Wire format of logd's QUERY_SLOTS and QUERY_HISTORY labels
     ├── log_record.rs           # Log record codec: RecordWriter, Record, key alphabet
     ├── recv_guard.rs           # RecvGuard backoff and EXIT_RECV_WEDGE policy
+    ├── serve.rs                # Reply slot and next_request: a reply sent with the next receive
     ├── <protocol>_labels.rs    # One file per label module (procmgr_labels.rs, ...)
     ├── <protocol>_errors.rs    # One file per error-code module (procmgr_errors.rs, ...)
     ├── sched_policy.rs ...     # One file per table module: sched_policy, published_names,
@@ -52,6 +54,28 @@ A label, error or table module is declared in `lib.rs` as `pub mod <name>;` and 
 `src/<name>.rs`; the three client files are private modules whose items `lib.rs` re-exports at
 the crate root. A change to one protocol's labels edits its own file (and, for a version bump, its
 constant in `lib.rs`).
+
+---
+
+## Serving
+
+A server loop holds one `serve::Reply` per receiving thread and receives with
+`serve::next_request(ep, &mut reply, ipc_buf)`. A handler whose turn ends with its reply leaves it
+with `Reply::set`, and the next `next_request` sends it with the receive in one
+`SYS_IPC_REPLY_RECV` ([IPC Design](../../docs/ipc-design.md) § The Call/Reply Model); with the slot
+empty, `next_request` is `ipc_recv`. A handler with work after its reply (an IPC call, a syscall,
+a use of the reply's outcome) replies at once with `ipc_reply` and leaves the slot empty, and a
+loop with work before its next receive sends a set reply alone first with `Reply::flush`, so no
+reply waits behind work.
+
+`next_request` returns the receive's errors, those of `ipc_recv`, for the loop's `RecvGuard`
+([IPC Design](../../docs/ipc-design.md) § Receive-Failure Policy). The kernel reports the receive's
+capability and headroom refusals before the reply, the reply's errors without receiving, and the
+wait's after the reply, and the first two share codes, so on one of those `next_request` sends the
+reply again alone: a refused receive keeps its caller bound, and that send makes the reply, while a
+failed reply consumed the binding, that send fails with nothing to answer, and the receive is made
+alone. No reply is lost or sent twice, and a reply's failure is never returned as a receive
+failure. The state machine is host-tested over a stand-in for the three syscalls.
 
 ---
 

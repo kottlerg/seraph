@@ -406,6 +406,15 @@ args! {
         #[arg(long, value_delimiter = ',', value_parser = parse_build_component)]
         pub limited_debug: Vec<BuildComponent>,
 
+        /// Build the named workspace package(s) at another opt-level within
+        /// the active profile, as `<package>=<level>`, the level one of 0, 1,
+        /// 2, 3, s or z. Comma-separated, e.g. `--opt-level shmem=3,framebuffer=3`.
+        /// A package is any of the workspace, a library included: it applies
+        /// wherever the build compiles it. Refused for a component `--debug`
+        /// names (`all` names every component), which sets its opt-level to 1.
+        #[arg(long, value_name = "PKG=LEVEL", value_delimiter = ',', value_parser = parse_opt_level)]
+        pub opt_level: Vec<OptLevelOverride>,
+
         /// Skip the formatting check (`cargo fmt --check`) and the
         /// per-component `cargo check` (clippy), which would otherwise double
         /// the cargo invocations per component. The build of a `StdUser`
@@ -488,6 +497,54 @@ fn parse_build_component(text: &str) -> Result<BuildComponent, String>
                 )
             }),
     }
+}
+
+/// The opt-levels `--opt-level` accepts: Cargo's `profile.opt-level` values.
+pub const OPT_LEVELS: [&str; 6] = ["0", "1", "2", "3", "s", "z"];
+
+/// An `--opt-level` override: a workspace package, by its name, and the
+/// opt-level of [`OPT_LEVELS`] it is built at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptLevelOverride
+{
+    pub package: String,
+    pub level: &'static str,
+}
+
+impl Leaf for OptLevelOverride
+{
+    fn parse(text: &str) -> Result<Self, String>
+    {
+        parse_opt_level(text)
+    }
+}
+
+/// The value parser of an [`OptLevelOverride`]: `<package>=<level>`. The
+/// package name is checked to be one Cargo accepts (ASCII letters, digits,
+/// `-` and `_`), so it is one TOML key segment when quoted; whether the
+/// workspace has it is checked by the build, which reads the workspace.
+fn parse_opt_level(text: &str) -> Result<OptLevelOverride, String>
+{
+    let (package, level) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not <package>=<level>"))?;
+    if package.is_empty()
+        || !package
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!("{package:?} is not a package name"));
+    }
+    let level = OPT_LEVELS.iter().find(|l| **l == level).ok_or_else(|| {
+        format!(
+            "no opt-level {level:?}; expected one of: {}",
+            OPT_LEVELS.join(", ")
+        )
+    })?;
+    Ok(OptLevelOverride {
+        package: package.to_owned(),
+        level,
+    })
 }
 
 // ── Run ───────────────────────────────────────────────────────────────────────
@@ -1108,10 +1165,11 @@ args! {
         /// Verify only the crates the change from the merge base of COMMIT and
         /// HEAD to the working tree can affect: each crate whose package, a
         /// package in its dependency closure, or a file one of them reads, the
-        /// change touches; every crate when it touches an input of every
-        /// build; and, when it selects no crate otherwise but touches
-        /// `.github/workflows/kani.yml` or `build-test.yml`, the crate with the
-        /// fewest harnesses.
+        /// change touches; every crate when it touches an input of every proof
+        /// (an input of every build, this command's source, or
+        /// `.github/workflows/kani.yml`); and, when it touches
+        /// `.github/workflows/build-test.yml`, the crate with the fewest
+        /// harnesses, whose jobs run whatever passes are stored.
         #[arg(long, value_name = "COMMIT", conflicts_with_all = ["component", "harness"])]
         pub since: Option<String>,
 
@@ -1137,13 +1195,25 @@ args! {
         #[arg(long, conflicts_with_all = ["component", "harness", "shard", "list"])]
         pub plan: bool,
 
+        /// With --plan, leave out each job whose pass a run of this repository
+        /// stored (an artifact named by the job's key, read with gh), printing
+        /// the run that proved it.
+        #[arg(long, requires = "plan")]
+        pub skip_passed: bool,
+
+        /// With --shard, when the harnesses judged are exactly the shard's and
+        /// all passed, write the record of the job's pass to DIR, as the file
+        /// CI stores it as: kani-pass-<key>.txt.
+        #[arg(long, value_name = "DIR", requires = "shard")]
+        pub pass_record: Option<PathBuf>,
+
         /// With --plan, append the workflow's outputs to FILE
         /// (`$GITHUB_OUTPUT`): the matrix and whether it holds a job.
         #[arg(long, value_name = "FILE", requires = "plan")]
         pub github_output: Option<PathBuf>,
 
         /// Print the pinned Kani release and exit, verifying nothing.
-        #[arg(long, conflicts_with_all = ["component", "harness", "since", "list", "shard", "plan"])]
+        #[arg(long, conflicts_with_all = ["component", "harness", "since", "list", "shard", "plan", "pass_record"])]
         pub pin: bool,
 
         /// The shared host's launch rules (see xtask/README.md "Host launch
@@ -2126,6 +2196,37 @@ mod tests
         assert_eq!(parse_build_component("boot"), Ok(BuildComponent::Boot));
         assert_eq!(parse_build_component("all"), Ok(BuildComponent::All));
         parse_build_component("no-such-crate").unwrap_err();
+    }
+
+    // Defect caught: an `--opt-level` value with a level Cargo does not
+    // know, or a package name that would not be one quoted TOML key segment
+    // of the `--config` flag the build writes from it.
+    #[test]
+    fn an_opt_level_override_takes_a_package_name_and_a_cargo_level()
+    {
+        for level in OPT_LEVELS
+        {
+            assert_eq!(
+                parse_opt_level(&format!("virtio-blk={level}")),
+                Ok(OptLevelOverride {
+                    package: "virtio-blk".into(),
+                    level,
+                })
+            );
+        }
+        for refused in [
+            "shmem",
+            "shmem=",
+            "shmem=4",
+            "shmem=O3",
+            "=3",
+            "sh\"mem=3",
+            "sh mem=3",
+            "shmem.x=3",
+        ]
+        {
+            parse_opt_level(refused).unwrap_err();
+        }
     }
 
     /// The host options `main` admits a parsed command line with as a build.

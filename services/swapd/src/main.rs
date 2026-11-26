@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, blk_labels, memmgr_errors, memmgr_labels, vfsd_errors, vfsd_labels};
 use layout::{AfterFailedCall, AfterTake, Extent, FaultReply, Geometry, Probe, Transfer};
 use std::os::seraph::thread::BuilderExt;
@@ -405,10 +406,11 @@ fn restore(swap: &Swap, word: u64, buf: &mut u64) -> FaultReply
 fn serve_faults(swap: &Swap, recv: u64, mut buf: u64, ipc_buf: *mut u64) -> !
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut slot = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(recv, ipc_buf) }
+        let msg = match unsafe { next_request(recv, &mut slot, ipc_buf) }
         {
             Ok(msg) =>
             {
@@ -440,8 +442,7 @@ fn serve_faults(swap: &Swap, recv: u64, mut buf: u64, ipc_buf: *mut u64) -> !
                 .word(0, word)
                 .build(),
         };
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        slot.set(reply);
     }
 }
 

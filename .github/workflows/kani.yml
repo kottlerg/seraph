@@ -6,9 +6,12 @@
 # The bounded proofs (docs/testing.md § Bounded verification), as the jobs
 # build-test.yml and burnin.yml call: a plan of the jobs the run owes, one
 # job for each crate it verifies, or for each shard of a crate xtask splits,
-# and kani-result, which judges them. The caller's concurrency group applies,
-# so a pull request's newer push cancels these jobs with the rest of its
-# older run (docs/conventions.md § CI Gating).
+# that no stored pass covers, and kani-result, which judges them. This file
+# is an input of every pass's key, since its prove job decides what is
+# stored as a pass, so a change to it proves every crate again. The
+# caller's concurrency group applies, so a pull request's newer push cancels
+# these jobs with the rest of its older run (docs/conventions.md § CI
+# Gating).
 
 name: kani
 
@@ -22,6 +25,13 @@ on:
         type: string
         required: false
         default: ''
+      skip-passed:
+        description: >-
+          Run no job whose pass a run of this repository stored; false
+          proves every job the plan selects
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -29,9 +39,14 @@ permissions:
 jobs:
   plan:
     # The jobs the run owes (`cargo xtask kani --plan`, xtask/README.md): a
-    # crate the selection does not pick has none, so the matrix holds no
-    # skipped entry.
+    # crate the selection does not pick has none, nor does a job whose pass a
+    # run of this repository stored, so the matrix holds no skipped entry.
+    # Reading the stored passes, artifacts of other runs, needs
+    # `actions: read`.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       owed: ${{ steps.plan.outputs.owed }}
@@ -57,16 +72,21 @@ jobs:
         shell: bash
         env:
           SINCE: ${{ inputs.since }}
+          SKIP_PASSED: ${{ inputs.skip-passed }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          since=()
+          options=()
           if [ -n "$SINCE" ]; then
-            since=(--since "$SINCE")
+            options+=(--since "$SINCE")
           fi
-          cargo xtask kani --plan "${since[@]}" --github-output "$GITHUB_OUTPUT" 2>&1 \
+          if [ "$SKIP_PASSED" = true ]; then
+            options+=(--skip-passed)
+          fi
+          cargo xtask kani --plan "${options[@]}" --github-output "$GITHUB_OUTPUT" 2>&1 \
             | tee "$RUNNER_TEMP/plan.log"
           { echo '```'; cat "$RUNNER_TEMP/plan.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           if grep -qx 'owed=false' "$GITHUB_OUTPUT"; then
-            echo "::notice title=kani::no proof crate affected"
+            echo "::notice title=kani::no proof job owed"
           fi
 
   prove:
@@ -112,7 +132,36 @@ jobs:
         env:
           PACKAGE: ${{ matrix.package }}
           SHARD: ${{ matrix.shard }}
-        run: cargo xtask kani --component "$PACKAGE" --shard "$SHARD"
+        run: >-
+          cargo xtask kani --component "$PACKAGE" --shard "$SHARD"
+          --pass-record "$RUNNER_TEMP/pass"
+
+      # The pass of a job whose harnesses all passed, stored as an artifact
+      # named by its key, which a later plan finds by that name alone. Kept
+      # 90 days, the longest GitHub allows, after which the job is proved
+      # again (docs/testing.md § Bounded verification). A re-run of the run
+      # replaces the artifact of the same name its earlier attempt stored.
+      - name: Find the pass record
+        id: pass
+        shell: bash
+        run: |
+          shopt -s nullglob
+          records=("$RUNNER_TEMP"/pass/kani-pass-*.txt)
+          if [ "${#records[@]}" -ne 1 ]; then
+            echo "::error title=kani::pass record missing, records=${#records[@]}"
+            exit 1
+          fi
+          echo "name=$(basename "${records[0]}" .txt)" >> "$GITHUB_OUTPUT"
+          echo "path=${records[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Store the pass
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pass.outputs.name }}
+          path: ${{ steps.pass.outputs.path }}
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: true
 
   result:
     # The one Kani job of every run, whatever the plan owes, so it can be a

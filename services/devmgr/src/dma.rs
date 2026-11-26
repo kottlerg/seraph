@@ -50,6 +50,7 @@ use firmware::dma::{
     check_access,
 };
 use ipc::recv_guard::RecvGuard;
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, devmgr_dma_errors, devmgr_dma_labels, iommu_errors};
 
 use crate::iommu::{Iommu, IommuClient};
@@ -459,6 +460,7 @@ fn serve(ep: u64, shared: &Shared)
         return;
     }
     let mut guard = RecvGuard::new(crate::recv_diag);
+    let mut slot = Reply::new();
     #[expect(
         clippy::infinite_loop,
         reason = "the thread returns early when it has no IPC buffer, so `serve` cannot be `-> !`; \
@@ -467,7 +469,7 @@ fn serve(ep: u64, shared: &Shared)
     loop
     {
         // SAFETY: ipc_buf is this thread's registered IPC buffer.
-        let msg = match unsafe { ipc::ipc_recv(ep, ipc_buf) }
+        let msg = match unsafe { next_request(ep, &mut slot, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -481,12 +483,12 @@ fn serve(ep: u64, shared: &Shared)
             && let Some(code) = firmware::headroom::dma_refusal(msg.label)
         {
             release_caps(msg.caps());
-            reply(&IpcMessage::new(code), ipc_buf);
+            slot.set_status(code);
             continue;
         }
         match msg.label
         {
-            devmgr_dma_labels::DMA_MAP => handle_map(&msg, shared, ipc_buf),
+            devmgr_dma_labels::DMA_MAP => handle_map(&msg, shared, ipc_buf, &mut slot),
             devmgr_dma_labels::DMA_FAULTS =>
             {
                 release_caps(msg.caps());
@@ -498,7 +500,7 @@ fn serve(ep: u64, shared: &Shared)
                 {
                     IpcMessage::new(devmgr_dma_errors::LABEL_VERSION_MISMATCH)
                 };
-                reply(&reply_msg, ipc_buf);
+                slot.set(reply_msg);
             }
             devmgr_dma_labels::DMA_UNMAP =>
             {
@@ -511,12 +513,12 @@ fn serve(ep: u64, shared: &Shared)
                 {
                     devmgr_dma_errors::LABEL_VERSION_MISMATCH
                 };
-                reply(&IpcMessage::new(code), ipc_buf);
+                slot.set_status(code);
             }
             _ =>
             {
                 release_caps(msg.caps());
-                reply(&IpcMessage::new(devmgr_dma_errors::UNKNOWN_OPCODE), ipc_buf);
+                slot.set_status(devmgr_dma_errors::UNKNOWN_OPCODE);
             }
         }
     }
@@ -526,15 +528,12 @@ fn serve(ep: u64, shared: &Shared)
 /// the mapping stands, and reply its device address. A refused request
 /// deletes the cap; a reply the caller cannot take undoes the mapping and
 /// deletes it too.
-fn handle_map(msg: &IpcMessage, shared: &Shared, ipc_buf: *mut u64)
+fn handle_map(msg: &IpcMessage, shared: &Shared, ipc_buf: *mut u64, slot: &mut Reply)
 {
     let Some((&cap, extra)) = msg.caps().split_first()
     else
     {
-        reply(
-            &IpcMessage::new(devmgr_dma_errors::INVALID_REQUEST),
-            ipc_buf,
-        );
+        slot.set_status(devmgr_dma_errors::INVALID_REQUEST);
         return;
     };
     release_caps(extra);
@@ -544,7 +543,7 @@ fn handle_map(msg: &IpcMessage, shared: &Shared, ipc_buf: *mut u64)
         Err(code) =>
         {
             let _ = syscall::cap_delete(cap);
-            reply(&IpcMessage::new(code), ipc_buf);
+            slot.set_status(code);
             return;
         }
     };
@@ -847,12 +846,4 @@ fn release_caps(caps: &[u64])
     {
         let _ = syscall::cap_delete(c);
     }
-}
-
-/// Reply `msg` on the current request; a reply the caller cannot take needs
-/// no further action, since it moves no cap.
-fn reply(msg: &IpcMessage, ipc_buf: *mut u64)
-{
-    // SAFETY: ipc_buf is this thread's registered IPC buffer.
-    let _ = unsafe { ipc::ipc_reply(msg, ipc_buf) };
 }

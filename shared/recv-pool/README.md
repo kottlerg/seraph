@@ -15,7 +15,10 @@ buffer page logs it and exits its thread, the process and the other workers goin
 hook, whose `Fatal` stage means the process exits, is not told. Each worker
 receives on its own IPC buffer page, under a `RecvGuard`
 ([IPC Design](../../docs/ipc-design.md) § Receive-Failure Policy), and calls the handler with the
-received message and its `IpcBuf`.
+received message, its `IpcBuf`, and its `ipc::serve::Reply`: a handler whose turn ends with its
+reply leaves it there, and the worker sends it with its next receive in one `SYS_IPC_REPLY_RECV`
+([shared/ipc/README.md](../ipc/README.md) § Serving); a handler with work after its reply replies
+at once with `ipc_reply`.
 
 `IpcBuf` is the calling thread's registered IPC buffer page, obtained only through
 `IpcBuf::current()` and neither `Send` nor `Sync`, so a handler can reach no page but its own
@@ -41,7 +44,7 @@ shared/recv-pool/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── lib.rs                  # IpcBuf, RecvPool: workers, start gate, guarded receive loop
+    └── lib.rs                  # IpcBuf, RecvPool: workers, start gate, reply-and-receive loop
 ```
 
 ---

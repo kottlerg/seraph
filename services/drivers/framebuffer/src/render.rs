@@ -11,10 +11,27 @@
 //! happens in `shared/text::render_codepoint`; this module is purely a
 //! pixel back-end.
 //!
-//! The kernel renderer (`core/kernel/src/framebuffer.rs`) remains
-//! byte-indexed against `font::FONT_9X20` for the early-boot / panic
-//! console; this renderer takes bitmaps so the UTF-8 + font-extension
-//! path can land without forcing the kernel onto the same stack.
+//! The kernel renderer (`core/kernel/src/framebuffer.rs`) shares the same
+//! `render_codepoint` resolution and is retained for the kernel's direct
+//! console lines (the panic path is serial-only); this renderer only takes
+//! the bitmaps that resolution yields.
+//!
+//! The renderer writes the framebuffer with plain stores, a whole pixel at a
+//! time, and fills runs of pixels in bulk. Framebuffer memory is memory to
+//! the CPU, not a device register: no read or write of it has a side
+//! effect, and the display scans out whatever it holds. The driver's one
+//! thread is its only userspace writer, so ordering within one CPU is all the
+//! renderer needs; the kernel's retained renderer
+//! (`core/kernel/src/framebuffer.rs`, docs/console-model.md) may also draw
+//! into the same memory at any time, unsynchronised with the driver, and
+//! neither `volatile` nor plain stores order the two. The renderer reads
+//! nothing back but its scroll's own row copy, so a line the kernel draws is
+//! at worst overdrawn or scrolled as any other pixels are. The compiler may
+//! merge stores, vectorise a fill, or drop a store that a later one
+//! overwrites before the call returns, and none of that changes the image
+//! the call leaves. `volatile` would forbid exactly those merges, and keep
+//! nothing correct here. Every pixel is a naturally aligned 32-bit word
+//! (`new` refuses a geometry where it is not), written as one `u32`.
 
 use boot_protocol::{FramebufferInfo, PixelFormat};
 use font::{GLYPH_HEIGHT, GLYPH_WIDTH};
@@ -22,7 +39,8 @@ use font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 /// Framebuffer text renderer.
 pub struct FramebufferWriter
 {
-    base: *mut u8,
+    /// The mapping's first pixel, 4-byte aligned (`new`).
+    base: *mut u32,
     stride: u32, // bytes per row
     /// `stride * height`: the bytes of the mapping.
     bytes: usize,
@@ -51,12 +69,17 @@ impl FramebufferWriter
     /// devmgr does not spawn the driver then, so this branch is defensive),
     /// or if the geometry cannot hold the writer's arithmetic: `width` or
     /// `height` smaller than one glyph cell, or `stride` narrower than
-    /// `width` pixels of 4 bytes, or `stride * height` past `usize`. The
+    /// `width` pixels of 4 bytes, or `stride * height` past `usize`, or
+    /// if `base` or `stride` is not a multiple of 4 bytes, so a pixel would
+    /// not be an aligned 32-bit word (GOP's stride is its pixels per scan
+    /// line times 4, and its base a device aperture, so no firmware mode is
+    /// refused on that account). The
     /// geometry is copied verbatim from the
     /// firmware's GOP mode, so it is checked here rather than trusted. A
     /// writer that exists therefore has at least one glyph row and column,
-    /// and every pixel it addresses (`row < height`, `byte < width * 4`)
-    /// lies inside `stride * height` bytes.
+    /// every pixel it addresses (`row < height`, `byte < width * 4`)
+    /// lies inside `stride * height` bytes, and every pixel starts on a
+    /// 4-byte boundary.
     ///
     /// # Safety
     /// `base` must be a writable mapping of at least `fb.stride *
@@ -67,6 +90,8 @@ impl FramebufferWriter
             || fb.width < GLYPH_WIDTH
             || fb.height < GLYPH_HEIGHT
             || u64::from(fb.stride) < u64::from(fb.width) * 4
+            || fb.stride & 3 != 0
+            || base.addr() & 3 != 0
         {
             return None;
         }
@@ -79,6 +104,11 @@ impl FramebufferWriter
         let last_row_start =
             row_bytes.checked_mul(usize::try_from(max_rows.checked_sub(1)?).ok()?)?;
 
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "the check above refused a `base` that is not 4-byte aligned"
+        )]
+        let base = base.cast::<u32>();
         let mut writer = FramebufferWriter {
             base,
             stride: fb.stride,
@@ -144,16 +174,17 @@ impl FramebufferWriter
         self.bg = bg;
     }
 
-    /// The four framebuffer bytes for an RGB colour under the active pixel
-    /// format (the X byte is always 0).
-    fn pixel_bytes(&self, c: [u8; 3]) -> [u8; 4]
+    /// The framebuffer word for an RGB colour under the active pixel format:
+    /// its four bytes in memory order (the X byte is always 0), so a native
+    /// store of the word lays them down in that order.
+    fn pixel(&self, c: [u8; 3]) -> u32
     {
         let [r, g, b] = c;
-        match self.format
+        u32::from_ne_bytes(match self.format
         {
             PixelFormat::Rgbx8 => [r, g, b, 0],
             PixelFormat::Bgrx8 => [b, g, r, 0],
-        }
+        })
     }
 
     /// Blit a 9×20 glyph bitmap at the current cursor and advance one
@@ -180,10 +211,14 @@ impl FramebufferWriter
             return;
         };
         let stride = self.stride as usize;
+        let fg = self.pixel(self.fg);
+        let bg = self.pixel(self.bg);
         // SAFETY: col < max_cols and row < max_rows, so the cell's first
         // byte lies inside the stride * height mapping (`cell_offset`).
-        let mut scanline = unsafe { self.base.add(cell) };
+        let mut scanline = unsafe { self.base.byte_add(cell) };
 
+        // Each scanline of the cell is one run of GLYPH_WIDTH plain pixel
+        // stores, which the compiler may merge.
         for &bits in bitmap.iter().take(GLYPH_HEIGHT as usize)
         {
             let mut p = scanline;
@@ -192,30 +227,20 @@ impl FramebufferWriter
                 // Bit 15 is the leftmost pixel: rotating column `col_idx`'s
                 // bit into bit 15 reads it (col_idx < GLYPH_WIDTH <= 16).
                 let lit = bits.rotate_left(col_idx) & 0x8000 != 0;
-                let [b0, b1, b2, b3] = self.pixel_bytes(if lit { self.fg } else { self.bg });
-
-                #[expect(
-                    clippy::multiple_unsafe_ops_per_block,
-                    reason = "every write is to one of the four bytes of the pixel at `p`, \
-                              which lie inside the framebuffer mapping"
-                )]
                 // SAFETY: the cell's scanline lies below row *
                 // GLYPH_HEIGHT + GLYPH_HEIGHT <= max_rows * GLYPH_HEIGHT <=
                 // height, and its pixel `col_idx` ends at most (col + 1) *
                 // GLYPH_WIDTH * 4 <= width * 4 <= stride bytes into the
-                // scanline (both checked in `new`), so the four bytes at `p`
-                // are inside the stride * height mapping.
-                unsafe {
-                    core::ptr::write_volatile(p, b0);
-                    core::ptr::write_volatile(p.add(1), b1);
-                    core::ptr::write_volatile(p.add(2), b2);
-                    core::ptr::write_volatile(p.add(3), b3);
-                }
+                // scanline (both checked in `new`), so the pixel at `p` is
+                // inside the stride * height mapping; `base`, `stride` and
+                // every pixel offset are multiples of 4 (`new`), so `p` is
+                // aligned.
+                unsafe { p.write(if lit { fg } else { bg }) };
                 // Wrapping: the step past the cell's last pixel or scanline
                 // is never written through.
-                p = p.wrapping_add(4);
+                p = p.wrapping_add(1);
             }
-            scanline = scanline.wrapping_add(stride);
+            scanline = scanline.wrapping_byte_add(stride);
         }
 
         // Below max_cols before the increment: no saturation.
@@ -247,34 +272,18 @@ impl FramebufferWriter
     /// Framebuffer pointer must be valid and writable.
     unsafe fn clear(&mut self)
     {
-        let [b0, b1, b2, b3] = self.pixel_bytes(self.bg);
-        // RGBX/BGRX is 4 bytes per pixel, so the `/ 4` drops no visible
-        // pixel (the remainder is stride padding).
-        let pixels = self.bytes / 4;
-        let mut p = self.base;
-        for _ in 0..pixels
-        {
-            #[expect(
-                clippy::multiple_unsafe_ops_per_block,
-                reason = "every write is to one of the four bytes of the pixel at `p`, which lie \
-                          inside the framebuffer mapping"
-            )]
-            // SAFETY: p is within the framebuffer mapping; pixels * 4 <= stride * height.
-            unsafe {
-                core::ptr::write_volatile(p, b0);
-                core::ptr::write_volatile(p.add(1), b1);
-                core::ptr::write_volatile(p.add(2), b2);
-                core::ptr::write_volatile(p.add(3), b3);
-            }
-            // SAFETY: p stays within framebuffer bounds; advanced one pixel.
-            p = unsafe { p.add(4) };
-        }
+        // RGBX/BGRX is 4 bytes per pixel and `stride` a multiple of 4
+        // (`new`), so `bytes / 4` pixels cover the mapping exactly, its
+        // stride padding included.
+        // SAFETY: `base` is the 4-byte aligned start of the writable
+        // stride * height mapping, which `bytes / 4` pixels span.
+        unsafe { fill_pixels(self.base, self.bytes / 4, self.pixel(self.bg)) };
     }
 
     /// Scroll up by one character row.
     ///
-    /// Copies rows `1..max_rows` to rows `0..max_rows-1`, then zeroes the last row.
-    /// Adjusts cursor to the last row.
+    /// Copies rows `1..max_rows` to rows `0..max_rows-1`, then fills the last
+    /// row with the background colour. Adjusts cursor to the last row.
     ///
     /// # Safety
     /// Framebuffer pointer must be valid.
@@ -289,59 +298,53 @@ impl FramebufferWriter
         // SAFETY: max_rows >= 1 and max_rows * row_bytes <= height * stride
         // (max_rows = height / GLYPH_HEIGHT), so row 1 starts inside the
         // framebuffer mapping or one past its end.
-        let second_row = unsafe { self.base.add(row_bytes) };
+        let second_row = unsafe { self.base.byte_add(row_bytes) };
         // SAFETY: row_bytes + last_row_start = max_rows * row_bytes <= height
         // * stride, so src, dst, and the last_row_start-byte memmove all lie
-        // inside the writable framebuffer mapping; `copy` allows the overlap.
+        // inside the writable framebuffer mapping; both rows start 4-byte
+        // aligned and `last_row_start` is a multiple of `stride`, itself a
+        // multiple of 4 (`new`), so the copy is whole words; `copy` allows
+        // the overlap.
         unsafe {
-            core::ptr::copy(second_row, self.base, last_row_start);
+            core::ptr::copy(second_row, self.base, last_row_start / 4);
         }
 
         // Fill the freed last row with the background colour.
         // SAFETY: the last row starts at last_row_start within the framebuffer.
-        let last_row = unsafe { self.base.add(last_row_start) };
-        if self.bg == [0, 0, 0]
-        {
-            // Fast path: a black background is a plain byte zero-fill. Scroll
-            // runs on every bottom-line newline, so the common default path
-            // stays a tight per-byte loop.
-            for i in 0..row_bytes
-            {
-                // SAFETY: i < row_bytes, and the last row's row_bytes bytes end
-                // inside the framebuffer mapping.
-                let byte = unsafe { last_row.add(i) };
-                // SAFETY: `byte` lies inside the writable framebuffer mapping.
-                unsafe {
-                    core::ptr::write_volatile(byte, 0);
-                }
-            }
-        }
-        else
-        {
-            let [b0, b1, b2, b3] = self.pixel_bytes(self.bg);
-            let mut p = last_row;
-            // `row_bytes = GLYPH_HEIGHT * stride` is a multiple of 4 (4 bytes/pixel).
-            for _ in 0..(row_bytes / 4)
-            {
-                #[expect(
-                    clippy::multiple_unsafe_ops_per_block,
-                    reason = "every write is to one of the four bytes of the pixel at `p`, \
-                              which lie inside the framebuffer mapping"
-                )]
-                // SAFETY: p stays within the last row (row_bytes wide).
-                unsafe {
-                    core::ptr::write_volatile(p, b0);
-                    core::ptr::write_volatile(p.add(1), b1);
-                    core::ptr::write_volatile(p.add(2), b2);
-                    core::ptr::write_volatile(p.add(3), b3);
-                }
-                // SAFETY: advanced one pixel within the last row.
-                p = unsafe { p.add(4) };
-            }
-        }
+        let last_row = unsafe { self.base.byte_add(last_row_start) };
+        // SAFETY: the last row's row_bytes bytes, a multiple of 4, end inside
+        // the writable framebuffer mapping, and start 4-byte aligned.
+        unsafe { fill_pixels(last_row, row_bytes / 4, self.pixel(self.bg)) };
 
         // Park cursor on the last row; max_rows >= 1, so no saturation.
         self.row = self.max_rows.saturating_sub(1);
+    }
+}
+
+/// Fill `count` pixels from `dst` with the pixel word `pixel`: one byte fill
+/// when the word's four bytes are equal (black, the default background), else
+/// one plain store per pixel, which the compiler may widen.
+///
+/// # Safety
+/// `dst` must be 4-byte aligned, and the `count` words from it writable
+/// framebuffer memory.
+unsafe fn fill_pixels(dst: *mut u32, count: usize, pixel: u32)
+{
+    let [byte, ..] = pixel.to_ne_bytes();
+    if pixel == u32::from_ne_bytes([byte; 4])
+    {
+        // SAFETY: the caller's contract makes the `count` aligned words from
+        // `dst` writable.
+        unsafe { core::ptr::write_bytes(dst, byte, count) };
+    }
+    else
+    {
+        for i in 0..count
+        {
+            // SAFETY: i < count, so the word lies in the caller's span and
+            // is aligned as `dst` is.
+            unsafe { dst.wrapping_add(i).write(pixel) };
+        }
     }
 }
 
@@ -361,14 +364,24 @@ mod tests
         }
     }
 
-    /// Construct a writer over a heap buffer of exactly `stride * height`
-    /// bytes, the mapping size the driver reserves.
-    fn writer(fb: &FramebufferInfo, buf: &mut Vec<u8>) -> Option<FramebufferWriter>
+    /// Construct a writer over a heap buffer of `stride * height` bytes, the
+    /// mapping size the driver reserves, held as words so that it is 4-byte
+    /// aligned as a framebuffer is.
+    fn writer(fb: &FramebufferInfo, buf: &mut Vec<u32>) -> Option<FramebufferWriter>
     {
-        buf.resize(fb.stride as usize * fb.height as usize, 0xEE);
-        // SAFETY: buf is a writable allocation of stride * height bytes that
-        // outlives the writer in every test.
-        unsafe { FramebufferWriter::new(buf.as_mut_ptr(), fb) }
+        buf.resize(
+            (fb.stride as usize * fb.height as usize).div_ceil(4),
+            0xEEEE_EEEE,
+        );
+        // SAFETY: buf is a writable allocation of at least stride * height
+        // bytes that outlives the writer in every test.
+        unsafe { FramebufferWriter::new(buf.as_mut_ptr().cast(), fb) }
+    }
+
+    /// The buffer's bytes in memory order, as the display scans them out.
+    fn bytes(buf: &[u32]) -> Vec<u8>
+    {
+        buf.iter().flat_map(|word| word.to_ne_bytes()).collect()
     }
 
     #[test]
@@ -392,6 +405,22 @@ mod tests
     }
 
     #[test]
+    fn new_rejects_a_base_or_stride_off_a_pixel_word()
+    {
+        // Every pixel is stored as one aligned u32: a stride or a base off a
+        // 4-byte boundary would make those stores misaligned.
+        let mut buf = Vec::new();
+        assert!(writer(&info(100, 100, 100 * 4 + 2), &mut buf).is_none());
+        let fb = info(100, 100, 100 * 4);
+        assert!(writer(&fb, &mut buf).is_some());
+        buf.push(0);
+        let off = buf.as_mut_ptr().cast::<u8>().wrapping_add(1);
+        // SAFETY: `off` starts stride * height writable bytes inside `buf`,
+        // one word longer than that; a refused writer stores nothing.
+        assert!(unsafe { FramebufferWriter::new(off, &fb) }.is_none());
+    }
+
+    #[test]
     fn a_glyph_lights_its_own_cells_first_and_last_columns_only()
     {
         // Two cells across, two down, with stride padding past the pixel row.
@@ -405,6 +434,7 @@ mod tests
         unsafe { w.draw_glyph_bitmap(&[0u16; GLYPH_HEIGHT as usize]) };
         // SAFETY: the writer's buffer is alive and exactly stride * height.
         unsafe { w.draw_glyph_bitmap(&[0x8080u16; GLYPH_HEIGHT as usize]) };
+        let buf = bytes(&buf);
         let stride = stride as usize;
         let lit = |y: usize, x: usize| {
             let at = y * stride + x * 4;
@@ -436,5 +466,81 @@ mod tests
         unsafe { w.draw_glyph_bitmap(&lit) };
         // The scroll cleared the only row to the black background again.
         assert!(buf.iter().all(|&b| b == 0));
+    }
+    #[test]
+    fn glyph_pixels_hold_their_colour_bytes_in_the_formats_order()
+    {
+        // One cell; its first scanline lit at the leftmost pixel only.
+        let mut glyph = [0u16; GLYPH_HEIGHT as usize];
+        glyph[0] = 0x8000;
+        for (format, lit, unlit) in [
+            (
+                PixelFormat::Rgbx8,
+                [0x11, 0x22, 0x33, 0],
+                [0x44, 0x55, 0x66, 0],
+            ),
+            (
+                PixelFormat::Bgrx8,
+                [0x33, 0x22, 0x11, 0],
+                [0x66, 0x55, 0x44, 0],
+            ),
+        ]
+        {
+            let mut fb = info(GLYPH_WIDTH, GLYPH_HEIGHT * 2, GLYPH_WIDTH * 4);
+            fb.pixel_format = format;
+            let mut buf = Vec::new();
+            let mut w = writer(&fb, &mut buf).expect("one-column geometry is valid");
+            w.set_attrs([0x11, 0x22, 0x33], [0x44, 0x55, 0x66]);
+            // SAFETY: the writer's buffer is alive and exactly stride * height.
+            unsafe { w.draw_glyph_bitmap(&glyph) };
+            let buf = bytes(&buf);
+            assert_eq!(buf[..4], lit, "{format:?}");
+            // The rest of the cell is the background, every pixel of it.
+            let cell = GLYPH_WIDTH as usize * 4 * GLYPH_HEIGHT as usize;
+            for pixel in buf[4..cell].as_chunks::<4>().0
+            {
+                assert_eq!(*pixel, unlit, "{format:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_moves_the_rows_up_and_fills_the_freed_row_with_the_background()
+    {
+        // Two rows of one cell, with stride padding the fill must cover too.
+        let stride = GLYPH_WIDTH * 4 + 8;
+        let fb = info(GLYPH_WIDTH, GLYPH_HEIGHT * 2, stride);
+        let mut buf = Vec::new();
+        let mut w = writer(&fb, &mut buf).expect("two-row geometry is valid");
+        w.set_attrs([0xFF, 0xFF, 0xFF], [0x12, 0x34, 0x56]);
+        // A fully lit glyph in row 1: drawing it wraps the only column, which
+        // scrolls it into row 0 and frees row 1.
+        // SAFETY: the writer's buffer is alive and exactly stride * height.
+        unsafe { w.newline() };
+        // SAFETY: as above.
+        unsafe { w.draw_glyph_bitmap(&[0xFFFFu16; GLYPH_HEIGHT as usize]) };
+        let buf = bytes(&buf);
+        let stride = stride as usize;
+        let row = stride * GLYPH_HEIGHT as usize;
+        for y in 0..GLYPH_HEIGHT as usize
+        {
+            let scanline = &buf[y * stride..y * stride + GLYPH_WIDTH as usize * 4];
+            assert!(
+                scanline
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| *p == [0xFF, 0xFF, 0xFF, 0]),
+                "row 0 scanline {y}"
+            );
+        }
+        assert!(
+            buf[row..2 * row]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [0x56, 0x34, 0x12, 0]),
+            "the freed row, padding included, holds the background"
+        );
     }
 }

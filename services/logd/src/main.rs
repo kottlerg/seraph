@@ -34,6 +34,7 @@ use death_set::OverflowWatch;
 use ipc::log_labels::{LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS};
 use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal};
 use ipc::log_record::{RECORD_MAX_BYTES, Record};
+use ipc::serve::Reply;
 use ipc::stream_labels::{
     LEVEL_INFO, LEVEL_WARN, NAME_UNKNOWN, RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES,
     STREAM_RECORD, STREAM_REGISTER_NAME, level_of, sender_named,
@@ -233,8 +234,8 @@ fn main() -> !
     let pool = RecvPool::new(
         caps.log_ep_recv,
         recv_diag,
-        move |msg: &IpcMessage, buf: IpcBuf| {
-            serve_request(logd, msg, buf);
+        move |msg: &IpcMessage, _: IpcBuf, reply: &mut Reply| {
+            serve_request(logd, msg, reply);
         },
     );
     match pool.spawn("logd-recv", RECV_WORKERS)
@@ -794,42 +795,37 @@ fn drain_deaths(logd: &Logd)
 }
 
 /// The receive workers' handler (`services/logd/docs/ipc-interface.md`
-/// § Receive pool): drain the death queue, then serve `msg` and reply on
-/// `buf`, the worker's own IPC buffer page.
-fn serve_request(logd: &Logd, msg: &IpcMessage, buf: IpcBuf)
+/// § Receive pool): drain the death queue, then serve `msg` and leave its
+/// reply for the worker to send with its next receive.
+fn serve_request(logd: &Logd, msg: &IpcMessage, reply: &mut Reply)
 {
     drain_deaths(logd);
-    let ipc_buf = buf.as_ptr();
     let label_id = msg.label & 0xFFFF;
     let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
     if label_id == STREAM_BYTES
     {
         let status = consume_bytes(logd, msg.badge, msg, byte_len);
-        // SAFETY: ipc_buf is this worker's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(status), ipc_buf) };
+        reply.set_status(status);
     }
     else if label_id == STREAM_RECORD
     {
         let status = consume_record(logd, msg.badge, msg, byte_len);
-        // SAFETY: ipc_buf is this worker's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(status), ipc_buf) };
+        reply.set_status(status);
     }
     else if label_id == STREAM_REGISTER_NAME
     {
         register_name(logd, msg.badge, msg, byte_len);
-        reply_ack(ipc_buf);
+        reply.set_status(0);
     }
     else if label_id == QUERY_SLOTS || label_id == QUERY_HISTORY
     {
-        let reply = answer_query(&logd.lock().table, msg);
-        // SAFETY: ipc_buf is this worker's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set(answer_query(&logd.lock().table, msg));
     }
     else
     {
         // Unknown / legacy label (e.g. GET_LOG_CAP from a hypothetical
         // pre-pivot caller). Reply empty so the sender unblocks.
-        reply_ack(ipc_buf);
+        reply.set_status(0);
     }
 }
 
@@ -868,12 +864,6 @@ fn answer_query(table: &SlotTable, msg: &IpcMessage) -> IpcMessage
             Err(status) => refusal(status),
         }
     }
-}
-
-fn reply_ack(ipc_buf: *mut u64)
-{
-    // SAFETY: ipc_buf is the calling worker's registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(0), ipc_buf) };
 }
 
 /// Append `byte_len` bytes from the IPC payload onto the slot for

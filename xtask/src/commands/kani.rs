@@ -37,23 +37,23 @@ use crate::util::step;
 
 /// The inputs of every crate's verification beside those of every build
 /// ([`affected::WORKSPACE_WIDE`], the toolchain pin among them): what can
-/// change a harness's verdict. That is this command, which holds the Kani
-/// pin, the arguments and the memory limit it runs `cargo kani` with, and
-/// the judge of Kani's output. What decides only which crates are verified,
-/// or whether and where a job runs them (the selection in
-/// `xtask/src/affected.rs`, the workflows), is not one.
-const KANI_INPUTS: &[&str] = &["xtask/src/commands/kani.rs"];
+/// change a harness's verdict or what is stored as one. That is this
+/// command, which holds the Kani pin, the arguments and the memory limit it
+/// runs `cargo kani` with, and the judge of Kani's output, and the workflow
+/// whose `prove` job runs it and stores its pass, whose steps and
+/// environment a pass's key would otherwise not name. What decides only
+/// which crates are verified, or whether a job runs them (the selection in
+/// `xtask/src/affected.rs`, the calling workflows), is not one.
+const KANI_INPUTS: &[&str] = &["xtask/src/commands/kani.rs", ".github/workflows/kani.yml"];
 
-/// The workflows that run the `kani` jobs: the reusable workflow that holds
-/// them, and build-test.yml, which calls it with the base of its selection. A
-/// change to one moves no harness's verdict, but can break the jobs' own
-/// steps (the plan, installing the pinned release, its setup, the run), which
-/// only a run that verifies a crate exercises. So a change to one that
-/// selects no crate otherwise selects the crate with the fewest harnesses.
-const KANI_JOB: &[&str] = &[
-    ".github/workflows/kani.yml",
-    ".github/workflows/build-test.yml",
-];
+/// The workflow that calls the `kani` jobs with the base of its selection
+/// and whether to skip stored passes. A change to it moves no harness's
+/// verdict, but can break how it calls the jobs, which only a run that
+/// verifies a crate exercises. So a change to it also selects the crate with
+/// the fewest harnesses, whose jobs the plan keeps whatever passes are
+/// stored. A change to `kani.yml`, which holds the jobs' steps, is an input
+/// of every verification ([`KANI_INPUTS`]).
+const KANI_JOB: &[&str] = &[".github/workflows/build-test.yml"];
 
 /// The Kani release every run uses (docs/build-system.md § Toolchain). A
 /// toolchain bump moves it to the newest release that builds the harnessed
@@ -89,7 +89,7 @@ const SLOWEST: usize = 10;
 /// verification); the closing report's time per crate gives the sums, a
 /// shard run's labelled with its shard. `--plan` fails on an entry that
 /// names no crate holding a harness.
-const SHARDS: &[(&str, usize)] = &[("boot-firmware", 5), ("devmgr-firmware", 4), ("elf", 2)];
+const SHARDS: &[(&str, usize)] = &[("boot-firmware", 5), ("devmgr-firmware", 5), ("elf", 2)];
 
 /// A crate whose proof harnesses the command runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,7 +120,10 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
     }
     let crates = match args.since.as_deref()
     {
-        Some(base) => affected_since(&ctx.root, harnessed(&ctx.root)?, base)?,
+        Some(base) => affected_since(&ctx.root, harnessed(&ctx.root)?, base)?
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect(),
         None => selected(harnessed(&ctx.root)?, args.component.as_deref())?,
     };
     if args.list
@@ -136,14 +139,33 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
     {
         return Ok(());
     }
-    check_version(&ctx.root)?;
+    let kani_version = check_version(&ctx.root)?;
     let shard = args.shard.as_deref().map(Shard::parse).transpose()?;
+    // The key is taken before Kani runs, so it names the inputs verified.
+    let pass = match (&args.pass_record, shard, crates.as_slice())
+    {
+        (Some(dir), Some(shard), [harnessed]) =>
+        {
+            let workspace = Workspace::load(&ctx.root)?;
+            let files = key_files(&workspace, harnessed, &tracked_files(&ctx.root)?)?;
+            let digest = input_digest(&ctx.root, &files)?;
+            Some((dir, PassKey::new(harnessed, shard, &kani_version, &digest)))
+        }
+        (Some(_), _, _) => bail!("Kani: --pass-record needs one crate and --shard"),
+        _ => None,
+    };
     let mut failed = Vec::new();
     let mut outcomes = Vec::new();
+    let mut asked = Vec::new();
     for harnessed in &crates
     {
-        let run = filter(&ctx.root, harnessed, args.harness.as_deref(), shard)
-            .and_then(|filter| verify(&ctx.root, harnessed, &filter, &mut outcomes));
+        let run = filter(&ctx.root, harnessed, args.harness.as_deref(), shard).and_then(|filter| {
+            if let Filter::Exact(names) = &filter
+            {
+                asked.extend(names.iter().cloned());
+            }
+            verify(&ctx.root, harnessed, &filter, &mut outcomes)
+        });
         if let Err(e) = run
         {
             failed.push(format!("{e:#}"));
@@ -159,7 +181,70 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
     {
         bail!("{}", failed.join("\n"));
     }
+    if let Some((dir, key)) = pass
+    {
+        record_pass(dir, &key, &asked, &outcomes)?;
+    }
     Ok(())
+}
+
+/// Write the record of `key`'s pass to `dir`, as the file the pass is
+/// stored as, when at least one harness ran and every one passed; otherwise
+/// write nothing, so CI stores no pass. Fails when the harnesses judged are
+/// not exactly `asked`, the shard's, since the key names the shard and not
+/// the harnesses that ran.
+fn record_pass(
+    dir: &Path,
+    key: &PassKey,
+    asked: &[String],
+    outcomes: &[(String, Outcome)],
+) -> Result<()>
+{
+    let (missing, extra) = harness_difference(asked, outcomes);
+    if !missing.is_empty() || !extra.is_empty()
+    {
+        bail!(
+            "Kani: verified harnesses differ from the shard's, missing={} extra={}",
+            missing.join(","),
+            extra.join(",")
+        );
+    }
+    if outcomes.is_empty() || outcomes.iter().any(|(_, o)| o.verdict != Verdict::Passed)
+    {
+        step(&format!(
+            "Kani: no pass recorded, harnesses={}",
+            outcomes.len()
+        ));
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!("{}.txt", key.name()));
+    std::fs::write(&path, key.record(outcomes))
+        .with_context(|| format!("writing {}", path.display()))?;
+    step(&format!("Kani: pass recorded, pass={}", key.name()));
+    Ok(())
+}
+
+/// The harnesses of `asked` that `outcomes` does not judge, and those it
+/// judges that `asked` does not hold, each sorted.
+fn harness_difference(
+    asked: &[String],
+    outcomes: &[(String, Outcome)],
+) -> (Vec<String>, Vec<String>)
+{
+    let mut missing: Vec<String> = asked
+        .iter()
+        .filter(|name| !outcomes.iter().any(|(_, o)| &o.harness == *name))
+        .cloned()
+        .collect();
+    let mut extra: Vec<String> = outcomes
+        .iter()
+        .map(|(_, o)| o.harness.clone())
+        .filter(|name| !asked.contains(name))
+        .collect();
+    missing.sort();
+    extra.sort();
+    (missing, extra)
 }
 
 /// The crates a run verifies: every crate that holds a harness, or the one
@@ -195,8 +280,9 @@ enum Reason
     BuildWide(String),
     /// The change touches an input of the crate's build.
     Input(Input),
-    /// The change touches a workflow that runs the jobs, and the crate holds
-    /// the fewest harnesses.
+    /// The change touches the workflow that calls the jobs, and the crate
+    /// holds the fewest harnesses: its jobs run whatever passes are stored, so
+    /// the call is exercised.
     Job(String),
 }
 
@@ -217,8 +303,8 @@ impl Reason
                 format!("{file} is an input of {package}, which the crate depends on")
             }
             Self::Job(file) => format!(
-                "{file} runs the jobs, and the crate holds the fewest harnesses, so the jobs' \
-                 steps run once"
+                "{file} calls the jobs, and the crate holds the fewest harnesses, so its jobs run \
+                 whatever passes are stored"
             ),
         }
     }
@@ -228,51 +314,59 @@ impl Reason
 /// `workspace`, with the first reason found, in the order of `crates`:
 /// every crate when a changed file is an input of every verification
 /// ([`affected::WORKSPACE_WIDE`], [`KANI_INPUTS`]), else each crate with a
-/// changed input of its build, else, when the change touches [`KANI_JOB`],
-/// the first crate with the fewest harnesses. Fails naming a crate that is
-/// no workspace package.
+/// changed input of its build, and, when the change touches [`KANI_JOB`],
+/// the first crate with the fewest harnesses, for that reason whatever other
+/// reason it has, so the plan runs its jobs whatever passes are stored. Fails
+/// naming a crate that is no workspace package.
 fn affected_crates(
     crates: Vec<Harnessed>,
     workspace: &Workspace,
     changed: &[String],
 ) -> Result<Vec<(Harnessed, Reason)>>
 {
-    let wide: Vec<&str> = affected::WORKSPACE_WIDE
-        .iter()
-        .chain(KANI_INPUTS)
-        .copied()
-        .collect();
-    if let Some(file) = affected::first_under(changed, &wide)
-    {
-        return Ok(crates
-            .into_iter()
-            .map(|h| (h, Reason::BuildWide(file.clone())))
-            .collect());
-    }
     let fewest = crates.iter().min_by_key(|h| h.harnesses).cloned();
     let mut selected = Vec::new();
-    for harnessed in crates
+    if let Some(file) = affected::first_under(changed, &every_verification())
     {
-        let input = workspace
-            .first_input(&harnessed.dir, changed)
-            .with_context(|| format!("{} holds a proof harness", harnessed.package))?;
-        if let Some(input) = input
+        selected.extend(
+            crates
+                .into_iter()
+                .map(|h| (h, Reason::BuildWide(file.clone()))),
+        );
+    }
+    else
+    {
+        for harnessed in crates
         {
-            selected.push((harnessed, Reason::Input(input)));
+            let input = workspace
+                .first_input(&harnessed.dir, changed)
+                .with_context(|| format!("{} holds a proof harness", harnessed.package))?;
+            if let Some(input) = input
+            {
+                selected.push((harnessed, Reason::Input(input)));
+            }
         }
     }
-    if selected.is_empty()
-        && let (Some(file), Some(harnessed)) = (affected::first_under(changed, KANI_JOB), fewest)
+    if let (Some(file), Some(fewest)) = (affected::first_under(changed, KANI_JOB), fewest)
     {
-        selected.push((harnessed, Reason::Job(file.clone())));
+        let job = Reason::Job(file.clone());
+        match selected.iter_mut().find(|(h, _)| h.dir == fewest.dir)
+        {
+            Some((_, reason)) => *reason = job,
+            None => selected.push((fewest, job)),
+        }
     }
     Ok(selected)
 }
 
 /// The crates of `crates` the change from `base` to the working tree can
-/// affect, each reported with why on stderr, or a line saying that none is,
+/// affect, each with why, reported on stderr, or a line saying that none is,
 /// so `--list` prints the packages alone on stdout.
-fn affected_since(root: &Path, crates: Vec<Harnessed>, base: &str) -> Result<Vec<Harnessed>>
+fn affected_since(
+    root: &Path,
+    crates: Vec<Harnessed>,
+    base: &str,
+) -> Result<Vec<(Harnessed, Option<Reason>)>>
 {
     let changed = affected::changed_files(root, base)?;
     let picked = affected_crates(crates, &Workspace::load(root)?, &changed)?;
@@ -296,7 +390,7 @@ fn affected_since(root: &Path, crates: Vec<Harnessed>, base: &str) -> Result<Vec
             reason.describe(&harnessed.package)
         );
     }
-    Ok(picked.into_iter().map(|(h, _)| h).collect())
+    Ok(picked.into_iter().map(|(h, r)| (h, Some(r))).collect())
 }
 
 // ── Shards and the plan ───────────────────────────────────────────────────────
@@ -363,15 +457,23 @@ fn plan(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
 {
     let all = harnessed(&ctx.root)?;
     let units = plan_units(&all, SHARDS)?;
-    let crates = match args.since.as_deref()
+    let picked = match args.since.as_deref()
     {
         Some(base) => affected_since(&ctx.root, all, base)?,
-        None => all,
+        None => all.into_iter().map(|h| (h, None)).collect(),
     };
     let units: Vec<(String, Shard)> = units
         .into_iter()
-        .filter(|(package, _)| crates.iter().any(|h| &h.package == package))
+        .filter(|(package, _)| picked.iter().any(|(h, _)| &h.package == package))
         .collect();
+    let units = if args.skip_passed
+    {
+        unproved(&ctx.root, &picked, units)?
+    }
+    else
+    {
+        units
+    };
     step(&format!("Kani: {} job(s)", units.len()));
     for (package, shard) in &units
     {
@@ -498,6 +600,379 @@ fn listed_names(text: &str) -> Result<Vec<String>>
     Ok(names)
 }
 
+// ── Stored passes ─────────────────────────────────────────────────────────────
+
+/// The version of the pass key's scheme: which fields [`PassKey::key`]
+/// feeds, in what order and form. A change to the scheme moves it, so no pass
+/// stored under an older scheme matches a newer key.
+const PASS_SCHEME: u32 = 1;
+
+/// The name of a stored pass, before its key: CI stores the pass of a job
+/// whose harnesses all passed as the workflow artifact of this name
+/// (docs/testing.md § Bounded verification).
+const PASS_PREFIX: &str = "kani-pass-";
+
+/// How many hex digits of the SHA-512 of a pass key's fields its key keeps:
+/// 256 bits.
+const KEY_DIGITS: usize = 64;
+
+/// Everything a job's verdict depends on: the crate and the part of its
+/// harnesses it verifies, the Kani release, the arguments and the memory
+/// limit it runs `cargo kani` with, and the content of every file
+/// [`key_files`] gives, which [`input_digest`] reads. Two jobs with one key
+/// verify the same harnesses of the same code with the same tool, so a pass
+/// of one stands for the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PassKey
+{
+    package: String,
+    shard: Shard,
+    /// The release `cargo kani --version` names: the pin, which the run
+    /// checks the installed release against before it verifies.
+    kani_version: String,
+    /// The arguments of [`kani_args`] for the whole crate, the time limit
+    /// among them; the shard's harnesses follow from `shard` and the inputs.
+    args: Vec<String>,
+    memory_limit_gib: u64,
+    /// The digest of the input files ([`input_digest`]), in hex.
+    inputs: String,
+    /// How many input files the digest covers.
+    files: usize,
+}
+
+impl PassKey
+{
+    /// The key of the job that verifies `shard` of `harnessed` with Kani
+    /// `kani_version`, whose input files give `inputs`.
+    fn new(
+        harnessed: &Harnessed,
+        shard: Shard,
+        kani_version: &str,
+        inputs: &(String, usize),
+    ) -> Self
+    {
+        Self {
+            package: harnessed.package.clone(),
+            shard,
+            kani_version: kani_version.to_owned(),
+            args: kani_args(&harnessed.package, &Filter::All),
+            memory_limit_gib: MEMORY_LIMIT_GIB,
+            inputs: inputs.0.clone(),
+            files: inputs.1,
+        }
+    }
+
+    /// The key: the first [`KEY_DIGITS`] hex digits of the SHA-512 of the
+    /// scheme and every field, each after its length.
+    fn key(&self) -> String
+    {
+        self.key_of_scheme(PASS_SCHEME)
+    }
+
+    /// The key under the scheme numbered `scheme`.
+    fn key_of_scheme(&self, scheme: u32) -> String
+    {
+        let mut hasher = crypto::Sha512::new();
+        let mut feed = |bytes: &[u8]| {
+            hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+            hasher.update(bytes);
+        };
+        feed(&scheme.to_le_bytes());
+        feed(self.package.as_bytes());
+        feed(self.shard.to_string().as_bytes());
+        feed(self.kani_version.as_bytes());
+        feed(
+            &u64::try_from(self.args.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        for arg in &self.args
+        {
+            feed(arg.as_bytes());
+        }
+        feed(&self.memory_limit_gib.to_le_bytes());
+        feed(self.inputs.as_bytes());
+        feed(&u64::try_from(self.files).unwrap_or(u64::MAX).to_le_bytes());
+        let mut hex = hex_of(&hasher.finalize());
+        hex.truncate(KEY_DIGITS);
+        hex
+    }
+
+    /// The name the pass of this key is stored under.
+    fn name(&self) -> String
+    {
+        format!("{PASS_PREFIX}{}", self.key())
+    }
+
+    /// The record a stored pass holds, for whoever audits it: every field of
+    /// the key, the run that proved it (from the environment GitHub Actions
+    /// gives a job, "-" outside one) and each harness with its time. Nothing
+    /// reads it to decide: the name is the claim.
+    fn record(&self, outcomes: &[(String, Outcome)]) -> String
+    {
+        let env = |name: &str| std::env::var(name).unwrap_or_else(|_| "-".to_owned());
+        let mut record = format!(
+            "name: {}\npackage: {}\nshard: {}\nscheme: {PASS_SCHEME}\nkani: {}\narguments: {}\n\
+             memory limit: {} GiB\ninputs: {} files, sha512 {}\nrepository: {}\n\
+             run: {} attempt {}\nhead: {}\nref: {}\nharnesses: {}\n",
+            self.name(),
+            self.package,
+            self.shard,
+            self.kani_version,
+            self.args.join(" "),
+            self.memory_limit_gib,
+            self.files,
+            self.inputs,
+            env("GITHUB_REPOSITORY"),
+            env("GITHUB_RUN_ID"),
+            env("GITHUB_RUN_ATTEMPT"),
+            env("GITHUB_SHA"),
+            env("GITHUB_REF"),
+            outcomes.len(),
+        );
+        record.push_str(&outcome_table(outcomes));
+        record
+    }
+}
+
+/// `bytes` in lower-case hex.
+fn hex_of(bytes: &[u8]) -> String
+{
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes
+    {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// The inputs of every crate's verification: those of every build
+/// ([`affected::WORKSPACE_WIDE`]) and [`KANI_INPUTS`].
+fn every_verification() -> Vec<&'static str>
+{
+    affected::WORKSPACE_WIDE
+        .iter()
+        .chain(KANI_INPUTS)
+        .copied()
+        .collect()
+}
+
+/// The files of `tracked` (paths relative to the root) that are inputs of
+/// `harnessed`'s verification, sorted: the inputs of every verification
+/// ([`every_verification`]) and each file [`Workspace::first_input`] counts
+/// as an input of the crate's build, the tests the selection applies to a
+/// changed file ([`affected_crates`]), so a file whose change selects the
+/// crate is in its key and no other is.
+fn key_files(
+    workspace: &Workspace,
+    harnessed: &Harnessed,
+    tracked: &[String],
+) -> Result<Vec<String>>
+{
+    let wide = every_verification();
+    let mut files = Vec::new();
+    for file in tracked
+    {
+        let one = std::slice::from_ref(file);
+        if affected::first_under(one, &wide).is_some()
+            || workspace.first_input(&harnessed.dir, one)?.is_some()
+        {
+            files.push(file.clone());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// The tracked files of the checkout at `root`, relative to it.
+fn tracked_files(root: &Path) -> Result<Vec<String>>
+{
+    let listed = affected::git(root, &["ls-files", "-z"])?;
+    Ok(listed
+        .split('\0')
+        .filter(|f| !f.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The SHA-512, in hex, of `files` (paths relative to `root`) and how many
+/// there are: for each, its path, then a kind byte and the file's content,
+/// a symbolic link's target, or nothing for a file the working tree lacks,
+/// each item after its length. A change to the content, the path or the
+/// presence of any of them changes it.
+fn input_digest(root: &Path, files: &[String]) -> Result<(String, usize)>
+{
+    let mut hasher = crypto::Sha512::new();
+    let mut feed = |bytes: &[u8]| {
+        hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(bytes);
+    };
+    for file in files
+    {
+        feed(file.as_bytes());
+        let path = root.join(file);
+        match std::fs::symlink_metadata(&path)
+        {
+            Ok(meta) if meta.file_type().is_symlink() =>
+            {
+                let target = std::fs::read_link(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                feed(b"l");
+                feed(target.to_string_lossy().as_bytes());
+            }
+            Ok(_) =>
+            {
+                let content =
+                    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+                feed(b"f");
+                feed(&content);
+            }
+            Err(_) => feed(b"-"),
+        }
+    }
+    Ok((hex_of(&hasher.finalize()), files.len()))
+}
+
+/// A pass stored by an earlier run: that run and its head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredPass
+{
+    run: u64,
+    head: String,
+}
+
+/// The pass named `name` in a reply of GitHub's list of a repository's
+/// artifacts (`GET /repos/{owner}/{repo}/actions/artifacts?name=<name>`):
+/// the first artifact of exactly that name that has not expired and that a
+/// run of the repository's own code made, its head repository the
+/// repository itself, so a fork's run, which can upload an artifact of any
+/// name, never counts. `None` when the reply holds none.
+fn stored_pass(reply: &json::Value, name: &str) -> Option<StoredPass>
+{
+    let Some(json::Value::Array(artifacts)) = reply.get("artifacts")
+    else
+    {
+        return None;
+    };
+    artifacts.iter().find_map(|artifact| {
+        let run = artifact.get("workflow_run")?;
+        let own = run.get("repository_id").and_then(json::Value::as_u64)?;
+        let head = run
+            .get("head_repository_id")
+            .and_then(json::Value::as_u64)?;
+        let named = artifact.get("name").and_then(json::Value::as_str) == Some(name);
+        let live = matches!(artifact.get("expired"), Some(json::Value::Bool(false)));
+        (named && live && head == own).then(|| StoredPass {
+            run: run.get("id").and_then(json::Value::as_u64).unwrap_or(0),
+            head: run
+                .get("head_sha")
+                .and_then(json::Value::as_str)
+                .unwrap_or("-")
+                .to_owned(),
+        })
+    })
+}
+
+/// The pass stored under `name` in the repository of the checkout at
+/// `root`, asked of GitHub with `gh api`. A failed request finds none, so
+/// the job runs.
+fn look_up(root: &Path, name: &str) -> Option<StoredPass>
+{
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "-X",
+            "GET",
+            "repos/{owner}/{repo}/actions/artifacts",
+            "-f",
+            &format!("name={name}"),
+            "-f",
+            "per_page=100",
+        ])
+        .current_dir(root)
+        .output();
+    let reply = match output
+    {
+        Ok(output) if output.status.success() => output.stdout,
+        Ok(output) =>
+        {
+            eprintln!(
+                "Kani: pass lookup failed, name={name} status={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return None;
+        }
+        Err(e) =>
+        {
+            eprintln!("Kani: pass lookup failed, name={name} error={e}");
+            return None;
+        }
+    };
+    match json::parse(&String::from_utf8_lossy(&reply))
+    {
+        Ok(reply) => stored_pass(&reply, name),
+        Err(e) =>
+        {
+            eprintln!("Kani: pass lookup failed, name={name} error={e}");
+            None
+        }
+    }
+}
+
+/// The units of `units` no stored pass covers, each unit printed with the
+/// name of its pass, and a covered one with the run that proved it.
+/// `picked` holds every unit's crate, with the reason the selection picked
+/// it: the units of a crate picked to run the jobs ([`Reason::Job`]) are
+/// owed whatever is stored, so the jobs' steps run.
+fn unproved(
+    root: &Path,
+    picked: &[(Harnessed, Option<Reason>)],
+    units: Vec<(String, Shard)>,
+) -> Result<Vec<(String, Shard)>>
+{
+    let workspace = Workspace::load(root)?;
+    let tracked = tracked_files(root)?;
+    let mut digests: Vec<(String, (String, usize))> = Vec::new();
+    let mut owed = Vec::new();
+    for (package, shard) in units
+    {
+        let (harnessed, reason) = picked
+            .iter()
+            .find(|(h, _)| h.package == package)
+            .ok_or_else(|| err!("Kani: no harnessed crate {package}"))?;
+        if !digests.iter().any(|(p, _)| *p == package)
+        {
+            let files = key_files(&workspace, harnessed, &tracked)?;
+            digests.push((package.clone(), input_digest(root, &files)?));
+        }
+        let Some((_, digest)) = digests.iter().find(|(p, _)| *p == package)
+        else
+        {
+            continue;
+        };
+        let name = PassKey::new(harnessed, shard, KANI_VERSION, digest).name();
+        if matches!(reason, Some(Reason::Job(_)))
+        {
+            println!("{package} {shard}: runs the jobs, pass={name}");
+            owed.push((package, shard));
+        }
+        else if let Some(pass) = look_up(root, &name)
+        {
+            println!(
+                "{package} {shard}: passed, run={} head={} pass={name}",
+                pass.run, pass.head
+            );
+        }
+        else
+        {
+            println!("{package} {shard}: no stored pass, pass={name}");
+            owed.push((package, shard));
+        }
+    }
+    Ok(owed)
+}
+
 // ── The installed release ─────────────────────────────────────────────────────
 
 /// How to install the pinned release.
@@ -509,8 +984,9 @@ fn install_hint() -> String
     )
 }
 
-/// Fail unless `cargo kani --version` names the pinned release.
-fn check_version(root: &Path) -> Result<()>
+/// The release `cargo kani --version` names; fails unless it is the pinned
+/// release.
+fn check_version(root: &Path) -> Result<String>
 {
     let output = Command::new("cargo")
         .args(["kani", "--version"])
@@ -524,10 +1000,11 @@ fn check_version(root: &Path) -> Result<()>
             install_hint()
         );
     }
-    match version_mismatch(&String::from_utf8_lossy(&output.stdout))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match version_mismatch(&stdout)
     {
         Some(finding) => bail!("{finding}"),
-        None => Ok(()),
+        None => Ok(reported_version(&stdout).unwrap_or(KANI_VERSION).to_owned()),
     }
 }
 
@@ -1211,6 +1688,340 @@ mod tests
         out
     }
 
+    /// One artifact of GitHub's list of a repository's artifacts, as the API
+    /// gave it for this repository (2026-11-26), with its name, its expiry
+    /// (`true` or `false`) and its run's head repository set.
+    fn artifact(name: &str, expired: &str, head_repository: u64, run: u64) -> String
+    {
+        format!(
+            r#"{{"id":15104881109,"node_id":"MDg6QXJ0aWZhY3QxNTEwNDg4MTEwOQ==","name":"{name}","size_in_bytes":50399,"url":"https://api.github.com/repos/kottlerg/seraph/actions/artifacts/15104881109","archive_download_url":"https://api.github.com/repos/kottlerg/seraph/actions/artifacts/15104881109/zip","expired":{expired},"digest":"sha256:020a78e673157a682962f293d5903d0b59f6cd62c2fb599f064c0f6d197a1d58","created_at":"2026-11-26T09:50:18Z","updated_at":"2026-11-26T09:50:18Z","expires_at":"2027-02-24T09:37:52Z","workflow_run":{{"id":{run},"repository_id":1160664734,"head_repository_id":{head_repository},"head_branch":"feature/kani-fuzz-ci-time-bound","head_sha":"c2f1384910362dce5b00a627b18afa5c0cb5293e"}}}}"#
+        )
+    }
+
+    // Defect caught: a pass taken from a fork's run, from an expired
+    // artifact, or from an artifact whose name only begins with the key, so
+    // a job is skipped on a claim this repository's code never made.
+    #[test]
+    fn a_stored_pass_is_a_live_artifact_of_exactly_its_name_from_this_repository()
+    {
+        const OWN: u64 = 1_160_664_734;
+        let name = "kani-pass-k";
+        let reply = |artifacts: &[String]| {
+            json::parse(&format!(
+                r#"{{"total_count":{},"artifacts":[{}]}}"#,
+                artifacts.len(),
+                artifacts.join(",")
+            ))
+            .unwrap()
+        };
+        let refused = [
+            artifact(name, "false", 4242, 1),
+            artifact(name, "true", OWN, 2),
+            artifact("kani-pass-kx", "false", OWN, 3),
+        ];
+        assert_eq!(stored_pass(&reply(&refused), name), None);
+        let mut with = refused.to_vec();
+        with.push(artifact(name, "false", OWN, 45_793_758_220));
+        assert_eq!(
+            stored_pass(&reply(&with), name),
+            Some(StoredPass {
+                run: 45_793_758_220,
+                head: "c2f1384910362dce5b00a627b18afa5c0cb5293e".to_owned(),
+            })
+        );
+        assert_eq!(stored_pass(&json::parse("{}").unwrap(), name), None);
+    }
+
+    fn pass_key() -> PassKey
+    {
+        let harnessed = Harnessed {
+            package: "elf".to_owned(),
+            dir: "shared/elf".to_owned(),
+            harnesses: 25,
+        };
+        PassKey::new(
+            &harnessed,
+            Shard { index: 1, count: 2 },
+            KANI_VERSION,
+            &("d".repeat(128), 40),
+        )
+    }
+
+    // Defect caught: a key that leaves out an input of the verdict, so a
+    // pass stored for one Kani release, argument list, memory limit, shard or
+    // source stands for another, and a broken proof is skipped.
+    #[test]
+    fn each_field_of_a_pass_key_changes_the_key()
+    {
+        let base = pass_key();
+        let key = base.key();
+        assert_eq!(key.len(), KEY_DIGITS);
+        assert_eq!(base.name(), format!("kani-pass-{key}"));
+        let mut changed: Vec<PassKey> = Vec::new();
+        let mut with = |change: &dyn Fn(&mut PassKey)| {
+            let mut other = base.clone();
+            change(&mut other);
+            changed.push(other);
+        };
+        with(&|k| k.package = "objsig".to_owned());
+        with(&|k| k.shard = Shard { index: 2, count: 2 });
+        with(&|k| k.shard = Shard { index: 1, count: 3 });
+        with(&|k| k.kani_version = "0.69.0".to_owned());
+        with(&|k| {
+            for arg in &mut k.args
+            {
+                if arg.ends_with('s') && arg.starts_with(char::is_numeric)
+                {
+                    *arg = "601s".to_owned();
+                }
+            }
+        });
+        with(&|k| k.args.push("--no-unwinding-checks".to_owned()));
+        with(&|k| k.memory_limit_gib = 16);
+        with(&|k| k.inputs = "e".repeat(128));
+        with(&|k| k.files = 41);
+        for other in &changed
+        {
+            assert_ne!(other, &base);
+            assert_ne!(other.key(), key, "{other:?}");
+        }
+        assert!(base.args.contains(&format!("{HARNESS_TIME_LIMIT_SECS}s")));
+        assert_ne!(base.key_of_scheme(PASS_SCHEME + 1), key);
+        assert_eq!(pass_key().key(), key);
+    }
+
+    // Defect caught: a digest that misses a change to an input file's
+    // content, its path or its presence, so a changed source keeps its key.
+    #[test]
+    fn a_change_to_any_input_file_changes_the_input_digest()
+    {
+        let dir = std::env::temp_dir().join(format!("xtask-kani-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files: Vec<String> = [
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            "shared/elf/src/lib.rs",
+            "shared/dep/src/lib.rs",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        for file in &files
+        {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, file.as_bytes()).unwrap();
+        }
+        let base = input_digest(&dir, &files).unwrap();
+        assert_eq!(base.1, files.len());
+        for file in &files
+        {
+            let path = dir.join(file);
+            std::fs::write(&path, b"changed").unwrap();
+            assert_ne!(input_digest(&dir, &files).unwrap(), base, "{file}");
+            std::fs::write(&path, file.as_bytes()).unwrap();
+        }
+        assert_eq!(input_digest(&dir, &files).unwrap(), base);
+        std::fs::remove_file(dir.join(&files[3])).unwrap();
+        assert_ne!(input_digest(&dir, &files).unwrap(), base);
+        let mut renamed = files.clone();
+        renamed[3] = "shared/dep/src/main.rs".to_owned();
+        std::fs::write(dir.join(&renamed[3]), files[3].as_bytes()).unwrap();
+        assert_ne!(input_digest(&dir, &renamed).unwrap(), base);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Defect caught: the key's file set drifting from the selection's, so a
+    // change that selects a crate leaves its key, and its stored pass,
+    // unchanged, or the key moves with a file the proofs never read.
+    #[test]
+    fn a_crate_s_key_files_are_the_files_whose_change_selects_it()
+    {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let workspace = Workspace::load(&root).unwrap();
+        let tracked = tracked_files(&root).unwrap();
+        let crates = super::harnessed(&root).unwrap();
+        for harnessed in &crates
+        {
+            let files = key_files(&workspace, harnessed, &tracked).unwrap();
+            for file in &tracked
+            {
+                let picked = affected_crates(
+                    vec![harnessed.clone()],
+                    &workspace,
+                    std::slice::from_ref(file),
+                )
+                .unwrap();
+                let selects = picked
+                    .iter()
+                    .any(|(_, reason)| !matches!(reason, Reason::Job(_)));
+                assert_eq!(
+                    selects,
+                    files.binary_search(file).is_ok(),
+                    "{file} for {}",
+                    harnessed.package
+                );
+            }
+            for input in [
+                "Cargo.lock",
+                "rust-toolchain.toml",
+                "xtask/src/commands/kani.rs",
+            ]
+            {
+                assert!(files.binary_search(&input.to_owned()).is_ok(), "{input}");
+            }
+            assert!(
+                files
+                    .iter()
+                    .any(|f| f.starts_with(&format!("{}/", harnessed.dir)))
+            );
+        }
+        // A crate's key holds the sources of a crate it depends on.
+        let firmware = crates
+            .iter()
+            .find(|h| h.package == "devmgr-firmware")
+            .unwrap();
+        let dependency = workspace
+            .dependencies(&firmware.package)
+            .unwrap()
+            .into_iter()
+            .nth(1)
+            .unwrap()
+            .dir
+            .clone();
+        let files = key_files(&workspace, firmware, &tracked).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|f| f.starts_with(&format!("{dependency}/")))
+        );
+    }
+
+    // Defect caught: a pass recorded for a shard whose run judged other
+    // harnesses than the shard's (one Kani skipped, one it ran beside them),
+    // or for a run with a harness that did not pass, so the stored pass
+    // claims a proof no run made.
+    #[test]
+    fn a_pass_is_recorded_only_for_exactly_the_shard_s_harnesses_all_passed()
+    {
+        let dir = std::env::temp_dir().join(format!("xtask-kani-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = pass_key();
+        let file = dir.join(format!("{}.txt", key.name()));
+        let asked: Vec<String> = ["proofs::a", "proofs::b"].map(str::to_owned).to_vec();
+        let outcome = |harness: &str, verdict: Verdict| {
+            (
+                "elf".to_owned(),
+                Outcome {
+                    harness: harness.to_owned(),
+                    verdict,
+                    detail: None,
+                    seconds: Some(1.0),
+                },
+            )
+        };
+        let short = [outcome("proofs::a", Verdict::Passed)];
+        assert!(record_pass(&dir, &key, &asked, &short).is_err());
+        let more = [
+            outcome("proofs::a", Verdict::Passed),
+            outcome("proofs::b", Verdict::Passed),
+            outcome("proofs::c", Verdict::Passed),
+        ];
+        assert!(record_pass(&dir, &key, &asked, &more).is_err());
+        let failed = [
+            outcome("proofs::a", Verdict::Passed),
+            outcome("proofs::b", Verdict::OverBudget),
+        ];
+        record_pass(&dir, &key, &asked, &failed).unwrap();
+        assert!(!file.exists());
+        let passed = [
+            outcome("proofs::b", Verdict::Passed),
+            outcome("proofs::a", Verdict::Passed),
+        ];
+        record_pass(&dir, &key, &asked, &passed).unwrap();
+        let record = std::fs::read_to_string(&file).unwrap();
+        assert!(record.starts_with(&format!("name: {}\npackage: elf\nshard: 1/2\n", key.name())));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The sources of a harnessed crate's closure that read a file through
+    /// a path they compute (`env!`, `concat!`), which no key can follow,
+    /// each with why that read reaches no proof.
+    const COMPUTED_READS: &[(&str, &str)] = &[(
+        "core/boot/src/signing.rs",
+        "its include of the trust store is #[cfg(not(test))], out of the test build Kani verifies",
+    )];
+
+    /// Whether an `include!`, `include_str!` or `include_bytes!` call in
+    /// `source` takes a path other than a string literal.
+    fn reads_a_computed_path(source: &str) -> bool
+    {
+        ["include!", "include_str!", "include_bytes!"]
+            .iter()
+            .flat_map(|call| source.match_indices(call).map(|(at, _)| at + call.len()))
+            .filter_map(|after| source[after..].trim_start().strip_prefix('('))
+            .any(|argument| {
+                let argument = argument.trim_start();
+                !(argument.starts_with('"')
+                    || argument.starts_with("r\"")
+                    || argument.starts_with("r#"))
+            })
+    }
+
+    // Defect caught: a file a proof's build reads that its key does not
+    // hold, one a build script reads or one an include reaches by a computed
+    // path, so a change to that file keeps the stored pass of a proof it
+    // moves.
+    #[test]
+    fn every_file_a_harnessed_crate_s_build_reads_lies_in_its_key()
+    {
+        assert!(!reads_a_computed_path(
+            "include_str!(\"a\") include!(r\"c\") an `include!`"
+        ));
+        assert!(reads_a_computed_path("include_bytes!(\n    env!(\"B\"))"));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let workspace = Workspace::load(&root).unwrap();
+        let tracked = tracked_files(&root).unwrap();
+        let crates = super::harnessed(&root).unwrap();
+        for harnessed in &crates
+        {
+            for package in workspace.dependencies(&harnessed.package).unwrap()
+            {
+                let dir = &package.dir;
+                assert!(
+                    !tracked.contains(&format!("{dir}/build.rs")),
+                    "{dir} has a build script, in {}'s closure",
+                    harnessed.package
+                );
+                let manifest = std::fs::read_to_string(root.join(dir).join("Cargo.toml")).unwrap();
+                let names_a_script = manifest.lines().any(|line| {
+                    line.split_once('=').is_some_and(|(key, value)| {
+                        key.trim() == "build" && value.trim() != "false"
+                    })
+                });
+                assert!(!names_a_script, "{dir}'s manifest names a build script");
+                for source in tracked.iter().filter(|f| {
+                    affected::under(f, dir)
+                        && Path::new(f)
+                            .extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("rs"))
+                })
+                {
+                    let text = std::fs::read_to_string(root.join(source)).unwrap();
+                    // A listed source's read is compiled out of the test
+                    // build of its own crate only, not of a crate that
+                    // depends on it.
+                    assert!(
+                        !reads_a_computed_path(&text)
+                            || (COMPUTED_READS.iter().any(|(s, _)| s == source)
+                                && dir == &harnessed.dir),
+                        "{source} reads a file by a computed path, in {}'s closure",
+                        harnessed.package
+                    );
+                }
+            }
+        }
+    }
+
     fn judge(output: &str) -> Vec<String>
     {
         let mut judge = Judge::default();
@@ -1600,7 +2411,8 @@ mod tests
     }
 
     // Defect caught: a change to an input of every verification (the Kani
-    // pin, the arguments and the judge in this command, the lock file, the
+    // pin, the arguments and the judge in this command, the workflow that
+    // runs it and stores its passes, the lock file, the
     // toolchain pin, the workspace manifest, Cargo's configuration) that
     // leaves a crate out, though it can move any harness's verdict.
     #[test]
@@ -1608,6 +2420,7 @@ mod tests
     {
         for file in [
             "xtask/src/commands/kani.rs",
+            ".github/workflows/kani.yml",
             "Cargo.lock",
             "Cargo.toml",
             "rust-toolchain.toml",
@@ -1625,10 +2438,10 @@ mod tests
         }
     }
 
-    // Defect caught: a change that decides only whether or where the jobs
-    // run, or which crates they select (a workflow, the selection's module),
-    // taken as an input of every verification, so an edit of a workflow
-    // proves every crate although no harness's verdict can move.
+    // Defect caught: a change that decides only whether the jobs run, or
+    // which crates they select (a calling workflow, the selection's module),
+    // taken as an input of every verification, so an edit of one proves
+    // every crate although no harness's verdict can move.
     #[test]
     fn a_change_to_the_workflows_or_the_selection_proves_no_crate_for_it()
     {
@@ -1636,30 +2449,40 @@ mod tests
         {
             assert_eq!(select(&["docs/x.md", file]), [], "{file}");
         }
-        for job in KANI_JOB
-        {
-            assert_eq!(
-                select(&["services/gpt/src/lib.rs", job]),
-                [("gpt".to_owned(), input("services/gpt/src/lib.rs", "gpt"))]
-            );
-        }
     }
 
-    // Defect caught: an edit of a workflow that runs the jobs selecting no
-    // crate, so the plan, install, setup and run steps are skipped on its own
-    // run and on master's, and a broken step lands green; or one that proves
-    // more than the crate with the fewest harnesses.
+    // Defect caught: an edit of the workflow that calls the jobs proving no
+    // crate past the stored passes, so the call's inputs go unexercised on
+    // its own run and on master's, and a broken call lands green, also when
+    // the change holds an input of every verification beside it; or one that
+    // proves more than the crate with the fewest harnesses for it.
     #[test]
     fn a_change_to_the_jobs_runs_them_on_the_crate_with_the_fewest_harnesses()
     {
-        for job in [
-            ".github/workflows/kani.yml",
-            ".github/workflows/build-test.yml",
-        ]
+        for job in KANI_JOB
         {
+            let job = *job;
             assert_eq!(
                 select(&["docs/x.md", job]),
                 [("proto".to_owned(), Reason::Job(job.to_owned()))]
+            );
+            assert_eq!(
+                select(&["services/gpt/src/lib.rs", job]),
+                [
+                    ("gpt".to_owned(), input("services/gpt/src/lib.rs", "gpt")),
+                    ("proto".to_owned(), Reason::Job(job.to_owned())),
+                ]
+            );
+            assert_eq!(
+                select(&["shared/proto/src/lib.rs", job]),
+                [("proto".to_owned(), Reason::Job(job.to_owned()))]
+            );
+            assert_eq!(
+                select(&["Cargo.lock", job]),
+                [
+                    ("gpt".to_owned(), Reason::BuildWide("Cargo.lock".to_owned())),
+                    ("proto".to_owned(), Reason::Job(job.to_owned())),
+                ]
             );
         }
     }

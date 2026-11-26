@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use arch::current::{Uart, serial_init};
 use driver_binding::resources::{self, PlatformDelivery};
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, serial_errors, serial_labels};
 use serial::ring::{self, Consumer, Producer, RX_RING_BYTES, Ring, TX_RING_BYTES};
 use serial::uart::{self, Cause};
@@ -558,10 +559,11 @@ impl Server
         // through this driver (see the module doc). The kernel's rate-limited
         // recv-failure line and the guard's exit remain the signal.
         let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
+        let mut reply = Reply::new();
         loop
         {
             // SAFETY: ipc_buf is this thread's registered IPC buffer page.
-            let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+            let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
             {
                 Ok(msg) => msg,
                 Err(e) =>
@@ -571,7 +573,7 @@ impl Server
                 }
             };
             guard.on_success();
-            let reply = match parse(&msg)
+            let answer = match parse(&msg)
             {
                 Request::Write { bytes, sent } => IpcMessage::new(self.write(bytes, sent)),
                 Request::Read => self.read(),
@@ -579,8 +581,7 @@ impl Server
                 Request::Unknown => IpcMessage::new(serial_errors::UNKNOWN_OPCODE),
                 Request::Unauthorized => IpcMessage::new(serial_errors::UNAUTHORIZED),
             };
-            // SAFETY: ipc_buf is this thread's registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            reply.set(answer);
         }
     }
 
@@ -861,10 +862,11 @@ fn polled_loop(uart: Uart, service_ep: u64, ipc_buf: *mut u64) -> !
     // this loop (see the module doc). The kernel's rate-limited recv-failure
     // line and the guard's exit remain the signal.
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -874,7 +876,7 @@ fn polled_loop(uart: Uart, service_ep: u64, ipc_buf: *mut u64) -> !
             }
         };
         guard.on_success();
-        let reply = match parse(&msg)
+        let answer = match parse(&msg)
         {
             Request::Write { bytes, sent } => IpcMessage::new(poll_write(uart, bytes, sent)),
             Request::Read =>
@@ -903,8 +905,7 @@ fn polled_loop(uart: Uart, service_ep: u64, ipc_buf: *mut u64) -> !
             Request::Unknown => IpcMessage::new(serial_errors::UNKNOWN_OPCODE),
             Request::Unauthorized => IpcMessage::new(serial_errors::UNAUTHORIZED),
         };
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set(answer);
     }
 }
 

@@ -45,6 +45,7 @@ use alloc::vec::Vec;
 
 use ipc::devmgr_dma_labels::{ACCESS_DEVICE_WRITE, ACCESS_MASK};
 use ipc::recv_guard::{RecvFailureStage, RecvGuard};
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, iommu_errors, iommu_labels};
 use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP, RIGHTS_MEM_WRITE};
 
@@ -1007,10 +1008,11 @@ where
     L: Lock<Service<B, C>>,
 {
     let mut guard = RecvGuard::new(diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -1020,10 +1022,7 @@ where
             }
         };
         guard.on_success();
-        let reply = service.with(|s| s.handle(&msg));
-        // SAFETY: as above. A reply the caller cannot take needs nothing
-        // further: it moves no cap.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply.set(service.with(|s| s.handle(&msg)));
     }
 }
 

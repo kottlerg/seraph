@@ -650,24 +650,26 @@ cells is proved again before that pull request merges (above). When no such comm
 runs cannot be read, every cell is owed.
 
 `host-tests` runs on every change. The `kani` jobs prove the crates the change can affect, one job
-per crate or per shard of a crate, and `fuzz` runs when the change can affect a crate it fuzzes,
-its engine, or xtask, which drives it. Both measure the change from the same base as the cells, so
-a proof or a fuzz run that a red or cancelled `master` run left unproven stays owed too. An input
-of every proof is what can change a harness's verdict: the workspace manifest and lock file,
-Cargo's configuration, the toolchain pin, and the command that holds the Kani pin, the arguments
-Kani runs with and the judge of its output. The workflows decide whether and where a job runs, not
-what a harness proves, so they are inputs of every build but of no proof; a change to
-`build-test.yml` or `kani.yml`, whose steps run the `kani` jobs, that selects no crate otherwise
-has them prove the crate with the fewest harnesses, so the jobs' steps run. The `summary` job
-reports the run: it fails when a job failed or was cancelled, or was skipped although the change
-owed it.
+per crate or per shard of a crate, and `fuzz` runs when the change can affect a crate it fuzzes, its
+engine, or xtask, which drives it. Both measure the change from the same base as the cells, so a
+proof or a fuzz run that a red or cancelled `master` run left unproven stays owed too. An input of
+every proof is what can change a harness's verdict or what is stored as one: the workspace manifest
+and lock file, Cargo's configuration, the toolchain pin, the command that holds the Kani pin, the
+arguments Kani runs with and the judge of its output, and `kani.yml`, whose `prove` job runs that
+command and stores its pass. The other workflows decide whether a job runs, not what a harness
+proves, so they are inputs of every build but of no proof; a change to `build-test.yml`, which calls
+the `kani` jobs, also has them prove the crate with the fewest harnesses, past any pass stored for
+it, so the call is exercised. The `summary` job reports the run: it fails when a job failed or was
+cancelled, or was skipped although the change owed it.
 
 The `kani-result` check gates a pull request on the bounded proofs of the crates the change can
-affect, not on the whole set, which runs in burn-in and in the release host runs
-([testing.md](testing.md#bounded-verification) § Bounded verification). It runs in every run and
-fails when a proof job failed, ran past its timeout or was cancelled, so it is fit to be a required
-check; a pull request that affects no proof crate runs no proof job and passes it, with a notice
-that it verified nothing.
+affect, not on the whole set, which burn-in checks against the stored passes and the release host
+runs prove past them ([testing.md](testing.md#bounded-verification) § Bounded verification). It runs
+in every run and fails when a proof job failed, ran past its timeout or was cancelled, so it is fit
+to be a required check. A job whose pass a run of this repository stored, at the same inputs, runs
+no proof job (testing.md § Bounded verification), and a pull request that affects no proof crate, or
+whose jobs all have stored passes, runs no proof job and passes it, with a notice that no job was
+owed.
 
 ## Release Production
 
@@ -739,12 +741,12 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    the hotplug cell (`test hotplug`, on both architectures),
    the CET cell (`test cet`, on x86_64), and the TPM cell (`test tpm`,
    on x86_64) once each, every bounded proof (`cargo xtask kani`
-   with no option), and the fuzz campaign: a manual dispatch of `fuzz.yml`
-   on `master` while the commit to be tagged is its head (`gh workflow run
-   fuzz.yml --ref master`), at the default time per target, whose run's
-   head commit is that commit and whose conclusion is `success`. A run at an
-   earlier `master` commit that contains the bump
-   stands for the commit to be tagged when the change between the two is
+   with no option, which reads no stored pass), and the fuzz campaign: a
+   manual dispatch of `fuzz.yml` on `master` while the commit to be
+   tagged is its head (`gh workflow run fuzz.yml --ref master`), at the
+   default time per target, whose run's head commit is that commit and
+   whose conclusion is `success`. A run at an earlier `master` commit that
+   contains the bump stands for the commit to be tagged when the change between the two is
    documentation or comments only, as [testing.md](testing.md#coverage-tiers)
    § Coverage tiers defines it.
    Their report, each run's command, `--runs` count, outcome, and head, is

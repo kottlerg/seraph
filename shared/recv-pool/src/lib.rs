@@ -14,11 +14,12 @@
 //! the first by construction: a handler receives the [`IpcBuf`] of the thread
 //! running it, and an `IpcBuf` cannot leave that thread. Each worker's loop
 //! is guarded as `docs/ipc-design.md` § Receive-Failure Policy says
-//! ([`RecvGuard`]). A worker whose thread has no registered IPC buffer page
-//! (the runtime's registration of the page failed) logs it and exits its
-//! thread without receiving; the process and the other workers go on, so the
-//! hook, whose [`RecvFailureStage::Fatal`] means the process exits, is not
-//! told.
+//! ([`RecvGuard`]), and sends the reply its handler leaves with the receive of
+//! the next request ([`ipc::serve`]). A worker whose thread has no registered
+//! IPC buffer page (the runtime's registration of the page failed) logs it and
+//! exits its thread without receiving; the process and the other workers go
+//! on, so the hook, whose [`RecvFailureStage::Fatal`] means the process exits,
+//! is not told.
 //!
 //! The crate spawns `std` threads, so it compiles only for seraph.
 
@@ -29,6 +30,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ipc::IpcMessage;
 use ipc::recv_guard::{RecvFailureStage, RecvGuard};
+use ipc::serve::{Reply, next_request};
 
 /// The calling thread's registered IPC buffer page.
 ///
@@ -88,11 +90,14 @@ struct Shared<H>
 
 /// A pool of threads receiving on one endpoint.
 ///
-/// Each worker receives a request and calls the handler with it and the
-/// worker's own [`IpcBuf`]. The request is already copied out of the page
-/// (`IpcMessage`), so the handler may make nested calls on that page. The
-/// handler replies, or deliberately leaves the caller unanswered, before it
-/// returns: the worker's next receive releases a caller still pending
+/// Each worker receives a request and calls the handler with it, the
+/// worker's own [`IpcBuf`] and the worker's [`Reply`]. The request is already
+/// copied out of the page (`IpcMessage`), so the handler may make nested calls
+/// on that page. The handler ends its turn with its reply left in the
+/// [`Reply`] ([`Reply::set`]), which the worker sends with its next receive
+/// in one `SYS_IPC_REPLY_RECV`; or it replies at once ([`ipc::ipc_reply`])
+/// when it has work after the reply; or it deliberately leaves the caller
+/// unanswered, which the worker's next receive then releases
 /// (`docs/ipc-design.md` § The Call/Reply Model).
 ///
 /// Workers start behind a gate: [`Self::spawn`] starts threads that wait,
@@ -124,7 +129,7 @@ pub struct SpawnError
 
 impl<H> RecvPool<H>
 where
-    H: Fn(&IpcMessage, IpcBuf) + Send + Sync + 'static,
+    H: Fn(&IpcMessage, IpcBuf, &mut Reply) + Send + Sync + 'static,
 {
     /// A pool with no workers and a closed gate, serving `endpoint` (a RECV
     /// capability) with `handler`. `diag` is each worker's `RecvGuard` hook.
@@ -222,7 +227,7 @@ where
 /// the gate, then receive and handle requests for the life of the process.
 fn serve<H>(shared: &Shared<H>, started: Option<&AtomicUsize>) -> !
 where
-    H: Fn(&IpcMessage, IpcBuf),
+    H: Fn(&IpcMessage, IpcBuf, &mut Reply),
 {
     let mut gate = shared.open.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(started) = started
@@ -249,10 +254,11 @@ where
     };
 
     let mut guard = RecvGuard::new(shared.diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: `buf` is this thread's registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(shared.endpoint, buf.as_ptr()) }
+        let msg = match unsafe { next_request(shared.endpoint, &mut reply, buf.as_ptr()) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -262,6 +268,6 @@ where
             }
         };
         guard.on_success();
-        (shared.handler)(&msg, buf);
+        (shared.handler)(&msg, buf, &mut reply);
     }
 }

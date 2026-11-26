@@ -20,6 +20,7 @@
 
 use cmos_rtc::{Calendar, CmosRegs, epoch_us};
 use driver_binding::resources::{self, PlatformDelivery, Resource};
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, devmgr_labels, rtc_errors, rtc_labels};
 use std::os::seraph::startup_info;
 
@@ -169,7 +170,7 @@ fn snapshot_cmos(century_reg: Option<u8>) -> Option<Calendar>
 
 // ── Service loop ───────────────────────────────────────────────────────────
 
-fn handle_request(msg: &IpcMessage, century_reg: Option<u8>, ipc_buf: *mut u64)
+fn handle_request(msg: &IpcMessage, century_reg: Option<u8>, out: &mut Reply)
 {
     let reply = match msg.label
     {
@@ -190,8 +191,7 @@ fn handle_request(msg: &IpcMessage, century_reg: Option<u8>, ipc_buf: *mut u64)
         }
         _ => IpcMessage::new(rtc_errors::UNKNOWN_OPCODE),
     };
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    out.set(reply);
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -215,10 +215,11 @@ fn service_loop(service_ep: u64, century_reg: Option<u8>, ipc_buf: *mut u64) -> 
 {
     std::os::seraph::log!("ready");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -235,7 +236,7 @@ fn service_loop(service_ep: u64, century_reg: Option<u8>, ipc_buf: *mut u64) -> 
         {
             let _ = syscall::cap_delete(cap);
         }
-        handle_request(&msg, century_reg, ipc_buf);
+        handle_request(&msg, century_reg, &mut reply);
     }
 }
 

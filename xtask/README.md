@@ -104,7 +104,7 @@ Build Seraph components and populate `sysroot/`.
 ```
 cargo xtask build [--arch x86_64|riscv64] [--release] \
     [--component <name>|all] [--debug <comp>[,...]] [--limited-debug <comp>[,...]] \
-    [--ktest-bench-only]
+    [--opt-level <pkg>=<level>[,...]] [--ktest-bench-only]
 ```
 
 | Option | Default | Description |
@@ -114,6 +114,7 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 | `--component` | `all` | Build a single component: `boot`, the crate name of any component the build installs (an entry of the `SPECS` table in `xtask/src/commands/build.rs`: `kernel`, `init`, `ktest`, each service, driver, program, fixture, and tester crate), or `all` |
 | `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, each named as `--component` names it, e.g. `--debug kernel,crashme`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
 | `--limited-debug` | (none) | Emit limited debuginfo (`debug="limited"`: line tables and function frames, inlined ones included, without types or variables) for the named component(s), at the active profile's own opt-level, so their instructions are a plain build's; a component `--debug` also names takes `--debug`. `path-account` reads the kernel's and ktest's. See [Debuginfo is opt-in](../docs/build-system.md#debuginfo-is-opt-in). |
+| `--opt-level` | (none) | Build the named workspace package(s) at another opt-level within the active profile, as `<package>=<level>` with the level one of `0`, `1`, `2`, `3`, `s`, `z`, e.g. `--opt-level shmem=3,framebuffer=3`: `--config profile.<active>.package."<pkg>".opt-level=<level>` on every cargo build of the build, so a library takes it wherever it is compiled, `-Z build-std`'s crates included. Refused for a package the workspace does not have, for one named twice, and for a component `--debug` names (`all` names every component, not the libraries), which builds it at opt-level 1. Under `--release`, fat LTO optimizes the merged module at the linking binary's level, so a library's override may not survive into the image. `compare-images` builds each commit without `--opt-level`: whether an override survives is read by committing it as a `[profile.<p>.package."<pkg>"]` table in a scratch commit and comparing that commit with its parent. See [Opt-level overrides](../docs/build-system.md#opt-level-overrides). |
 | `--ktest-bench-only` | off | Build ktest with its `bench-only` feature, which runs Tier 3 alone at its benchmark iteration count ([core/ktest/README.md](../core/ktest/README.md#compile-time-options) § Compile-time options); refused with a `--component` other than `ktest` or `all` |
 
 Before it compiles, the build checks that the workspace's Rust source is formatted as
@@ -1618,8 +1619,9 @@ verification) with the pinned Kani release.
 
 ```
 cargo xtask kani [--component <CRATE> [--harness <NAME> | --shard <K/N>]] [--list]
+cargo xtask kani --component <CRATE> --shard <K/N> --pass-record <DIR>
 cargo xtask kani --since <COMMIT> [--list]
-cargo xtask kani --plan [--since <COMMIT>] [--github-output <FILE>]
+cargo xtask kani --plan [--since <COMMIT>] [--skip-passed] [--github-output <FILE>]
 cargo xtask kani --pin
 ```
 
@@ -1631,6 +1633,8 @@ cargo xtask kani --pin
 | `--shard <K/N>` | every harness | Verify the K-th of N parts of the crate's harnesses (below); needs `--component`, takes no `--harness` |
 | `--list` | `false` | Print the package of each crate the run would verify, one a line, and exit, verifying nothing; needs no Kani |
 | `--plan` | `false` | Print the jobs CI's matrix runs for the crates the run would verify (below), one `<package> <K/N>` a line, and exit, verifying nothing; needs no Kani; takes `--since` only |
+| `--skip-passed` | `false` | With `--plan`, leave out each job whose pass a run of this repository stored (below), printing the run that proved it; reads GitHub with `gh` |
+| `--pass-record <DIR>` | none | With `--shard`, when the harnesses judged are exactly the shard's and all passed, write the record of the job's pass to `DIR/kani-pass-<key>.txt` (below) |
 | `--github-output <FILE>` | none | With `--plan`, append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): `matrix`, an `include` list of `package` and `shard`, and `owed`, whether it holds a job |
 | `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
 
@@ -1649,20 +1653,20 @@ gives the path dependencies (of every kind and target: a superset of what its te
 or is a file one of those packages names in an `include!`, `include_str!`, `include_bytes!` or
 `#[path]` string literal, Markdown included: a document no source reads changes no build. Every
 crate is affected when a changed file is an input of every proof, one that can change a harness's
-verdict: an input of every build (the workspace `Cargo.toml` and `Cargo.lock`,
-`rust-toolchain.toml`, `.cargo/config.toml`), or the command's own source,
+verdict or what is stored as one: an input of every build (the workspace `Cargo.toml` and
+`Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`), the command's own source,
 `xtask/src/commands/kani.rs`, which holds the Kani pin, the arguments and the memory limit it runs
-`cargo kani` with, and the judge of Kani's output. What decides only which crates are verified, or
-whether and where a job runs them (the selection in `xtask/src/affected.rs`, the workflows), is not
-one, and a change to it alone selects no crate, save one: a change to `.github/workflows/kani.yml`
-or `.github/workflows/build-test.yml`, whose steps run CI's `kani` jobs, that selects no crate
-otherwise selects the crate with the fewest harnesses (the first by directory among equals), so the
-jobs' install, setup and run steps run. The change is taken from the merge base of `<COMMIT>` and
-`HEAD`, so a branch behind `<COMMIT>` is charged its own change alone. A package's build script,
-features and `cfg` settings lie in its directory or the workspace manifest, so a change to them
-selects it. A commit the checkout does not hold fails the command, so a shallow clone never narrows
-the run. With no crate affected the command verifies nothing and does not check the installed
-release.
+`cargo kani` with, and the judge of Kani's output, or `.github/workflows/kani.yml`, whose `prove`
+job runs the command and stores its pass. What decides only which crates are verified, or whether a
+job runs them (the selection in `xtask/src/affected.rs`, the other workflows), is not one, and a
+change to it alone selects no crate, save one: a change to `.github/workflows/build-test.yml`, which
+calls CI's `kani` jobs, also selects the crate with the fewest harnesses (the first by directory
+among equals), whose jobs `--skip-passed` keeps whatever passes are stored, so the call is
+exercised. The change is taken from the merge base of `<COMMIT>` and `HEAD`, so a branch behind
+`<COMMIT>` is charged its own change alone. A package's build script, features and `cfg` settings
+lie in its directory or the workspace manifest, so a change to them selects it. A commit the
+checkout does not hold fails the command, so a shallow clone never narrows the run. With no crate
+affected the command verifies nothing and does not check the installed release.
 
 It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
@@ -1676,6 +1680,21 @@ harness exactly once, and a harness added to the crate joins a shard with no cha
 crate, or one for each shard of a crate `SHARDS` in the command's source splits, never more shards
 than the crate's harnesses; it fails on an entry of `SHARDS` that names no crate that holds a
 harness.
+
+A job's pass key ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification,
+Stored passes) is the first 64 hex digits of the SHA-512 of `PASS_SCHEME`, the package, the shard,
+the Kani release, the arguments of `cargo kani` for the crate, the memory limit, and the path and
+content of each tracked file whose change `--since` counts as selecting the crate, the inputs of
+every proof among them. With `--pass-record`, the command takes the key before Kani runs, and after
+a run in which every harness of the shard ran and passed, and no other, writes
+`kani-pass-<key>.txt`: the key's fields, the run GitHub Actions names in its environment, and each
+harness with its time. It writes nothing when a harness did not pass, and fails, naming the
+harnesses, when the run judged other harnesses than the shard's. With `--skip-passed`, the plan asks
+GitHub (`gh api`, `GET /repos/{owner}/{repo}/actions/artifacts` with the name) for each job's
+`kani-pass-<key>`, and leaves the job out when the reply holds an artifact of exactly that name that
+has not expired and whose run's head repository is the repository itself; a failed request leaves
+the job in. It prints each job with its pass, and a job left out with the run that proved it. The
+jobs of a crate selected for a change to `build-test.yml` (above) stay in whatever is stored.
 
 For each selected crate it runs `cargo kani --tests -p <package>` (with `--harness` when given),
 which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies each
@@ -1700,14 +1719,17 @@ each crate's harness count and the sum of its harnesses' verification times, whi
 (a `--shard` run labels the crate with its shard, `<package> K/N`, the sum being that shard's),
 and fails naming each crate that failed.
 
-CI's `kani` jobs (`.github/workflows/kani.yml`) run the command. Their `plan` job runs `--plan`
-with `--github-output`: in `build-test.yml`, `--since` the base its `select` job found, with
-`cargo xtask cells --since-covered` on a pull request and `--since-green` on a push to `master`, or
-a dispatch's `kani-since` input, and with no `--since` when there is none; in `burnin.yml` with no
-`--since`. When the plan holds no job it says so in a notice on the run and no `prove` job runs;
-otherwise each `prove` job installs the release `--pin` prints and runs `--component <package>
---shard <K/N>`, and `kani-result` judges them
-([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
+CI's `kani` jobs (`.github/workflows/kani.yml`) run the command. Their `plan` job runs `--plan` with
+`--github-output`, and with `--skip-passed` unless a dispatch's `kani-prove-all` input asks for
+every job: in `build-test.yml`, `--since` the base its `select` job found, with `cargo xtask cells
+--since-covered` on a pull request and `--since-green` on a push to `master`, or a dispatch's
+`kani-since` input, and with no `--since` when there is none; in `burnin.yml` with no `--since`.
+When the plan holds no job it says so in a notice on the run and no `prove` job runs; otherwise each
+`prove` job installs the release `--pin` prints, runs `--component <package> --shard <K/N>
+--pass-record`, and uploads the record as the artifact `kani-pass-<key>`, kept 90 days, and
+`kani-result` judges them ([docs/build-system.md](../docs/build-system.md#continuous-integration) §
+Continuous Integration). The release host runs run the command with no option, which reads no stored
+pass.
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
 session runs `cargo xtask kani` there. A session installs nothing (`cargo install` is outside the

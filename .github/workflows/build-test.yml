@@ -551,8 +551,8 @@ jobs:
             svctest)
               checks=(--whole-lines whole-lines) ;;
             usertest)
-              checks=(--require '\[vfsd\] DEBUG ' --require '\[fatfs\] DEBUG '
-                      --fail-also '\[(devmgr|procmgr)\] DEBUG ') ;;
+              checks=(--require 'DEBUG  \[vfsd\] ' --require 'DEBUG  \[fatfs\] '
+                      --fail-also 'DEBUG  \[(devmgr|procmgr)\] ') ;;
             ktest)
               checks=(--require 'mapredo knob present; redoing steps 6 and 7'
                       --fail-also ' SKIP ') ;;

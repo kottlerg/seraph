@@ -52,7 +52,9 @@ use init_sender_table::{SenderSlot, SenderTable};
 
 use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
 use ipc::log_record::{RECORD_MAX_BYTES, Record};
-use ipc::stream_labels::{RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD, level_of};
+use ipc::stream_labels::{
+    LEVEL_INFO, LEVEL_WARN, RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD, level_of,
+};
 use logd_codec::LINE_BUF_SIZE;
 use logd_codec::handover::{self, NameResend};
 use logd_codec::history::{ENTRY_MAX_BYTES, EntryKind, HistoryCursor, HistoryRing};
@@ -774,7 +776,8 @@ impl KernelReader
             {}
             Accept::AfterGap { first, last } =>
             {
-                flush_synthetic_logd_line(
+                write_init_logd_line(
+                    LEVEL_WARN,
                     logd_codec::kernel::gap_text(first, last)
                         .as_str()
                         .as_bytes(),
@@ -961,7 +964,7 @@ fn register_sender_name(
 }
 
 /// Emit a synthetic registration-event line attributed to the receiver
-/// itself: `[sec.usfrac] [init-logd] badge=<N> registered name='<name>'`.
+/// itself: `[sec.usfrac] INFO   [init-logd] badge=<N> registered name='<name>'`.
 /// Bypasses the slot machinery so it does not interfere with active
 /// senders' line buffers.
 fn emit_registration_event(badge: u64, name: &[u8])
@@ -1059,34 +1062,24 @@ fn flush_kernel_log_failed(what: &str, err: i64)
     );
 }
 
-/// Emit `[sec.usfrac] [init-logd] <payload>\r\n` directly to the
-/// serial port. Used for synthetic registration-event lines and
-/// saturation warnings; bypasses the per-badge slot/buffer machinery
-/// so it does not collide with in-flight log streams. The `init-`
-/// prefix marks the receiver as init's interim log thread; a future
-/// real `logd` service will emit the same line shape under bare
-/// `[logd]`.
+/// Emit `[sec.usfrac] INFO   [init-logd] <payload>\r\n` directly to the
+/// serial port (`write_init_logd_line` at `LEVEL_INFO`).
 fn flush_synthetic_logd_line(payload: &[u8])
 {
+    write_init_logd_line(LEVEL_INFO, payload);
+}
+
+/// Emit one line of init-logd's own at `level` directly to the serial port:
+/// the prefix (`logd_codec::prefix::write`) under the name `init-logd`, then
+/// `payload` and `\r\n`. Used for registration events, saturation warnings
+/// and the kernel log's own lines; bypasses the per-badge slot/buffer
+/// machinery so it does not collide with in-flight log streams. The `init-`
+/// prefix marks the receiver as init's interim log thread; logd emits the
+/// same lines under bare `[logd]`.
+fn write_init_logd_line(level: u64, payload: &[u8])
+{
     let us = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
-    let sec = us / 1_000_000;
-    let usfrac = (us % 1_000_000) as u32;
-
-    arch::current::serial_write_byte(b'[');
-    write_decimal(sec);
-    arch::current::serial_write_byte(b'.');
-    write_decimal_padded(u64::from(usfrac), 6);
-    arch::current::serial_write_byte(b']');
-    arch::current::serial_write_byte(b' ');
-
-    arch::current::serial_write_byte(b'[');
-    for &b in b"init-logd"
-    {
-        arch::current::serial_write_byte(b);
-    }
-    arch::current::serial_write_byte(b']');
-    arch::current::serial_write_byte(b' ');
-
+    logd_codec::prefix::write(us, level, b"init-logd", arch::current::serial_write_byte);
     for &b in payload
     {
         if b == b'\n'
@@ -1183,9 +1176,8 @@ fn consume_record(
     RECORD_ACCEPTED
 }
 
-/// Emit `[sec.usfrac] [name] <buffered bytes>\r\n` to the serial port, with
-/// the line's level tag and a space after `[name] ` for any level but info
-/// (`logd_codec::level::tag`). `[name]` uses the display name registered via
+/// Emit the line's prefix (`write_line_prefix`), its buffered bytes and
+/// `\r\n` to the serial port. `[name]` uses the display name registered via
 /// `STREAM_REGISTER_NAME`; senders that have not registered yet render as
 /// `[?]`.
 fn flush_line(slot: &SenderSlot)
@@ -1203,9 +1195,9 @@ fn flush_line(slot: &SenderSlot)
     arch::current::serial_write_byte(b'\n');
 }
 
-/// Emit a line's `[sec.usfrac] [name] ` prefix, stamped now, and the level's
-/// tag and a space for any level but info, to the serial port: `[?]` for a
-/// sender with no registered `name`.
+/// Emit a line's prefix to the serial port, stamped now: `[sec.usfrac] `,
+/// the level's tag padded to six columns, and `[name] `, `[?]` for a sender
+/// with no registered `name` (`logd_codec::prefix::write`).
 fn write_line_prefix(name: &[u8], level: u64)
 {
     // Source: `SYS_SYSTEM_INFO(ElapsedUs)` — kernel handler returns
@@ -1217,89 +1209,5 @@ fn write_line_prefix(name: &[u8], level: u64)
 /// [`write_line_prefix`], stamped `us` microseconds since boot.
 fn write_line_prefix_at(name: &[u8], level: u64, us: u64)
 {
-    // ── Timestamp: [sec.usfrac:06] ─────────────────────────────────────
-    //
-    // Format matches the kernel's `[sec.usfrac:06] ` prefix in
-    // `kernel/src/console.rs`.
-    let sec = us / 1_000_000;
-    let usfrac = (us % 1_000_000) as u32;
-
-    arch::current::serial_write_byte(b'[');
-    write_decimal(sec);
-    arch::current::serial_write_byte(b'.');
-    write_decimal_padded(u64::from(usfrac), 6);
-    arch::current::serial_write_byte(b']');
-    arch::current::serial_write_byte(b' ');
-
-    // ── Name: [<registered name>] or [?] ───────────────────────────────
-    arch::current::serial_write_byte(b'[');
-    if name.is_empty()
-    {
-        arch::current::serial_write_byte(b'?');
-    }
-    else
-    {
-        for &b in name
-        {
-            arch::current::serial_write_byte(b);
-        }
-    }
-    arch::current::serial_write_byte(b']');
-    arch::current::serial_write_byte(b' ');
-
-    if let Some(tag) = logd_codec::level::tag(level)
-    {
-        for &b in tag.as_bytes()
-        {
-            arch::current::serial_write_byte(b);
-        }
-        arch::current::serial_write_byte(b' ');
-    }
-}
-
-/// Write `value` as base-10 ASCII to the serial port with no padding.
-fn write_decimal(value: u64)
-{
-    // Least-significant digit first; a `u64` has at most 20 digits.
-    let mut buf = [0u8; 20];
-    let mut len = 0usize;
-    let mut n = value;
-    for slot in &mut buf
-    {
-        *slot = b'0'.saturating_add((n % 10) as u8);
-        // `len` indexed a slot, so it is below the array length.
-        len = len.saturating_add(1);
-        n /= 10;
-        if n == 0
-        {
-            break;
-        }
-    }
-    for &b in buf.get(..len).unwrap_or_default().iter().rev()
-    {
-        arch::current::serial_write_byte(b);
-    }
-}
-
-/// Write `value` as zero-padded base-10 ASCII of exactly `width` digits.
-/// `width` must be <= 20 (max decimal digits in a u64).
-fn write_decimal_padded(value: u64, width: usize)
-{
-    let mut buf = [b'0'; 20];
-    let mut n = value;
-    for slot in buf.iter_mut().rev()
-    {
-        if n == 0
-        {
-            break;
-        }
-        *slot = b'0'.saturating_add((n % 10) as u8);
-        n /= 10;
-    }
-    let start = buf.len().saturating_sub(width);
-    // `start` is at most `buf.len()`.
-    for &b in buf.get(start..).unwrap_or_default()
-    {
-        arch::current::serial_write_byte(b);
-    }
+    logd_codec::prefix::write(us, level, name, arch::current::serial_write_byte);
 }

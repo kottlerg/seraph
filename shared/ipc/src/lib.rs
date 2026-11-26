@@ -358,7 +358,7 @@ pub mod log_badges;
 
 /// Wire-protocol version of [`log_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const LOG_LABELS_VERSION: u32 = 5;
+pub const LOG_LABELS_VERSION: u32 = 6;
 pub mod log_labels;
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────

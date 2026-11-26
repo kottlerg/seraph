@@ -748,6 +748,14 @@ args! {
         #[arg(long, requires = "runs")]
         pub crash_reports: Option<CrashReportExpect>,
 
+        /// Check that the console stayed whole in each passing run's log:
+        /// between the lines `<TAG> begin` and `<TAG> end ...`, every line is
+        /// one console line, and each sender's numbered lines arrive whole, in
+        /// order, none missing (svctest's `console_whole_lines` phase). A run
+        /// whose check fails is FAIL; a QEMU-CRASH run is not checked.
+        #[arg(long, value_name = "TAG", requires = "runs")]
+        pub whole_lines: Option<String>,
+
         /// On a hard-timeout HANG of `--runs`, do not kill the QEMU instance:
         /// print the attach instructions and block until it is terminated
         /// externally, preserving the wedged guest for inspection (pair with
@@ -1051,6 +1059,16 @@ args! {
         /// campaign, which a fixed seed does not reproduce.
         #[arg(long, value_name = "SECS", conflicts_with_all = ["replay", "minimize"])]
         pub time: Option<u64>,
+
+        /// Fail a target whose run of an execution count takes more than SECS
+        /// seconds of wall-clock time, stopping it there (default: 1200 for a
+        /// run of the default count, none for one of `--runs`).
+        #[arg(
+            long,
+            value_name = "SECS",
+            conflicts_with_all = ["list", "self_test", "time", "replay", "minimize"]
+        )]
+        pub cap: Option<u64>,
 
         /// The seed of the engine's random choices.
         #[arg(long, default_value = "0")]

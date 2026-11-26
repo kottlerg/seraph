@@ -90,6 +90,7 @@ mod tasklist;
 mod term;
 mod timing;
 mod util;
+mod whole_lines;
 
 use cli::{Cli, CliCommand};
 use context::Context;

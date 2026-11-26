@@ -68,6 +68,7 @@ xtask/
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup
+│   ├── whole_lines.rs          # The check of a log's console lines (run --whole-lines)
 │   ├── commands/               # Subcommand modules (build, capture_acpi, run (the
 │   │   │                       #   interactive boot; run/classified.rs, --runs),
 │   │   │                       #   ktest_timing, bench_check, bench_baseline, path_account,
@@ -259,8 +260,8 @@ cargo xtask run [--arch x86_64|riscv64] \
 
 cargo xtask run --runs N [launch options] [--display framebuffer|headless] [--debug-listen] \
     [--parallel N] [--timeout SECONDS] [--pass REGEX] [--fail REGEX] [--fail-also REGEX] \
-    [--require REGEX]... [--crash-reports reports|none] [--fail-grace-secs SECONDS] \
-    [--hold-on-hang] [--save-logs DIR]
+    [--require REGEX]... [--crash-reports reports|none] [--whole-lines TAG] \
+    [--fail-grace-secs SECONDS] [--hold-on-hang] [--save-logs DIR]
 ```
 
 The launch options, the same in both modes:
@@ -428,11 +429,12 @@ before the runs copy them, and removes it after the last run.
 | `--runs` | (interactive boot) | Total runs, dispatched in waves of `--parallel`; selects the classified boot |
 | `--parallel` | `1` | Concurrency: QEMU instances in flight at once |
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
-| `--pass` | the marker of the image's harness | Regex marking a successful run. The default is `\[<harness>\] ALL TESTS PASSED`, the terminal marker ([docs/testing.md](../docs/testing.md) § Reporting marker) of the one harness the image boots, which its pack recorded in `sysroot/.image-harness`: `ktest` for the ktest bundle, otherwise each of `svctest`, `usertest` and `ubench` whose recipe was staged on a layer the image holds. An image that boots no harness, or several, has no default, and `--runs` refuses to start without `--pass`; an image with no record is refused until it is packed again (`cargo xtask mkdisk`). On match, and every `--require` and `--crash-reports` check holding, the log is discarded and the run is classified `PASS` |
+| `--pass` | the marker of the image's harness | Regex marking a successful run. The default is `\[<harness>\] ALL TESTS PASSED`, the terminal marker ([docs/testing.md](../docs/testing.md) § Reporting marker) of the one harness the image boots, which its pack recorded in `sysroot/.image-harness`: `ktest` for the ktest bundle, otherwise each of `svctest`, `usertest` and `ubench` whose recipe was staged on a layer the image holds. An image that boots no harness, or several, has no default, and `--runs` refuses to start without `--pass`; an image with no record is refused until it is packed again (`cargo xtask mkdisk`). On match, and every `--require`, `--crash-reports` and `--whole-lines` check holding, the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
 | `--require` | (none) | A regex a line of the log must match for the run to pass; repeatable, each must match a line. A run whose `--pass` matched but whose log has no line matching one of them is `FAIL`, its reason naming the pattern |
 | `--crash-reports` | (none) | Check the crash service's report blocks in each passing run's log: every block must be complete and hold the fields its kind, thread, and status require, read with `shared/crash-report`, the crate crashd emits them with ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)). `reports` also requires one `vm` and one `exception` block of the `crashme` fixture's main thread and one `exception` block of a `spawned` thread (its `worker` mode), found through the badge logd's `reclaim:` line names it by, each complete, its walk starting at its instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the block read the thread the kernel killed; the `vm` block's `addr` must also be the faulting address that dump prints (`cr2` on x86_64, `stval` on riscv64). `none` requires no block at all. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `reports`, its `crash-endpoint` svctest boot and its usertest boot `none`; the model is in [docs/testing.md](../docs/testing.md) § Crash reports |
+| `--whole-lines` | (none) | Check the console in each passing run's log between the lines `<TAG> begin` and `<TAG> end ...`: every line there is one console line, and each sender's numbered lines arrive whole, in order, none missing. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `--whole-lines whole-lines`, the tag svctest's `console_whole_lines` phase logs ([services/svctest/README.md](../services/svctest/README.md); the console is in [docs/console-model.md](../docs/console-model.md)) |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, or the first death line of rule 2 below, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
 | `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> icount=<on\|off> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing`, `bench-check` and `bench-baseline` read |
@@ -483,8 +485,8 @@ an earlier one left under `target/xtask/run/`, so the preserved files are its ow
    has no supervisor to log its death: a fault of its own thread stays a `HANG`
 3. `--pass` regex matches → `PASS` (even if QEMU was watchdog-killed,
    which is the normal case for kernels that idle after success), unless a `--require` pattern
-   matches no line of the log or the `--crash-reports` check fails → `FAIL`, its reason naming the
-   pattern or the defect
+   matches no line of the log or the `--crash-reports` or `--whole-lines` check fails → `FAIL`, its
+   reason naming the pattern or the defect
 4. init-logd's last line, `handover complete; init-logd thread exiting`, with no userspace line
    (`[<seconds>] [<name>] ...`) after it → `FAIL`, its reason naming the lost console: real-logd,
    which owns the console from the handover on, wrote nothing to it. A run with nothing at all
@@ -1557,7 +1559,7 @@ Build the fuzz targets with coverage instrumentation and run them under the in-t
 ([docs/testing.md](../docs/testing.md#fuzzing) § Fuzzing gives the tier, its layout and its rules).
 
 ```
-cargo xtask fuzz <TARGET>|--all [--runs N | --time SECS] [--seed S]
+cargo xtask fuzz <TARGET>|--all [--runs N [--cap SECS] | --time SECS] [--seed S]
 cargo xtask fuzz <TARGET> --replay FILE
 cargo xtask fuzz <TARGET>|--all --minimize
 cargo xtask fuzz --list
@@ -1570,6 +1572,7 @@ cargo xtask fuzz --self-test
 | `--all` | Every target in turn, each whatever another's outcome; fails naming those that found a failing input |
 | `--runs N` | Stop after N executions (default 200,000, the gating CI job's count) |
 | `--time SECS` | Stop after SECS seconds instead |
+| `--cap SECS` | Stop a target whose run of an execution count takes more than SECS seconds of wall-clock time and fail it as over the cap (default 1200, `DEFAULT_CAP_SECS`, for a run of the default count; none for a run of `--runs`) |
 | `--seed S` | The seed of the engine's random choices (default 0) |
 | `--replay FILE` | Run the property once on FILE: 0 when it holds, non-zero when it fails |
 | `--minimize` | Reduce the target's working corpus to a subset of its inputs with the same coverage, the shorter inputs kept first |
@@ -1591,6 +1594,12 @@ failing input, minimized, beside its `.txt` report. A target binary runs the sea
 of itself and catches the endings no panic catch can: a signal, an AddressSanitizer report (exit
 73), the allocation cap of 2 GiB (exit 72), and an input that runs past 10 seconds (exit 71); it
 reports each, and minimizes all but a timeout by replaying candidates in fresh processes.
+
+A run of an execution count under a cap runs each target binary in a process group of its own.
+At the cap the command kills the group, the search the binary supervises with it, prints
+`fuzz: <target>: over the <SECS> s cap`, and goes on with the next target; it then fails naming
+every target over the cap beside those that found a failing input. The default count's cap is the
+gating CI job's per-target budget ([docs/testing.md](../docs/testing.md#fuzzing) § Fuzzing, Time).
 
 `--self-test` runs the planted targets `planted-magic`, `planted-length` and `planted-nested`
 from clean working directories, each from seed 0 within its budget in `src/commands/fuzz.rs`
@@ -1639,12 +1648,9 @@ crate is affected when a changed file is an input of every proof, one that can c
 verdict: an input of every build (the workspace `Cargo.toml` and `Cargo.lock`,
 `rust-toolchain.toml`, `.cargo/config.toml`), or the command's own source,
 `xtask/src/commands/kani.rs`, which holds the Kani pin, the arguments and the memory limit it runs
-`cargo kani` with, and the judge of Kani's output. What decides only which crates are verified, or
-whether and where a job runs them (the selection in `xtask/src/affected.rs`, the workflows), is not
-one, and a change to it alone selects no crate, save one: a change to
-`.github/workflows/build-test.yml`, whose steps run CI's `kani` job, that selects no crate otherwise
-selects the crate with the fewest harnesses (the first by directory among equals), so the job's
-install, setup and run steps run. The change is taken from the merge base of `<COMMIT>` and `HEAD`,
+`cargo kani` with, and the judge of Kani's output. What decides only which crates are verified (the
+selection in `xtask/src/affected.rs`) is not one, nor is a workflow, and a change to it alone
+selects no crate. The change is taken from the merge base of `<COMMIT>` and `HEAD`,
 so a branch behind `<COMMIT>` is charged its own change alone. A package's build script, features
 and `cfg` settings lie in its directory or the workspace manifest, so a change to them selects it. A
 commit the checkout does not hold fails the command, so a shallow clone never narrows the run. With
@@ -1658,30 +1664,33 @@ For each selected crate it runs `cargo kani --tests -p <package>` (with `--harne
 which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies each
 harness with Kani's unwinding assertions on. It runs `cargo kani` under `prlimit --as` (util-linux),
 which holds each process of the run (`cargo`, the Kani compiler, and the CBMC of each harness, which
-Kani runs one at a time) to 12 GiB of address space (`MEMORY_LIMIT_GIB`). The limit derives from the
-runner CI's `kani` job runs on (`ubuntu-latest` for a public repository: 4 vCPUs, 16 GB), leaving
-4 GB to the runner's own processes, so a harness whose CBMC needs more fails, named as out of memory
-under the limit, where without it the runner would be shut down with no verdict. It prints Kani's
+Kani runs one at a time) to 12 GiB of address space (`MEMORY_LIMIT_GIB`), which leaves 4 GB of a
+16 GB machine to its other processes, so a harness whose CBMC needs more fails, named as out of
+memory under the limit, where without it the host would swap or kill processes and the run give no
+verdict. It prints Kani's
 output as it comes and judges it as well as Kani's verdict: the crate fails when `cargo kani` exits
 unsuccessfully, when a harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED`
 check or a `FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's
 verdict names), and when Kani's closing summary is missing, counts a failure or no harness, or
 counts other harnesses than reported a verdict; a harness that Kani starts and prints no verdict for
-fails too. Every selected crate runs, and the command then prints a table of every harness, by
-package and path, with its verdict and verification time, and fails naming each crate that failed.
+fails too. Kani stops each harness's CBMC after `HARNESS_TIME_LIMIT_SECS` (600 s) of
+wall-clock time, given as its unstable `--harness-timeout` (with `-Z unstable-options`), and goes
+on with the next harness; the command fails such a harness as over budget, naming it and the limit
+([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification). Every
+selected crate runs, and the command then prints a table of every harness, by package and path,
+with its verdict and verification time, then the same table of the ten slowest, slowest first, and
+fails naming each crate that failed.
 
-CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the base its `select` job
-found, with `cargo xtask cells --since-covered` on a pull request and `--since-green` on a push to
-`master`, and with no option when that job found none; when the list is empty it installs no Kani
-and says so in a notice on the run, and otherwise it installs the release `--pin` prints and runs
-the command with the same `--since`. The `kani` job of `burnin.yml` runs the command with no option
-([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
+No CI workflow runs the command. A pull request whose change can affect a harnessed crate runs
+`--since <merge base>` at its validated head and reports the run in its body, and the release host
+runs run it with no option ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded
+verification).
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
 session runs `cargo xtask kani` there. A session installs nothing (`cargo install` is outside the
 permissions `.claude/settings.json` grants) and does not run `cargo kani` itself, which the
 `bash` hook refuses ([§ `cargo xtask hook`](#cargo-xtask-hook)). A new or changed harness is
-sized there, under the limit the command sets, before CI runs it
+sized there, under the limit the command sets, before it is pushed
 ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification).
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`
@@ -1705,7 +1714,7 @@ cargo xtask cells [--since <COMMIT> | --since-green <REV> | --since-covered <REV
 | `--since <COMMIT>` | no base | The change from the merge base of this commit and `HEAD` to the working tree |
 | `--since-green <REV>` | no base | The change from the newest commit of `REV`'s first-parent history, 200 commits at most, whose `build-test` run on a push to `master` passed (`gh run list`, the 200 newest runs); every cell, after a `WARNING:` line, when there is none or the runs cannot be read. A push to `master` takes this base, so `master`'s own runs prove every commit, and a cell a red or cancelled run left unproven stays owed |
 | `--since-covered <REV>` | no base | As `--since-green`, but a commit whose run has not finished counts too, unless a newer commit of the history has a red or cancelled run, which took that change in and failed: a pull request takes this base, so it is not charged the change a running `master` run is proving; a red or cancelled run's change stays owed, and the merge gate waits for a running tip (`gate-base-green`) |
-| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate`, `build` and `bench`, each a matrix's `include` list, `build` holding one tree per architecture and profile a `validate` cell is owed in and the release trees when the `bench` cell is owed, those with `bench` true; `validate-owed`, `build-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
+| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate`, `build` and `bench`, each a matrix's `include` list, `build` holding one tree per architecture and profile a `validate` cell is owed in and the release trees when the `bench` cell is owed, those with `bench` true; `validate-owed`, `build-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit the selection measured from, empty when there is none |
 
 Without a base, every cell is owed. With one, the command places each changed file (`git diff
 --name-only` from the merge base of the base and `HEAD` to the working tree, a rename as both its

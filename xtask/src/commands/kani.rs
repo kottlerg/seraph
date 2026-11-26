@@ -14,8 +14,10 @@
 //! harness's checks itself as well as Kani's verdict ([`Judge`]), so that an
 //! undetermined check fails the run whatever verdict Kani gives. Every
 //! process of the run is held to [`MEMORY_LIMIT_GIB`] of address space, so a
-//! harness too large for CI's runner fails by name instead of taking the
-//! runner down, and the run closes with every harness's verdict and time.
+//! harness too large fails by name instead of exhausting the host's memory,
+//! each harness to [`HARNESS_TIME_LIMIT_SECS`], and the run closes with every
+//! harness's verdict and time. The command runs on the development host
+//! only; no CI workflow runs it.
 //! With `--since`, the run verifies
 //! only the crates the change from a base commit can affect ([`affected`]).
 
@@ -34,17 +36,9 @@ use crate::util::step;
 /// ([`affected::WORKSPACE_WIDE`], the toolchain pin among them): what can
 /// change a harness's verdict. That is this command, which holds the Kani
 /// pin, the arguments and the memory limit it runs `cargo kani` with, and
-/// the judge of Kani's output. What decides only which crates are verified,
-/// or whether and where a job runs them (the selection in
-/// `xtask/src/affected.rs`, the workflows), is not one.
+/// the judge of Kani's output. What decides only which crates are verified
+/// (the selection in `xtask/src/affected.rs`) is not one.
 const KANI_INPUTS: &[&str] = &["xtask/src/commands/kani.rs"];
-
-/// The workflow that runs the `kani` job. A change to it moves no harness's
-/// verdict, but can break the job's own steps (installing the pinned
-/// release, its setup, the run), which only a run that verifies a crate
-/// exercises. So a change to it that selects no crate otherwise selects the
-/// crate with the fewest harnesses.
-const KANI_JOB: &[&str] = &[".github/workflows/build-test.yml"];
 
 /// The Kani release every run uses (docs/build-system.md § Toolchain). A
 /// toolchain bump moves it to the newest release that builds the harnessed
@@ -53,12 +47,23 @@ pub const KANI_VERSION: &str = "0.68.0";
 
 /// The address space, in GiB, each process of a run may map: `cargo`, the
 /// Kani compiler, and each harness's CBMC, which Kani runs one at a time.
-/// Derived from the runner CI's `kani` job runs on (`ubuntu-latest` for a
-/// public repository: 4 vCPUs, 16 GB): a harness gets 12 GiB, and the other
-/// 4 GB stay with the runner's own processes, so a harness that needs more
-/// fails with an out-of-memory error, which [`Judge`] reports by name, where
-/// without the limit the runner is shut down and the job reports nothing.
+/// A harness gets 12 GiB, which leaves 4 GB of a 16 GB machine to the
+/// host's other processes, so a harness that needs more fails with an
+/// out-of-memory error, which [`Judge`] reports by name, where without the
+/// limit the host would swap or kill processes and the run report nothing.
 const MEMORY_LIMIT_GIB: u64 = 12;
+
+/// The wall-clock time, in seconds, each harness's CBMC may run: Kani's
+/// `--harness-timeout`, which stops a harness's CBMC at the limit and goes on
+/// with the next harness, so a slow harness fails by name, as over budget
+/// ([`Verdict::OverBudget`]), and costs the run no more than the limit. A
+/// backstop set from the measured full run (docs/testing.md
+/// § Bounded verification), not a bound a harness is sized to: one over it
+/// is a defect of the harness.
+const HARNESS_TIME_LIMIT_SECS: u32 = 600;
+
+/// How many harnesses the closing list of the slowest names.
+const SLOWEST: usize = 10;
 
 /// A crate whose proof harnesses the command runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +118,8 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
     }
     step("Kani: every harness");
     print!("{}", outcome_table(&outcomes));
+    step(&format!("Kani: the {SLOWEST} slowest harnesses"));
+    print!("{}", outcome_table(&slowest(&outcomes)));
     if !failed.is_empty()
     {
         bail!("{}", failed.join("\n"));
@@ -153,9 +160,6 @@ enum Reason
     BuildWide(String),
     /// The change touches an input of the crate's build.
     Input(Input),
-    /// The change touches the workflow that runs the job, and the crate
-    /// holds the fewest harnesses.
-    Job(String),
 }
 
 impl Reason
@@ -174,10 +178,6 @@ impl Reason
             {
                 format!("{file} is an input of {package}, which the crate depends on")
             }
-            Self::Job(file) => format!(
-                "{file} runs the job, and the crate holds the fewest harnesses, so the job's \
-                 steps run once"
-            ),
         }
     }
 }
@@ -186,9 +186,8 @@ impl Reason
 /// `workspace`, with the first reason found, in the order of `crates`:
 /// every crate when a changed file is an input of every verification
 /// ([`affected::WORKSPACE_WIDE`], [`KANI_INPUTS`]), else each crate with a
-/// changed input of its build, else, when the change touches [`KANI_JOB`],
-/// the first crate with the fewest harnesses. Fails naming a crate that is
-/// no workspace package.
+/// changed input of its build. Fails naming a crate that is no workspace
+/// package.
 fn affected_crates(
     crates: Vec<Harnessed>,
     workspace: &Workspace,
@@ -207,7 +206,6 @@ fn affected_crates(
             .map(|h| (h, Reason::BuildWide(file.clone())))
             .collect());
     }
-    let fewest = crates.iter().min_by_key(|h| h.harnesses).cloned();
     let mut selected = Vec::new();
     for harnessed in crates
     {
@@ -218,11 +216,6 @@ fn affected_crates(
         {
             selected.push((harnessed, Reason::Input(input)));
         }
-    }
-    if selected.is_empty()
-        && let (Some(file), Some(harnessed)) = (affected::first_under(changed, KANI_JOB), fewest)
-    {
-        selected.push((harnessed, Reason::Job(file.clone())));
     }
     Ok(selected)
 }
@@ -451,27 +444,39 @@ fn crate_dir(file: &str, manifest: impl Fn(&str) -> Option<String>) -> Option<(&
 /// The `prlimit` arguments that run `cargo` with `args` under
 /// [`MEMORY_LIMIT_GIB`]. A limit given as one value is both the soft and the
 /// hard limit, so no process of the run can raise it.
-fn limited(args: Vec<&str>) -> Vec<String>
+fn limited(args: Vec<String>) -> Vec<String>
 {
     let mut limited = vec![
         format!("--as={}", MEMORY_LIMIT_GIB << 30),
         "--".to_owned(),
         "cargo".to_owned(),
     ];
-    limited.extend(args.into_iter().map(str::to_owned));
+    limited.extend(args);
     limited
 }
 
 /// The `cargo` arguments that verify `package`'s harnesses, or the one
-/// `harness` names. Kani's unwinding assertions stay on: no
+/// `harness` names, each under [`HARNESS_TIME_LIMIT_SECS`], which Kani takes
+/// as an unstable option. Kani's unwinding assertions stay on: no
 /// `--default-unwind` and no `--no-unwinding-checks`, so a loop a harness's
 /// bound does not cover fails it.
-fn kani_args<'a>(package: &'a str, harness: Option<&'a str>) -> Vec<&'a str>
+fn kani_args(package: &str, harness: Option<&str>) -> Vec<String>
 {
-    let mut args = vec!["kani", "--tests", "-p", package];
+    let mut args: Vec<String> = [
+        "kani",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout",
+        &format!("{HARNESS_TIME_LIMIT_SECS}s"),
+        "--tests",
+        "-p",
+        package,
+    ]
+    .map(str::to_owned)
+    .to_vec();
     if let Some(harness) = harness
     {
-        args.extend(["--harness", harness]);
+        args.extend(["--harness".to_owned(), harness.to_owned()]);
     }
     args
 }
@@ -538,6 +543,8 @@ enum Verdict
     /// Its CBMC ran out of memory under [`MEMORY_LIMIT_GIB`]: a failure,
     /// whatever verdict Kani gives.
     OutOfMemory,
+    /// Its CBMC ran past [`HARNESS_TIME_LIMIT_SECS`] and Kani stopped it.
+    OverBudget,
     /// Kani started it and printed no verdict for it.
     Unfinished,
 }
@@ -552,6 +559,7 @@ impl Verdict
             Self::Passed => "PASSED",
             Self::Failed => "FAILED",
             Self::OutOfMemory => "FAILED (out of memory)",
+            Self::OverBudget => "FAILED (over budget)",
             Self::Unfinished => "FAILED (no verdict)",
         }
     }
@@ -566,8 +574,25 @@ struct Outcome
     verdict: Verdict,
     /// Why it failed, when it did and Kani's output says why.
     detail: Option<String>,
-    /// Kani's `Verification Time` for it, in seconds, when it printed one.
+    /// Kani's `Verification Time` for it, in seconds, when it printed one, or
+    /// the time limit when Kani stopped it there.
     seconds: Option<f64>,
+}
+
+/// The [`SLOWEST`] outcomes of `outcomes` with a time, slowest first, the
+/// earlier first among equal times.
+fn slowest(outcomes: &[(String, Outcome)]) -> Vec<(String, Outcome)>
+{
+    let mut timed: Vec<&(String, Outcome)> = outcomes
+        .iter()
+        .filter(|(_, o)| o.seconds.is_some())
+        .collect();
+    timed.sort_by(|(_, a), (_, b)| {
+        b.seconds
+            .unwrap_or(0.0)
+            .total_cmp(&a.seconds.unwrap_or(0.0))
+    });
+    timed.into_iter().take(SLOWEST).cloned().collect()
 }
 
 /// The table that closes a run: each harness, by its package and its path,
@@ -599,7 +624,9 @@ fn outcome_table(outcomes: &[(String, Outcome)]) -> String
 /// line, a `- Status: <status>` line per check, its `VERIFICATION:- <result>`
 /// line and its `Verification Time: <seconds>s` line, then one
 /// `Complete - ...` summary. A line that says CBMC ran out of memory marks
-/// the harness it falls in, or follows the verdict of, as out of memory.
+/// the harness it falls in, or follows the verdict of, as out of memory; the
+/// line `CBMC timed out...` that follows the verdict of a harness Kani stopped
+/// at its time limit marks it as over budget.
 #[derive(Debug, Default)]
 struct Judge
 {
@@ -654,6 +681,14 @@ impl Judge
                 && last.seconds.is_none()
             {
                 last.seconds = time.trim_end_matches('s').parse().ok();
+            }
+        }
+        else if line.starts_with("CBMC timed out")
+        {
+            if let Some(last) = self.outcomes.last_mut()
+            {
+                last.verdict = Verdict::OverBudget;
+                last.seconds = Some(f64::from(HARNESS_TIME_LIMIT_SECS));
             }
         }
         else if let Some(counts) = line.strip_prefix("Complete - ")
@@ -765,6 +800,9 @@ impl Judge
                     Verdict::OutOfMemory => Some(format!(
                         "{name}: FAILED, out of memory under the {MEMORY_LIMIT_GIB} GiB limit{}",
                         detail.map_or_default(|d| format!(" ({d})"))
+                    )),
+                    Verdict::OverBudget => Some(format!(
+                        "{name}: FAILED, over budget at the {HARNESS_TIME_LIMIT_SECS} s time limit"
                     )),
                     Verdict::Unfinished => Some(format!("{name}: no verdict")),
                 }
@@ -1048,12 +1086,13 @@ mod tests
         assert_eq!(outcome_table(&[]), "no harness reported a verdict\n");
     }
 
-    // Defect caught: Kani run without the memory limit, or with one that a
-    // process of the run could raise.
+    // Defect caught: Kani run without the memory limit or the time limit, or
+    // with a memory limit that a process of the run could raise.
     #[test]
     fn cargo_kani_runs_under_the_memory_limit()
     {
         let args = limited(kani_args("pkg", Some("a::proofs::one")));
+        let limit = format!("{HARNESS_TIME_LIMIT_SECS}s");
         assert_eq!(
             args,
             [
@@ -1061,6 +1100,10 @@ mod tests
                 "--",
                 "cargo",
                 "kani",
+                "-Z",
+                "unstable-options",
+                "--harness-timeout",
+                &limit,
                 "--tests",
                 "-p",
                 "pkg",
@@ -1241,35 +1284,89 @@ mod tests
         }
     }
 
-    // Defect caught: a change that decides only whether or where the job
-    // runs, or which crates it selects (a workflow, the selection's module),
-    // taken as an input of every verification, so an edit of the workflow
-    // proves every crate although no harness's verdict can move.
+    // Defect caught: a change that decides no harness's verdict (a
+    // workflow, the selection's module) taken as an input of every
+    // verification, or of a crate, so an edit of it owes a proof run although
+    // no verdict can move.
     #[test]
     fn a_change_to_the_workflows_or_the_selection_proves_no_crate_for_it()
     {
-        for file in [".github/workflows/burnin.yml", "xtask/src/affected.rs"]
+        for file in [
+            ".github/workflows/burnin.yml",
+            ".github/workflows/build-test.yml",
+            "xtask/src/affected.rs",
+        ]
         {
             assert_eq!(select(&["docs/x.md", file]), [], "{file}");
         }
-        let job = ".github/workflows/build-test.yml";
         assert_eq!(
-            select(&["services/gpt/src/lib.rs", job]),
+            select(&[
+                "services/gpt/src/lib.rs",
+                ".github/workflows/build-test.yml"
+            ]),
             [("gpt".to_owned(), input("services/gpt/src/lib.rs", "gpt"))]
         );
     }
 
-    // Defect caught: an edit of the workflow that runs the job selecting no
-    // crate, so the job's install, setup and run steps are skipped on its
-    // own run and on master's, and a broken step lands green; or one that
-    // proves more than the crate with the fewest harnesses.
+    // Defect caught: a harness Kani stopped at the time limit passed, or
+    // reported without its name, the limit or its time, so a slow harness
+    // goes unnamed.
     #[test]
-    fn a_change_to_the_job_runs_it_on_the_crate_with_the_fewest_harnesses()
+    fn a_harness_stopped_at_the_time_limit_fails_as_over_budget()
     {
-        let job = ".github/workflows/build-test.yml";
+        let out = format!(
+            "{}Checking harness a::proofs::slow...
+RESULTS:
+
+CBMC failed
+VERIFICATION:-              FAILED
+CBMC timed out. You may want to rerun your proof with a larger timeout or              use stubbing to reduce the size of the code the verifier reasons about.
+             Complete - 1 successfully verified harnesses, 1 failures, 2 total.
+",
+            harness_output("a::proofs::one", &["SUCCESS"], "SUCCESSFUL"),
+        );
+        let (outcomes, findings) = judged(&out);
+        assert_eq!(outcomes[0].verdict, Verdict::Passed);
+        assert_eq!(outcomes[1].verdict, Verdict::OverBudget);
         assert_eq!(
-            select(&["docs/x.md", job]),
-            [("proto".to_owned(), Reason::Job(job.to_owned()))]
+            outcomes[1].seconds,
+            Some(f64::from(HARNESS_TIME_LIMIT_SECS))
+        );
+        assert_eq!(
+            findings[0],
+            format!(
+                "a::proofs::slow: FAILED, over budget at the {HARNESS_TIME_LIMIT_SECS} s time limit"
+            )
+        );
+    }
+
+    // Defect caught: the closing list of the slowest harnesses leaving out a
+    // slow one, naming a fast one before it, or listing more than ten.
+    #[test]
+    fn the_slowest_list_names_the_ten_slowest_slowest_first()
+    {
+        let outcome = |i: usize, seconds: Option<f64>| {
+            (
+                "pkg".to_owned(),
+                Outcome {
+                    harness: format!("h{i}"),
+                    verdict: Verdict::Passed,
+                    detail: None,
+                    seconds,
+                },
+            )
+        };
+        let mut outcomes: Vec<_> = (0..12)
+            .map(|i| outcome(i, Some(f64::from(u32::try_from(i).unwrap()))))
+            .collect();
+        outcomes.push(outcome(12, None));
+        let names: Vec<String> = slowest(&outcomes)
+            .into_iter()
+            .map(|(_, o)| o.harness)
+            .collect();
+        assert_eq!(
+            names,
+            ["h11", "h10", "h9", "h8", "h7", "h6", "h5", "h4", "h3", "h2"]
         );
     }
 
@@ -1308,10 +1405,10 @@ mod tests
     fn a_run_keeps_unwinding_assertions_and_names_its_harness()
     {
         let args = kani_args("kernel", Some("cpu_mask::proofs::x"));
+        let args: Vec<&str> = args.iter().map(String::as_str).skip(5).collect();
         assert_eq!(
             args,
             [
-                "kani",
                 "--tests",
                 "-p",
                 "kernel",

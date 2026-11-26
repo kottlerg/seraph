@@ -1482,6 +1482,23 @@ pub struct SvcmgrEndowment
     /// from it in `endow_svcmgr`; svcmgr derives the one
     /// `entropy_authority = yes` service's copy from that on every launch.
     pub entropy_root: u64,
+    /// A `Read` copy of the root `KernelLog` capability the kernel minted
+    /// into init, or `0` when none is described or the derive failed. svcmgr
+    /// derives real-logd's copy from it on every launch.
+    pub kernel_log_source: u64,
+}
+
+impl SvcmgrEndowment
+{
+    /// The terminal round's log-sink sources.
+    fn logd_sources(&self) -> svcmgr_endowment::LogdSources
+    {
+        svcmgr_endowment::LogdSources {
+            master_log_source: self.master_log_source,
+            procmgr_death_auth_source: self.procmgr_death_auth_source,
+            kernel_log_source: self.kernel_log_source,
+        }
+    }
 }
 
 /// `cap_derive(source, rights)`, or `0` when `source` is `0` or the derive
@@ -1666,17 +1683,13 @@ fn endow_svcmgr(
         return false;
     }
 
-    // Terminal round (LOGD_SOURCES): the reserved master-log endpoint source
-    // and the badge-0 procmgr `SEND|GRANT` source. svcmgr mints real-logd's
-    // bootstrap caps from these on every (re)launch. A source whose derive
-    // failed is left off the round and its presence bit clear, and svcmgr
-    // holds it as absent; an absent source then leaves its slot of logd's
-    // own bootstrap round absent, and logd runs without that cap (or, for
-    // the master-log source, exits at startup).
-    let logd_round = svcmgr_endowment::encode_logd_sources(&svcmgr_endowment::LogdSources {
-        master_log_source: endow.master_log_source,
-        procmgr_death_auth_source: endow.procmgr_death_auth_source,
-    });
+    // Terminal round (LOGD_SOURCES): the reserved master-log endpoint source,
+    // the badge-0 procmgr `SEND|GRANT` source and the `KernelLog` `Read`
+    // source, from which svcmgr mints real-logd's bootstrap caps on every
+    // (re)launch. An absent source (its derive failed) has its presence bit
+    // clear; logd then runs without that cap, or, without the master-log
+    // source, exits at startup.
+    let logd_round = svcmgr_endowment::encode_logd_sources(&endow.logd_sources());
     serve(
         bootstrap_ep,
         child,
@@ -1769,6 +1782,7 @@ fn end_endowment(bootstrap_ep: u64, child: &BootChild, ipc_buf: *mut u64)
     let empty = svcmgr_endowment::encode_logd_sources(&svcmgr_endowment::LogdSources {
         master_log_source: 0,
         procmgr_death_auth_source: 0,
+        kernel_log_source: 0,
     });
     let _ = serve(
         bootstrap_ep,
@@ -1866,6 +1880,12 @@ pub fn phase3_svcmgr_handover(
     // transfer a cap, which the IPC kernel gates on it.
     let procmgr_death_auth_source =
         syscall::cap_derive(procmgr_ep, syscall::RIGHTS_EP_SEND_GRANT).unwrap_or(0);
+    // `Read`, the right real-logd's copy carries; svcmgr derives that copy
+    // from this one on every launch.
+    let kernel_log_source = derive_or_absent(
+        crate::find_cap_by_type(info, CapType::KernelLog).unwrap_or(0),
+        syscall::RIGHTS_KLOG_READ,
+    );
     let endowment = SvcmgrEndowment {
         svcmgr_service_ep,
         svcmgr_bootstrap_ep,
@@ -1876,6 +1896,7 @@ pub fn phase3_svcmgr_handover(
         master_log_source,
         procmgr_death_auth_source,
         entropy_root: crate::find_cap_by_type(info, CapType::EntropyControl).unwrap_or(0),
+        kernel_log_source,
     };
     let svcmgr_endowed = endow_svcmgr(
         bootstrap_ep,

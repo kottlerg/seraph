@@ -52,6 +52,8 @@ services/logd/codec/
     ├── history.rs              # HistoryRing: init-logd's captured history
     ├── hold.rs                 # HeldLines: logd's self-log lines held
     │                           # until the handover release
+    ├── kernel.rs               # Kernel log lines: the record cursor, the
+    │                           # [kernel] line parts, the reserved name
     ├── level.rs                # The level tag a rendered line carries
     ├── query.rs                # Query pages: which slots and history
     │                           # entries a reply carries

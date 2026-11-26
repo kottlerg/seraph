@@ -248,6 +248,27 @@ In-flight `STREAM_BYTES` and `STREAM_RECORD` sends from other processes queue at
 endpoint and are drained by real-logd once it enters its main receive
 loop.
 
+## Kernel log
+
+init-logd is the kernel log's first reader
+([docs/console-model.md](../../../docs/console-model.md) item 3), and its history holds the
+kernel's lines under `LOG_BADGE_KERNEL` (3), which the drain sends as any slot's lines. The first
+`HANDOVER_PULL` ends that reading: before init-logd builds the first chunk it reads what the
+kernel holds, writes and records it, acknowledges it with an empty read, and unbinds its
+notification; it reads no more. An acknowledged release with no pull before it (a pull the
+kernel dropped) ends the reading the same way before init-logd's last line. The history the
+drain sends therefore holds every kernel line init-logd wrote, and no line is written twice.
+
+The records the kernel appends from then on wait in its ring. Once it holds the drained table,
+real-logd names the kernel's slot `kernel` and, through the `KernelLog` cap in its bootstrap slot
+5 ([README](../README.md) § Bootstrap caps), binds a notification of its own and reads from the
+record after the last one acknowledged (`from_seq` 0), so it writes exactly the records
+init-logd left. When the release takes longer than `KLOG_STALL_MS` after the first of them was
+appended, the kernel detaches the reader and writes its lines directly until real-logd's first
+read attaches it again; the records of that wait are written then, each stamped with its own
+time. A restarted logd reads the same way with no handover: the dead instance's binding was
+cleared when its notification was freed, and the new one's bind replaces any binding left.
+
 ## Failure modes
 
 | Symptom | Cause | Recovery |
@@ -260,6 +281,7 @@ loop.
 | Reply with unknown `word(0)` kind | Wire-format drift; one side built against an out-of-sync `logd-codec` or `shared/ipc` revision | Real-logd skips the chunk and continues. A bounded iteration cap (`MAX_ITERS`) in `pull_all` guarantees termination on a malformed reply stream. |
 | `SLOT`, `LINE`, or `RECORD` length word larger than the carried payload | A malformed or hostile reply | Real-logd takes the bytes the message carries and ignores the excess; the declared length cannot overflow its bounds arithmetic. |
 | `RECORD` payload that does not decode as a record | A malformed or hostile reply | Real-logd skips the chunk and continues. |
+| real-logd does not read the kernel log (no `KernelLog` cap in slot 5, or its notification, binding, or reader thread could not be had) | svcmgr held no `KernelLog` source, or logd ran out of a resource | logd logs one line saying so. The records init-logd left stall after `KLOG_STALL_MS`, the kernel writes its lines directly from then on, as with no reader, and a restarted logd that reads attaches again. |
 
 ## Reference
 

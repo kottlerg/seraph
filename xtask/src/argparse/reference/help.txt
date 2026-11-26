@@ -198,6 +198,8 @@ Options:
           A regex a line of the log must match for a run of `--runs` to pass; repeatable, each must match. A run whose `--pass` pattern matched but whose log has no line matching one of these is FAIL, naming the pattern
       --crash-reports <CRASH_REPORTS>
           Check the crash service's report blocks in each passing run's log: every block well-formed, and `reports` the `crashme` fixture's three reports, `none` no block at all. A run whose check fails is FAIL; a QEMU-CRASH run is not checked [possible values: reports, none]
+      --whole-lines <TAG>
+          Check that the console stayed whole in each passing run's log: between the lines `<TAG> begin` and `<TAG> end ...`, every line is one console line, and each sender's numbered lines arrive whole, in order, none missing (svctest's `console_whole_lines` phase). A run whose check fails is FAIL; a QEMU-CRASH run is not checked
       --hold-on-hang
           On a hard-timeout HANG of `--runs`, do not kill the QEMU instance: print the attach instructions and block until it is terminated externally, preserving the wedged guest for inspection (pair with `--debug-listen`). Requires `--parallel 1`
       --fail-grace-secs <FAIL_GRACE_SECS>
@@ -365,6 +367,9 @@ Options:
           Possible values:
           - reports: The `crashme` fixture's `vm` and `exception` reports of its main thread and its `worker` report of a spawned thread: a svctest boot with crashd staged
           - none:    No report block: a boot of an image that stages no crashd
+
+      --whole-lines <TAG>
+          Check that the console stayed whole in each passing run's log: between the lines `<TAG> begin` and `<TAG> end ...`, every line is one console line, and each sender's numbered lines arrive whole, in order, none missing (svctest's `console_whole_lines` phase). A run whose check fails is FAIL; a QEMU-CRASH run is not checked
 
       --hold-on-hang
           On a hard-timeout HANG of `--runs`, do not kill the QEMU instance: print the attach instructions and block until it is terminated externally, preserving the wedged guest for inspection (pair with `--debug-listen`). Requires `--parallel 1`
@@ -587,6 +592,7 @@ Options:
       --self-test         Run each planted target of the engine from seed 0 within its budget, twice, and fail unless both runs find its defect at the same execution with the same minimized input
       --runs <N>          Stop after N executions (default: the count of the gating CI job, 200000). A run from a fixed seed and corpus over a fixed count is reproducible
       --time <SECS>       Stop after SECS seconds instead of an execution count: a longer campaign, which a fixed seed does not reproduce
+      --cap <SECS>        Fail a target whose run of an execution count takes more than SECS seconds of wall-clock time, stopping it there (default: 1200 for a run of the default count, none for one of `--runs`)
       --seed <SEED>       The seed of the engine's random choices [default: 0]
       --replay <FILE>     Run the property once on FILE and exit non-zero when it fails: the command a crash report prints
       --minimize          Reduce the target's working corpus to a subset of its inputs with the same coverage, the shorter inputs kept first
@@ -607,6 +613,7 @@ Options:
       --self-test         Run each planted target of the engine from seed 0 within its budget, twice, and fail unless both runs find its defect at the same execution with the same minimized input
       --runs <N>          Stop after N executions (default: the count of the gating CI job, 200000). A run from a fixed seed and corpus over a fixed count is reproducible
       --time <SECS>       Stop after SECS seconds instead of an execution count: a longer campaign, which a fixed seed does not reproduce
+      --cap <SECS>        Fail a target whose run of an execution count takes more than SECS seconds of wall-clock time, stopping it there (default: 1200 for a run of the default count, none for one of `--runs`)
       --seed <SEED>       The seed of the engine's random choices [default: 0]
       --replay <FILE>     Run the property once on FILE and exit non-zero when it fails: the command a crash report prints
       --minimize          Reduce the target's working corpus to a subset of its inputs with the same coverage, the shorter inputs kept first

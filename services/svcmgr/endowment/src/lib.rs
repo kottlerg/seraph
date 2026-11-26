@@ -86,6 +86,8 @@ pub mod logd_present
     pub const MASTER_LOG: u64 = 1 << 0;
     /// The badge-0 `SEND|GRANT` source on procmgr's service endpoint.
     pub const PROCMGR_DEATH_AUTH: u64 = 1 << 1;
+    /// The `KernelLog` source carrying `Read`.
+    pub const KERNEL_LOG: u64 = 1 << 2;
 }
 
 /// Values of a `SUBSTRATE` round's observer word (`data[2]`): which cap,
@@ -181,6 +183,9 @@ pub struct LogdSources
     pub master_log_source: u64,
     /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint, or `0`.
     pub procmgr_death_auth_source: u64,
+    /// `KernelLog` source carrying `Read`, derived from the root
+    /// capability the kernel mints into init, or `0`.
+    pub kernel_log_source: u64,
 }
 
 /// One encoded round: the caps to transfer, none of them `0`, and the data
@@ -451,7 +456,8 @@ pub fn encode_logd_sources(sources: &LogdSources) -> Round
         | round.push_optional(
             sources.procmgr_death_auth_source,
             logd_present::PROCMGR_DEATH_AUTH,
-        );
+        )
+        | round.push_optional(sources.kernel_log_source, logd_present::KERNEL_LOG);
     round.data[1] = presence;
     round
 }
@@ -597,13 +603,14 @@ pub fn decode_logd_sources(caps: &[u64], data: &[u64]) -> Result<LogdSources, De
         return Err(DecodeError::Malformed);
     };
     let slots = ipc::bootstrap::spread_slots(caps, presence).map_err(|_| DecodeError::Malformed)?;
-    if presence >> 2 != 0
+    if presence >> 3 != 0
     {
         return Err(DecodeError::Malformed);
     }
     Ok(LogdSources {
         master_log_source: slots[0],
         procmgr_death_auth_source: slots[1],
+        kernel_log_source: slots[2],
     })
 }
 
@@ -671,11 +678,13 @@ mod tests
     #[test]
     fn logd_sources_round_trip_with_every_source_present_or_absent()
     {
-        for (master, death) in [(0, 0), (0x31, 0), (0, 0x32), (0x31, 0x32)]
+        for mask in 0u64..8
         {
+            let pick = |bit: u64, cap: u64| if mask & bit != 0 { cap } else { 0 };
             let sent = LogdSources {
-                master_log_source: master,
-                procmgr_death_auth_source: death,
+                master_log_source: pick(1, 0x31),
+                procmgr_death_auth_source: pick(2, 0x32),
+                kernel_log_source: pick(4, 0x33),
             };
             let round = encode_logd_sources(&sent);
             assert_eq!(decode_logd_sources(round.caps(), round.data()), Ok(sent));
@@ -694,6 +703,7 @@ mod tests
         let logd = encode_logd_sources(&LogdSources {
             master_log_source: 0x31,
             procmgr_death_auth_source: 0,
+            kernel_log_source: 0,
         });
         assert_eq!(logd.caps(), &[0x31]);
         assert_eq!(logd.data()[1], logd_present::MASTER_LOG);
@@ -805,6 +815,7 @@ mod tests
         let none = encode_logd_sources(&LogdSources {
             master_log_source: 0,
             procmgr_death_auth_source: 0,
+            kernel_log_source: 0,
         });
         assert_eq!(
             decode_logd_sources(&[0x31], none.data()),
@@ -815,7 +826,7 @@ mod tests
     #[test]
     fn a_presence_bit_with_no_slot_is_malformed()
     {
-        let data = [kind::LOGD_SOURCES, logd_present::MASTER_LOG | (1 << 2)];
+        let data = [kind::LOGD_SOURCES, logd_present::MASTER_LOG | (1 << 3)];
         assert_eq!(
             decode_logd_sources(&[0x31, 0x32], &data),
             Err(DecodeError::Malformed)
@@ -837,6 +848,7 @@ mod tests
         let logd = encode_logd_sources(&LogdSources {
             master_log_source: 0,
             procmgr_death_auth_source: 0,
+            kernel_log_source: 0,
         });
         assert_eq!(
             CapsDecoder::new().push(logd.caps(), logd.data()),
@@ -924,6 +936,7 @@ mod tests
         let logd = encode_logd_sources(&LogdSources {
             master_log_source: 0x31,
             procmgr_death_auth_source: 0,
+            kernel_log_source: 0,
         });
         assert_eq!(
             decode_substrate(logd.caps(), logd.data()),

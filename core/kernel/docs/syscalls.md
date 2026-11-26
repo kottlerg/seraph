@@ -4140,7 +4140,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `KLOG_LINE_MAX` | 512 | Most text bytes of one kernel log record; a longer line is cut and flagged |
 | `KLOG_RECORD_MAX` | 536 | Bytes of a kernel log record at its longest: the 24-byte header and `KLOG_LINE_MAX` |
 | `KLOG_READ_MAX` | 16384 | Most bytes one `SYS_KERNEL_LOG_READ` writes |
-| `KLOG_STALL_MS` | 1000 | Milliseconds an attached kernel log reader may leave records unread before the kernel writes its lines directly |
+| `KLOG_STALL_MS` | 1000 | Milliseconds an attached kernel log reader may leave a record unread, measured from its append or from the reader's last read of a new record when that came later, before the kernel writes its lines directly |
 | `BOOT_PROTOCOL_VERSION` | 24 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and

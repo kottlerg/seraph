@@ -1376,8 +1376,9 @@ beside them (release, one CPU and four, under icount; [Benchmarks](#benchmarks-b
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + virtio-rng + serial + the machine's RTC, the machine's IOMMU
 with the virtio-blk, virtio-keyboard, and virtio-rng devices behind it — `intel-iommu` on x86_64,
-offering interrupt remapping on a split irqchip to the svctest and usertest cells and remapping DMA
-alone on KVM's I/O APIC in the ktest cell, which never turns remapping on
+offering interrupt remapping to the svctest and usertest cells and remapping DMA alone in the ktest
+cell, which never turns remapping on; QEMU emulates the I/O APIC in every cell under TCG, and only a
+KVM launch splits the irqchip for the offer
 ([xtask/README.md](../xtask/README.md#attached-devices) § Attached devices), and
 `riscv-iommu-pci` at 00:01.0 on riscv64 — and, on x86_64, `vmgenid,guid=auto`; the svctest cells
 also attach the test devices (`--test-devices`): QEMU's `edu` DMA test device, which svctest's DMA

@@ -117,6 +117,62 @@ const fn queues_above(level: u8) -> u32
     }
 }
 
+/// A CPU's ranks as a wake's placement compares them: the rank of the level
+/// its running thread was dispatched at, and that of the highest thread queued
+/// on it. A level's rank is the index of its run queue, so the idle level ranks
+/// 0, every fair level 1 (all of them share the fair queue), and the RT levels
+/// above them in level order; a thread at a level of a higher rank outranks one
+/// of a lower (`outranks`). An RT thread runs at once on a CPU whose
+/// [`effective`](Self::effective) rank is below its level's
+/// (core/kernel/docs/scheduler.md § Thread Assignment).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CpuRanks
+{
+    /// The rank of the running thread's recorded level (`current_level`).
+    pub running: u32,
+    /// The rank of the highest run queue other than the idle queue that
+    /// links a thread, or 0 when none does.
+    pub queued: u32,
+}
+
+impl CpuRanks
+{
+    /// The ranks of a CPU whose running thread was dispatched at
+    /// `current_level` and whose `non_empty` mask is `non_empty`. The
+    /// idle queue's bit counts for nothing: it links only the idle thread.
+    pub const fn of(current_level: u8, non_empty: u32) -> Self
+    {
+        let queued = non_empty & QUEUED_THREAD_MASK;
+        Self {
+            running: level_rank(current_level),
+            queued: if queued == 0 { 0 } else { queued.ilog2() },
+        }
+    }
+
+    /// The CPU's effective rank: the higher of its running and its queued
+    /// rank. A thread whose level ranks above it outranks every thread the
+    /// CPU runs or queues.
+    pub const fn effective(self) -> u32
+    {
+        if self.queued > self.running
+        {
+            self.queued
+        }
+        else
+        {
+            self.running
+        }
+    }
+}
+
+/// The rank of `level` for a wake's placement: the index of its run queue
+/// ([`CpuRanks`]).
+pub const fn level_rank(level: u8) -> u32
+{
+    // queue_index(level) < NUM_RUN_QUEUES <= 32, so the narrowing is lossless.
+    queue_index(level) as u32
+}
+
 /// The `outranking` value of a stale level ([`PerCpuScheduler::mark_level_stale`]):
 /// every bit, which no [`queues_above`] value has, since none has the idle
 /// queue's.
@@ -450,15 +506,17 @@ pub struct PerCpuScheduler
     /// under the running thread's, `IDLE_PRIORITY` when it switches to idle, and
     /// `sched::enter`'s boot dispatch of init; and where a return to user mode
     /// re-records a stale level (`sched::preempt_if_outranked`), under the
-    /// running thread's `sched_lock`. Read only by this CPU: by its
-    /// `timer_tick`, through [`tick_outcome`](Self::tick_outcome); its returns
-    /// to user mode compare its mask, `outranking`. It stands
+    /// running thread's `sched_lock`. Read by this CPU, by its `timer_tick`,
+    /// through [`tick_outcome`](Self::tick_outcome) (its returns to user mode
+    /// compare its mask, `outranking`); and by a wake's placement on any CPU,
+    /// as a hint, through [`ranks`](Self::ranks). It stands
     /// in for `(*current).priority`, which neither may read without the
     /// thread's `sched_lock`, so a priority change of a running thread reaches
     /// its slice (bounded by the new level's quantum from the first tick after
     /// it) and its class at its next dispatch, or at the earlier re-record that
-    /// a stale `outranking` forces. Atomic only so a shared reference can
-    /// reach it; Relaxed, since one CPU both writes and reads it.
+    /// a stale `outranking` forces. Atomic so a shared reference can reach it;
+    /// Relaxed, since one CPU writes it and decides on it, and the placement's
+    /// read from another CPU is a hint no locked step depends on.
     current_level: AtomicU8,
 
     /// The `non_empty` bits of the run queues whose threads outrank the running
@@ -1037,6 +1095,21 @@ impl PerCpuScheduler
     pub fn outranked(&self) -> bool
     {
         self.non_empty.load(Ordering::Relaxed) & self.outranking.load(Ordering::Relaxed) != 0
+    }
+
+    /// This CPU's ranks as a wake's placement samples them ([`CpuRanks`]),
+    /// from `current_level` and `non_empty`. Lockless and Relaxed, from any
+    /// CPU: a placement hint that no locked step re-reads, which a dispatch, a
+    /// link or a dequeue here after the loads makes stale; a stale level after
+    /// a priority change of the running thread reads its level before the
+    /// change. core/kernel/docs/scheduling-internals.md § Target CPU selection
+    /// states what a stale sample costs.
+    pub fn ranks(&self) -> CpuRanks
+    {
+        CpuRanks::of(
+            self.current_level.load(Ordering::Relaxed),
+            self.non_empty.load(Ordering::Relaxed),
+        )
     }
 
     /// The thread running on this CPU (null before `init`). A read without
@@ -2511,6 +2584,28 @@ mod tests
         assert_eq!(locate_relocate(&scheds, pt, 6, 3, 0), None);
         assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);
         assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), 0);
+    }
+
+    // Defect caught: a wake placement that counts the idle thread's link as a
+    // queued thread, ranks two fair levels apart (they share one queue), or
+    // misses a thread queued above the running one, so it places an RT thread
+    // where it waits, or keeps it off a CPU where it would run at once.
+    #[test]
+    fn a_cpus_rank_is_the_higher_of_its_running_and_its_queued_level()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut idle_tcb = make_tcb();
+        let mut queued = make_tcb();
+        sched.set_current_level(syscall::PRIORITY_MIN);
+        assert!(enq(&sched, &raw mut *idle_tcb, IDLE_PRIORITY));
+        assert_eq!(sched.ranks().effective(), level_rank(RT_PRIORITY_MIN - 1));
+        assert_eq!(sched.ranks().queued, 0);
+        assert!(level_rank(syscall::PRIORITY_MIN) > level_rank(IDLE_PRIORITY));
+        assert!(enq(&sched, &raw mut *queued, RT_PRIORITY_MIN + 3));
+        assert_eq!(sched.ranks().effective(), level_rank(RT_PRIORITY_MIN + 3));
+        sched.set_current_level(RT_PRIORITY_MIN + 5);
+        assert_eq!(sched.ranks().effective(), level_rank(RT_PRIORITY_MIN + 5));
+        assert!(level_rank(RT_PRIORITY_MIN + 5) > level_rank(RT_PRIORITY_MIN + 3));
     }
 
     // Defect caught: a `lock_saving_flags` that does not take the CPU lock, or an

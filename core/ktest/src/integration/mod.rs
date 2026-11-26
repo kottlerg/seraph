@@ -68,6 +68,7 @@ pub mod reply_recv_placement;
 pub mod return_work;
 pub mod retype_over_mapped_refused;
 pub mod retype_reclaim;
+pub mod rt_wake_placement;
 pub mod rt_wake_preempt;
 pub mod shared_memory_two_aspaces;
 pub mod smt_siblings;
@@ -212,6 +213,10 @@ pub fn run_all(ctx: &TestContext)
         priority_preemption::run(ctx)
     );
     run_integration_test!("integration::rt_wake_preempt", rt_wake_preempt::run(ctx));
+    run_integration_test!(
+        "integration::rt_wake_placement",
+        rt_wake_placement::run(ctx)
+    );
     run_integration_test!(
         "integration::fair_share_progress",
         fair_share_progress::run(ctx)

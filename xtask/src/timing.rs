@@ -114,7 +114,8 @@ pub struct Timing
     pub arch: Option<String>,
     /// From the kernel's scheduler line, else the trailer.
     pub cpus: Option<u32>,
-    /// `ALL TESTS PASSED` or `SOME TESTS FAILED` when ktest printed its marker.
+    /// `ALL TESTS PASSED`, `SELECTED TESTS PASSED` (a focused ktest) or
+    /// `SOME TESTS FAILED` when ktest printed its marker.
     pub marker: Option<String>,
     /// The accelerator the trailer names (`kvm`, `tcg`).
     pub accel: Option<String>,
@@ -377,7 +378,10 @@ impl Scan
             LineKind::Ktest => self.ktest_line(p, at, msg),
             LineKind::Marker =>
             {
-                if msg == "ALL TESTS PASSED" || msg == "SOME TESTS FAILED"
+                if matches!(
+                    msg,
+                    "ALL TESTS PASSED" | "SELECTED TESTS PASSED" | "SOME TESTS FAILED"
+                )
                 {
                     self.timing.marker = Some(msg.to_string());
                 }
@@ -1171,6 +1175,22 @@ mod tests
         assert!(tiers[1].0 == "Tier S" && close(tiers[1].1, 4.0));
         assert!(close(t.boot_secs.unwrap(), 2.0));
         assert!(close(t.ktest_secs.unwrap(), 5.0));
+    }
+
+    #[test]
+    fn a_focused_ktest_marker_is_recorded()
+    {
+        let text = "[1.000000] ktest: starting\n\
+                    [1.000000] ktest: selection stress::stop_\n\
+                    [1.000000] ktest: --- Tier S: stress ---\n\
+                    [1.000000] ktest: stress::stop_repark starting\n\
+                    [2.000000] ktest: PASS stress::stop_repark\n\
+                    [2.000000] ktest: passed=1\n\
+                    [2.000000] ktest: failed=0\n\
+                    [2.000000] [ktest] SELECTED TESTS PASSED\n";
+        let t = parse_log(text).unwrap();
+        assert_eq!(t.marker.as_deref(), Some("SELECTED TESTS PASSED"));
+        assert_eq!(cell(&t, "stress::stop_repark").outcome, CellOutcome::Pass);
     }
 
     #[test]

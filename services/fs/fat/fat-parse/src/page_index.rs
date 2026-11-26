@@ -9,8 +9,8 @@
 //! its slot index, sorted by LBA-base in an array sized at init to the cache's
 //! slot ceiling and padded to a power of two with [`PageIndex::EMPTY`] keys.
 //! A lookup is a binary search of a fixed number of steps, the logarithm of
-//! the padded length, each step choosing its half by arithmetic rather than a
-//! branch: its instructions depend on the slot ceiling alone, not on the key,
+//! the padded length, each step choosing its half by a conditional select
+//! rather than a branch: its instructions depend on the slot ceiling alone, not on the key,
 //! on what else the cache holds, or on the order the pages were filled in.
 //! That order follows the order of the requests the filesystem served before,
 //! which the machine's timing decides, so a search whose cost depended on the
@@ -165,8 +165,8 @@ impl PageIndex
 
     /// The first position whose key is not below `key` (the padded length's
     /// last position when every key is below it), found in the logarithm of the
-    /// padded length steps whatever the keys are: each step adds the half it
-    /// skips through a mask of the comparison, so no step branches on a key.
+    /// padded length steps whatever the keys are: each step takes the half it
+    /// skips through a conditional select, so no step branches on a key.
     fn position(&self, key: u64) -> usize
     {
         let mut at: usize = 0;
@@ -181,7 +181,13 @@ impl PageIndex
                 .get(at | half.wrapping_sub(1))
                 .copied()
                 .unwrap_or(Self::EMPTY);
-            at |= half & usize::from(probe < key).wrapping_neg();
+            // The comparison as a mask of all ones or none, taken through
+            // `black_box` so the compiler cannot see that it is one of two
+            // values: from a known boolean it rebuilds a select, which LLVM's
+            // x86 backend turns into a branch inside a loop, and the step's
+            // instruction count would then follow the comparison.
+            let below = core::hint::black_box(usize::from(probe < key).wrapping_neg());
+            at |= half & below;
             half /= 2;
         }
         at

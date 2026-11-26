@@ -24,7 +24,8 @@
 //! ([`session_pool::SessionPool`]) with the schedule of its sweeps for
 //! sessions whose client is gone ([`sweep::SweepSchedule`]), and picks the
 //! page cache's eviction victim ([`lru_victim`]) and the idle pages it keeps
-//! when it gives the others back ([`keep_most_recent`]). This crate
+//! when it gives the others back ([`keep_most_recent`]), and its index from a
+//! cached page to its slot ([`page_index::PageIndex`]). This crate
 //! performs no
 //! I/O and holds no filesystem state: the `fatfs` service reads sectors over
 //! a block-device IPC, hands the bytes here, and keeps the
@@ -41,6 +42,7 @@ use core::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 
 pub mod file_write;
 pub mod node_slab;
+pub mod page_index;
 pub mod session_pool;
 pub mod sweep;
 

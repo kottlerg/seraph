@@ -7208,7 +7208,18 @@ fn place_wake(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) -> u
     {
         return affinity as usize;
     }
+    place_unpinned(view, exclude, hint)
+}
 
+/// [`place_wake`] past hard affinity: the save-window pin, the synchronous
+/// wake, the RT rule, the sticky preferred CPU and the least load.
+///
+/// Kept out of line so a pinned wake, which returns at hard affinity, pays for
+/// none of this function's frame: inlined, the frame the RT rule needs was
+/// built before the affinity return of `select_target_cpu_excluding`.
+#[inline(never)]
+fn place_unpinned(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) -> usize
+{
     let cpu_count = view.cpu_count();
     let eligible = |c: usize| -> bool { c < cpu_count && Some(c) != exclude };
 
@@ -7250,7 +7261,7 @@ fn place_wake(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) -> u
         }
     }
 
-    if let Some(cpu) = place_rt_wake(view, &eligible, hint)
+    if let Some(cpu) = place_rt_wake(view, cpu_count, exclude, hint)
     {
         return cpu;
     }
@@ -7315,10 +7326,12 @@ fn place_wake(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) -> u
 /// waker in the scan.
 fn place_rt_wake(
     view: &impl WakeView,
-    eligible: &impl Fn(usize) -> bool,
+    cpu_count: usize,
+    exclude: Option<usize>,
     hint: WakeHint,
 ) -> Option<usize>
 {
+    let eligible = |c: usize| -> bool { c < cpu_count && Some(c) != exclude };
     let level = view.level();
     if level < RT_PRIORITY_MIN
     {
@@ -7348,7 +7361,7 @@ fn place_rt_wake(
 
     let left_out = waker_cpu.filter(|_| waker_parked && view.outranks_waker());
     least_loaded_cpu(
-        (0..view.cpu_count()).filter(|&cpu| eligible(cpu) && Some(cpu) != left_out),
+        (0..cpu_count).filter(|&cpu| eligible(cpu) && Some(cpu) != left_out),
         |cpu| (rank(cpu), view.load(cpu)),
         |cpu| view.busy_siblings(cpu),
     )

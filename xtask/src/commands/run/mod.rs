@@ -25,11 +25,11 @@ use crate::arch::Arch;
 use crate::cli::RunArgs;
 use crate::context::Context as BuildContext;
 use crate::disk::{logical_block_size, second_disk_block_size};
-use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, SecondSlot, build_qemu_argv_for,
-    validate_sysroot_for_launch,
+    Firmware, GdbMode, InterruptRemapping, QemuLaunchSpec, SecondDisk, SecondSlot,
+    build_qemu_argv_for, validate_sysroot_for_launch,
 };
+use crate::qemu::{QemuDisplay, X86Irqchip};
 use crate::term::filter::FilterWriter;
 use crate::term::guard::TerminalGuard;
 use crate::term::line_gate::LineGate;
@@ -121,6 +121,7 @@ fn boot_qemu(
         }),
         None => None,
     };
+    let interrupt_remapping = InterruptRemapping::for_sysroot(ctx);
     let spec = QemuLaunchSpec {
         arch: launch.arch,
         disk_path: &disk_path,
@@ -153,6 +154,7 @@ fn boot_qemu(
         x86_paging: launch.x86_paging,
         x86_shadow_stack: launch.x86_shadow_stack,
         iommu: launch.iommu,
+        interrupt_remapping,
         debug_port: launch.debug_port,
         test_devices: launch.test_devices,
         hotplug_port: None,
@@ -161,8 +163,16 @@ fn boot_qemu(
 
     let desc = match launch.arch
     {
-        Arch::X86_64 => "x86_64, UEFI",
-        Arch::Riscv64 => "riscv64, TCG, UEFI",
+        Arch::X86_64 => format!(
+            "x86_64, UEFI,{}",
+            X86Irqchip::launch_field(
+                launch.arch,
+                launch.iommu,
+                interrupt_remapping,
+                launch.execution()
+            )
+        ),
+        Arch::Riscv64 => "riscv64, TCG, UEFI".to_owned(),
     };
     let output = if args.verbose
     {
@@ -172,7 +182,7 @@ fn boot_qemu(
     {
         QemuOutput::Filtered
     };
-    launch_qemu(launch.arch.qemu_binary(), &qemu_args, desc, output)
+    launch_qemu(launch.arch.qemu_binary(), &qemu_args, &desc, output)
 }
 
 /// How QEMU's serial output reaches the host terminal.

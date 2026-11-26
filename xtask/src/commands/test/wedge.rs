@@ -42,8 +42,8 @@ use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::guest::Guest;
 use crate::qemu::{
-    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging,
-    X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
+    Firmware, GdbMode, InterruptRemapping, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr,
+    X86Paging, X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::{Span, Stub, field_hex, function_path, le_hex};
 use crate::socket_dir::SocketDir;
@@ -172,6 +172,7 @@ fn boot_once(ctx: &Context, args: &CaseArgs, image: &Image, victim: Victim) -> R
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,
+        interrupt_remapping: InterruptRemapping::for_sysroot(ctx),
         debug_port: None,
         test_devices: false,
         hotplug_port: None,

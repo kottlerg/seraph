@@ -99,15 +99,22 @@ receiver stays queued unrecorded. The TCB keeps the address of its slot's receiv
 the Thread dealloc unlink) clears that word by a compare-and-swap from the removed TCB to null,
 which leaves alone a slot a later park has since taken. `RecvQueue` is the only way to the inner
 queue, so no removal skips the clear, and a slot's receiver, read under the endpoint's lock, is a
-thread still parked on that queue. A lookup compares at most four queue words and loads one
-receiver word, and reads no TCB. A table with no record for the endpoint, full or not, leaves
-the call to the longest-waiting receiver: no call is refused for want of a slot.
+thread still parked on that queue. A lookup compares all four queue words, whichever slot names
+the endpoint, loads one receiver word, and reads no TCB; a park's search for the slot naming its
+queue compares all four the same way. The slot an endpoint takes follows the order of the CPU's
+earlier parks on other endpoints, which the machine's timing decides, so a search that stopped
+at the match would make one call cost more or fewer instructions from one boot to the next. A
+table with no record for the endpoint, full or not, leaves the call to the longest-waiting
+receiver: no call is refused for want of a slot.
 
-The table has no lock of its own, and its words are `Relaxed` atomics. A CPU records and looks up
-in its own table only, under the lock of the endpoint it parks on or calls, with interrupts off;
-a remover on any CPU clears a slot only under the lock of the endpoint it removes the receiver
-from, and only from that receiver to null. An access that decides an outcome therefore holds the
-lock of the endpoint the slot names, which orders it (scheduling-internals.md
+The table has no lock of its own. Its words are atomics accessed `Relaxed`, but for the owning
+CPU's plain (non-atomic) reads of its queue words in `RecvParkTable::named`, sound only because
+no other CPU reads or writes a queue word; a cross-CPU access of one needs `named` back on an
+atomic load. A CPU records and looks up in its own table only, under the lock of the endpoint it
+parks on or calls, with interrupts off; a remover on any CPU clears a slot only under the lock of
+the endpoint it removes the receiver from, and only from that receiver to null. An access that
+decides an outcome therefore holds the lock of the endpoint the slot names, which orders it
+(scheduling-internals.md
 [§ Atomic Ordering Invariants](scheduling-internals.md#atomic-ordering-invariants)).
 
 **Release when no receiver is left.** `release_if_unreceivable` runs where a slot's reference is
@@ -1165,8 +1172,9 @@ authoritative for all cross-cutting concurrency rules touched by IPC.
 The capability-revocation deferred-cleanup pattern remains specified in
 [capability-internals.md](capability-internals.md).
 
-The per-CPU parked-receiver table (§ Wait Queues) adds no lock: its slots are atomics accessed
-under the endpoint lock that already serialises the receive queue.
+The per-CPU parked-receiver table (§ Wait Queues) adds no lock: its slots are atomics, read by
+the owning CPU plainly in their queue words alone, accessed under the endpoint lock that already
+serialises the receive queue.
 
 ### Cross-CPU Wakeup
 
@@ -1223,7 +1231,7 @@ the "Lock primitive" and "Bare spin locks" paragraphs of
 ## Summarized By
 
 [core/kernel/README.md](../README.md), [Capability Subsystem Internals](capability-internals.md),
-[Scheduler Internals](scheduler.md),
+[Kernel Hot-Path Instruction Account](hot-path-account.md), [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
 [Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),

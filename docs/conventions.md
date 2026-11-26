@@ -591,12 +591,6 @@ gives the PR-level linear view.
   that [testing.md](testing.md#bounded-verification) § Bounded verification owes: its
   verification time, the peak resident memory of the run, its unwind bounds, and the head it
   ran at.
-- Every PR body whose change can affect a crate that holds a proof harness, as
-  `cargo xtask kani --since <merge base> --list` selects it, MUST report, in its
-  `## Validation` section, the local `cargo xtask kani --since <merge base>` run that
-  [testing.md](testing.md#bounded-verification) § Bounded verification owes at the validated
-  head: the command, the head, the crates verified and the outcome. A PR that affects no such
-  crate says so.
 
 ## CI Gating
 
@@ -655,16 +649,25 @@ proves it, and one that a run left unproven when it failed after a pull request'
 cells is proved again before that pull request merges (above). When no such commit is found, or the
 runs cannot be read, every cell is owed.
 
-`host-tests` runs on every change. `fuzz` runs when the change can affect a crate it fuzzes, its
-engine, or xtask, which drives it, and measures the change from the same base as the cells, so a
-fuzz run that a red or cancelled `master` run left unproven stays owed too. The `summary` job
-reports the run: it fails when a job failed or was cancelled, or was skipped
-although the change owed it.
+`host-tests` runs on every change. The `kani` jobs prove the crates the change can affect, one job
+per crate or per shard of a crate, and `fuzz` runs when the change can affect a crate it fuzzes,
+its engine, or xtask, which drives it. Both measure the change from the same base as the cells, so
+a proof or a fuzz run that a red or cancelled `master` run left unproven stays owed too. An input
+of every proof is what can change a harness's verdict: the workspace manifest and lock file,
+Cargo's configuration, the toolchain pin, and the command that holds the Kani pin, the arguments
+Kani runs with and the judge of its output. The workflows decide whether and where a job runs, not
+what a harness proves, so they are inputs of every build but of no proof; a change to
+`build-test.yml` or `kani.yml`, whose steps run the `kani` jobs, that selects no crate otherwise
+has them prove the crate with the fewest harnesses, so the jobs' steps run. The `summary` job
+reports the run: it fails when a job failed or was cancelled, or was skipped although the change
+owed it.
 
-No CI job runs the bounded proofs. A pull request whose change can affect a crate that holds a
-proof harness owes a local `cargo xtask kani --since <merge base>` run at its validated head,
-reported in its body (§ PR-body checklist discipline), and the whole set runs in the release host
-runs ([testing.md](testing.md#bounded-verification) § Bounded verification).
+The `kani-result` check gates a pull request on the bounded proofs of the crates the change can
+affect, not on the whole set, which runs in burn-in and in the release host runs
+([testing.md](testing.md#bounded-verification) § Bounded verification). It runs in every run and
+fails when a proof job failed, ran past its timeout or was cancelled, so it is fit to be a required
+check; a pull request that affects no proof crate runs no proof job and passes it, with a notice
+that it verified nothing.
 
 ## Release Production
 

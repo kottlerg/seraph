@@ -1369,8 +1369,10 @@ with the virtio-blk, virtio-keyboard, and virtio-rng devices behind it — `inte
 `riscv-iommu-pci` at 00:01.0 on riscv64 — and, on x86_64, `vmgenid,guid=auto`; the svctest cells
 also attach the test devices (`--test-devices`): QEMU's `edu` DMA test device, which svctest's DMA
 confinement and MSI forge phases drive, and five `pci-testdev` functions, which its
-on-demand-bind phase drives through the test-only test-fault driver; CI boots headless, so no
-framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`,
+on-demand-bind phase drives through the test-only test-fault driver; the ktest, svctest and
+usertest cells boot headless, so no framebuffer (the `bench` cell's ubench boots attach one,
+`--display framebuffer`); this is the main set of Driver coverage below; the no-IOMMU boot,
+`--iommu absent`,
 the framebuffer boot, `--display framebuffer`, and the debug-port boots, the `debug-port` case's
 two, are device cells (CI's `terminal` case boots, and the `shutdown` case's boots of the targets it
 kills through the GDB stub, attach the debug port too, to reach the stub over it), see Device
@@ -2402,48 +2404,80 @@ sizing below), so a harness that needs more fails, named as out of memory; it st
 harness at a wall-clock time limit, so a harness that runs past it fails, named as over budget;
 and it closes with every harness's verdict and verification time, then the ten slowest.
 
-**Where the proofs run.** On the development host only: no CI workflow installs or runs Kani. A
-pull request whose change can affect a crate that holds a harness, as
-`cargo xtask kani --since <merge base> --list` selects it, MUST run
-`cargo xtask kani --since <merge base>` at its validated head, under the limits the command sets,
-and its body's `## Validation` section reports the run as it reports any other local run: the
-command, the head, the crates verified and the outcome. The merge base is that of the head and
-`master`. The selection takes a crate that holds a harness and whose own package, a workspace
-package in its dependency closure (Markdown aside), or a file those read, the change touches, and
-every such crate when the change touches an input of every proof (the workspace manifest and lock
-file, Cargo's configuration, the toolchain pin, and the command's own source, which holds the Kani
-pin, the arguments and the judge). A pull request that affects no such crate owes no run. The
-whole set (`cargo xtask kani` with no option) is a release host run (§ Coverage tiers;
-[conventions.md](conventions.md#release-production) § Release Production), so a change the
-selection missed is found before a tag.
+**Where the proofs run.** In CI's `kani` jobs (`.github/workflows/kani.yml`), which `build-test.yml`
+calls on every pull request, every push to `master` and a manual dispatch, and `burnin.yml` on each
+tag push and manual dispatch ([build-system.md](build-system.md#continuous-integration) § Continuous
+Integration). A `plan` job selects the crates (`cargo xtask kani --plan`). On a pull request it
+takes the crates the change can affect, `--since` the base the `select` job found, the newest commit
+before the run's whose `master` run passed, or has not finished with no newer red or cancelled one
+([conventions.md](conventions.md#ci-gating) § CI Gating): a crate that holds a harness and whose own
+package, a workspace package in its dependency closure (Markdown aside), or a file those read, the
+change touches, and every such crate when the change touches an input of every proof (the workspace
+manifest and lock file, Cargo's configuration, the toolchain pin, and the command's own source,
+which holds the Kani pin, the arguments and the judge). A change to `kani.yml` or `build-test.yml`,
+whose steps run the jobs, that selects no crate otherwise selects the crate with the fewest
+harnesses, so the jobs' steps run. On a push to `master` the plan runs the same selection from the
+newest commit whose `master` run passed, so a harness a red or cancelled `master` run left unproven
+stays owed until a run proves it. A dispatch of `build-test.yml` selects from its `kani-since`
+input, and `burnin.yml` and a dispatch without that input select every crate. The plan gives one
+`prove` job to each crate it selects, or to each shard of a crate split below, and none to a crate
+it does not select: a run that selects none runs no `prove` job and says so in a notice. The
+`kani-result` job runs in every run and judges them: it fails when the plan failed, or a `prove` job
+failed, ran past its timeout or was cancelled, so it can be a required check, which a matrix job
+that runs only when owed cannot be. A pull request is gated on the proofs of the crates its change
+can affect; the whole set runs in burn-in and in the release host runs (§ Coverage tiers;
+[conventions.md](conventions.md#release-production) § Release Production), so a change the selection
+missed is found before a tag.
 
-**Local sizing.** A harness is sized on the development host before it is pushed. The author of a
+**Shards.** A crate whose harnesses' verification times sum to more than about 10 minutes on CI's
+runner is proved in several jobs, its shards: the fewest that keep each shard's sum under about 600
+s, a count `SHARDS` in `xtask/src/commands/kani.rs` lists; every other crate is one job. Shard `k/n`
+(`cargo xtask kani --component <crate> --shard k/n`) takes, of the harnesses Kani lists for the
+crate's test build, sorted by path, every n-th from the k-th, so the n shards of a crate take each
+harness exactly once, and a harness added to the crate joins a shard with no change to the table.
+Every run closes with each crate's sum of verification times, a shard job's labelled with its shard
+(`<package> k/n`), so a split crate's sum is the total over its shard jobs. The sums keep the table:
+a run that shows a shard or a whole crate past the 10 minutes, or a split crate whose sum one shard
+fewer would hold under them, moves its count. Each `prove` job has a `timeout-minutes` of 40, the
+backstop beside the time limit below.
+
+**Local sizing.** A harness is sized on the development host before CI runs it. The author of a
 change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
-with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries
-it, under the limit the command sets on every process of the run: 12 GiB of address space, which
-leaves 4 GB of a 16 GB machine to its other processes. A run that the limit ends (an allocation
-failure, or a process killed) or that does not finish MUST be made to fit before the harness is
-pushed, by smaller bounds that still cover the property or by the induction form of the parser
-proofs below. Beside the memory
-limit, each harness has a time limit: the command stops a harness's CBMC after 10 minutes of
-wall-clock time (`HARNESS_TIME_LIMIT_SECS`) and fails it as over budget. The limit is a backstop
-set from the measured full run below, not a bound a harness is sized to: a harness over it is a
-defect of the harness, made to fit the same way, by a narrower bound or a split into harnesses
-that together cover the property. A failed,
-undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
-or the harness, fixed as such, and MUST NOT be bounded away. The PR body's `## Validation`
-section states, for each such harness, the verification time Kani reports, the peak resident
-memory of the run (the maximum resident set size of its largest process, as GNU `time -v`
-reports it), and the unwind bounds the harness carries. This run is owed whatever § Coverage
-tiers owes, since a harness change is inert there.
+with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries it,
+under the limit the command sets on every process of the run: 12 GiB of address space, the share of
+the 16 GB of CI's `kani` runner ([GitHub's standard Linux runner for a public
+repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)) that leaves
+4 GB to the runner's own processes. A fit under it locally does not yet prove a fit on the runner: a
+harness has passed locally well under the limit and run out of memory on the runner under the same
+limit ([#1614](https://github.com/kottlerg/seraph/issues/1614)); a harness the limit ends in CI is
+made to fit as one it ends locally is. A run that the limit ends (an allocation failure, or a
+process killed) or that does not finish MUST be made to fit before the harness is pushed, by smaller
+bounds that still cover the property or by the induction form of the parser proofs below. Beside the
+memory limit, each harness has a time limit: the command stops a harness's CBMC after 10 minutes of
+wall-clock time (`HARNESS_TIME_LIMIT_SECS`) and fails it as over budget. The limit is a backstop set
+from the measured full run on CI's runner below, not a bound a harness is sized to: a harness over
+it is a defect of the harness, made to fit the same way, by a narrower bound or a split into
+harnesses that together cover the property. A failed, undetermined or unwinding-incomplete check is
+not a sizing result: it is a defect in the code or the harness, fixed as such, and MUST NOT be
+bounded away. The PR body's `## Validation` section states, for each such harness, the verification
+time Kani reports, the peak resident memory of the run (the maximum resident set size of its largest
+process, as GNU `time -v` reports it), and the unwind bounds the harness carries. This run is owed
+whatever § Coverage tiers owes, since a harness change is inert there.
 
 **Measured time.** The whole set, 204 harnesses, took 86 minutes run serially on GitHub's standard
-Linux runner (4 vCPUs, 16 GB; `build-test` run 45738265526), the harnesses' own verification
-times summing to 82 minutes. The slowest,
-devmgr-firmware's proof of the AML IRQ descriptor with its flags byte, took 306 s, and the next
-slowest 234 s. The small AML descriptors are proved one per harness, since all four in one CBMC
-problem took 29 minutes. The time limit of 10 minutes is about twice the slowest harness: room
-for a slower host, and a harness past it costs the run no more than the limit.
+Linux runner (4 vCPUs, 16 GB; `build-test` run 45738265526), the harnesses' own verification times
+summing to 82 minutes. The slowest, devmgr-firmware's proof of the AML IRQ descriptor with its flags
+byte, took 306 s, and the next slowest 234 s. The small AML descriptors are proved one per harness,
+since all four in one CBMC problem took 29 minutes. The time limit of 10 minutes is about twice the
+slowest harness: room for a slower runner, and a harness past it costs the run no more than the
+limit. Split as `SHARDS` gives, a `prove` job holds at most about 10 minutes of harnesses. The
+matrix's measured full-set run (`build-test` run 45804003430) ran boot-firmware's harnesses 16%
+slower than run 45738265526 did. In it, boot-firmware's three shards then took 670, 715 and 213 s,
+so the crate is split in five, which put it at 518 s at most by that run's times. devmgr-firmware's
+four shards took 186 to 557 s and elf's two 439 and 377 s. Each job adds about 1.5 minutes of setup
+and build. The whole set runs as 21 jobs side by side. In that run, the 19 jobs of the three-way
+split took 22.5 minutes from the first start to the last end, as runners came free beside the rest
+of the run, which ended a minute later.
 
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
 tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches

@@ -109,14 +109,14 @@ const LOGD_RECLAIM_ROLE: &str = "logd-reclaim-child";
 fn logd_reclaim_child_main() -> !
 {
     use ipc::stream_labels::{
-        LEVEL_INFO, LEVEL_SHIFT, RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD,
+        LEVEL_INFO, RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD, level_bits,
     };
 
     std::os::seraph::log::register_name(LOGD_RECLAIM_NAME);
     let cap = std::os::seraph::log::acquire();
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let send = |id: u64, bytes: &[u8]| {
-        let label = id | ((bytes.len() as u64) << 16) | (LEVEL_INFO << LEVEL_SHIFT);
+        let label = id | ((bytes.len() as u64) << 16) | level_bits(LEVEL_INFO);
         let msg = ipc::IpcMessage::builder(label).bytes(0, bytes).build();
         // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
         unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }

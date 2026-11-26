@@ -100,11 +100,11 @@ under its sender's name, the first after the restart included
   evicted slot is retired with its name and entries, a bounded number of them kept (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Retired slots).
 
-* **Kernel log reader.** From the handover's release on, and at each restart, a thread of logd
-  reads the kernel's console records and writes each as a `[<t>] [kernel] <text>` line through the
+* **Kernel log reader.** From the handover's release on, and at each restart, a thread of logd reads
+  the kernel's console records and writes each as a `[<t>] LEVEL  [kernel] <text>` line through the
   sinks. The lines are kept in the kernel's slot, badge `LOG_BADGE_KERNEL` (3), named `kernel`,
-  which `QUERY_SLOTS` and `QUERY_HISTORY` return like any sender's slot and which no eviction
-  takes. A sender that registers the name `kernel` is stored as `kernel_`
+  which `QUERY_SLOTS` and `QUERY_HISTORY` return like any sender's slot and which no eviction takes.
+  A sender that registers the name `kernel` is stored as `kernel_`
   (`logd_codec::kernel::stored_name`). A gap in the record sequence is named in a warning line of
   logd's (see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Kernel log and
   [docs/console-model.md](../../docs/console-model.md) item 4).

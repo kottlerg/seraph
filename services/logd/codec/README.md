@@ -19,9 +19,9 @@ logs when it evicts a slot (`ReclaimLine`, built as a log record; see the same d
 § Death-notification cascade, where the line is a test contract), and which entries a page of
 real-logd's `QUERY_SLOTS` and `QUERY_HISTORY` replies carries (`query::slot_page`,
 `query::history_page`; see the same document § Queries). It also holds the level tag both
-log receivers render after a line's `[name]` prefix (`level::tag`; see the same document § Levels),
-how both render a log record and the parser that reads its fields back from the rendered text
-(`record::render`, `record::fields`, `RENDERED_MAX_BYTES`; see the same document
+log receivers render between a line's stamp and its `[name]` prefix (`level::tag`; see the same
+document § Levels), how both render a log record and the parser that reads its fields back from
+the rendered text (`record::render`, `record::fields`, `RENDERED_MAX_BYTES`; see the same document
 § `stream_labels::STREAM_RECORD`), the line and name widths both log
 receivers keep per sender (`LINE_BUF_SIZE`, `MAX_NAME_LEN`), `BoundedStr`, the
 fixed-capacity, UTF-8-safe formatter logd uses for its own diagnostics, and `HeldLines`, the

@@ -2323,11 +2323,14 @@ pub mod log {
     // The level codes `log!`'s arms pass to `__emit_at` and `__emit_record`
     // as literals, since the macro expands in crates that cannot name `ipc`.
     const _: () = assert!(
-        ::ipc::stream_labels::LEVEL_ERROR == 1
-            && ::ipc::stream_labels::LEVEL_WARN == 2
-            && ::ipc::stream_labels::LEVEL_INFO == 3
-            && ::ipc::stream_labels::LEVEL_DEBUG == 4
-            && ::ipc::stream_labels::LEVEL_TRACE == 5
+        ::ipc::stream_labels::LEVEL_EMERGENCY == 0
+            && ::ipc::stream_labels::LEVEL_ALERT == 1
+            && ::ipc::stream_labels::LEVEL_CRITICAL == 2
+            && ::ipc::stream_labels::LEVEL_ERROR == 3
+            && ::ipc::stream_labels::LEVEL_WARN == 4
+            && ::ipc::stream_labels::LEVEL_NOTICE == 5
+            && ::ipc::stream_labels::LEVEL_INFO == 6
+            && ::ipc::stream_labels::LEVEL_DEBUG == 7
     );
 }
 
@@ -2368,17 +2371,20 @@ pub mod registry {
 /// The receiver tags each line with the registered display name
 /// (default `[?]`); see [`log::register_name`].
 ///
-/// `log!("fmt", args…)` logs at the info level. A leading `error:`,
-/// `warn:`, `info:`, `debug:`, or `trace:` sets the level, as in
-/// `log!(warn: "retrying {name}")`; the receiver tags a line of any level
-/// but info with it (`services/logd/docs/ipc-interface.md`
-/// § `stream_labels::STREAM_BYTES`).
+/// `log!("fmt", args…)` logs at the info level. A leading keyword, one of
+/// the eight RFC 5424 severities `emergency:`, `alert:`, `critical:`,
+/// `error:`, `warn:`, `notice:`, `info:` or `debug:`, sets the level, as
+/// in `log!(warn: "retrying {name}")`; the receiver tags every line with its
+/// level (`services/logd/docs/ipc-interface.md` § Levels).
 ///
-/// Give each line the level that document's § Levels rule gives it: error
-/// for a failure the component does not recover from, warn for an anomaly
-/// it recovers from, info for lifecycle shown once per event and for every
-/// test-harness line, debug for per-request or per-step detail, trace for
-/// per-message or hot-path lines. A line an xtask check or a CI pattern
+/// Give each line the level that document's § Levels rule gives it:
+/// emergency when the system cannot go on, alert when an operator must act
+/// now, critical for a component lost with the system degrading around it,
+/// error for a failure the component does not recover from, warn for an
+/// anomaly it recovers from, notice for a significant normal event shown
+/// once, info for lifecycle shown once per event and for every test-harness
+/// line, and debug for per-request, per-step or per-message detail. A line
+/// an xtask check or a CI pattern
 /// matches stays at info unless the check changes with it, and so does a
 /// line a document says the component logs or tells its reader to read.
 ///
@@ -2405,20 +2411,29 @@ macro_rules! __seraph_log {
     // The literal codes are `ipc::stream_labels::LEVEL_*`, which
     // `std::os::seraph::log` asserts. The arms with fields come before the
     // plain arms they would otherwise reach.
-    (error: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+    (emergency: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+        $crate::__seraph_log!(@record 0, $fmt $(, $arg)* ; $($key = $val),+)
+    }};
+    (alert: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
         $crate::__seraph_log!(@record 1, $fmt $(, $arg)* ; $($key = $val),+)
     }};
-    (warn: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+    (critical: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
         $crate::__seraph_log!(@record 2, $fmt $(, $arg)* ; $($key = $val),+)
     }};
-    (info: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+    (error: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
         $crate::__seraph_log!(@record 3, $fmt $(, $arg)* ; $($key = $val),+)
     }};
-    (debug: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+    (warn: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
         $crate::__seraph_log!(@record 4, $fmt $(, $arg)* ; $($key = $val),+)
     }};
-    (trace: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+    (notice: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
         $crate::__seraph_log!(@record 5, $fmt $(, $arg)* ; $($key = $val),+)
+    }};
+    (info: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+        $crate::__seraph_log!(@record 6, $fmt $(, $arg)* ; $($key = $val),+)
+    }};
+    (debug: $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
+        $crate::__seraph_log!(@record 7, $fmt $(, $arg)* ; $($key = $val),+)
     }};
     (@record $lvl:literal, $fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+) => {{
         $(
@@ -2437,23 +2452,32 @@ macro_rules! __seraph_log {
             &[$((::core::stringify!($key), &$val as &dyn ::core::fmt::Display)),+],
         )
     }};
-    (error: $($arg:tt)+) => {{
+    (emergency: $($arg:tt)+) => {{
+        $crate::os::seraph::log::__emit_at(0, ::core::format_args!($($arg)+))
+    }};
+    (alert: $($arg:tt)+) => {{
         $crate::os::seraph::log::__emit_at(1, ::core::format_args!($($arg)+))
     }};
-    (warn: $($arg:tt)+) => {{
+    (critical: $($arg:tt)+) => {{
         $crate::os::seraph::log::__emit_at(2, ::core::format_args!($($arg)+))
     }};
-    (info: $($arg:tt)+) => {{
+    (error: $($arg:tt)+) => {{
         $crate::os::seraph::log::__emit_at(3, ::core::format_args!($($arg)+))
     }};
-    (debug: $($arg:tt)+) => {{
+    (warn: $($arg:tt)+) => {{
         $crate::os::seraph::log::__emit_at(4, ::core::format_args!($($arg)+))
     }};
-    (trace: $($arg:tt)+) => {{
+    (notice: $($arg:tt)+) => {{
         $crate::os::seraph::log::__emit_at(5, ::core::format_args!($($arg)+))
     }};
+    (info: $($arg:tt)+) => {{
+        $crate::os::seraph::log::__emit_at(6, ::core::format_args!($($arg)+))
+    }};
+    (debug: $($arg:tt)+) => {{
+        $crate::os::seraph::log::__emit_at(7, ::core::format_args!($($arg)+))
+    }};
     ($fmt:literal $(, $arg:expr)* ; $($key:ident = $val:expr),+ $(,)?) => {{
-        $crate::__seraph_log!(@record 3, $fmt $(, $arg)* ; $($key = $val),+)
+        $crate::__seraph_log!(@record 6, $fmt $(, $arg)* ; $($key = $val),+)
     }};
     ($($arg:tt)*) => {{
         $crate::os::seraph::log::__emit(::core::format_args!($($arg)*))

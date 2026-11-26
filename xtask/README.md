@@ -488,10 +488,10 @@ an earlier one left under `target/xtask/run/`, so the preserved files are its ow
    matches no line of the log or the `--crash-reports` or `--whole-lines` check fails → `FAIL`, its
    reason naming the pattern or the defect
 4. init-logd's last line, `handover complete; init-logd thread exiting`, with no userspace line
-   (`[<seconds>] [<name>] ...`) after it → `FAIL`, its reason naming the lost console: real-logd,
-   which owns the console from the handover on, wrote nothing to it. A run with nothing at all
-   after that line, as one the watchdog cut off there, is not judged by it, nor is a run killed by
-   SIGSEGV or SIGABRT (rule 7), nor a boot with no handover (ktest)
+   (`[<seconds>] LEVEL  [<name>] ...`) after it → `FAIL`, its reason naming the lost console:
+   real-logd, which owns the console from the handover on, wrote nothing to it. A run with nothing
+   at all after that line, as one the watchdog cut off there, is not judged by it, nor is a run
+   killed by SIGSEGV or SIGABRT (rule 7), nor a boot with no handover (ktest)
 5. Watchdog timeout → `HANG`
 6. Exit code 0 with no marker → `OK`
 7. Killed by SIGSEGV/SIGABRT with no marker → `QEMU-CRASH` — the host emulator
@@ -651,8 +651,8 @@ A boot that redoes the bootloader's steps 6 and 7 logs `boot: memory map: mapred
 redoing steps 6 and 7`, which `run --runs --require` matches, once in the run
 ([docs/testing.md](../docs/testing.md#steps-6-and-7-redo-ktest-cell) § Steps 6 and 7 redo). A
 log-levels file that sets only `vfsd = debug` (`services/init/log-levels-vfsd-debug.conf`) makes
-`[vfsd] DEBUG ` and `[fatfs] DEBUG ` lines appear, fatfs logging at the level of vfsd, which spawns
-it, and no `[devmgr] DEBUG ` or `[procmgr] DEBUG ` line, which `run --runs --require` and
+`DEBUG  [vfsd] ` and `DEBUG  [fatfs] ` lines appear, fatfs logging at the level of vfsd, which
+spawns it, and no `DEBUG  [devmgr] ` or `DEBUG  [procmgr] ` line, which `run --runs --require` and
 `--fail-also` match
 ([docs/testing.md](../docs/testing.md#log-levels-usertest-cell) § Log levels).
 

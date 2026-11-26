@@ -247,9 +247,8 @@ const DEFAULT_SECTOR_SIZE: u32 = 512;
 /// [`DEFAULT_SECTOR_SIZE`], as the divisor the page arithmetic takes.
 const DEFAULT_SECTOR_BYTES: NonZeroU64 = NonZeroU64::new(DEFAULT_SECTOR_SIZE as u64).unwrap();
 
-/// Sentinel for an unfilled slot. Page-base LBAs are always multiples of
-/// the sectors per page; `u64::MAX` cannot collide with any valid page base.
-/// The page index's mark of an unused entry is the same value.
+/// Sentinel for an unfilled slot: the page index's mark of an unused entry,
+/// above every LBA a disk addresses, so no valid page base collides with it.
 const PAGE_BASE_EMPTY: u64 = PageIndex::EMPTY;
 
 /// One cache slot. Holds one page of consecutive sectors starting at

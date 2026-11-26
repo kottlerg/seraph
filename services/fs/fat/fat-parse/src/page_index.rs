@@ -9,8 +9,8 @@
 //! its slot index, sorted by LBA-base in an array sized at init to the cache's
 //! slot ceiling and padded to a power of two with [`PageIndex::EMPTY`] keys.
 //! A lookup is a binary search of a fixed number of steps, the logarithm of
-//! the padded length, each step choosing its half by a conditional select
-//! rather than a branch: its instructions depend on the slot ceiling alone, not on the key,
+//! the padded length, each step choosing its half by arithmetic rather than a
+//! branch: its instructions depend on the slot ceiling alone, not on the key,
 //! on what else the cache holds, or on the order the pages were filled in.
 //! That order follows the order of the requests the filesystem served before,
 //! which the machine's timing decides, so a search whose cost depended on the
@@ -44,11 +44,12 @@ pub struct PageIndex
 
 impl PageIndex
 {
-    /// The key of an unused entry, above every LBA-base: a page-aligned
-    /// LBA-base is a multiple of the sectors per page, which `u64::MAX` is
-    /// not for any page of more than one sector, and the cache uses it as
-    /// its own mark of a slot holding no page.
-    pub const EMPTY: u64 = u64::MAX;
+    /// The key of an unused entry, the largest below 2^63: above every
+    /// LBA-base, since a disk's LBAs lie far below it, and the cache uses it as
+    /// its own mark of a slot holding no page. The index holds no key at or
+    /// above it, so the difference of any two keys it compares keeps their
+    /// order in its sign ([`Self::position`]).
+    pub const EMPTY: u64 = u64::MAX >> 1;
 
     /// An empty index for at most `capacity` pages, or `None` when the heap
     /// cannot hold its arrays.
@@ -91,16 +92,17 @@ impl PageIndex
     pub fn lookup(&self, key: u64) -> Option<usize>
     {
         let at = self.position(key);
-        let found = self.keys.get(at).copied() == Some(key) && key != Self::EMPTY;
+        let found = self.keys.get(at).copied() == Some(key) && key < Self::EMPTY;
         found.then(|| self.slots.get(at).copied()).flatten()
     }
 
     /// Record that slot `slot` holds the page at `key`, replacing the slot an
-    /// entry for `key` named. `false`, the index unchanged, when `key` is
-    /// [`Self::EMPTY`], or the index is full and holds no entry for `key`.
+    /// entry for `key` named. `false`, the index unchanged, when `key` is not
+    /// below [`Self::EMPTY`], or the index is full and holds no entry for
+    /// `key`.
     pub fn insert(&mut self, key: u64, slot: usize) -> bool
     {
-        if key == Self::EMPTY
+        if key >= Self::EMPTY
         {
             return false;
         }
@@ -140,7 +142,7 @@ impl PageIndex
     /// the index holds no entry for `key`.
     pub fn remove(&mut self, key: u64) -> Option<usize>
     {
-        if key == Self::EMPTY
+        if key >= Self::EMPTY
         {
             return None;
         }
@@ -166,7 +168,9 @@ impl PageIndex
     /// The first position whose key is not below `key` (the padded length's
     /// last position when every key is below it), found in the logarithm of the
     /// padded length steps whatever the keys are: each step takes the half it
-    /// skips through a conditional select, so no step branches on a key.
+    /// skips through a mask made by arithmetic, so no step branches on a key.
+    /// A `key` at or above [`Self::EMPTY`] may give a wrong position, which
+    /// holds no such key, so a lookup still finds none.
     fn position(&self, key: u64) -> usize
     {
         let mut at: usize = 0;
@@ -181,13 +185,14 @@ impl PageIndex
                 .get(at | half.wrapping_sub(1))
                 .copied()
                 .unwrap_or(Self::EMPTY);
-            // The comparison as a mask of all ones or none, taken through
-            // `black_box` so the compiler cannot see that it is one of two
-            // values: from a known boolean it rebuilds a select, which LLVM's
-            // x86 backend turns into a branch inside a loop, and the step's
+            // All ones when `probe` is below `key`, else none: both lie below
+            // 2^63, so their difference's sign is their order, and an
+            // arithmetic shift spreads it. A mask made from a comparison
+            // would be rebuilt by the compiler into a select, which LLVM's x86
+            // backend turns into a branch inside a loop, and the step's
             // instruction count would then follow the comparison.
-            let below = core::hint::black_box(usize::from(probe < key).wrapping_neg());
-            at |= half & below;
+            let below = (probe.wrapping_sub(key).cast_signed() >> 63).cast_unsigned();
+            at |= half & usize::try_from(below).unwrap_or(usize::MAX);
             half /= 2;
         }
         at
@@ -296,9 +301,17 @@ mod tests
     fn the_empty_key_is_never_held()
     {
         let mut index = PageIndex::with_capacity(2).expect("heap");
-        assert!(!index.insert(PageIndex::EMPTY, 0));
-        assert_eq!(index.remove(PageIndex::EMPTY), None);
-        assert_eq!(index.lookup(PageIndex::EMPTY), None);
+        for key in [PageIndex::EMPTY, PageIndex::EMPTY + 1, u64::MAX]
+        {
+            assert!(!index.insert(key, 0));
+            assert_eq!(index.remove(key), None);
+            assert_eq!(index.lookup(key), None);
+        }
+        // A key below the bound is found beside one at it.
+        assert!(index.insert(PageIndex::EMPTY - 1, 1));
+        assert_eq!(index.lookup(PageIndex::EMPTY - 1), Some(1));
+        assert_eq!(index.lookup(u64::MAX), None);
+        assert_eq!(index.remove(PageIndex::EMPTY - 1), Some(1));
         assert!(index.is_empty());
     }
 }

@@ -1648,12 +1648,9 @@ crate is affected when a changed file is an input of every proof, one that can c
 verdict: an input of every build (the workspace `Cargo.toml` and `Cargo.lock`,
 `rust-toolchain.toml`, `.cargo/config.toml`), or the command's own source,
 `xtask/src/commands/kani.rs`, which holds the Kani pin, the arguments and the memory limit it runs
-`cargo kani` with, and the judge of Kani's output. What decides only which crates are verified, or
-whether and where a job runs them (the selection in `xtask/src/affected.rs`, the workflows), is not
-one, and a change to it alone selects no crate, save one: a change to
-`.github/workflows/build-test.yml`, whose steps run CI's `kani` job, that selects no crate otherwise
-selects the crate with the fewest harnesses (the first by directory among equals), so the job's
-install, setup and run steps run. The change is taken from the merge base of `<COMMIT>` and `HEAD`,
+`cargo kani` with, and the judge of Kani's output. What decides only which crates are verified (the
+selection in `xtask/src/affected.rs`) is not one, nor is a workflow, and a change to it alone
+selects no crate. The change is taken from the merge base of `<COMMIT>` and `HEAD`,
 so a branch behind `<COMMIT>` is charged its own change alone. A package's build script, features
 and `cfg` settings lie in its directory or the workspace manifest, so a change to them selects it. A
 commit the checkout does not hold fails the command, so a shallow clone never narrows the run. With
@@ -1667,10 +1664,10 @@ For each selected crate it runs `cargo kani --tests -p <package>` (with `--harne
 which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies each
 harness with Kani's unwinding assertions on. It runs `cargo kani` under `prlimit --as` (util-linux),
 which holds each process of the run (`cargo`, the Kani compiler, and the CBMC of each harness, which
-Kani runs one at a time) to 12 GiB of address space (`MEMORY_LIMIT_GIB`). The limit derives from the
-runner CI's `kani` job runs on (`ubuntu-latest` for a public repository: 4 vCPUs, 16 GB), leaving
-4 GB to the runner's own processes, so a harness whose CBMC needs more fails, named as out of memory
-under the limit, where without it the runner would be shut down with no verdict. It prints Kani's
+Kani runs one at a time) to 12 GiB of address space (`MEMORY_LIMIT_GIB`), which leaves 4 GB of a
+16 GB machine to its other processes, so a harness whose CBMC needs more fails, named as out of
+memory under the limit, where without it the host would swap or kill processes and the run give no
+verdict. It prints Kani's
 output as it comes and judges it as well as Kani's verdict: the crate fails when `cargo kani` exits
 unsuccessfully, when a harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED`
 check or a `FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's
@@ -1684,18 +1681,16 @@ selected crate runs, and the command then prints a table of every harness, by pa
 with its verdict and verification time, then the same table of the ten slowest, slowest first, and
 fails naming each crate that failed.
 
-CI's `kani` job of `build-test.yml` runs `--since` with `--list` against the base its `select` job
-found, with `cargo xtask cells --since-covered` on a pull request and `--since-green` on a push to
-`master`, and with no option when that job found none; when the list is empty it installs no Kani
-and says so in a notice on the run, and otherwise it installs the release `--pin` prints and runs
-the command with the same `--since`. The `kani` job of `burnin.yml` runs the command with no option
-([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
+No CI workflow runs the command. A pull request whose change can affect a harnessed crate runs
+`--since <merge base>` at its validated head and reports the run in its body, and the release host
+runs run it with no option ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded
+verification).
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
 session runs `cargo xtask kani` there. A session installs nothing (`cargo install` is outside the
 permissions `.claude/settings.json` grants) and does not run `cargo kani` itself, which the
 `bash` hook refuses ([§ `cargo xtask hook`](#cargo-xtask-hook)). A new or changed harness is
-sized there, under the limit the command sets, before CI runs it
+sized there, under the limit the command sets, before it is pushed
 ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification).
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`
@@ -1719,7 +1714,7 @@ cargo xtask cells [--since <COMMIT> | --since-green <REV> | --since-covered <REV
 | `--since <COMMIT>` | no base | The change from the merge base of this commit and `HEAD` to the working tree |
 | `--since-green <REV>` | no base | The change from the newest commit of `REV`'s first-parent history, 200 commits at most, whose `build-test` run on a push to `master` passed (`gh run list`, the 200 newest runs); every cell, after a `WARNING:` line, when there is none or the runs cannot be read. A push to `master` takes this base, so `master`'s own runs prove every commit, and a cell a red or cancelled run left unproven stays owed |
 | `--since-covered <REV>` | no base | As `--since-green`, but a commit whose run has not finished counts too, unless a newer commit of the history has a red or cancelled run, which took that change in and failed: a pull request takes this base, so it is not charged the change a running `master` run is proving; a red or cancelled run's change stays owed, and the merge gate waits for a running tip (`gate-base-green`) |
-| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate`, `build` and `bench`, each a matrix's `include` list, `build` holding one tree per architecture and profile a `validate` cell is owed in and the release trees when the `bench` cell is owed, those with `bench` true; `validate-owed`, `build-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit, empty when there is none, from which the `kani` job selects its crates |
+| `--github-output <FILE>` | none | Append the workflow's outputs to `FILE` (`$GITHUB_OUTPUT`): `validate`, `build` and `bench`, each a matrix's `include` list, `build` holding one tree per architecture and profile a `validate` cell is owed in and the release trees when the `bench` cell is owed, those with `bench` true; `validate-owed`, `build-owed` and `bench-owed`, whether the list is not empty; `ktest-bench`, whether the `bench` cell's ktest boots are owed; `fuzz-owed`, whether the `fuzz` job is; `base`, the base commit the selection measured from, empty when there is none |
 
 Without a base, every cell is owed. With one, the command places each changed file (`git diff
 --name-only` from the merge base of the base and `HEAD` to the working tree, a rename as both its

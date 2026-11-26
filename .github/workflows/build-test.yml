@@ -18,6 +18,12 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
+      kani-since:
+        description: >-
+          The commit the kani jobs select the affected proof crates from;
+          empty proves every crate
+        required: false
+        default: ''
       cells-since:
         description: >-
           The commit the select job computes the owed cells from; empty
@@ -58,6 +64,7 @@ jobs:
       bench-owed: ${{ steps.cells.outputs.bench-owed }}
       ktest-bench: ${{ steps.cells.outputs.ktest-bench }}
       fuzz-owed: ${{ steps.cells.outputs.fuzz-owed }}
+      base: ${{ steps.cells.outputs.base }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -152,6 +159,20 @@ jobs:
         with:
           mode: save
           name: host-tests
+
+  kani:
+    # The bounded proofs of the crates the change can affect, one job per
+    # crate or shard (.github/workflows/kani.yml; docs/testing.md § Bounded
+    # verification); burnin.yml proves every crate. On a pull request or a
+    # push, from the base the select job found, so a proof a red or
+    # cancelled master run left unproven stays owed; on a dispatch from its
+    # input. None proves every crate.
+    needs: select
+    uses: ./.github/workflows/kani.yml
+    with:
+      since: >-
+        ${{ github.event_name != 'workflow_dispatch' && needs.select.outputs.base
+        || inputs.kani-since }}
 
   # The gating fuzz tier (docs/testing.md § Fuzzing): the engine's self-test,
   # then every target for the default execution count from seed 0, from the
@@ -459,31 +480,28 @@ jobs:
         # docs/build-system.md § Continuous Integration states from each
         # cell's worst pass, over the boots of its image (the cell's boot, and
         # on usertest and ktest the log-level and mapredo boots whose checks
-        # its boot carries), in the 174 build-test runs from 2026-11-17 22:44 to
-        # 2026-11-18 15:28 UTC (the latest attempt of each); the worst passes
-        # are beside the values. riscv64 debug
-        # svctest's three runs that the previous 300 s budget cut short were
-        # still passing phases; its worst is the slowest one's projected
-        # completion (the phases it had left, at its own pace, from a passing
-        # run's log), above the 297.5 s of its worst observed pass. The svctest
-        # worsts marked (est.) add to that worst the sum of the seven testers
-        # whose checks svctest's phases took over (crashme, deadline,
-        # debugger, pipestress, stdiotest, threadchurn, threadstack), at its
-        # largest in usertest's logs of the 8 master runs from 2026-11-22 to
-        # 2026-11-24; the usertest budgets keep the worst of a boot that ran
-        # them, an upper bound until CI's passes re-derive both.
+        # its boot carries); the worst passes are beside the values. The
+        # svctest worsts are of the 47 passing master runs from 2026-11-24
+        # 12:13 to 2026-11-26 07:34 UTC whose head stages the svctest boot
+        # with no program (42 passes a cell; the latest attempt of each). The
+        # usertest and ktest worsts are of the 174 build-test runs from
+        # 2026-11-17 22:44 to 2026-11-18 15:28 UTC (the latest attempt of
+        # each); the usertest budgets keep the worst of a boot that still ran
+        # the seven testers whose checks svctest's phases took over (crashme,
+        # deadline, debugger, pipestress, stdiotest, threadchurn,
+        # threadstack), an upper bound until CI's passes re-derive them.
         run: |
           case "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" in
-            riscv64-debug-svctest)    budget=1380 ;;  # worst pass 456.8 s (est.)
+            riscv64-debug-svctest)    budget=1380 ;;  # worst pass 448.2 s
             riscv64-debug-usertest)   budget=540 ;;   # worst pass 168.4 s
             riscv64-debug-ktest)      budget=300 ;;   # worst pass 81.9 s
-            riscv64-release-svctest)  budget=780 ;;   # worst pass 246.2 s (est.)
+            riscv64-release-svctest)  budget=1020 ;;  # worst pass 327.3 s
             riscv64-release-usertest) budget=240 ;;   # worst pass 66.4 s
             riscv64-release-ktest)    budget=240 ;;   # worst pass 70.9 s
-            x86_64-debug-svctest)     budget=660 ;;   # worst pass 204.8 s (est.)
+            x86_64-debug-svctest)     budget=840 ;;   # worst pass 278.5 s
             x86_64-debug-usertest)    budget=240 ;;   # worst pass 61.4 s
             x86_64-debug-ktest)       budget=480 ;;   # worst pass 153.3 s
-            x86_64-release-svctest)   budget=540 ;;   # worst pass 160.9 s (est.)
+            x86_64-release-svctest)   budget=660 ;;   # worst pass 219.4 s
             x86_64-release-usertest)  budget=180 ;;   # worst pass 39.3 s
             x86_64-release-ktest)     budget=540 ;;   # worst pass 175.8 s
             *) echo "no budget for this cell" >&2; exit 1 ;;
@@ -743,7 +761,7 @@ jobs:
     # change owes it nothing passes. A check that never reports blocks a
     # merge, so the cells, which run only when owed, are not required
     # checks themselves.
-    needs: [select, host-tests, fuzz, qemu-debs, build, validate, bench]
+    needs: [select, host-tests, kani, fuzz, qemu-debs, build, validate, bench]
     if: always()
     runs-on: ubuntu-latest
     steps:

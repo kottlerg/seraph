@@ -684,13 +684,14 @@ CPU; an asynchronous producer and consumer whose every handoff drains within a t
 there too, since the pull does not spread them either. Two unpinned threads that each wait on a
 thread of another CPU, such as the clients of two servers, can likewise come to share one CPU
 while another idles, and stay there while each wake keeps them there (the sticky preferred CPU of
-`select_target_cpu` stays within the threshold of the least-loaded CPU). Two threads of one RT
-level do not stay so: an RT wake leaves a CPU that runs or queues a thread of its level or above
-for one of a lower rank, an idle CPU among them (§ Thread Assignment), unless the save-window pin
-or a synchronous wake's guard keeps it there. An RT thread that outranks the thread it shares a CPU
-with does stay, since it runs there at once, and the lower thread waits behind it until it blocks
-or the idle pull takes the lower one. What the episode leaves is bounded by the threshold: a load
-above it is pulled at once, so a backlog the pull leaves to
+`select_target_cpu` stays within the threshold of the least-loaded CPU). Two threads of one RT level
+do not stay so: an RT wake leaves a CPU that runs or queues a thread of its level or above for one
+of a lower rank, an idle CPU among them (§ Thread Assignment), unless the save-window pin or a
+synchronous wake's guard keeps it there. An RT thread that outranks the thread it shares a CPU with
+does stay, since it runs there at once, save when its wake is the reply of a server that runs on
+there (`WakeHint::WakerRuns`, § Thread Assignment), and the lower thread waits behind it until it
+blocks or the idle pull takes the lower one. What the episode leaves is bounded by the threshold: a
+load above it is pulled at once, so a backlog the pull leaves to
 break and re-form is one at a load of at most `LOAD_BALANCE_IMBALANCE_THRESHOLD` (2), the
 running thread and one queued behind it. A call or a fault delivery places its receiver by its
 waker, and the reply of a `SYS_IPC_REPLY_RECV` to a `SYS_IPC_CALL` caller places the caller by

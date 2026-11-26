@@ -989,10 +989,25 @@ enum Received
     ParkRefused,
 }
 
+/// The syscall a [`receive_on`] belongs to.
+#[cfg(not(test))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiveOf
+{
+    /// `SYS_IPC_RECV`.
+    Recv,
+    /// `SYS_IPC_REPLY_RECV`, after its reply.
+    ReplyRecv,
+}
+
 /// The receive step of `SYS_IPC_RECV` on `ep_state`: [`Received`] when a
 /// caller was waiting or `tcb` parked on the recv queue (or its park was
 /// refused), `Err(WouldBlock)` for an empty try-once, and `Err(NoReceiver)`
 /// when no capability with the Receive right on the endpoint is left.
+///
+/// `of` names the syscall the receive belongs to; whether it is
+/// `SYS_IPC_REPLY_RECV` is recorded in `tcb`'s `serves_reply_recv` before
+/// the receive can link `tcb` on the recv queue.
 ///
 /// # Safety
 /// `ep_state` must be a pinned Endpoint's state and `tcb` the running thread,
@@ -1008,8 +1023,19 @@ unsafe fn receive_on(
     ep_state: *mut crate::ipc::endpoint::EndpointState,
     tcb: *mut crate::sched::thread::ThreadControlBlock,
     timeout_ms: u64,
+    of: ReceiveOf,
 ) -> Result<Received, SyscallError>
 {
+    // Before the receive's link: a call that dequeues tcb from the recv queue
+    // does so under ep.lock, which the link's release orders after this store.
+    // SAFETY: tcb is the running thread (the caller's contract), and the mark
+    // is an atomic.
+    unsafe {
+        (*tcb).serves_reply_recv.store(
+            of == ReceiveOf::ReplyRecv,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
     let try_once = timeout_ms == syscall::WAIT_TRY_ONCE;
     let received = if try_once
     {
@@ -1097,7 +1123,7 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // before the park below (or the return of the immediate delivery); tcb is
     // the running thread (current_tcb above); no scheduler lock and no ep.lock
     // held.
-    let result = unsafe { receive_on(ep_state, tcb, timeout_ms) }?;
+    let result = unsafe { receive_on(ep_state, tcb, timeout_ms, ReceiveOf::Recv) }?;
 
     // SAFETY: tcb validated above; ipc_buffer is written only by this thread's
     // own SYS_IPC_BUFFER_SET, so it cannot change during this syscall.
@@ -1427,7 +1453,7 @@ pub fn sys_ipc_reply_recv(tf: UserFrame) -> Result<u64, SyscallError>
     unsafe { crate::sched::thread::open_park_episode(tcb) };
     // SAFETY: ep_state is the state of the Endpoint `slot` pins until the drop
     // below; tcb is the running thread; no scheduler lock and no ep.lock held.
-    let received = unsafe { receive_on(ep_state, tcb, timeout_ms) };
+    let received = unsafe { receive_on(ep_state, tcb, timeout_ms, ReceiveOf::ReplyRecv) };
     drop(slot);
 
     // The deferred wake. The claim pinned the caller until now, so its level
@@ -1485,12 +1511,16 @@ pub fn sys_ipc_reply_recv(tf: UserFrame) -> Result<u64, SyscallError>
 }
 
 /// Wake `caller`, whose reply deposit the running server `server` has
-/// stamped, placed by `hint`. Returns whether the server must yield to it
-/// before returning to user mode: the wake is [`WakeHint::WakerRuns`], it
-/// placed the caller on this CPU, and the server does not outrank the caller
-/// (core/kernel/docs/ipc-internals.md § Reply-and-Receive Path). A caller above the
-/// server's rank would preempt it at that return anyway; one at the same
-/// rank would otherwise wait behind it until it blocks or its slice ends.
+/// stamped, placed by `hint`, leaving this CPU out when the server outranks
+/// the caller and runs on ([`reply_wake_exclusion`]). Returns whether the
+/// server must yield to it before returning to user mode: the wake is
+/// [`WakeHint::WakerRuns`], it placed the caller on this CPU, and the server
+/// does not outrank the caller (core/kernel/docs/ipc-internals.md
+/// § Reply-and-Receive Path). A caller above the server's rank would preempt
+/// it at that return anyway; one at the same rank would otherwise wait behind
+/// it until it blocks or its slice ends.
+///
+/// [`reply_wake_exclusion`]: crate::sched::reply_wake_exclusion
 ///
 /// # Safety
 /// `caller` must be pinned by `server`'s won reply claim, its deposit
@@ -1510,13 +1540,15 @@ unsafe fn wake_replied(
     let caller_level = unsafe { (*caller).priority };
     // SAFETY: server is the running thread (contract).
     let server_level = unsafe { (*server).priority };
+    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+    let exclude = crate::sched::reply_wake_exclusion(hint, server_level, caller_level, this_cpu);
     // SAFETY: the contract, which is select_target_cpu's.
-    let target_cpu = unsafe { crate::sched::select_target_cpu(caller, hint) };
+    let target_cpu = unsafe { crate::sched::select_target_cpu_excluding(caller, exclude, hint) };
     // SAFETY: caller is pinned by the claim; target_cpu came from
-    // select_target_cpu.
+    // select_target_cpu_excluding.
     unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
     hint == crate::sched::WakeHint::WakerRuns
-        && target_cpu == crate::arch::current::cpu::current_cpu() as usize
+        && target_cpu == this_cpu
         && !crate::sched::run_queue::outranks(server_level, caller_level)
 }
 

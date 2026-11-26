@@ -613,6 +613,42 @@ measured loop
 fails a gating measurement whose line reports a halt or no count, naming the measurement and its
 halts.
 
+A counter read ([shared/bench/README.md § Counters](../shared/bench/README.md#counters)) bounds
+the region between two reads, the benchmark's measured operation, as follows:
+
+- **Compiler.** On both architectures the read's inline assembly declares that it may read and
+  write memory. The compiler therefore keeps every load and store of the region between the two
+  reads, and every one the program puts outside them outside, for memory that code it cannot see
+  could reach. It does not keep register-only work there, nor work whose result nothing uses, nor
+  accesses to memory it can prove the region alone touches. A benchmark therefore makes its region's
+  result observable after the closing read, as `ubench.shmem_ring` does by comparing the bytes it
+  read with those it wrote.
+- **Under icount.** QEMU retires a vCPU's instructions one at a time in program order, and the
+  counter advances one per instruction. A sample is therefore exactly the instructions retired
+  between the two reads: the region as compiled, and the reads' own instructions on the region's
+  side (on x86-64 the `lfence` after the opening `rdtsc`, and the `mfence; lfence` before the
+  closing one).
+- **On hardware, x86-64.** The read is `mfence; lfence; rdtsc; lfence`. `mfence; lfence` holds
+  `rdtsc` until every earlier instruction has completed and every earlier load and store is
+  globally visible. The last `lfence` holds every later instruction until `rdtsc` has read the
+  counter. A window therefore covers all of its region's execution, its stores' drain included,
+  and none of what precedes or follows it, plus the cost of the fences, as the Intel SDM's `RDTSC`
+  entry gives. AMD's processors give it where `lfence` is dispatch-serializing, which AMD's
+  guidance on `lfence` documents per processor family, with the `DE_CFG` bit that makes it so
+  where it is not by default.
+- **On hardware, riscv64.** `csrr cycle` returns the hart's cycle count at the point where the hart
+  executes it, and two reads on one hart are ordered with each other. RISC-V defines no fence that
+  orders a counter read with the execution of other instructions. An in-order hart reads in program
+  order. An out-of-order hart may overlap a small window's edges with the work around it, so a
+  window shorter than its pipeline's depth measures the region only to within that overlap.
+
+Every sample therefore includes the cost of the reads themselves: their instructions on the
+region's side under icount, and on hardware the cycles of those instructions and of the fences.
+The `empty_window` benchmark of each suite, `ktest.empty_window` and `ubench.empty_window`,
+measures that offset as two reads with nothing between them, in both modes. A line's p50 includes
+the offset its suite's `empty_window` line reports in the same mode. No tool subtracts it: a
+reader who wants the region's cost alone subtracts it.
+
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
 (`--mode host`, x86_64 under KVM, on the release build the cell measures, per-measurement bands
@@ -1376,6 +1412,10 @@ beside them (release, one CPU and four, under icount; [Benchmarks](#benchmarks-b
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + virtio-rng + serial + the machine's RTC, the machine's IOMMU
 with the virtio-blk, virtio-keyboard, and virtio-rng devices behind it — `intel-iommu` on x86_64,
+offering interrupt remapping to the svctest and usertest cells and remapping DMA alone in the ktest
+cell, which never turns remapping on; QEMU emulates the I/O APIC in every cell under TCG, and only a
+KVM launch splits the irqchip for the offer
+([xtask/README.md](../xtask/README.md#attached-devices) § Attached devices), and
 `riscv-iommu-pci` at 00:01.0 on riscv64 — and, on x86_64, `vmgenid,guid=auto`; the svctest cells
 also attach the test devices (`--test-devices`): QEMU's `edu` DMA test device, which svctest's DMA
 confinement and MSI forge phases drive, and five `pci-testdev` functions, which its
@@ -1868,14 +1908,14 @@ one when it names another listed item or lies within a listed item's definition.
 or writes one of the type's fields, calls one of its methods, or constructs or matches its value
 names it in another use and stays on the surface. The exemption reaches no listed function
 or constant: each stays on a surface as the sentences above define. The listed
-types are `InterruptObject`, `Iommu`, `SecondDisk`, `DiskLine`, `BlockSize`, `FramebufferInfo`,
-`InitFramebufferInfo`, `QemuDisplay`, `HotplugControl`, `BootEntropy`, `Tpm`, and
-`TpmInterface`. A PR owes
+types are `InterruptObject`, `Iommu`, `InterruptRemapping`, `X86Irqchip`, `SecondDisk`, `DiskLine`,
+`BlockSize`, `FramebufferInfo`, `InitFramebufferInfo`, `QemuDisplay`, `HotplugControl`,
+`BootEntropy`, `Tpm`, and `TpmInterface`. A PR owes
 the cells of every surface a non-inert line of its own diff is on.
 
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
-| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/` and the firmware-table formats it decodes with (`shared/firmware-tables/`), `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, `core/kernel/src/arch/riscv64/aia_encoding.rs`, `core/kernel/src/arch/x86_64/msi.rs`, and `core/kernel/src/arch/x86_64/remap.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, `sys_irq_split`, `sys_irq_msg_alloc`, `sys_irq_route`, and `sys_irq_remap`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, the message-signaled targets' slots (`alloc_message_target`, `free_message_target`, and the slot entry a delivery reads, `slot_entry`), and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, `select_ioapics`, and the allocation of the per-CPU device-vector rows the routes and targets take (`init_vector_storage`)); the interrupt-remapping switch and the entries it needs (`set_remap`, `remap_entry`, and `remap_handles`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes and targets take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules, as files (`shared/ipc/src/devmgr_labels.rs`, `shared/ipc/src/devmgr_errors.rs`, `shared/ipc/src/devmgr_dma_labels.rs`, `shared/ipc/src/devmgr_dma_errors.rs`, and `shared/ipc/src/device_info_kind.rs`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, `RISCV_IOMMU_DEVICE`, `X86_IOMMU_DEVICE`, and `X86_MACHINE_SPLIT_IRQCHIP`) | every device cell |
+| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/` and the firmware-table formats it decodes with (`shared/firmware-tables/`), `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, `core/kernel/src/arch/riscv64/aia_encoding.rs`, `core/kernel/src/arch/x86_64/msi.rs`, and `core/kernel/src/arch/x86_64/remap.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, `sys_irq_split`, `sys_irq_msg_alloc`, `sys_irq_route`, and `sys_irq_remap`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, the message-signaled targets' slots (`alloc_message_target`, `free_message_target`, and the slot entry a delivery reads, `slot_entry`), and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, `select_ioapics`, and the allocation of the per-CPU device-vector rows the routes and targets take (`init_vector_storage`)); the interrupt-remapping switch and the entries it needs (`set_remap`, `remap_entry`, and `remap_handles`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes and targets take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules, as files (`shared/ipc/src/devmgr_labels.rs`, `shared/ipc/src/devmgr_errors.rs`, `shared/ipc/src/devmgr_dma_labels.rs`, `shared/ipc/src/devmgr_dma_errors.rs`, and `shared/ipc/src/device_info_kind.rs`); and the launchers' IOMMU attachment and the irqchip it decides (`Iommu`, `virtio_property`, `RISCV_IOMMU_DEVICE`, `X86_IOMMU_DEVICE`, `X86_IOMMU_DEVICE_DMA_ONLY`, `InterruptRemapping`, `X86Irqchip`, `X86_MACHINE_SPLIT_IRQCHIP`, and `X86_MACHINE_KVM_IRQCHIP`) | every device cell |
 | Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), the storage statement's crate `shared/storage-statement/`, `xtask/src/disk.rs`, its GPT writer `xtask/src/gpt.rs`, its FAT writer `xtask/src/fat.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers, as files (`shared/ipc/src/vfsd_labels.rs`, `shared/ipc/src/vfsd_errors.rs`, `shared/ipc/src/fs_labels.rs`, `shared/ipc/src/fs_errors.rs`, `shared/ipc/src/blk_labels.rs`, and `shared/ipc/src/blk_errors.rs`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_line`, `DiskLine`, `SecondSlot`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_FIRST_DISK_SLOT`, `MOVED_DISK_SLOT`, `first_disk_slot`, `SECOND_DISK_LOCATION`, `BlockSize`, and `split_data`) | every storage cell |
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
@@ -1939,7 +1979,8 @@ D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_io
 D="$D|(alloc|free)_message_target|slot_entry|init_vector_storage"
 D="$D|InterruptObject|dispatch_external|init_eid_storage|M(IN|AX)_IRQ_ID"
 D="$D|Iommu|virtio_property|RISCV_IOMMU_DEVICE"
-D="$D|X86_IOMMU_DEVICE|X86_MACHINE_SPLIT_IRQCHIP|EDU_DEVICE"
+D="$D|X86_IOMMU_DEVICE(_DMA_ONLY)?|InterruptRemapping|X86Irqchip"
+D="$D|X86_MACHINE_(SPLIT|KVM)_IRQCHIP|EDU_DEVICE"
 D="$D|dma_confinement_phase|msi_(delivery|forge|churn|release)_phase|call_test_dma"
 D="$D|hwrng_re(ad|start)_phase|hwrng_read|hwrng_denied"
 D="$D|QemuDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"

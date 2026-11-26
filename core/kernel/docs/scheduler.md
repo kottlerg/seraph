@@ -506,19 +506,36 @@ A synchronous wake places its thread by its waker. A call that finds a receiver 
 fault delivery that finds a handler parked, wake it with `WakeHint::Sync` when the caller's park
 committed: the caller blocks in the same syscall, so one CPU serves both threads. The receiver then
 runs on the caller's CPU when that CPU queues no thread but its idle thread and the receiver does
-not outrank the caller (its run queue is not above the caller's), whatever CPU it last ran on; hard
+not outrank the caller (its run queue is not above the caller's), or outranks it but last
+received through `SYS_IPC_REPLY_RECV` and the caller can leave that CPU (below), whatever CPU it
+last ran on; hard
 affinity and the save-window pin still come first
 ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). A pair that starts
 apart, or that a pull or an affinity change split, so comes together on its first round trip,
 which then wakes no other CPU: the reply's wake finds the caller's preferred CPU on that CPU, and
 the server's next receive blocks. An RT pair stays together so only when its server replies with
-`SYS_IPC_REPLY_RECV` (below). Two cases stay with the other rules: a call made while other
+`SYS_IPC_REPLY_RECV` (below). Besides a caller that cannot move (below), two cases stay with the
+other rules: a call made while other
 work is queued on the caller's CPU, whose threads the receiver would otherwise run ahead of while
-its own CPU idles, and a receiver that outranks its caller, such as an RT server called by a fair
-client, which, serving a backlog without parking, would hold off the caller's reply wake past any
-slice (§ Time Slice Policy). The second condition stays though a server can reply with
-`SYS_IPC_REPLY_RECV`: at the call the kernel cannot tell how the receiver will reply, and a
-`SYS_IPC_REPLY`'s wake still goes by the caller's preferred CPU (by rank for an RT caller, below).
+its own CPU idles, and a receiver that outranks its caller and last received through
+`SYS_IPC_RECV`, such as an RT server that answers a fair client with `SYS_IPC_REPLY`, which,
+serving a backlog without parking, would hold off the caller's reply wake past any slice (§ Time
+Slice Policy): a `SYS_IPC_REPLY`'s wake goes by the caller's preferred CPU (by rank for an RT
+caller, below). A server that replies with `SYS_IPC_REPLY_RECV` holds off no reply wake of a
+caller that can move, since that wake is placed by whether its receive parks, and when the server
+runs on, on another CPU than the server's (below), so an RT server serving unpinned fair clients
+that way runs on each caller's CPU that queues nothing else. A caller that cannot leave its CPU is
+never made to share it with a receiver that outranks it: one pinned there by hard affinity, which
+its reply wake must return to that CPU whatever the server does, and a thread in a fault delivery,
+whose resume reply wakes it before the handler's receive. Their receivers go by the other rules with
+that CPU left out, even when it is the receiver's preferred CPU, so such a pair stays apart, each
+call and each reply waking another CPU. At the call the kernel
+cannot tell how the receiver will reply; it takes the syscall of the receiver's latest receive as
+the prediction. A
+server that received through `SYS_IPC_REPLY_RECV` and answers the call with a `SYS_IPC_REPLY` after
+all can keep that caller's reply wake queued behind it until it parks, or until an idle CPU pulls
+the caller (§ Load Balancing): the cost the second condition otherwise keeps off, paid by each call
+it answers so.
 
 A reply's wake is placed by what its server does next. A `SYS_IPC_REPLY` passes
 `WakeHint::None`: the kernel cannot tell whether the server blocks next, so a receiver at its
@@ -530,9 +547,10 @@ in the same syscall, and the caller is woken with `WakeHint::Sync` onto the serv
 guard above with the server as the waker. Otherwise the server runs on, and the caller is woken
 with `WakeHint::WakerRuns`, for which the preferred-CPU rules skip the server's CPU: the caller
 goes to its preferred CPU when that is another (an RT caller only where it runs at once), and
-otherwise by rank (an RT caller) or least load. A caller still placed on the
-server's CPU, at the server's level or above, runs before the server returns to user mode, the
-server yielding to the tail of its level
+otherwise by rank (an RT caller) or least load. When the server outranks the caller, every rule but
+hard affinity leaves the server's CPU out. A caller still placed on the server's CPU, at the
+server's level or above, runs before the server returns to user mode, the server yielding to the
+tail of its level
 ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). Every other wake
 passes `WakeHint::None`.
 
@@ -540,9 +558,9 @@ An RT caller's plain `SYS_IPC_REPLY` wake therefore leaves its server's CPU when
 the caller's level or above: the server runs on past the reply, so that CPU ranks at the server's
 level, and the caller goes to the CPU of the lowest rank, often an idle one, and runs there at once.
 A pair of one level that a call placed together so splits at each plain reply, and its next call
-brings it together again. A pair whose server outranks its caller, which the synchronous wake's
-guard never places on the caller's CPU, stays apart: each call and each plain reply wakes another
-CPU. Kept on the
+brings it together again. A pair whose server outranks its caller and replies with
+`SYS_IPC_REPLY`, which the synchronous wake's guard never places on the caller's CPU, stays apart:
+each call and each plain reply wakes another CPU. Kept on the
 server's CPU, the caller would wait behind a server that serves a backlog until it parks or its
 slice ends, the wait the rule exists to remove, and the kernel cannot tell at the reply whether the
 server blocks next. A `SYS_IPC_REPLY_RECV` tells it: when its receive parks, the server has blocked,

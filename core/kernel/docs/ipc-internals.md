@@ -366,8 +366,9 @@ the faulter itself, then step 6 with `WakeHint::None`.
    or fails; drop the endpoint pin
 4. Wake the owed caller (wake_replied): with WakeHint::Sync after a
    committed park, the server then blocking in this syscall's schedule();
-   with WakeHint::WakerRuns otherwise, the server running on
-   (scheduling-internals.md § Target CPU selection). The caller's and the
+   with WakeHint::WakerRuns otherwise, the server running on, this CPU
+   left out when the server outranks the caller (reply_wake_exclusion;
+   scheduling-internals.md § Target CPU selection). The caller's and the
    server's levels are read before the wake, after which the caller may
    run and exit elsewhere
 5. Deliver as SYS_IPC_RECV does: a bound message at once (Receive Path
@@ -497,7 +498,9 @@ every reply wakes the recipient through `enqueue_and_wake` on the CPU
 decides when it runs. A call rendezvous whose caller's park committed
 (`CallRendezvous::Bound` with `hint: WakeHint::Sync`) asks for the caller's
 CPU, which the placement grants when that CPU queues no thread but its idle
-thread and the receiver does not outrank the caller
+thread and the receiver does not outrank the caller, or outranks it but last
+received through `SYS_IPC_REPLY_RECV` and the caller has no hard affinity and
+is not in a fault delivery
 ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection); a
 refused park and a `SYS_IPC_REPLY` pass `WakeHint::None`. A `SYS_IPC_REPLY_RECV` wakes its replied
 caller after its receive, with `WakeHint::Sync` when the receive parked and

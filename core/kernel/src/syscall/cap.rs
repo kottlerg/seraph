@@ -1309,6 +1309,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 cpu_affinity: AFFINITY_ANY,
                 preferred_cpu: 0,
                 placement: crate::sched::thread::PlacementCounts::new(),
+                serves_reply_recv: core::sync::atomic::AtomicBool::new(false),
                 run_queue_next: None,
                 queued_on: core::sync::atomic::AtomicI16::new(-1),
                 #[cfg(debug_assertions)]

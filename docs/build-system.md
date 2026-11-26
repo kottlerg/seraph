@@ -374,8 +374,9 @@ the ring and the renderer gained their bulk copies, five ubench boots of each bu
 Neither is kept. `framebuffer`'s win is past the band on x86_64 alone, does not show as time,
 and costs more `.text` than the bound allows. `shmem`'s ring copies are calls to `memcpy`, whose
 code is not `shmem`'s, so its level does not reach the measured copy. The rows these rest on are
-`console_write` at both sizes and `shmem_ring` at 4096 and 65536 bytes; the rows of 64 and 512
-bytes measure less than the transfer they name (#1690) and decide nothing here.
+`console_write` at both sizes and `shmem_ring` at every size, measured before the `shmem_ring`
+rows were split by the ring index they start at (`wrap=`); every row of the earlier set ran the
+whole transfer in its window.
 
 `kernel` is not a candidate. The override's unit is the package, so `opt-level = 3` on
 `kernel` would raise the whole kernel; its targets have no vector unit to use

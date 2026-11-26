@@ -446,8 +446,10 @@ impl FreePool
     }
 
     /// Store `run` in the pooled slot `idx`, at an unchanged physical
-    /// position, moving the slot to `run`'s size class when its page count
-    /// changed class. Leaves the totals to the caller.
+    /// position, and file the slot at the head of `run`'s size class. The
+    /// slot is unlinked and linked again whether or not its class changed,
+    /// so a split costs the same steps wherever its remainder falls.
+    /// Leaves the totals to the caller.
     fn refile<S: SlotStore>(&mut self, arena: &mut Arena<S>, idx: NodeIdx, run: FreeRun)
     {
         let Some(p) = pooled_of(arena, idx)
@@ -455,17 +457,9 @@ impl FreePool
         {
             return;
         };
-        let old = class_of(p.run.page_count);
-        let new = class_of(run.page_count);
-        if old != new
-        {
-            self.unlink_class(arena, idx, p, old);
-        }
+        self.unlink_class(arena, idx, p, class_of(p.run.page_count));
         update(arena, idx, |q| q.run = run);
-        if old != new
-        {
-            self.link_class(arena, idx, new);
-        }
+        self.link_class(arena, idx, class_of(run.page_count));
     }
 
     /// The first run of class `class`, [`NODE_NULL`] when it is empty.
@@ -1050,6 +1044,32 @@ mod tests
                 "{small} small and {large} large runs, order {stride}"
             );
         }
+    }
+
+    /// The slots a 16-page selection split off a lone run of `pages` pages
+    /// touches.
+    fn split_cost(pages: u64) -> u64
+    {
+        let mut a = Arena::new(CountingStore::default());
+        // SAFETY: VecStore grows on write.
+        unsafe { a.add_page() };
+        let mut pool = FreePool::new();
+        pool.push(&mut a, run(1, pages, 0x8000_0000)).unwrap();
+        a.store().touched.set(0);
+        let g = pool
+            .select(&mut a, 16, Fit::Contiguous, |cap, _| Some(cap + 1))
+            .unwrap();
+        assert_eq!(g.entries(), [(1, 16, 0x8000_0000)]);
+        a.store().touched.get()
+    }
+
+    #[test]
+    fn a_split_costs_the_same_whether_its_remainder_changes_class()
+    {
+        // 4200 - 16 stays in 4200's class; 4096 - 16 falls to the class below.
+        assert_eq!(class_of(4200 - 16), class_of(4200));
+        assert_ne!(class_of(4096 - 16), class_of(4096));
+        assert_eq!(split_cost(4096), split_cost(4200));
     }
 
     #[test]

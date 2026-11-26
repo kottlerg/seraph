@@ -101,23 +101,23 @@ free pages and runs. Selection reads the size classes, never the whole pool:
   of the highest non-empty class, a walk of that one class.
 
 Taking a whole run frees its node, unlinked from both lists without a walk;
-splitting one keeps the node for the remainder, whose physical position does
-not change and which moves to its own size class. Returning a run inserts it
-at its physical position, found by a walk of the list, and at the head of its
-size class. A reclaimed frame's descriptor node is rewritten into
-the run's node in place, so reclamation never allocates and cannot fail. When
-the arena has no free node outside its reserve (below) and the pool cannot
-fund an arena page, the returned run funds it itself: its first page (all of
-it, for a one-page run) becomes the arena page. When that carve fails (both
-arena zones are spent, the split of its first page fails, or the page cannot
-be mapped because memmgr's page tables cannot be funded), the run takes a
-reserved node; when the split of its first page cannot be merged back, the
-remainder takes the reserved node before the head page. A run a growth path
-takes from the pool and cannot use goes back without growing the arena: merged
-back into the remainder its split left, else into a free node, the reserve
-included. A run stays owned and counted in `pool_total` but out of circulation
-only when it reaches the reserve with the reserve already spent and the arena
-unable to grow.
+splitting one keeps the node for the remainder, whose physical position does not
+change and which is filed again at the head of its size class, the same steps
+whether or not its class changed. Returning a run inserts it at its physical
+position, found by a walk of the list, and at the head of its size class. A
+reclaimed frame's descriptor node is rewritten into the run's node in place, so
+reclamation never allocates and cannot fail. When the arena has no free node
+outside its reserve (below) and the pool cannot fund an arena page, the returned
+run funds it itself: its first page (all of it, for a one-page run) becomes the
+arena page. When that carve fails (both arena zones are spent, the split of its
+first page fails, or the page cannot be mapped because memmgr's page tables
+cannot be funded), the run takes a reserved node; when the split of its first
+page cannot be merged back, the remainder takes the reserved node before the
+head page. A run a growth path takes from the pool and cannot use goes back
+without growing the arena: merged back into the remainder its split left, else
+into a free node, the reserve included. A run stays owned and counted in
+`pool_total` but out of circulation only when it reaches the reserve with the
+reserve already spent and the arena unable to grow.
 
 ---
 

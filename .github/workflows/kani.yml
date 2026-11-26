@@ -134,8 +134,8 @@ jobs:
         run: |
           if [ "$PLAN" = success ] && { [ "$PROVE" = success ] ||
              { [ "$PROVE" = skipped ] && [ "$OWED" = false ]; }; }; then
-            echo "plan: $PLAN, prove: $PROVE (owed: $OWED)"
+            echo "kani jobs passed, plan=$PLAN prove=$PROVE owed=$OWED"
           else
-            echo "::error title=kani-result::plan: $PLAN, prove: $PROVE (owed: $OWED)"
+            echo "::error title=kani-result::kani jobs failed, plan=$PLAN prove=$PROVE owed=$OWED"
             exit 1
           fi

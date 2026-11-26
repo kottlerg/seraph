@@ -392,7 +392,7 @@ fn plan_units(crates: &[Harnessed], table: &[(&str, usize)]) -> Result<Vec<(Stri
         .iter()
         .find(|(package, _)| !crates.iter().any(|h| h.package == *package))
     {
-        bail!("Kani: SHARDS names {stale}, which holds no proof harness");
+        bail!("Kani: SHARDS entry {stale} holds no proof harness");
     }
     let mut units = Vec::new();
     for harnessed in crates
@@ -458,7 +458,7 @@ fn listed_harnesses(root: &Path, package: &str) -> Result<Vec<String>>
         .context("failed to launch prlimit (util-linux), which runs cargo kani")?;
     if !status.success()
     {
-        bail!("Kani: listing the harnesses of {package} failed: cargo kani exited with {status}");
+        bail!("Kani: listing the harnesses of {package} failed with {status}");
     }
     let text =
         std::fs::read_to_string(&list).with_context(|| format!("reading {}", list.display()))?;
@@ -739,13 +739,13 @@ fn filter(
     if part.is_empty()
     {
         bail!(
-            "Kani: shard {shard} of {} holds no harness: Kani lists {}",
+            "Kani: shard holds no harness, package={} shard={shard} listed={}",
             harnessed.package,
             names.len()
         );
     }
     step(&format!(
-        "Kani: {} shard {shard}: {} of {} harnesses",
+        "Kani: verifying a shard, package={} shard={shard} harnesses={} listed={}",
         harnessed.package,
         part.len(),
         names.len()
@@ -1913,7 +1913,7 @@ CBMC timed out. You may want to rerun your proof with a larger timeout or       
             ]
         );
         let refused = plan_units(&crates, &[("gone", 2)]).unwrap_err().to_string();
-        assert!(refused.contains("SHARDS names gone"), "{refused}");
+        assert!(refused.contains("SHARDS entry gone"), "{refused}");
     }
 
     // Defect caught: a matrix the workflow cannot read, or an empty one

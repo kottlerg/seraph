@@ -258,15 +258,17 @@ only when the arena cannot grow because system RAM is exhausted, surfaced as
 
 Each record is itself an arena node, so the number of tracked processes is bounded by RAM, not by a
 constant. Records are found by badge, and node handle states and memory objects by the key their
-handles carry, through
-one linear-hash index: a bucket array of arena indices, in its own window of memmgr's address space,
-that grows one page of buckets at a time from the pool. Linear hashing splits one bucket per step
-once the mean chain length passes two, so the array only ever appends and lookup stays constant-time
-on average; when the window is spent, buckets stop splitting and chains lengthen, which costs lookup
-time and bounds no capacity. The window's base is fixed, not drawn per boot like the arena's: the
-array holds only arena indices. `REGISTER_PROCESS` returns `TOO_MANY_PROCESSES` only when the
-record's node, its caps node, its budget node or, when procmgr asks for a node handle, its handle
-state cannot be allocated: system RAM is exhausted.
+handles carry, through one linear-hash index: a bucket array of arena indices, in its own window of
+memmgr's address space, that grows one page of buckets at a time from the pool. Linear hashing
+splits one bucket per step once the mean chain length passes two, so the array only ever appends and
+lookup stays constant-time on average; when the window is spent, buckets stop splitting and chains
+lengthen, which costs lookup time and bounds no capacity. A fault and a request for memory move
+their caller's record to the head of its chain as they find it, so a process's repeated faults and
+grants read one slot of the chain whatever records the badges of the boot placed before it. The
+window's base is fixed, not drawn per boot like the arena's: the array holds only arena indices.
+`REGISTER_PROCESS` returns `TOO_MANY_PROCESSES` only when the record's node, its caps node, its
+budget node or, when procmgr asks for a node handle, its handle state cannot be allocated: system
+RAM is exhausted.
 
 ---
 

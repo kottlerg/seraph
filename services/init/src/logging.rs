@@ -666,30 +666,40 @@ impl KernelReader
         };
         if reader.cap == 0
         {
-            flush_synthetic_logd_line(b"no KernelLog capability; the kernel writes its own lines");
+            flush_synthetic_logd_line(b"klog: no KernelLog capability");
             return reader;
         }
-        let Ok(ntf) = syscall::cap_create_notification(crate::endpoint_slab())
-        else
+        let ntf = match syscall::cap_create_notification(crate::endpoint_slab())
         {
-            flush_synthetic_logd_line(b"kernel log notification not created; not reading it");
-            return reader;
+            Ok(ntf) => ntf,
+            Err(e) =>
+            {
+                flush_kernel_log_failed("notification create", e);
+                return reader;
+            }
         };
-        let Ok(ws) = syscall::wait_set_create(crate::endpoint_slab(), 2)
-        else
+        let ws = match syscall::wait_set_create(crate::endpoint_slab(), 2)
         {
-            let _ = syscall::cap_delete(ntf);
-            flush_synthetic_logd_line(b"log wait set not created; not reading the kernel log");
-            return reader;
+            Ok(ws) => ws,
+            Err(e) =>
+            {
+                let _ = syscall::cap_delete(ntf);
+                flush_kernel_log_failed("wait set create", e);
+                return reader;
+            }
         };
-        let ready = syscall::wait_set_add(ws, log_ep, WS_LOG_EP).is_ok()
-            && syscall::wait_set_add(ws, ntf, WS_KERNEL_LOG).is_ok()
-            && syscall::kernel_log_bind(reader.cap, ntf, KERNEL_LOG_BIT).is_ok();
-        if !ready
+        let cap = reader.cap;
+        let ready = syscall::wait_set_add(ws, log_ep, WS_LOG_EP)
+            .and_then(|()| syscall::wait_set_add(ws, ntf, WS_KERNEL_LOG))
+            .map_err(|e| ("wait set add", e))
+            .and_then(|()| {
+                syscall::kernel_log_bind(cap, ntf, KERNEL_LOG_BIT).map_err(|e| ("bind", e))
+            });
+        if let Err((what, e)) = ready
         {
             let _ = syscall::cap_delete(ws);
             let _ = syscall::cap_delete(ntf);
-            flush_synthetic_logd_line(b"kernel log not bound; not reading it");
+            flush_kernel_log_failed(what, e);
             return reader;
         }
         reader.ntf = ntf;
@@ -1036,6 +1046,17 @@ fn write_decimal_into(value: u64, buf: &mut [u8; LINE_BUF_SIZE], start: usize) -
         idx = idx.saturating_add(1);
     }
     idx
+}
+
+/// Say, in a line of init-logd's, that step `what` of reading the kernel log
+/// failed with the error code `err`.
+fn flush_kernel_log_failed(what: &str, err: i64)
+{
+    flush_synthetic_logd_line(
+        logd_codec::kernel::failed_text(what, err)
+            .as_str()
+            .as_bytes(),
+    );
 }
 
 /// Emit `[sec.usfrac] [init-logd] <payload>\r\n` directly to the

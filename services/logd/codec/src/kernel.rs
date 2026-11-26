@@ -243,9 +243,19 @@ pub fn gap_text(first: u64, last: u64) -> BoundedStr<LINE_BUF_SIZE>
     let count = last.saturating_sub(first).saturating_add(1);
     let _ = write!(
         text,
-        "{count} kernel log lines not read (records {first}-{last}): overwritten in the \
-         kernel's ring, or written by the kernel itself"
+        "klog: {count} records not read first={first} last={last}"
     );
+    text
+}
+
+/// The text of the reader's own line saying that step `what` of reading the
+/// kernel log failed with the error code `err`, the same words in init-logd
+/// and logd.
+#[must_use]
+pub fn failed_text(what: &str, err: i64) -> BoundedStr<LINE_BUF_SIZE>
+{
+    let mut text = BoundedStr::new();
+    let _ = write!(text, "klog: {what} failed err={err:#x}");
     text
 }
 
@@ -381,8 +391,18 @@ mod tests
     {
         assert_eq!(
             gap_text(42, 44).as_str(),
-            "3 kernel log lines not read (records 42-44): overwritten in the kernel's ring, or \
-             written by the kernel itself"
+            "klog: 3 records not read first=42 last=44"
+        );
+    }
+
+    // Defect guarded: an error code printed in decimal, or a failure line
+    // whose words differ between init-logd and logd.
+    #[test]
+    fn a_failure_line_names_the_step_and_the_error_in_hex()
+    {
+        assert_eq!(
+            failed_text("bind", -3).as_str(),
+            "klog: bind failed err=0xfffffffffffffffd"
         );
     }
 }

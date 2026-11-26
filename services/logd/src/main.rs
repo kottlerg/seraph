@@ -1041,7 +1041,7 @@ fn start_kernel_reader(cap: u64, logd: &'static Logd)
         .install_from_handover(ipc::log_badges::LOG_BADGE_KERNEL, KERNEL_NAME);
     if cap == 0
     {
-        self_log("no KernelLog capability; the kernel writes its own lines");
+        self_log("klog: no KernelLog capability");
         return;
     }
     let Some(ntf) =
@@ -1050,13 +1050,13 @@ fn start_kernel_reader(cap: u64, logd: &'static Logd)
         })
     else
     {
-        self_log("kernel log notification not created; the kernel writes its own lines");
+        self_log("klog: notification create failed");
         return;
     };
-    if syscall::kernel_log_bind(cap, ntf, KERNEL_LOG_BIT).is_err()
+    if let Err(e) = syscall::kernel_log_bind(cap, ntf, KERNEL_LOG_BIT)
     {
         let _ = syscall::cap_delete(ntf);
-        self_log("kernel log not bound; the kernel writes its own lines");
+        self_log(logd_codec::kernel::failed_text("bind", e).as_str());
         return;
     }
     let spawned = std::thread::Builder::new().spawn(move || read_kernel_log(cap, ntf, logd));
@@ -1064,7 +1064,7 @@ fn start_kernel_reader(cap: u64, logd: &'static Logd)
     {
         // The notification's deletion clears the binding.
         let _ = syscall::cap_delete(ntf);
-        self_log("kernel log reader spawn failed; the kernel writes its own lines");
+        self_log("klog: reader spawn failed");
     }
 }
 
@@ -1098,12 +1098,7 @@ fn read_kernel_log(cap: u64, ntf: u64, logd: &Logd)
             }
             Err(e) =>
             {
-                let mut text = SerialFmt::new();
-                let _ = write!(
-                    text,
-                    "kernel log read failed ({e}); the kernel writes its own lines"
-                );
-                self_log(text.as_str());
+                self_log(logd_codec::kernel::failed_text("read", e).as_str());
                 let _ = syscall::cap_delete(ntf);
                 return;
             }

@@ -5,9 +5,14 @@
 
 //! Endpoint IPC — synchronous call / receive / reply.
 //!
-//! An endpoint has two intrusive FIFO queues ([`WaitQueue`]):
-//! - `send`: callers blocked waiting for a server to `recv`.
-//! - `recv`: servers blocked waiting for a caller to `call`.
+//! An endpoint has two intrusive queues:
+//! - `send`: callers blocked waiting for a server to `recv`, a FIFO
+//!   ([`WaitQueue`]): a receive binds the longest-waiting caller.
+//! - `recv`: servers blocked waiting for a caller to `call` ([`RecvQueue`]):
+//!   a call takes a receiver parked on the caller's CPU when that CPU queues
+//!   no thread but its idle thread and its parked-receiver table records one
+//!   for this endpoint, and otherwise the longest-waiting receiver
+//!   (core/kernel/docs/ipc-internals.md § Wait Queues).
 //!
 //! ## Protocol
 //! The call, receive, and reply paths (`endpoint_call`, `endpoint_recv`,
@@ -36,15 +41,19 @@
 //! in core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes.
 
 use super::WaitQueue;
+use super::recv_park::RecvQueue;
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 
 // ── EndpointState ─────────────────────────────────────────────────────────────
 
 /// Kernel state backing an Endpoint capability.
 ///
-/// The send/recv queues are [`WaitQueue`]s: FIFO, and O(1) to remove any
-/// thread from, which a canceller, a dying thread and a refused park's
-/// rollback do. `lock` serialises every non-atomic field that changes after
+/// The send queue is a [`WaitQueue`] and the receive queue a [`RecvQueue`]
+/// over one: each O(1) to remove any thread from, which a canceller, a dying
+/// thread, a refused park's rollback and a call's take of a receiver parked on
+/// its CPU do. Callers are bound in arrival order; a call takes the receiver
+/// parked on its CPU when [`RecvQueue::take`] finds one, and otherwise the
+/// longest-waiting. `lock` serialises every non-atomic field that changes after
 /// construction (the bare-field exception of docs/coding-standards.md
 /// § Concurrency).
 pub struct EndpointState
@@ -57,7 +66,7 @@ pub struct EndpointState
     /// (core/kernel/docs/ipc-internals.md § Wait Path).
     pub send_nonempty: core::sync::atomic::AtomicU32,
     /// The blocked receivers (servers waiting for a caller).
-    pub recv: WaitQueue,
+    pub recv: RecvQueue,
     /// Opaque pointer to the `WaitSetState` this endpoint is registered with,
     /// or null if not in any wait set. Type-erased to avoid a circular import.
     /// Cast to `*mut WaitSetState` only inside `wait_set.rs`.
@@ -109,7 +118,7 @@ impl EndpointState
         Self {
             send: WaitQueue::new(),
             send_nonempty: core::sync::atomic::AtomicU32::new(0),
-            recv: WaitQueue::new(),
+            recv: RecvQueue::new(),
             wait_set: core::ptr::null_mut(),
             wait_set_member_idx: 0,
             lock: crate::sync::Spinlock::new(),
@@ -243,6 +252,28 @@ unsafe fn copy_message(src: *const ThreadControlBlock, dst: *mut ThreadControlBl
     unsafe { (*dst).ipc_msg.copy_from(msg) };
 }
 
+/// This CPU's parked-receiver table when this CPU queues no thread but its
+/// idle thread, the occupancy condition of the synchronous wake rule
+/// ([`WakeHint::Sync`](crate::sched::WakeHint::Sync)), else `None`: a call
+/// from a CPU with other work queued takes the longest-waiting receiver.
+///
+/// # Safety
+/// Interrupts are off, so the CPU stays this one while the table is used.
+#[cfg(not(test))]
+unsafe fn local_receiver_table() -> Option<&'static super::recv_park::RecvParkTable>
+{
+    // SAFETY: the per-CPU pointer is installed before any thread runs.
+    let scheduler = unsafe { crate::percpu::current_scheduler() };
+    // Relaxed, a local read, as the synchronous wake rule reads it: it only
+    // chooses a receiver, and every link this CPU made precedes it.
+    if scheduler.has_queued_thread()
+    {
+        return None;
+    }
+    // SAFETY: as above, and interrupts are off (contract).
+    Some(unsafe { crate::percpu::this_cpu_recv_parked() })
+}
+
 /// What [`endpoint_call`] did with a call.
 #[cfg(not(test))]
 pub enum CallRendezvous
@@ -333,9 +364,14 @@ pub unsafe fn endpoint_call(
         return CallRendezvous::NoReceiver;
     }
 
-    // Is a server waiting?
-    // SAFETY: ep.lock is held.
-    let server = unsafe { ep.recv.pop() };
+    // Is a server waiting? A call from a CPU that queues no thread but its
+    // idle thread takes the receiver its parked-receiver table records for
+    // this endpoint, if any; any other call takes the longest-waiting
+    // (core/kernel/docs/ipc-internals.md § Wait Queues).
+    // SAFETY: ep.lock is held, with interrupts off, so the CPU stays this one.
+    let local = unsafe { local_receiver_table() };
+    // SAFETY: ep.lock is held, and `local` is this CPU's table for the hold.
+    let server = unsafe { ep.recv.take(local) };
     if !server.is_null()
     {
         // The dequeue claimed the server's receive, so a timed receive's
@@ -827,10 +863,13 @@ pub unsafe fn endpoint_recv(
             .context_saved
             .store(0, core::sync::atomic::Ordering::Relaxed);
     }
-    // SAFETY: server is the running thread, on no wait queue; ep.lock held.
-    unsafe {
-        ep.recv.push(server);
-    }
+    // The push records the park in this CPU's parked-receiver table, where a
+    // call from this CPU looks for it.
+    // SAFETY: ep.lock is held, with interrupts off, so the CPU stays this one.
+    let table = unsafe { crate::percpu::this_cpu_recv_parked() };
+    // SAFETY: server is the running thread, on no wait queue; ep.lock is held,
+    // and `table` is this CPU's for the hold.
+    unsafe { ep.recv.push(server, table) };
     let blocked_on = core::ptr::from_mut::<EndpointState>(ep).cast::<u8>();
     // SAFETY: server is the current CPU's running thread (this fn's contract);
     // held ep.lock excludes recv-queue writes.

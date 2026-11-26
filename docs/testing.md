@@ -666,6 +666,19 @@ its `crash-endpoint` boot and the usertest cell's boot pass `--crash-reports non
 first or the second check on its boot's own log
 ([xtask/README.md](../xtask/README.md#classified-boots---runs)).
 
+### Console whole lines
+
+svctest's `console_whole_lines` phase, before the `logd_sinks` phases (whose stopped serial driver
+leaves logd's serial sink dropping lines until it writes again), has four threads log numbered
+lines between `whole-lines begin` and `whole-lines end senders=4 lines=N` for up to 3 s, while the
+`program-modes relrofault` fixture faults in a loop and `capexhaust` wedges its CSpace. The guest
+cannot read its own serial output, so `cargo xtask run --whole-lines <TAG>` checks a passing run's
+log: between `<TAG> begin` and `<TAG> end ...` every line is one console line and each sender's
+numbered lines arrive whole, in order, none missing. A run whose check fails is `FAIL`; a
+`QEMU-CRASH` run is not checked. The svctest cell's CI boot passes `--whole-lines whole-lines`
+([docs/console-model.md](console-model.md);
+[xtask/README.md](../xtask/README.md#classified-boots---runs)).
+
 The crash service cannot cover every process. init, memmgr, and procmgr are not created by procmgr,
 and the debug port's virtio-console driver and crashd declare themselves undebuggable, as svctest
 and the GDB stub, debug-authority holders, do in a boot that stages them; their faults leave only
@@ -1399,7 +1412,7 @@ registry runs it on (its `md-test-cells` rule).
 
 | Cell | Tier | Architectures | Launch | Cases | Covers |
 |---|---|---|---|---|---|
-| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `crasher-once`, `memhog`, `reserve-creator`, `stopsrc`), crashd's test recipe and oomd's test recipe | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, the restart, out-of-memory, and stop-source paths its fixtures drive, and the crash reports of its boot ([Crash reports](#crash-reports)) |
+| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `crasher-once`, `memhog`, `reserve-creator`, `stopsrc`), crashd's test recipe and oomd's test recipe | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, the restart, out-of-memory, and stop-source paths its fixtures drive, the crash reports of its boot ([Crash reports](#crash-reports)), and the console's whole lines ([Console whole lines](#console-whole-lines)) |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `storage-roles`, `shutdown` | the programs surface, a boot with no crash report ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
 | `bench` | Canonical | x86_64, riscv64; release | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |

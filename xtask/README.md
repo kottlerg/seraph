@@ -68,6 +68,7 @@ xtask/
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup
+│   ├── whole_lines.rs          # The check of a log's console lines (run --whole-lines)
 │   ├── commands/               # Subcommand modules (build, capture_acpi, run (the
 │   │   │                       #   interactive boot; run/classified.rs, --runs),
 │   │   │                       #   ktest_timing, bench_check, bench_baseline, path_account,
@@ -259,8 +260,8 @@ cargo xtask run [--arch x86_64|riscv64] \
 
 cargo xtask run --runs N [launch options] [--display framebuffer|headless] [--debug-listen] \
     [--parallel N] [--timeout SECONDS] [--pass REGEX] [--fail REGEX] [--fail-also REGEX] \
-    [--require REGEX]... [--crash-reports reports|none] [--fail-grace-secs SECONDS] \
-    [--hold-on-hang] [--save-logs DIR]
+    [--require REGEX]... [--crash-reports reports|none] [--whole-lines TAG] \
+    [--fail-grace-secs SECONDS] [--hold-on-hang] [--save-logs DIR]
 ```
 
 The launch options, the same in both modes:
@@ -428,11 +429,12 @@ before the runs copy them, and removes it after the last run.
 | `--runs` | (interactive boot) | Total runs, dispatched in waves of `--parallel`; selects the classified boot |
 | `--parallel` | `1` | Concurrency: QEMU instances in flight at once |
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
-| `--pass` | the marker of the image's harness | Regex marking a successful run. The default is `\[<harness>\] ALL TESTS PASSED`, the terminal marker ([docs/testing.md](../docs/testing.md) § Reporting marker) of the one harness the image boots, which its pack recorded in `sysroot/.image-harness`: `ktest` for the ktest bundle, otherwise each of `svctest`, `usertest` and `ubench` whose recipe was staged on a layer the image holds. An image that boots no harness, or several, has no default, and `--runs` refuses to start without `--pass`; an image with no record is refused until it is packed again (`cargo xtask mkdisk`). On match, and every `--require` and `--crash-reports` check holding, the log is discarded and the run is classified `PASS` |
+| `--pass` | the marker of the image's harness | Regex marking a successful run. The default is `\[<harness>\] ALL TESTS PASSED`, the terminal marker ([docs/testing.md](../docs/testing.md) § Reporting marker) of the one harness the image boots, which its pack recorded in `sysroot/.image-harness`: `ktest` for the ktest bundle, otherwise each of `svctest`, `usertest` and `ubench` whose recipe was staged on a layer the image holds. An image that boots no harness, or several, has no default, and `--runs` refuses to start without `--pass`; an image with no record is refused until it is packed again (`cargo xtask mkdisk`). On match, and every `--require`, `--crash-reports` and `--whole-lines` check holding, the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
 | `--require` | (none) | A regex a line of the log must match for the run to pass; repeatable, each must match a line. A run whose `--pass` matched but whose log has no line matching one of them is `FAIL`, its reason naming the pattern |
 | `--crash-reports` | (none) | Check the crash service's report blocks in each passing run's log: every block must be complete and hold the fields its kind, thread, and status require, read with `shared/crash-report`, the crate crashd emits them with ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)). `reports` also requires one `vm` and one `exception` block of the `crashme` fixture's main thread and one `exception` block of a `spawned` thread (its `worker` mode), found through the badge logd's `reclaim:` line names it by, each complete, its walk starting at its instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the block read the thread the kernel killed; the `vm` block's `addr` must also be the faulting address that dump prints (`cr2` on x86_64, `stval` on riscv64). `none` requires no block at all. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `reports`, its `crash-endpoint` svctest boot and its usertest boot `none`; the model is in [docs/testing.md](../docs/testing.md) § Crash reports |
+| `--whole-lines` | (none) | Check the console in each passing run's log between the lines `<TAG> begin` and `<TAG> end ...`: every line there is one console line, and each sender's numbered lines arrive whole, in order, none missing. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `--whole-lines whole-lines`, the tag svctest's `console_whole_lines` phase logs ([services/svctest/README.md](../services/svctest/README.md); the console is in [docs/console-model.md](../docs/console-model.md)) |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, or the first death line of rule 2 below, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
 | `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> icount=<on\|off> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing`, `bench-check` and `bench-baseline` read |
@@ -483,8 +485,8 @@ an earlier one left under `target/xtask/run/`, so the preserved files are its ow
    has no supervisor to log its death: a fault of its own thread stays a `HANG`
 3. `--pass` regex matches → `PASS` (even if QEMU was watchdog-killed,
    which is the normal case for kernels that idle after success), unless a `--require` pattern
-   matches no line of the log or the `--crash-reports` check fails → `FAIL`, its reason naming the
-   pattern or the defect
+   matches no line of the log or the `--crash-reports` or `--whole-lines` check fails → `FAIL`, its
+   reason naming the pattern or the defect
 4. init-logd's last line, `handover complete; init-logd thread exiting`, with no userspace line
    (`[<seconds>] [<name>] ...`) after it → `FAIL`, its reason naming the lost console: real-logd,
    which owns the console from the handover on, wrote nothing to it. A run with nothing at all

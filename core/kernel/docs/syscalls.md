@@ -159,8 +159,8 @@ On `ECALL` from U-mode:
 ### Restartable Syscalls
 
 `SYS_GETRANDOM`, `SYS_ENTROPY_CONTRIBUTE`, `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`,
-`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, `SYS_ASPACE_HARVEST`, `SYS_THREAD_LIST_PAGES`, and
-`SYS_THREAD_READ_EXT_REGS` are restartable: a fault
+`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, `SYS_ASPACE_HARVEST`, `SYS_THREAD_LIST_PAGES`,
+`SYS_THREAD_READ_EXT_REGS`, and `SYS_KERNEL_LOG_READ` are restartable: a fault
 of the kernel's copy to or from the caller's buffer is handled as
 [docs/fault-handling.md § Kernel Copies](../../../docs/fault-handling.md#kernel-copies)
 specifies. With a fault handler bound to the caller, the fault is delivered as `FAULT_KIND_VM`
@@ -238,10 +238,12 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  72  SYS_ASPACE_RELEASE
                                  73  SYS_ENDPOINT_IDENTIFY
                                  74  SYS_CAP_BIND_SOLE_REFERENCE
+                                 75  SYS_KERNEL_LOG_READ
+                                 76  SYS_KERNEL_LOG_BIND
 ```
 
-**Implementation status.** Every number 0–74 has a handler; every number at or past
-`SYSCALL_NR_BOUND` (75) returns `UnknownSyscall`. The kernel refuses a number at or past the
+**Implementation status.** Every number 0–76 has a handler; every number at or past
+`SYSCALL_NR_BOUND` (77) returns `UnknownSyscall`. The kernel refuses a number at or past the
 bound, then selects the handler with one `match` on the number, clamped as data
 ([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and calls
 it directly. The `match` and a build-time check of its numbers come from one list
@@ -3893,6 +3895,82 @@ per-call cap bounds the stack copy and the interrupts-off hold of the pool lock 
 
 ---
 
+## Kernel Log Syscalls
+
+The kernel log and its reader protocol are specified in [kernel-log.md](kernel-log.md).
+
+### `SYS_KERNEL_LOG_READ` (75)
+
+Copy kernel log records into a user buffer, acknowledge the reader's progress, and attach the
+caller as the log's reader ([kernel-log.md](kernel-log.md) § Readers).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `klog_cap` | `KernelLog` capability carrying `Read` |
+| 1 | `from_seq` | Sequence number of the first record wanted; `0` for the one after the committed mark |
+| 2 | `ack_seq` | The last record the reader has written or given up |
+| 3 | `buf` | Destination buffer VA (must lie wholly in the user half) |
+| 4 | `len` | Buffer length: `0`, or `KLOG_RECORD_MAX..=KLOG_READ_MAX` |
+
+The call first raises the committed mark to `ack_seq`, never past the newest record and never
+down, and then chooses the first record: `from_seq`, or the one after the mark when `from_seq` is
+`0`. It copies whole records, oldest first, while the next fits in `len`. A record the ring no
+longer holds is skipped, so the first sequence number returned can be past the one asked for; a
+gap is a lost line. After the copy the caller is the attached reader. A `len` of `0` copies
+nothing: the call acknowledges and attaches.
+
+Each record is a 24-byte header of three little-endian words — the sequence number, the kernel's
+time in microseconds when the line was formed, and a word holding the level (RFC 5424 severity)
+in bits 0-7, the `KLOG_FLAG_*` flags in bits 8-15 and the text length in bits 16-31 — then the
+text, UTF-8 with no line end, padded with zero bytes to a whole word.
+`syscall_abi::kernel_log_records` walks a buffer of them.
+
+**Return:** `rax`/`a0`: the bytes written on success; negative `SyscallError` on failure.
+
+**Capability requirement:** `klog_cap` must be a `KernelLog` cap holding `Read`
+([capability-model.md](../../../docs/capability-model.md) § `KernelLog`).
+
+**Errors**, checked in this order: `InvalidCapability` (the handle names no `KernelLog` cap);
+`InsufficientRights` (the cap lacks `Read`); `InvalidArgument` (`len` past `KLOG_READ_MAX`, or
+non-zero and below `KLOG_RECORD_MAX`); `InvalidAddress` (`len > 0` and a null buffer, or a span
+not wholly within the user half); `InvalidAddress` (a fault on the span that is unhandled;
+restartable, § Restartable Syscalls). The acknowledgement only raises the mark, and the attach
+follows every copy, so a faulted call that re-executes changes nothing twice.
+
+---
+
+### `SYS_KERNEL_LOG_BIND` (76)
+
+Name the notification the kernel signals when it appends a kernel log record
+([kernel-log.md](kernel-log.md) § Reader notification).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `klog_cap` | `KernelLog` capability carrying `Read` |
+| 1 | `ntf_cap` | Notification capability carrying `Notify`, or `0` to unbind |
+| 2 | `bits` | Bits to signal; non-zero unless unbinding |
+
+The binding replaces any earlier one, whoever made it. The kernel signals the bound notification
+from the first timer tick after an append: one signal for all the records appended since the tick
+before.
+The binding holds no reference on the notification: freeing the notification ends it.
+
+**Return:** `rax`/`a0`: 0 on success; negative `SyscallError` on failure.
+
+**Capability requirement:** `klog_cap` must be a `KernelLog` cap holding `Read`, and a non-zero
+`ntf_cap` a Notification cap holding `Notify`.
+
+**Errors**, checked in this order: `InvalidCapability` (the first handle names no `KernelLog`
+cap); `InsufficientRights` (it lacks `Read`); `InvalidCapability` (a non-zero `ntf_cap` names
+no Notification); `InsufficientRights` (the Notification cap lacks `Notify`);
+`InvalidArgument` (a Notification with `bits == 0`).
+
+---
+
 ## Revocation Notes
 
 ### `SYS_CAP_REVOKE` targets the caller's own CSpace
@@ -3994,6 +4072,10 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `MAX_THREAD_MEM_COPY` | 4096 | Most bytes one `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM` or `SYS_THREAD_READ_EXT_REGS` copies |
 | `MAX_PAGE_RUNS` | 128 | Most runs one `SYS_THREAD_LIST_PAGES` writes |
 | `MAX_HARVEST_PAGES` | 4096 | Most pages one `SYS_ASPACE_HARVEST` reports |
+| `KLOG_LINE_MAX` | 512 | Most text bytes of one kernel log record; a longer line is cut and flagged |
+| `KLOG_RECORD_MAX` | 536 | Bytes of a kernel log record at its longest: the 24-byte header and `KLOG_LINE_MAX` |
+| `KLOG_READ_MAX` | 16384 | Most bytes one `SYS_KERNEL_LOG_READ` writes |
+| `KLOG_STALL_MS` | 1000 | Milliseconds an attached kernel log reader may leave a record unread, measured from its append or from the reader's last read of a new record when that came later, before the kernel writes its lines directly |
 | `BOOT_PROTOCOL_VERSION` | 24 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and

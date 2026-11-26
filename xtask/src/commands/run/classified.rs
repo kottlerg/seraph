@@ -179,7 +179,11 @@ fn run_waves(
     markers: &Markers,
 ) -> Result<()>
 {
-    let checks = Arc::new(PassChecks::new(&args.require, args.crash_reports)?);
+    let checks = Arc::new(PassChecks::new(
+        &args.require,
+        args.crash_reports,
+        args.whole_lines.clone(),
+    )?);
 
     // Resolve qemu binary once, up front: missing-tool errors should
     // surface at startup, not N times mid-wave inside
@@ -650,18 +654,24 @@ fn names_death(line: &str, names: &[&str]) -> bool
 }
 
 /// The checks a run whose `--pass` pattern matched must also pass: each
-/// `--require` pattern matching a line of its log, and the
-/// `--crash-reports` check of its report blocks.
+/// `--require` pattern matching a line of its log, the `--crash-reports`
+/// check of its report blocks, and the `--whole-lines` check of its console.
 struct PassChecks
 {
     /// Each `--require` pattern, as given and compiled.
     require: Vec<(String, Regex)>,
     crash_reports: Option<CrashReportExpect>,
+    /// The `--whole-lines` tag.
+    whole_lines: Option<String>,
 }
 
 impl PassChecks
 {
-    fn new(require: &[String], crash_reports: Option<CrashReportExpect>) -> Result<Self>
+    fn new(
+        require: &[String],
+        crash_reports: Option<CrashReportExpect>,
+        whole_lines: Option<String>,
+    ) -> Result<Self>
     {
         let require = require
             .iter()
@@ -674,6 +684,7 @@ impl PassChecks
         Ok(Self {
             require,
             crash_reports,
+            whole_lines,
         })
     }
 
@@ -702,6 +713,11 @@ impl PassChecks
             && let Err(err) = crate::crash_check::check_log(log, expect)
         {
             return (Status::Fail, Some(format!("--crash-reports: {err:#}")));
+        }
+        if let Some(tag) = &self.whole_lines
+            && let Err(err) = crate::whole_lines::check_log(log, tag)
+        {
+            return (Status::Fail, Some(format!("--whole-lines: {err:#}")));
         }
         (status, matched)
     }
@@ -1109,9 +1125,10 @@ fn console_lost_after_handover(log: &str) -> Option<String>
     ))
 }
 
-/// Whether `line` is a userspace log line as init-logd and logd write it,
-/// `[<seconds>] [<name>] <text>`, rather than a kernel line
-/// (`[<seconds>] kernel: <text>`).
+/// Whether `line` is a log line as init-logd and logd write it,
+/// `[<seconds>] [<name>] <text>`, the kernel's lines they read from the
+/// kernel log (`[<seconds>] [kernel] <text>`) among them, rather than a line
+/// the kernel wrote itself (`[<seconds>] kernel: <text>`).
 fn is_userspace_line(line: &str) -> bool
 {
     line.trim_start()
@@ -1617,6 +1634,14 @@ mod tests
     }
 
     #[test]
+    fn a_kernel_line_logd_wrote_after_the_handover_keeps_the_console()
+    {
+        let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n\
+                   [47.331494] [kernel] USERSPACE FAULT: tid=2589005658 cpu=0\n";
+        assert!(matches!(classify_log(log), Status::Ok));
+    }
+
+    #[test]
     fn a_hang_right_at_the_handover_stays_a_hang()
     {
         let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n";
@@ -2016,7 +2041,7 @@ mod tests
     #[test]
     fn a_pass_without_a_required_line_is_a_fail_naming_the_pattern()
     {
-        let checks = PassChecks::new(&["mapredo knob present".to_owned()], None).unwrap();
+        let checks = PassChecks::new(&["mapredo knob present".to_owned()], None, None).unwrap();
         let log = "[0.1] boot: memory map: mapredo knob present\n[2.0] [ktest] ALL TESTS PASSED\n";
         assert!(matches!(
             checks.judge(Status::Pass, None, log).0,
@@ -2036,6 +2061,7 @@ mod tests
                 "\\[fatfs\\] DEBUG ".to_owned(),
             ],
             None,
+            None,
         )
         .unwrap();
         let one = "[1.0] [vfsd] DEBUG mounted\n[2.0] [usertest] ALL TESTS PASSED\n";
@@ -2052,7 +2078,7 @@ mod tests
     #[test]
     fn the_crash_report_check_fails_a_pass_and_leaves_other_verdicts()
     {
-        let checks = PassChecks::new(&[], Some(CrashReportExpect::Reports)).unwrap();
+        let checks = PassChecks::new(&[], Some(CrashReportExpect::Reports), None).unwrap();
         let no_reports = "[2.0] [usertest] ALL TESTS PASSED\n";
         let (status, reason) = checks.judge(Status::Pass, None, no_reports);
         assert!(matches!(status, Status::Fail));
@@ -2068,7 +2094,7 @@ mod tests
             checks.judge(Status::Hang, None, no_reports).0,
             Status::Hang
         ));
-        let none = PassChecks::new(&[], Some(CrashReportExpect::None)).unwrap();
+        let none = PassChecks::new(&[], Some(CrashReportExpect::None), None).unwrap();
         assert!(matches!(
             none.judge(Status::Pass, None, no_reports).0,
             Status::Pass
@@ -2078,7 +2104,9 @@ mod tests
     #[test]
     fn an_invalid_require_regex_is_refused()
     {
-        let err = PassChecks::new(&["(".to_owned()], None).err().unwrap();
+        let err = PassChecks::new(&["(".to_owned()], None, None)
+            .err()
+            .unwrap();
         assert!(err.to_string().contains("--require"), "{err}");
     }
 

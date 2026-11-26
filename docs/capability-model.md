@@ -547,6 +547,29 @@ per-service level assignments live in `shared/ipc`'s `sched_policy` module
 and the svcmgr `.svc` recipes. For priority levels, ranges, and constants, see
 [core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/scheduler.md#priority-levels).
 
+### KernelLog
+
+A capability authorising the holder to read the kernel log with `SYS_KERNEL_LOG_READ` and to bind
+the notification it is signalled through with `SYS_KERNEL_LOG_BIND`, on both architectures.
+Rights:
+- **Read** — may read the log's records, acknowledge them, and bind its notification
+
+Reading attaches the caller as the log's one reader: while it is attached, the kernel's
+address-free lines are records it writes instead of the kernel
+([core/kernel/docs/kernel-log.md](../core/kernel/docs/kernel-log.md) § Readers). The records
+carry no kernel address and no physical address
+([core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
+§ Kernel console diagnostics), but they report every process's faults, so reading them is
+authority-bearing.
+
+`KernelLogObject` carries no fields, and its init descriptor has `aux0 = aux1 = 0`; there is no
+split or merge. The kernel mints the one root cap at boot into init's CSpace, carrying **Read**,
+and init finds it by its descriptor's type. `KernelLog` capabilities are not creatable at
+runtime. Which process holds it after init is userspace policy. ktest, loaded as init, reads the
+log through the root. In the default image no process reads it: the root stays in init's CSpace
+and is released when the reap frees it (see [process-lifecycle.md § Init
+reap](process-lifecycle.md#init-reap)), and the kernel writes its lines directly.
+
 ### EntropyControl
 
 A capability authorising the holder to mix bytes into the kernel entropy pool with
@@ -1052,6 +1075,7 @@ The kernel mints these during Phases 7–9 of
 - One SbiControl capability (RISC-V only) carrying every sanctioned SBI right
 - One SchedControl capability spanning the full userspace priority range `[1, PRIORITY_MAX]`
 - One EntropyControl capability carrying Contribute
+- One KernelLog capability carrying Read
 - Thread, AddressSpace, and CSpace capabilities for init itself
 - Memory capabilities for each boot module image (raw ELF images for early services)
 - Reclaimable Memory capabilities, one per `BootInfo.reclaim_ranges` entry (bootloader

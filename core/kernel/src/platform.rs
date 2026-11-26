@@ -21,8 +21,8 @@
 use boot_protocol::{BootInfo, KernelMmio, MemoryMapEntry, MemoryType, MmioAperture};
 use core::cell::UnsafeCell;
 
-use crate::kprintln;
 use crate::mm::{PAGE_SIZE, paging::phys_to_virt};
+use crate::{kprintln, kprintln_serial};
 
 // ── Kernel MMIO cache ────────────────────────────────────────────────────────
 
@@ -239,7 +239,7 @@ fn report_apertures(raw: &[MmioAperture], mmap: &[MemoryMapEntry]) -> ApertureCo
         }
         if let Some(ram) = ram_overlap(entry, mmap)
         {
-            kprintln!(
+            kprintln_serial!(
                 "  aperture[{}]: range {:#x}+{:#x} intersects {:?} memory {:#x}+{:#x}, skipping",
                 i,
                 entry.phys_base,
@@ -327,7 +327,7 @@ fn report_fault(index: usize, ap: &MmioAperture, fault: ApertureFault)
     {
         ApertureFault::UnalignedBase =>
         {
-            kprintln!(
+            kprintln_serial!(
                 "  aperture[{}]: base {:#x} is not page-aligned, skipping",
                 index,
                 ap.phys_base
@@ -336,7 +336,7 @@ fn report_fault(index: usize, ap: &MmioAperture, fault: ApertureFault)
         ApertureFault::EmptySize => kprintln!("  aperture[{}]: size is zero, skipping", index),
         ApertureFault::UnalignedSize =>
         {
-            kprintln!(
+            kprintln_serial!(
                 "  aperture[{}]: size {:#x} is not page-aligned, skipping",
                 index,
                 ap.size
@@ -344,7 +344,7 @@ fn report_fault(index: usize, ap: &MmioAperture, fault: ApertureFault)
         }
         ApertureFault::Wraps =>
         {
-            kprintln!(
+            kprintln_serial!(
                 "  aperture[{}]: range {:#x}+{:#x} wraps u64, skipping",
                 index,
                 ap.phys_base,

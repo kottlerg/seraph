@@ -718,6 +718,7 @@ fn event_loop(
         deaths,
         master_log_source: caps.master_log_source,
         procmgr_death_auth_source: caps.procmgr_death_auth_source,
+        kernel_log_source: caps.kernel_log_source,
         entropy_source: caps.entropy_source,
         core_death_queue,
         pressure_notification,

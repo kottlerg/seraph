@@ -124,8 +124,12 @@ core/kernel/
 │   │   ├── event_queue.rs      # Event queue: ring buffer
 │   │   ├── fault.rs            # Fault redirection to a thread's fault handler
 │   │   ├── message.rs          # IPC message type: label, data words, cap slots
+│   │   ├── recv_park.rs        # Endpoint receive queue, per-CPU parked-receiver table
 │   │   ├── upcall.rs           # Asynchronous upcalls: post, mask, delivery points
 │   │   └── wait_set.rs         # Wait set: multi-source aggregation
+│   ├── klog/                   # Kernel log
+│   │   ├── mod.rs              # Kernel log: records for a userspace reader, flushes
+│   │   └── ring.rs             # The log's ring of atomic words and the reader cursor
 │   ├── sched/                  # Scheduler
 │   │   ├── mod.rs              # Public API: init, schedule, timer_tick, wake protocol
 │   │   ├── deadline_heap.rs    # Intrusive deadline heap: the sleep list's storage
@@ -139,6 +143,7 @@ core/kernel/
 │       ├── entropy.rs          # SYS_GETRANDOM, SYS_ENTROPY_CONTRIBUTE
 │       ├── hw.rs               # MMIO, IRQ, and I/O-port syscalls and their splits
 │       ├── ipc.rs              # IPC syscall implementations
+│       ├── klog.rs             # SYS_KERNEL_LOG_READ and SYS_KERNEL_LOG_BIND
 │       ├── mem.rs              # Memory syscall implementations
 │       ├── sbi.rs              # SYS_SBI_CALL (riscv64)
 │       ├── sysinfo.rs          # SYS_SYSTEM_INFO
@@ -155,6 +160,7 @@ core/kernel/
     ├── memory-internals.md     # Memory subsystem implementation details
     ├── capability-internals.md # Capability subsystem implementation details
     ├── entropy.md              # Entropy subsystem, CSPRNG, health tests, draw API
+    ├── kernel-log.md           # Kernel log: ring, print classes, reader protocol, flushes
     ├── ipc-internals.md        # IPC subsystem implementation details
     ├── scheduler.md            # Scheduler internals and algorithms
     ├── scheduling-internals.md # SMP locking, wake protocol, IPI taxonomy, BSP boot transient
@@ -230,10 +236,18 @@ per-CPU buffered block; userspace draws from the same generators through
 
 IPC kernel objects: endpoints for synchronous call/reply, notifications for coalescing async
 notification, event queues for ordered async notification, and wait sets for
-multiplexed waiting. Notifications, event queues, and wait sets queue their blocked waiters
-through `ipc::WaitQueue` in `mod.rs`, which also holds the shared waiter claims and timed-park
-arming.
+multiplexed waiting. Notifications, event queues, wait sets and an endpoint's callers queue their
+blocked waiters through `ipc::WaitQueue` in `mod.rs`, which also holds the shared waiter claims and
+timed-park arming. An endpoint's receivers queue through `RecvQueue` in `recv_park.rs`, a
+`WaitQueue` whose parks are recorded in the parking CPU's parked-receiver table, through which a
+call prefers a receiver parked on its CPU.
 See [`docs/ipc-internals.md`](docs/ipc-internals.md).
+
+### `klog/`
+
+The kernel log appends the kernel's address-free lines as records while a userspace reader
+holding a `KernelLog` capability is attached, and writes them directly otherwise. A failure path
+flushes the records no reader has read first. See [`docs/kernel-log.md`](docs/kernel-log.md).
 
 ### `sched/`
 

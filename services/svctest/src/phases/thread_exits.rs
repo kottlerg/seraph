@@ -78,10 +78,7 @@ pub(crate) fn end_two(authority: u64, process: u64, main_code: u32, other_code: 
         )
     });
     let endpoint =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
-        .unwrap_or_else(|| panic!("{what}: an upcall endpoint"));
+        std::os::seraph::create_endpoint().unwrap_or_else(|| panic!("{what}: an upcall endpoint"));
     let send = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, DEBUGGER_BADGE)
         .unwrap_or_else(|e| panic!("{what}: an upcall SEND ({e})"));
     hold(main_cap, endpoint, send, main_code, what);

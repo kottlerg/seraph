@@ -264,10 +264,7 @@ fn run_client(client: u64, send: u64) -> Vec<String>
 fn recv_pool_phase(_: &Caps)
 {
     let new_endpoint = |what: &str| {
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
-        .unwrap_or_else(|| panic!("recv_pool: {what} endpoint"))
+        std::os::seraph::create_endpoint().unwrap_or_else(|| panic!("recv_pool: {what} endpoint"))
     };
     // Neither endpoint is deleted: a pool worker whose endpoint is deleted
     // fails its receives, and its `RecvGuard` exits the whole process. The

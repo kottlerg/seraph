@@ -40,11 +40,7 @@ pub fn phases() -> &'static [Phase]
 
 fn wedged_receiver_phase(_: &Caps)
 {
-    let endpoint =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
-        .expect("log_wedged_receiver: an endpoint");
+    let endpoint = std::os::seraph::create_endpoint().expect("log_wedged_receiver: an endpoint");
 
     let (received_tx, received_rx) = mpsc::channel::<()>();
     let (release_tx, release_rx) = mpsc::channel::<()>();

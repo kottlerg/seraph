@@ -6,8 +6,9 @@
 //! Tier 1 tests for system info syscalls.
 //!
 //! Covers: `SYS_SYSTEM_INFO` (every `SystemInfoType` variant, and an unknown
-//! discriminant). `SpeculationControls` is read here for its views and their
-//! refusals; x86-64's `integration::speculation_controls` checks the words
+//! discriminant). `EndpointRetypeBytes` and `ThreadRetypeBytes` are each
+//! checked against the creation they fund. `SpeculationControls` is read here
+//! for its views and their refusals; x86-64's `integration::speculation_controls` checks the words
 //! against each other on every CPU. `InstructionCacheSyncs` is read here for the boot's sync of
 //! ktest's own image; its rise across each runtime call site is checked by
 //! `integration::thread_memory` and `unit::retype`'s code stub. `SmtSibling` is
@@ -18,10 +19,10 @@
 //! it around their timed samples (shared/bench/README.md § Idle halts).
 
 use syscall::{
-    MAP_WRITABLE, cap_copy, cap_create_cspace, cap_create_notification, cap_create_thread,
-    cap_delete, cap_info, idle_halts, mem_map, mem_unmap, memory_merge, memory_split,
-    notification_send, notification_wait, smt_sibling, speculation_controls, system_info,
-    thread_exit, thread_set_affinity, thread_sleep, thread_yield,
+    MAP_WRITABLE, cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_notification,
+    cap_create_thread, cap_delete, cap_info, idle_halts, mem_map, mem_unmap, memory_merge,
+    memory_split, notification_send, notification_wait, smt_sibling, speculation_controls,
+    system_info, thread_exit, thread_set_affinity, thread_sleep, thread_yield,
 };
 use syscall_abi::{
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, KERNEL_VERSION, PAGE_SIZE, RIGHTS_NTF_NOTIFY,
@@ -318,6 +319,82 @@ pub fn thread_retype_bytes_funds_one_thread(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// `system_info(EndpointRetypeBytes)` is what one endpoint creation consumes:
+/// the 72 bytes of the object wrapper and the endpoint's state, and a hint
+/// byte for every four CPUs of the boot. A Memory cap of whole pages funds as
+/// many endpoints as the debit's size class fits in it, is left with nothing,
+/// and refuses one more.
+///
+/// ruststd sizes every endpoint's slab request from this value, and the
+/// kernel sizes the endpoint's slot hints from the boot's CPU count, so a
+/// selector that disagreed with the slot would fail every endpoint creation
+/// or let the hints of one endpoint overrun the next.
+pub fn endpoint_retype_bytes_funds_one_endpoint(ctx: &TestContext) -> TestResult
+{
+    let bytes = system_info(SystemInfoType::EndpointRetypeBytes as u64)
+        .map_err(|_| "system_info(EndpointRetypeBytes) failed")?;
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "sysinfo::endpoint_retype_bytes: system_info(CpuCount) failed")?;
+    if Some(bytes) != cpus.div_ceil(4).checked_add(72)
+    {
+        return Err("system_info(EndpointRetypeBytes) is not 72 bytes and two bits per CPU");
+    }
+    crate::log_u64("ktest: EndpointRetypeBytes=", bytes);
+    // The kernel's size classes: the 128- and 512-byte bins, whole pages
+    // above.
+    let class = match bytes
+    {
+        0..=128 => 128,
+        129..=512 => 512,
+        _ => bytes.next_multiple_of(PAGE_SIZE),
+    };
+    let pages = class.div_ceil(PAGE_SIZE);
+    let fits = pages
+        .saturating_mul(PAGE_SIZE)
+        .checked_div(class)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+
+    let grant = split_top(ctx, pages)?;
+    let mut made = [0u64; (PAGE_SIZE / 128) as usize];
+    let mut count: usize = 0;
+    for slot in made.iter_mut().take(fits)
+    {
+        let Ok(ep) = cap_create_endpoint(grant)
+        else
+        {
+            break;
+        };
+        *slot = ep;
+        count = count.saturating_add(1);
+    }
+    let left = cap_info(grant, CAP_INFO_MEMORY_AVAILABLE);
+    let refused = cap_create_endpoint(grant);
+    if let Ok(ep) = refused
+    {
+        let _ = cap_delete(ep);
+    }
+    for &ep in made.iter().take(count)
+    {
+        let _ = cap_delete(ep);
+    }
+    memory_merge(ctx.memory_base, grant)
+        .map_err(|_| "sysinfo::endpoint_retype_bytes: memory_merge of the grant failed")?;
+    if count != fits
+    {
+        return Err("a grant of whole pages funded fewer endpoints than EndpointRetypeBytes sets");
+    }
+    if refused.is_ok()
+    {
+        return Err("cap_create_endpoint succeeded from a grant EndpointRetypeBytes says is spent");
+    }
+    if left != Ok(0)
+    {
+        return Err("endpoints left bytes in a grant EndpointRetypeBytes says they fill");
+    }
+    Ok(())
+}
+
 /// `system_info(LiveCSpaceCount)` counts `CSpace` ids in use: at least the
 /// root's, one more while a created `CSpace` lives, and back once it is
 /// deleted.
@@ -357,13 +434,13 @@ pub fn live_cspace_count(ctx: &TestContext) -> TestResult
 fn split_top(ctx: &TestContext, pages: u64) -> Result<u64, &'static str>
 {
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
-        .map_err(|_| "sysinfo::thread_retype_bytes: cap_info(memory_base) failed")?;
+        .map_err(|_| "sysinfo::split_top: cap_info(memory_base) failed")?;
     let at = pages
         .checked_mul(PAGE_SIZE)
         .and_then(|bytes| size.checked_sub(bytes))
-        .ok_or("sysinfo::thread_retype_bytes: memory_base too small")?;
+        .ok_or("sysinfo::split_top: memory_base too small")?;
     memory_split(ctx.memory_base, at)
-        .map_err(|_| "sysinfo::thread_retype_bytes: memory_split(memory_base) failed")
+        .map_err(|_| "sysinfo::split_top: memory_split(memory_base) failed")
 }
 
 /// `system_info(SpeculationControls)` answers each view where the kernel

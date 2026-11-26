@@ -705,10 +705,8 @@ fn run_child(handle: u64, arg: Option<&str>) -> std::process::ExitStatus
 {
     use std::os::seraph::process::CommandExt;
 
-    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .expect("memory_objects: server endpoint creation failed");
+    let ep = std::os::seraph::create_endpoint()
+        .expect("memory_objects: server endpoint creation failed");
     let root = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND).expect("memory_objects: root SEND");
     let stop = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, STOP_BADGE)
         .expect("memory_objects: stop SEND");

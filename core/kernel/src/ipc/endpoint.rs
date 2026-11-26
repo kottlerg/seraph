@@ -41,7 +41,7 @@
 //! in core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes.
 
 use super::WaitQueue;
-use super::recv_park::RecvQueue;
+use super::recv_park::{RecvQueue, recv_park_hint_bytes};
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 
 // ── EndpointState ─────────────────────────────────────────────────────────────
@@ -57,14 +57,13 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 /// construction (the bare-field exception of docs/coding-standards.md
 /// § Concurrency).
 ///
-/// The state fills the rest of the endpoint's 128-byte retype slot after the
-/// 24-byte `EndpointObject` wrapper, and `repr(C)` fixes its order across the
-/// slot's two 64-byte cache lines (asserted below): the fields a call or a
-/// receive touches (`lock`, `send`, `send_nonempty`, `receivers`, and the
-/// receive queue's list) take bytes 24 to 55, and the receive queue's slot
-/// hints follow, CPUs 0 to 31 in bytes 56 to 63 of the first line and CPUs 32
-/// to 223 in the second. The wait-set back-pointer and its index, which a call
-/// reads only when it queues, end the second line.
+/// The state follows the 24-byte `EndpointObject` wrapper in the endpoint's
+/// retype slot, and the endpoint's slot hints follow the state ([`hints`],
+/// [`retype_bytes`]). `repr(C)` fixes the order asserted below: the fields a
+/// call or a receive touches (`lock`, `send`, `send_nonempty`, `receivers`,
+/// and the receive queue) take bytes 24 to 55 of the slot, inside its first
+/// 64-byte cache line, and the wait-set back-pointer and its index, which a
+/// call reads only when it queues, end the state.
 #[repr(C)]
 pub struct EndpointState
 {
@@ -88,8 +87,7 @@ pub struct EndpointState
     /// reads it under `lock` and fails with `NoReceiver` at zero; the release
     /// that made it zero then drains the queues ([`release_if_unreceivable`]).
     pub receivers: core::sync::atomic::AtomicU32,
-    /// The blocked receivers (servers waiting for a caller), with the slot
-    /// hints of the CPUs' parked-receiver tables.
+    /// The blocked receivers (servers waiting for a caller).
     pub recv: RecvQueue,
     /// Opaque pointer to the `WaitSetState` this endpoint is registered with,
     /// or null if not in any wait set. Type-erased to avoid a circular import.
@@ -114,18 +112,65 @@ unsafe impl Send for EndpointState {}
 // (`wait_set::source_is_ready`) reads only the atomic `send_nonempty`.
 unsafe impl Sync for EndpointState {}
 
-// Pins the retype-slot budget assumed by `cap::retype::dispatch_for(Endpoint)`:
-// the 24 B `EndpointObject` wrapper plus this state must fit BIN_128 (128 B),
-// which the receive queue's hints fill. Catches a field added that would
-// overflow the bin, and pins the layout above: the receive queue's hints start
-// at byte 56 of the slot, after every field a call or a receive touches, so
-// that hints of CPUs 0 to 31 share the first cache line with those fields.
+/// Bytes of an endpoint's retype slot before its slot hints: the
+/// `EndpointObject` wrapper and the state.
+const FIXED_BYTES: usize = core::mem::size_of::<crate::cap::object::EndpointObject>()
+    + core::mem::size_of::<EndpointState>();
+
+// Pins the layout above: the wrapper is 24 bytes, the fields a call or a
+// receive touches end inside the slot's first cache line (a retype slot is
+// aligned to at least 128 bytes), and the wrapper and state fit BIN_128, so a
+// boot of up to 224 CPUs debits one 128-byte bin per endpoint.
 const _: () = {
-    use core::mem::offset_of;
-    assert!(24 + core::mem::size_of::<EndpointState>() == 128);
-    assert!(24 + offset_of!(EndpointState, recv) + offset_of!(RecvQueue, hints) == 56);
+    use core::mem::{offset_of, size_of};
+    assert!(size_of::<crate::cap::object::EndpointObject>() == 24);
+    assert!(24 + offset_of!(EndpointState, recv) + size_of::<RecvQueue>() <= 64);
     assert!(offset_of!(EndpointState, wait_set) > offset_of!(EndpointState, recv));
+    assert!(FIXED_BYTES <= 128);
 };
+
+/// The raw retype debit of one endpoint on a boot of `cpu_count` CPUs: the
+/// wrapper, the state, and the slot hints, two bits per CPU
+/// ([`recv_park_hint_bytes`]). Rounded to its size class by the retype, it is
+/// one 128-byte bin up to 224 CPUs, one 512-byte bin up to 1760, and whole
+/// pages above.
+pub const fn retype_bytes_for(cpu_count: usize) -> u64
+{
+    FIXED_BYTES.saturating_add(recv_park_hint_bytes(cpu_count)) as u64
+}
+
+/// This boot's raw retype debit of one endpoint, [`retype_bytes_for`] the
+/// boot CPU count: what `SYS_CAP_CREATE_ENDPOINT` debits and its reclaim
+/// credits back, and `SYS_SYSTEM_INFO` reports as `EndpointRetypeBytes`.
+pub fn retype_bytes() -> u64
+{
+    retype_bytes_for(boot_cpu_count())
+}
+
+/// The boot CPU count, which sizes every endpoint's slot hints.
+fn boot_cpu_count() -> usize
+{
+    crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
+}
+
+/// The slot hints of endpoint `ep`: the [`recv_park_hint_bytes`] of the boot
+/// CPU count that follow its state in its retype slot, read and written by
+/// the parked-receiver tables ([`RecvQueue`]).
+///
+/// # Safety
+/// `ep` names a live endpoint that `SYS_CAP_CREATE_ENDPOINT` created, whose
+/// slot is [`retype_bytes`] long, with provenance over the whole slot (the
+/// object's `state` pointer); the caller holds `ep.lock` for the life of the
+/// slice and makes no other reference to the hints meanwhile.
+pub unsafe fn hints<'a>(ep: *mut EndpointState) -> &'a mut [u8]
+{
+    // SAFETY: the hints start right after the state, inside the slot
+    // (contract).
+    let first = unsafe { ep.add(1) }.cast::<u8>();
+    // SAFETY: the slot holds this many bytes after the state, which only the
+    // lock holder touches (contract).
+    unsafe { core::slice::from_raw_parts_mut(first, recv_park_hint_bytes(boot_cpu_count())) }
+}
 
 impl EndpointState
 {
@@ -345,8 +390,9 @@ pub enum CallRendezvous
 /// (core/kernel/docs/ipc-internals.md § Call Path (Sender)).
 ///
 /// # Safety
-/// `ep` and `caller` must be valid, and `caller` must be the running thread,
-/// its message staged in its `ipc_msg`. Call with no scheduler lock and no
+/// `ep` must be a live endpoint's `EndpointObject::state` pointer, whose
+/// provenance covers the slot hints after the state ([`hints`]). `caller`
+/// must be valid and the running thread, its message staged in its `ipc_msg`. Call with no scheduler lock and no
 /// `ep.lock` held.
 // too_many_lines: one rendezvous under one ep.lock hold, whose two arms (bind
 // a waiting server, or park on the send queue) each commit the caller's park
@@ -364,6 +410,8 @@ pub unsafe fn endpoint_call(
     deadline: u64,
 ) -> CallRendezvous
 {
+    // The raw pointer, whose provenance covers the slot hints after the state.
+    let ep_slot = ep;
     // SAFETY: ep validated by caller.
     let ep = unsafe { &mut *ep };
 
@@ -387,8 +435,11 @@ pub unsafe fn endpoint_call(
     // (core/kernel/docs/ipc-internals.md § Wait Queues).
     // SAFETY: ep.lock is held, with interrupts off, so the CPU stays this one.
     let local = unsafe { local_receiver_table() };
+    // SAFETY: ep_slot names the live endpoint (contract), whose lock is held,
+    // and the take makes the only reference to its hints.
+    let hints = unsafe { hints(ep_slot) };
     // SAFETY: ep.lock is held, and `local` is this CPU's table for the hold.
-    let server = unsafe { ep.recv.take(local) };
+    let server = unsafe { ep.recv.take(local, hints) };
     if !server.is_null()
     {
         // The dequeue claimed the server's receive, so a timed receive's
@@ -835,8 +886,10 @@ pub enum RecvMiss
 /// an untimed one.
 ///
 /// # Safety
-/// `ep` and `server` must be valid, and `server` must be the running thread.
-/// Call with no scheduler lock and no `ep.lock` held.
+/// `ep` must be a live endpoint's `EndpointObject::state` pointer, whose
+/// provenance covers the slot hints after the state ([`hints`]). `server`
+/// must be valid and the running thread. Call with no scheduler lock and no
+/// `ep.lock` held.
 #[cfg(not(test))]
 #[expect(
     clippy::inline_always,
@@ -853,6 +906,8 @@ pub unsafe fn endpoint_recv(
     // SAFETY: server is the running thread; no lock held (contract).
     unsafe { release_unreplied_caller(server) };
 
+    // The raw pointer, whose provenance covers the slot hints after the state.
+    let ep_slot = ep;
     // SAFETY: ep validated by caller.
     let ep = unsafe { &mut *ep };
 
@@ -895,9 +950,12 @@ pub unsafe fn endpoint_recv(
     // call from this CPU looks for it.
     // SAFETY: ep.lock is held, with interrupts off, so the CPU stays this one.
     let table = unsafe { crate::percpu::this_cpu_recv_parked() };
+    // SAFETY: ep_slot names the live endpoint (contract), whose lock is held,
+    // and the push makes the only reference to its hints.
+    let hints = unsafe { hints(ep_slot) };
     // SAFETY: server is the running thread, on no wait queue; ep.lock is held,
     // and `table` is this CPU's for the hold.
-    unsafe { ep.recv.push(server, table) };
+    unsafe { ep.recv.push(server, table, hints) };
     let blocked_on = core::ptr::from_mut::<EndpointState>(ep).cast::<u8>();
     // SAFETY: server is the current CPU's running thread (this fn's contract);
     // held ep.lock excludes recv-queue writes.

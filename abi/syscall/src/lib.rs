@@ -131,16 +131,15 @@ pub const fn cap_handle_gen(handle: u64) -> u32
 // ── Retype costs ──────────────────────────────────────────────────────────────
 
 // The raw bytes the kernel debits from a Memory cap's retype budget for one
-// sub-page kernel object: the 24-byte object wrapper plus the object's state
-// (`cap::retype::dispatch_for` in core/kernel/src/cap/retype.rs, which uses
-// these constants and pins them to the real sizes with const assertions). A
-// userspace slab allocator sizes its request from them; the kernel rounds the
-// debit up to its size class. They are the kernel's current retype cost for
-// each object kind, so a change to an object's size changes them, and that is
-// an ABI-visible change by design.
-
-/// Raw retype debit of one `Endpoint`, in bytes.
-pub const ENDPOINT_RETYPE_BYTES: u64 = 128;
+// sub-page kernel object of a fixed size: the 24-byte object wrapper plus the
+// object's state (`cap::retype::dispatch_for` in core/kernel/src/cap/retype.rs,
+// which uses these constants and pins them to the real sizes with const
+// assertions). A userspace slab allocator sizes its request from them; the
+// kernel rounds the debit up to its size class. They are the kernel's current
+// retype cost for each object kind, so a change to an object's size changes
+// them, and that is an ABI-visible change by design. An endpoint's debit
+// depends on the boot's CPU count and is read at run time
+// (`SystemInfoType::EndpointRetypeBytes`).
 
 /// Raw retype debit of one `Notification`, in bytes.
 pub const NOTIFICATION_RETYPE_BYTES: u64 = 64;
@@ -2152,6 +2151,14 @@ pub enum SystemInfoType
     /// (shared/bench/README.md § Idle halts; core/kernel/docs/syscalls.md
     /// § `SYS_SYSTEM_INFO`).
     IdleHalts = 15,
+    /// Raw retype debit of one `Endpoint`, in bytes: the 24-byte object
+    /// wrapper, the endpoint's 48-byte state, and the slot hints of the CPUs'
+    /// parked-receiver tables, two bits for each CPU of the boot, so fixed for
+    /// a boot but not across machines. The kernel rounds the debit up to its
+    /// size class (128 bytes up to 224 CPUs, 512 up to 1760, whole pages
+    /// above). A process sizes the Memory cap it retypes an endpoint from with
+    /// it.
+    EndpointRetypeBytes = 16,
 }
 
 /// `SystemInfoType::SpeculationControls` view: the selection's inputs, a

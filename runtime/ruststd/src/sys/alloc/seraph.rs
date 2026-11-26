@@ -1495,8 +1495,8 @@ pub fn slab_release_fresh(region_id: u64) {
 /// Retype one kernel object out of the slab machinery.
 ///
 /// `min_bytes` is the full raw debit the kernel charges for the upcoming
-/// retype, the object wrapper plus its state (`syscall_abi::ENDPOINT_RETYPE_BYTES`,
-/// `NOTIFICATION_RETYPE_BYTES`, `wait_set_retype_bytes(capacity)`,
+/// retype, the object wrapper plus its state ([`endpoint_retype_bytes`],
+/// `syscall_abi::NOTIFICATION_RETYPE_BYTES`, `wait_set_retype_bytes(capacity)`,
 /// `event_queue_retype_bytes(capacity, observers)`, or a
 /// page-granular object's byte size); it is rounded up to the kernel's size
 /// class, so the request covers the debit. `retype` is
@@ -1523,6 +1523,30 @@ pub fn slab_release_fresh(region_id: u64) {
 /// a cap too small for the class, or `retype` itself fails.
 pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u64) -> Option<T>) -> Option<T> {
     object_slab_retype_reclaimable(min_bytes, retype).map(|(out, _)| out)
+}
+
+/// The kernel's debit for one Endpoint retype
+/// (`SystemInfoType::EndpointRetypeBytes`), fixed for the boot: the boot's CPU
+/// count sizes it. Queried once and cached; `None` if the query fails.
+pub fn endpoint_retype_bytes() -> Option<u64> {
+    // restore: none
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Some(cached);
+    }
+    let bytes =
+        syscall::system_info(syscall_abi::SystemInfoType::EndpointRetypeBytes as u64).ok()?;
+    CACHED.store(bytes, Ordering::Relaxed);
+    Some(bytes)
+}
+
+/// Create one Endpoint out of the slab machinery: [`object_slab_retype`] of
+/// [`endpoint_retype_bytes`] with `cap_create_endpoint`. Returns the new
+/// endpoint's cap slot, which holds every endpoint right; `None` if the debit
+/// query, memmgr or the retype fails.
+pub fn create_endpoint() -> Option<u64> {
+    object_slab_retype(endpoint_retype_bytes()?, |slab| syscall::cap_create_endpoint(slab).ok())
 }
 
 /// [`object_slab_retype`], also returning the `region_id` of the dedicated

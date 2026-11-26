@@ -77,10 +77,7 @@ pub fn endpoint() -> u64
 /// unbound, as before the endpoint existed; it is logged.
 pub fn start()
 {
-    let Some(ep) =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |s| {
-            syscall::cap_create_endpoint(s).ok()
-        })
+    let Some(ep) = std::os::seraph::create_endpoint()
     else
     {
         std::os::seraph::log!(warn: "crash endpoint not created; exceptions stay unbound");

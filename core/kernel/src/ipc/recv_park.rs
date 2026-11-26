@@ -10,21 +10,20 @@
 //! A receiver that parks on an endpoint records itself in the table of the CPU
 //! it parks on; a call from a CPU that queues no thread but its idle thread
 //! takes the receiver that CPU's table records for the endpoint, and any other
-//! call the longest-waiting receiver. A CPU below [`RECV_PARK_HINT_CPUS`] finds
-//! the endpoint's slot through the two bits the receive queue keeps for it; a
-//! CPU above compares every slot. The receiver order and the table's protocol
-//! are specified in core/kernel/docs/ipc-internals.md § Wait Queues.
+//! call the longest-waiting receiver. A CPU finds the endpoint's slot through
+//! the two bits the endpoint keeps for it, its slot hint. The receiver order
+//! and the table's protocol are specified in core/kernel/docs/ipc-internals.md
+//! § Wait Queues.
 //!
 //! ## Ordering
 //!
 //! Every slot word is an atomic accessed `Relaxed`, but for the owning CPU's
 //! plain reads of its queue words, which no other CPU reads or writes, so no
 //! access runs beside such a read; a cross-CPU access of a queue word would
-//! need `RecvParkTable::names` and `RecvParkTable::scan` back on atomic
-//! loads. A receive queue's hints are plain bytes, read and written only under
-//! the lock of the endpoint that owns the queue. The table has no lock of its
-//! own: each access that decides an outcome holds the lock of the endpoint the
-//! slot names, which orders it. The owning CPU records and looks up under the
+//! need `RecvParkTable::names` back on an atomic load. An endpoint's slot
+//! hints are plain bytes, read and written only under its lock. The table has
+//! no lock of its own: each access that decides an outcome holds the lock of
+//! the endpoint the slot names, which orders it. The owning CPU records and looks up under the
 //! lock of the endpoint it parks on or calls, with interrupts off, so no other
 //! access of its own interleaves with either. A remover on any CPU clears a
 //! slot by a compare-and-swap of its receiver word from the removed receiver to
@@ -46,27 +45,22 @@ use super::WaitQueue;
 use crate::sched::thread::ThreadControlBlock;
 
 /// Slots in each CPU's [`RecvParkTable`]: the endpoints a CPU keeps a parked
-/// receiver for at once. A CPU without a hint compares this many words.
+/// receiver for at once.
 pub const RECV_PARK_SLOTS: usize = 4;
 
-/// Bytes of slot hints in each [`RecvQueue`]: what is left of the endpoint's
-/// 128-byte retype slot after its wrapper and the rest of its state, asserted
-/// in `ipc::endpoint`. A hint is two bits, since a table has four slots.
-pub const RECV_PARK_HINT_BYTES: usize = 56;
+/// Bytes of slot hints an endpoint keeps for a boot of `cpu_count` CPUs: two
+/// bits per CPU, since a table has four slots. CPU `c`'s hint is bits
+/// `2 * (c % 4)` and up of byte `c / 4`. The endpoint's retype debit holds
+/// them (`ipc::endpoint::retype_bytes`).
+pub const fn recv_park_hint_bytes(cpu_count: usize) -> usize
+{
+    cpu_count.div_ceil(4)
+}
 
-/// CPUs whose slot a [`RecvQueue`] keeps a hint for: CPU indices below this
-/// find an endpoint's slot through its hint, and those above by comparing
-/// every slot.
-pub const RECV_PARK_HINT_CPUS: usize = RECV_PARK_HINT_BYTES * 4;
-
-/// A receive queue's slot hints: CPU `c`'s is bits `2 * (c % 4)` and up of
-/// byte `c / 4`.
-type Hints = [u8; RECV_PARK_HINT_BYTES];
-
-/// The [`RecvParkTable::hint_byte_end`] of a table with no hint, zero so that
-/// an all-zero table, which the zero-filled per-CPU slab holds until
-/// [`RecvParkTable::bind`] runs, is one.
-const NO_HINT: usize = 0;
+/// The [`RecvParkTable::hint_byte_end`] of a table not yet bound to its CPU,
+/// zero so that an all-zero table, which the zero-filled per-CPU slab holds
+/// until [`RecvParkTable::bind`] runs, is one.
+const UNBOUND: usize = 0;
 
 /// One slot of a [`RecvParkTable`]: a receive queue, the receiver last parked
 /// on it from the owning CPU, and when that park was recorded.
@@ -109,10 +103,9 @@ pub struct RecvParkTable
     /// The stamp of this CPU's last record. A `u64` counting records does not
     /// wrap in the system's life.
     last_stamp: AtomicU64,
-    /// One past the index of the byte of a receive queue's hints that holds
-    /// this CPU's hint, or [`NO_HINT`] for a CPU at or above
-    /// [`RECV_PARK_HINT_CPUS`]. Written once, by [`Self::bind`] before the CPU
-    /// runs, and read only by this CPU.
+    /// One past the index of the byte of an endpoint's slot hints that holds
+    /// this CPU's hint, or [`UNBOUND`]. Written once, by [`Self::bind`] before
+    /// the CPU runs, and read only by this CPU.
     hint_byte_end: usize,
     /// The shift of this CPU's two bits in that byte.
     hint_shift: u32,
@@ -120,41 +113,34 @@ pub struct RecvParkTable
 
 impl RecvParkTable
 {
-    /// An empty table with no hint, until [`Self::bind`] names its CPU.
+    /// An empty table, unbound until [`Self::bind`] names its CPU: it records
+    /// parks but finds no slot, so a call through it takes the longest-waiting
+    /// receiver. The all-zero value.
     pub const fn new() -> Self
     {
         Self {
             slots: [const { RecvParkSlot::new() }; RECV_PARK_SLOTS],
             last_stamp: AtomicU64::new(0),
-            hint_byte_end: NO_HINT,
+            hint_byte_end: UNBOUND,
             hint_shift: 0,
         }
     }
 
-    /// Bind the table to logical CPU `cpu`: a CPU below
-    /// [`RECV_PARK_HINT_CPUS`] finds a queue's slot through its hint, and any
-    /// other by comparing every slot. Runs once, at the CPU's per-CPU init,
+    /// Bind the table to logical CPU `cpu`, whose hint in an endpoint's slot
+    /// hints it then reads and writes. Runs once, at the CPU's per-CPU init,
     /// before any park or call on it.
     pub fn bind(&mut self, cpu: u32)
     {
         let cpu = cpu as usize;
-        if cpu < RECV_PARK_HINT_CPUS
+        self.hint_byte_end = (cpu / 4).wrapping_add(1);
+        #[expect(clippy::cast_possible_truncation, reason = "(cpu & 3) * 2 is below 8")]
         {
-            self.hint_byte_end = (cpu / 4).wrapping_add(1);
-            #[expect(clippy::cast_possible_truncation, reason = "(cpu & 3) * 2 is below 8")]
-            {
-                self.hint_shift = (cpu & 3).wrapping_mul(2) as u32;
-            }
-        }
-        else
-        {
-            self.hint_byte_end = NO_HINT;
-            self.hint_shift = 0;
+            self.hint_shift = (cpu & 3).wrapping_mul(2) as u32;
         }
     }
 
-    /// The index of this CPU's byte of a receive queue's hints, past the last
-    /// byte when the CPU has no hint.
+    /// The index of this CPU's byte of an endpoint's slot hints, past every
+    /// byte when the table is unbound.
     fn hint_byte(&self) -> usize
     {
         self.hint_byte_end.wrapping_sub(1)
@@ -180,67 +166,27 @@ impl RecvParkTable
         core::ptr::eq(named, queue)
     }
 
-    /// The index of the slot naming `queue`, or `None` when none does.
+    /// The index of the slot naming `queue` that may hold a receiver for it,
+    /// or `None`.
     ///
-    /// A CPU with a hint loads its two bits of `hints` and checks the slot
-    /// they name, and no other: its records keep the hint on the slot that
-    /// records a receiver for `queue` ([`RecvQueue`]), so a slot the hint
-    /// does not name holds no receiver for `queue`, and a hint whose slot was
-    /// given to another endpoint since fails the check, as a table with no
-    /// slot for `queue` does. A CPU without one compares every slot
-    /// ([`Self::scan`]). Either way the cost is the same whichever slot names
-    /// `queue`, and hit and miss follow only what the table holds.
+    /// The table loads its CPU's two bits of `hints`, the slot hints of the
+    /// endpoint that owns `queue`, and checks the slot they name, and no
+    /// other: its records keep the hint on the slot that records a receiver
+    /// for `queue` ([`RecvQueue`]), so a slot the hint does not name holds no
+    /// receiver for `queue`, and a hint whose slot was given to another
+    /// endpoint since fails the check, as a table with no slot for `queue`
+    /// does. The cost is the same whichever slot names `queue`, a slot the
+    /// order of the CPU's earlier parks on other endpoints sets, which the
+    /// machine's timing decides; hit and miss follow only what the table
+    /// holds. An unbound table, whose byte is past `hints`, finds none.
     ///
     /// The caller is this table's CPU and holds the lock of the endpoint that
     /// owns `queue` and `hints`, with interrupts off.
-    fn find(&self, queue: *const RecvQueue, hints: &Hints) -> Option<usize>
+    fn find(&self, queue: *const RecvQueue, hints: &[u8]) -> Option<usize>
     {
-        match hints.get(self.hint_byte())
-        {
-            Some(&byte) =>
-            {
-                let index = usize::from((byte >> self.hint_shift) & 3);
-                self.names(index, queue).then_some(index)
-            }
-            None => self.scan(queue),
-        }
-    }
-
-    /// The index of the slot naming `queue`, or `None`, found by comparing
-    /// every slot's queue word: the search of a CPU with no hint. At most one
-    /// slot names a queue in such a table, since its records take the slot
-    /// naming their queue when one does.
-    ///
-    /// Every slot is compared, whichever one names `queue`, so the search
-    /// runs the same instructions whichever slot that is. The slot is set by
-    /// the order of the CPU's earlier parks on other endpoints, which the
-    /// machine's timing decides, and a search that stopped at the match would
-    /// make the cost of every round trip through the endpoint depend on it.
-    ///
-    /// The caller is this table's CPU, with interrupts off.
-    fn scan(&self, queue: *const RecvQueue) -> Option<usize>
-    {
-        // One more than the index of the slot naming `queue`, or 0: each
-        // slot ORs in its own number masked by whether it matches, and at most
-        // one matches. The compiler makes each step a select of the number or
-        // zero, which both targets build without a branch (a conditional move
-        // on x86_64, a negated set-if-equal and an AND on riscv64), so every
-        // slot runs the same instructions. A select between two slots instead
-        // becomes branches on riscv64, which has no conditional move, and its
-        // instruction count then follows the slot that matched.
-        let mut number: usize = 0;
-        for (slot, index) in self.slots.iter().zip(1usize..)
-        {
-            // SAFETY: only this table's CPU writes a queue word (`record`),
-            // and the caller is that CPU with interrupts off, so no write runs
-            // beside this read. A plain read lets the compiler fold it into
-            // the comparison, which an atomic load does not.
-            let named = unsafe { slot.queue.as_ptr().read() };
-            let matches = usize::from(core::ptr::eq(named, queue)).wrapping_neg();
-            number |= index & matches;
-        }
-        // Whether some slot matched, never which, decides this one branch.
-        number.checked_sub(1)
+        let byte = *hints.get(self.hint_byte())?;
+        let index = usize::from((byte >> self.hint_shift) & 3);
+        self.names(index, queue).then_some(index)
     }
 
     /// Record `receiver`, parking on `queue` from this table's CPU, and return
@@ -248,14 +194,16 @@ impl RecvParkTable
     /// does ([`Self::find`]; its earlier receiver, if still parked, stays
     /// queued and is no longer recorded), else a slot holding no receiver, else
     /// the slot recorded longest ago, whose receiver stays queued unrecorded.
-    /// A slot newly taken for `queue` gets this CPU's hint in `hints`.
+    /// A slot newly taken for `queue` gets this CPU's hint in `hints`, the slot
+    /// hints of the endpoint that owns `queue` (none when the table is
+    /// unbound).
     ///
     /// The caller is this table's CPU and holds the lock of the endpoint that
     /// owns `queue` and `hints`, with interrupts off.
     fn record(
         &self,
         queue: *const RecvQueue,
-        hints: &mut Hints,
+        hints: &mut [u8],
         receiver: *mut ThreadControlBlock,
     ) -> &AtomicPtr<ThreadControlBlock>
     {
@@ -298,7 +246,7 @@ impl RecvParkTable
     ///
     /// The caller is this table's CPU and holds the lock of the endpoint that
     /// owns `queue` and `hints`, with interrupts off.
-    fn lookup(&self, queue: *const RecvQueue, hints: &Hints) -> *mut ThreadControlBlock
+    fn lookup(&self, queue: *const RecvQueue, hints: &[u8]) -> *mut ThreadControlBlock
     {
         self.find(queue, hints)
             .map_or(core::ptr::null_mut(), |index| {
@@ -317,28 +265,23 @@ impl RecvParkTable
 /// receiver that has left the queue. That keeps a slot's receiver word, read
 /// under this queue's endpoint lock, a thread still parked here.
 ///
-/// `hints` keeps, for each CPU below [`RECV_PARK_HINT_CPUS`], the index of
-/// the slot that CPU's table last took for this queue. A record that finds no
-/// slot naming the queue writes the hint of the slot it takes, so a slot of
-/// that CPU's table that names this queue and holds a receiver is always the
-/// one the hint names; a slot naming the queue that the hint does not name
-/// holds no receiver (one left behind by an endpoint freed at the same
-/// address), and a hint whose slot was given to another endpoint fails the
-/// check of its queue word. A zero hint is a slot index like any other, so a
-/// new queue's hints need no state for none.
+/// The methods that record or look up a park take the slot hints of the
+/// endpoint that owns the queue (`EndpointState::hints`): for each CPU of the
+/// boot, two bits naming the slot that CPU's table last took for this queue
+/// ([`recv_park_hint_bytes`]). A record that finds no slot naming the queue
+/// writes the hint of the slot it takes, so a slot of that CPU's table that
+/// names this queue and holds a receiver is always the one the hint names; a
+/// slot naming the queue that the hint does not name holds no receiver (one
+/// left behind by an endpoint freed at the same address), and a hint whose
+/// slot was given to another endpoint fails the check of its queue word. Any
+/// hint is a slot index, so a new endpoint's hints need no state for none.
 ///
 /// Every method runs under the owning endpoint's `ep.lock`. The queue must
 /// not move while a thread is on it: the TCBs' queue tags and the tables'
-/// slots hold its address. `repr(C)` keeps `hints` after `waiting`, where
-/// `EndpointState`'s layout puts its first bytes in the endpoint's first
-/// cache line (`ipc::endpoint`).
-#[repr(C)]
+/// slots hold its address.
 pub struct RecvQueue
 {
     waiting: WaitQueue,
-    /// Per CPU below [`RECV_PARK_HINT_CPUS`], two bits: the slot that CPU's
-    /// table last took for this queue.
-    pub(super) hints: Hints,
 }
 
 impl RecvQueue
@@ -348,7 +291,6 @@ impl RecvQueue
     {
         Self {
             waiting: WaitQueue::new(),
-            hints: [0; RECV_PARK_HINT_BYTES],
         }
     }
 
@@ -369,33 +311,44 @@ impl RecvQueue
     }
 
     /// Append `tcb`, a receiver parking from the CPU that owns `table`, and
-    /// record the park in `table`.
+    /// record the park in `table` and its slot in `hints`, the endpoint's
+    /// slot hints.
     ///
     /// # Safety
     /// `tcb` is a valid TCB on no wait queue; the endpoint's lock is held, by
     /// the CPU that owns `table`, with interrupts off.
-    pub unsafe fn push(&mut self, tcb: *mut ThreadControlBlock, table: &RecvParkTable)
+    pub unsafe fn push(
+        &mut self,
+        tcb: *mut ThreadControlBlock,
+        table: &RecvParkTable,
+        hints: &mut [u8],
+    )
     {
         // SAFETY: forwarded caller contract.
         unsafe { self.waiting.push(tcb) };
         let queue = core::ptr::from_ref(self);
-        let word = table.record(queue, &mut self.hints, tcb);
+        let word = table.record(queue, hints, tcb);
         // SAFETY: tcb is valid (contract); its recv_park_slot is owned by the
         // held lock of the endpoint whose queue now links it.
         unsafe { (*tcb).recv_park_slot = core::ptr::from_ref(word) };
     }
 
     /// Remove and return the receiver a call takes: the one `local`, the
-    /// calling CPU's table, records for this queue, or, when `local` is
-    /// `None` or records none, the longest-waiting. Null when empty.
+    /// calling CPU's table, records for this queue, found through `hints`,
+    /// the endpoint's slot hints, or, when `local` is `None` or records none,
+    /// the longest-waiting. Null when empty.
     ///
     /// # Safety
     /// The endpoint's lock is held; `local`, when `Some`, is the table of
     /// the CPU that holds it, with interrupts off.
-    pub unsafe fn take(&mut self, local: Option<&RecvParkTable>) -> *mut ThreadControlBlock
+    pub unsafe fn take(
+        &mut self,
+        local: Option<&RecvParkTable>,
+        hints: &[u8],
+    ) -> *mut ThreadControlBlock
     {
         let recorded = local.map_or(core::ptr::null_mut(), |table| {
-            table.lookup(core::ptr::from_ref(self), &self.hints)
+            table.lookup(core::ptr::from_ref(self), hints)
         });
         // A recorded receiver is on this queue (above), so its removal holds;
         // the head is taken if it ever did not.
@@ -426,7 +379,7 @@ impl RecvQueue
     pub unsafe fn pop(&mut self) -> *mut ThreadControlBlock
     {
         // SAFETY: forwarded caller contract.
-        unsafe { self.take(None) }
+        unsafe { self.take(None, &[]) }
     }
 
     /// Remove `tcb` if it is on this queue; returns whether it was.
@@ -471,24 +424,33 @@ mod tests
 {
     use core::sync::atomic::Ordering::Relaxed;
 
-    use super::{RECV_PARK_HINT_CPUS, RecvParkTable, RecvQueue};
+    use super::{RecvParkTable, RecvQueue, recv_park_hint_bytes};
+    use crate::sched::MAX_CPUS;
     use crate::sched::thread::ThreadControlBlock;
 
-    /// The first CPU index of a fixture's tables, for each test that runs on
-    /// both searches: every table hinted; CPUs 222 and 223 hinted beside a
-    /// CPU 224 that scans (the boundary); every table scanning.
-    const BASES: [u32; 3] = [0, 222, 224];
+    /// The first CPU index of a fixture's three tables, for each test that
+    /// runs at several: CPUs 0 to 2, which share a hint byte; CPUs 3 to 5,
+    /// across the edge between two bytes; and the last three CPU indices a
+    /// boot can have.
+    fn bases() -> [u32; 3]
+    {
+        let last = u32::try_from(MAX_CPUS - 3).expect("MAX_CPUS fits a u32");
+        [0, 3, last]
+    }
 
-    /// The TCBs, receive queues and tables of one test, used only on the
-    /// test's thread, so every operation runs as under the endpoint lock and
-    /// on the table's CPU. Each TCB is a heap allocation, and the queues and
-    /// tables are held in vectors that are never resized, so none moves; all
-    /// are freed only when the fixture drops, after every queue is emptied.
-    /// The methods name each by index; table `i` is bound to CPU `base + i`.
+    /// The TCBs, receive queues, their endpoints' slot hints, and tables of
+    /// one test, used only on the test's thread, so every operation runs as
+    /// under the endpoint lock and on the table's CPU. Each TCB is a heap
+    /// allocation, and the queues and tables are held in vectors that are
+    /// never resized, so none moves; all are freed only when the fixture
+    /// drops, after every queue is emptied. The methods name each by index;
+    /// table `i` is bound to CPU `base + i`, and each queue's hints are sized
+    /// for a boot whose last CPU is the last table's.
     struct Fixture
     {
         tcbs: Vec<*mut ThreadControlBlock>,
         queues: Vec<RecvQueue>,
+        hints: Vec<Vec<u8>>,
         tables: Vec<RecvParkTable>,
     }
 
@@ -496,6 +458,7 @@ mod tests
     {
         fn new(tcbs: usize, queues: usize, tables: u32, base: u32) -> Self
         {
+            let cpu_count = (base + tables) as usize;
             Self {
                 tcbs: (0..tcbs)
                     .map(|_| {
@@ -507,6 +470,9 @@ mod tests
                     })
                     .collect(),
                 queues: (0..queues).map(|_| RecvQueue::new()).collect(),
+                hints: (0..queues)
+                    .map(|_| vec![0; recv_park_hint_bytes(cpu_count)])
+                    .collect(),
                 tables: (0..tables)
                     .map(|i| {
                         let mut table = RecvParkTable::new();
@@ -523,7 +489,7 @@ mod tests
             let tcb = self.tcbs[t];
             // SAFETY: tcb is a live TCB of the fixture, on no queue (each test
             // parks a TCB once until it is removed).
-            unsafe { self.queues[q].push(tcb, &self.tables[cpu]) };
+            unsafe { self.queues[q].push(tcb, &self.tables[cpu], &mut self.hints[q]) };
         }
 
         /// Take from queue `q` for a call from the CPU of table `cpu`, or
@@ -532,7 +498,7 @@ mod tests
         {
             let table = cpu.map(|c| &self.tables[c]);
             // SAFETY: as under the endpoint lock (above).
-            let tcb = unsafe { self.queues[q].take(table) };
+            let tcb = unsafe { self.queues[q].take(table, &self.hints[q]) };
             self.index_of(tcb)
         }
 
@@ -553,16 +519,23 @@ mod tests
         /// The TCB index table `cpu` records for queue `q`.
         fn recorded(&self, cpu: usize, q: usize) -> Option<usize>
         {
-            let queue = &self.queues[q];
-            let tcb = self.tables[cpu].lookup(core::ptr::from_ref(queue), &queue.hints);
+            let queue = core::ptr::from_ref(&self.queues[q]);
+            let tcb = self.tables[cpu].lookup(queue, &self.hints[q]);
             self.index_of(tcb)
         }
 
         /// The index of the slot table `cpu` finds queue `q` in.
         fn named_slot(&self, cpu: usize, q: usize) -> Option<usize>
         {
-            let queue = &self.queues[q];
-            self.tables[cpu].find(core::ptr::from_ref(queue), &queue.hints)
+            let queue = core::ptr::from_ref(&self.queues[q]);
+            self.tables[cpu].find(queue, &self.hints[q])
+        }
+
+        /// The two bits of queue `q`'s hints that CPU `cpu` owns.
+        fn hint(&self, q: usize, cpu: u32) -> u8
+        {
+            let cpu = cpu as usize;
+            (self.hints[q][cpu / 4] >> ((cpu % 4) * 2)) & 3
         }
 
         /// Whether TCB `t` points at no slot.
@@ -608,7 +581,7 @@ mod tests
     #[test]
     fn a_call_takes_the_receiver_parked_on_its_cpu_and_keeps_the_others_in_order()
     {
-        for base in BASES
+        for base in bases()
         {
             let mut f = Fixture::new(3, 1, 3, base);
             f.park(0, 0, 0);
@@ -624,7 +597,7 @@ mod tests
     #[test]
     fn a_call_with_no_receiver_recorded_on_its_cpu_takes_the_longest_waiting()
     {
-        for base in BASES
+        for base in bases()
         {
             let mut f = Fixture::new(2, 1, 3, base);
             f.park(0, 0, 0);
@@ -637,7 +610,7 @@ mod tests
     #[test]
     fn the_latest_park_on_a_cpu_is_the_one_its_calls_take()
     {
-        for base in BASES
+        for base in bases()
         {
             let mut f = Fixture::new(3, 1, 2, base);
             f.park(0, 0, 1);
@@ -654,7 +627,7 @@ mod tests
     #[test]
     fn removing_a_displaced_receiver_leaves_the_slot_that_replaced_it()
     {
-        for base in BASES
+        for base in bases()
         {
             let mut f = Fixture::new(3, 1, 2, base);
             f.park(0, 0, 1);
@@ -670,7 +643,7 @@ mod tests
     #[test]
     fn a_lookup_finds_its_endpoint_in_every_slot_and_no_other()
     {
-        for base in BASES
+        for base in bases()
         {
             // Table 0 names queues 0 to 3, in slots 0 to 3; queue 4 is parked
             // on from table 1's CPU only.
@@ -699,7 +672,7 @@ mod tests
     #[test]
     fn a_full_table_gives_the_slot_recorded_longest_ago_to_a_new_endpoint()
     {
-        for base in BASES
+        for base in bases()
         {
             // Queue i has a head parked from table 1's CPU (TCB i) and a
             // receiver parked from table 0's (TCB 5 + i), recorded in queue
@@ -722,7 +695,7 @@ mod tests
     #[test]
     fn a_slot_whose_receiver_left_is_taken_before_the_oldest()
     {
-        for base in BASES
+        for base in bases()
         {
             let mut f = Fixture::new(9, 5, 2, base);
             for q in 0..4
@@ -742,7 +715,7 @@ mod tests
     #[test]
     fn every_removal_clears_the_removed_receivers_slot()
     {
-        for base in BASES
+        for base in bases()
         {
             // Each removal path: the head's pop, a removal from the middle,
             // and a call's take of a recorded receiver.
@@ -764,7 +737,7 @@ mod tests
     #[test]
     fn a_clear_before_its_slot_is_recorded_again_leaves_the_new_record()
     {
-        for base in BASES
+        for base in bases()
         {
             // Table 0 is full (queues 0 to 3, TCBs 0 to 3, TCB 0 oldest); TCB 0
             // leaves queue 0, clearing its slot, before a park on queue 4,
@@ -792,7 +765,7 @@ mod tests
     #[test]
     fn a_stale_clear_after_its_slot_is_recorded_again_changes_nothing()
     {
-        for base in BASES
+        for base in bases()
         {
             // As above, but the park on queue 4 evicts TCB 0's slot while TCB
             // 0 is still parked on queue 0, and TCB 0 leaves afterwards: its
@@ -817,7 +790,7 @@ mod tests
     #[test]
     fn a_clear_between_a_records_queue_and_receiver_stores_leaves_the_new_record()
     {
-        for base in BASES
+        for base in bases()
         {
             // The owner's record of TCB 4 on queue 4 into the slot of TCB 0
             // (queue 0) is interrupted, between its queue store and its
@@ -832,7 +805,7 @@ mod tests
             }
             let queue4 = core::ptr::from_ref(&f.queues[4]);
             let table = &f.tables[0];
-            assert_eq!(table.find(queue4, &f.queues[4].hints), None);
+            assert_eq!(table.find(queue4, &f.hints[4]), None);
             let index = table.free_or_oldest();
             let slot_ptr = core::ptr::from_ref(table.slot(index));
             // SAFETY: the slot lives in the heap buffer of the tables vector,
@@ -840,8 +813,8 @@ mod tests
             // fixture's methods touch only the queues and TCBs.
             let slot = unsafe { &*slot_ptr };
             assert_eq!(f.index_of(slot.receiver.load(Relaxed)), Some(0));
-            // Slot 0, which a CPU with a hint finds queue 4's zero hint
-            // already naming, so the record would leave the hint as it is.
+            // Slot 0, which queue 4's zero hint already names, so the record
+            // would leave the hint as it is.
             assert_eq!(index, 0);
             slot.queue.store(queue4.cast_mut(), Relaxed);
             assert!(f.remove(0, 0));
@@ -863,9 +836,10 @@ mod tests
     #[test]
     fn a_stale_hint_finds_no_slot_and_the_next_park_repoints_it()
     {
-        // CPU 223 is the last with a hint (byte 55, bits 6 and 7), CPU 0 the
-        // first.
-        for cpu in [0, 223]
+        // CPU 0, CPU 5 (bits 2 and 3 of byte 1), and the last CPU index a boot
+        // can have (bits 6 and 7 of the last byte).
+        let last = u32::try_from(MAX_CPUS - 1).expect("MAX_CPUS fits a u32");
+        for cpu in [0, 5, last]
         {
             // The table records queues 0 to 3 in slots 0 to 3; a park on
             // queue 4 takes slot 0, the oldest, while TCB 0 stays parked on
@@ -887,8 +861,7 @@ mod tests
             assert_eq!(f.recorded(0, 0), Some(5));
             assert_eq!(f.recorded(0, 1), None);
             assert_eq!(f.recorded(0, 4), Some(4));
-            let byte = f.queues[0].hints[(cpu / 4) as usize];
-            assert_eq!((byte >> ((cpu % 4) * 2)) & 3, 1);
+            assert_eq!(f.hint(0, cpu), 1);
             assert_eq!(f.take(0, Some(0)), Some(5));
             assert_eq!(f.take(0, Some(0)), Some(0));
         }
@@ -899,7 +872,7 @@ mod tests
     {
         // A slot that names queue 2's address and holds no receiver, as one
         // left by an endpoint freed at that address, while the queue's hint
-        // names another slot (a new queue's hints are zero): the next park
+        // names another slot (a new endpoint's hints are zero): the next park
         // takes the first free slot, before the one left behind, and points
         // the hint at it, and calls find the receiver there.
         let mut f = Fixture::new(5, 4, 1, 0);
@@ -910,7 +883,7 @@ mod tests
         assert_eq!(f.named_slot(0, 2), Some(3));
         assert!(f.remove(1, 1));
         assert!(f.remove(2, 3));
-        f.queues[2].hints = [0; super::RECV_PARK_HINT_BYTES];
+        f.hints[2].fill(0);
         assert_eq!(f.named_slot(0, 2), None);
         f.park(2, 4, 0);
         assert_eq!(f.named_slot(0, 2), Some(1));
@@ -926,10 +899,10 @@ mod tests
     #[test]
     fn cpus_sharing_a_hint_byte_keep_their_own_hints()
     {
-        // CPUs 220 to 223 share the queue's last hint byte; each records the
-        // queue in a different slot of its own table (table c's slots 0 to
-        // c - 1 hold other queues first).
-        let mut f = Fixture::new(10, 4, 4, 220);
+        // CPUs 4 to 7 share the queues' second hint byte; each records queue
+        // 3 in a different slot of its own table (table c's slots 0 to c - 1
+        // hold other queues first), and no park touches another CPU's bits.
+        let mut f = Fixture::new(10, 4, 4, 4);
         for cpu in 0..4
         {
             for q in 0..cpu
@@ -938,6 +911,7 @@ mod tests
             }
             f.park(3, cpu, cpu);
         }
+        assert_eq!(f.hints[3], [0, 0b1110_0100]);
         for cpu in 0..4
         {
             assert_eq!(f.named_slot(cpu, 3), Some(cpu));
@@ -948,47 +922,49 @@ mod tests
     }
 
     #[test]
-    fn a_cpu_at_or_above_the_hinted_range_scans_and_writes_no_hint()
+    fn the_hints_hold_a_byte_for_every_cpu_of_the_boot()
     {
-        assert_eq!(RECV_PARK_HINT_CPUS, 224);
-        for cpu in [224, u32::MAX]
+        // Two bits per CPU: one byte up to four CPUs, a byte more for each
+        // four after, and the last CPU's byte the last of the hints of a boot
+        // of that many CPUs.
+        assert_eq!(recv_park_hint_bytes(1), 1);
+        assert_eq!(recv_park_hint_bytes(4), 1);
+        assert_eq!(recv_park_hint_bytes(5), 2);
+        assert_eq!(recv_park_hint_bytes(MAX_CPUS), MAX_CPUS / 4);
+        for cpu_count in [1, 4, 5, 8, 9, 224, 225, MAX_CPUS]
         {
-            let mut f = Fixture::new(4, 4, 1, cpu);
-            for q in 0..4
-            {
-                f.park(q, q, 0);
-            }
-            for q in 0..4
-            {
-                assert_eq!(f.named_slot(0, q), Some(q));
-                assert_eq!(f.queues[q].hints, [0; super::RECV_PARK_HINT_BYTES]);
-            }
-            assert_eq!(f.take(3, Some(0)), Some(3));
+            let mut table = RecvParkTable::new();
+            let last = u32::try_from(cpu_count - 1).expect("MAX_CPUS fits a u32");
+            table.bind(last);
+            assert_eq!(table.hint_byte() + 1, recv_park_hint_bytes(cpu_count));
         }
     }
 
     #[test]
-    fn an_all_zero_table_scans_and_writes_no_hint_until_bound()
+    fn an_unbound_table_finds_no_slot_and_writes_no_hint()
     {
         // The per-CPU slab is zero-filled before `bind` runs: an all-zero
-        // table is `RecvParkTable::new()`, and keeps no hint.
-        // SAFETY: every field of a table (atomics, a pointer, integers) is
-        // valid at zero.
+        // table is `RecvParkTable::new()`, which records parks but finds no
+        // slot, so a call through it takes the longest-waiting receiver.
+        // SAFETY: every field of a table (atomics, integers) is valid at zero.
         let zeroed: RecvParkTable = unsafe { core::mem::zeroed() };
         let new = RecvParkTable::new();
         assert_eq!(zeroed.hint_byte_end, new.hint_byte_end);
         assert_eq!(zeroed.hint_shift, new.hint_shift);
-        let mut f = Fixture::new(4, 4, 1, 0);
+        let mut f = Fixture::new(5, 4, 1, 0);
+        f.hints.iter_mut().for_each(|hints| hints.fill(0xff));
         f.tables[0] = zeroed;
         for q in 0..4
         {
             f.park(q, q, 0);
         }
+        f.park(3, 4, 0);
         for q in 0..4
         {
-            assert_eq!(f.named_slot(0, q), Some(q));
-            assert_eq!(f.queues[q].hints, [0; super::RECV_PARK_HINT_BYTES]);
+            assert_eq!(f.named_slot(0, q), None);
+            assert_eq!(f.recorded(0, q), None);
+            assert_eq!(f.hints[q], [0xff]);
         }
-        assert_eq!(f.take(2, Some(0)), Some(2));
+        assert_eq!(f.take(3, Some(0)), Some(3));
     }
 }

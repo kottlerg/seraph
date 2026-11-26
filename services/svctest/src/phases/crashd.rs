@@ -1066,10 +1066,7 @@ impl<R: Send + 'static> Account<R>
     /// after it holds the thread's pages.
     fn start(what: &str, serve: impl FnOnce(u64) -> R + Send + 'static) -> Self
     {
-        let ep =
-            std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-                syscall::cap_create_endpoint(slab).ok()
-            })
+        let ep = std::os::seraph::create_endpoint()
             .unwrap_or_else(|| panic!("crashd_live_core: {what}: an account endpoint"));
         let send = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND)
             .unwrap_or_else(|e| panic!("crashd_live_core: {what}: the account SEND ({e})"));

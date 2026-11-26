@@ -1313,17 +1313,37 @@ pub fn read_verified(
 // `min_bytes` to pass to `object_slab_retype`. Each constant is defined as the
 // ABI crate's item and the function forwards to the ABI crate's, so each
 // equals the ABI value by construction; the kernel pins those values to its
-// real object sizes, and a size change is an ABI-visible change by design.
+// real object sizes, and a size change is an ABI-visible change by design. An
+// endpoint's debit depends on the boot's CPU count, so it is read from the
+// kernel instead (`endpoint_retype_bytes`).
 // They are defined here rather than re-exported because an item reached
 // through the sysroot-private ABI crate is unstable (`rustc_private`) to
 // std's users: build-std compiles std's dependencies with
 // `-Zforce-unstable-if-unmarked`. The same holds for `ruststd-death-queues`,
 // which std uses internally and services take as a path dependency instead.
 
-/// Raw retype debit of one `Endpoint`, in bytes (`syscall_abi`'s
-/// `ENDPOINT_RETYPE_BYTES`).
+/// Raw retype debit of one `Endpoint` on this boot, in bytes
+/// (`SystemInfoType::EndpointRetypeBytes`): fixed for the boot, since the
+/// boot's CPU count sizes it. Queried from the kernel once and cached; `None`
+/// if the query fails.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub const ENDPOINT_RETYPE_BYTES: u64 = syscall_abi::ENDPOINT_RETYPE_BYTES;
+#[must_use]
+pub fn endpoint_retype_bytes() -> Option<u64> {
+    pal_alloc::endpoint_retype_bytes()
+}
+
+/// Create one `Endpoint` out of the runtime's object-slab machinery:
+/// [`object_slab_retype`] of [`endpoint_retype_bytes`] with
+/// `cap_create_endpoint`. Returns the new endpoint's cap slot, which holds
+/// every endpoint right.
+///
+/// Returns `None` if the debit query fails, memmgr is unreachable or refuses
+/// the request, or the retype fails.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+#[must_use]
+pub fn create_endpoint() -> Option<u64> {
+    pal_alloc::create_endpoint()
+}
 
 /// Raw retype debit of one `Notification`, in bytes (`syscall_abi`'s
 /// `NOTIFICATION_RETYPE_BYTES`).
@@ -1350,7 +1370,7 @@ pub fn event_queue_retype_bytes(capacity: u64, observers: u64) -> u64 {
 ///
 /// `min_bytes` is the full raw debit the kernel charges for the object the
 /// caller is about to create, the object wrapper plus its state:
-/// [`ENDPOINT_RETYPE_BYTES`], [`NOTIFICATION_RETYPE_BYTES`],
+/// [`endpoint_retype_bytes`], [`NOTIFICATION_RETYPE_BYTES`],
 /// [`wait_set_retype_bytes`]`(capacity)`, or
 /// [`event_queue_retype_bytes`]`(capacity, observers)`, or
 /// the byte size of a page-granular object. The runtime rounds it up to the

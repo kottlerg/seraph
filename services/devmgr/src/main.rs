@@ -2969,9 +2969,7 @@ fn spawn_boot_drivers(
 /// created.
 fn create_service_endpoint() -> Option<u64>
 {
-    std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
+    std::os::seraph::create_endpoint()
 }
 
 /// Spawn and settle the batch of a drivers-directory pass, on the control

@@ -269,10 +269,7 @@ impl SettleBatch
     /// when it cannot be created.
     pub fn new() -> Option<Self>
     {
-        let Some(driver_ep) =
-            std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-                syscall::cap_create_endpoint(slab).ok()
-            })
+        let Some(driver_ep) = std::os::seraph::create_endpoint()
         else
         {
             std::os::seraph::log!(warn: "settle: driver endpoint not created");

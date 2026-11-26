@@ -546,18 +546,18 @@ logd's waits on it for longer than `SINK_STALL_MS` (1000 ms,
   the sink stalls as for a stopped driver. The writers are spawned beside the receive workers,
   before the handover pull.
 - **Serial writes.** The serial sink writes a line's chunks as plain writes, then one zero-length
-  write with `serial_labels::SERIAL_WRITE_SENT`, a barrier the driver answers once every byte
-  before it has left the UART, not once it is in its transmit ring, so a line counts as written
-  when it is on the wire
+  write with `serial_labels::SERIAL_WRITE_SENT`, a barrier the driver answers once every byte before
+  it has left the UART, not once it is in its transmit ring, so a line counts as written when it is
+  on the wire
   ([serial driver](../../drivers/serial/README.md#label-1-serial_write_bytes)
   § Label 1). The driver answers a call that waited on a transmitter making no progress for its
-  `TX_STALL_MS` (1000 ms) with `STALLED`. A chunk answered `STALLED` was not put in the ring,
-  so its line is counted as dropped; a barrier answered `STALLED` ends a line that is in the ring
-  and leaves when the transmitter moves again, so it is not, nor is one whose barrier is not
-  answered within its bound. A barrier whose call is interrupted (the writer stopped, or the
-  driver's serving thread freed) is made again. A barrier whose call fails, as every call to a
-  driver devmgr has withdrawn does, ends a line whose bytes went with the driver, so it is
-  counted. The barrier costs each serial line one call more than its chunks.
+  `TX_STALL_MS` (1000 ms) with `STALLED`. A chunk answered `STALLED` was not put in the ring, so its
+  line is counted as dropped; a barrier answered `STALLED` ends a line that is in the ring and
+  leaves when the transmitter moves again, so it is not, nor is one whose barrier is not answered
+  within its bound. A barrier whose call is interrupted (the writer stopped, or the driver receiving
+  again before it replied, or its serving thread freed) is made again. A barrier whose call fails,
+  as every call to a driver devmgr has withdrawn does, ends a line whose bytes went with the driver,
+  so it is counted. The barrier costs each serial line one call more than its chunks.
 - **Inline.** Until a sink's writer runs, or when it cannot be spawned, a line's producer writes
   the line itself, one producer at a time so a line stays whole. Its wait for its turn and its
   calls end `SINK_STALL_MS` after it took the line, so no producer waits on the sink for longer;

@@ -1887,8 +1887,8 @@ enum Answer
     /// still be serving the call.
     Unanswered,
     /// The call was cancelled before its answer (`Interrupted`): the calling
-    /// thread was stopped or took an upcall, or the driver's serving thread
-    /// was freed. The driver may have taken the call's bytes, so a chunk
+    /// thread was stopped, or the driver received again before it replied,
+    /// or its serving thread was freed. The driver may have taken the call's bytes, so a chunk
     /// interrupted is not written again, and its line is counted rather than
     /// repeated.
     Interrupted,

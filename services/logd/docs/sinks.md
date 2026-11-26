@@ -74,12 +74,15 @@ logd's history entry is the record. Every sink renders from it, and the query in
   badge alone: a live and a retired slot can share a badge
   ([ipc-interface.md](ipc-interface.md) § Retired slots), and a reader that lags behind the history
   must name an entry whose slot has since been retired. A serial names one slot for the life of the
-  instance, so a reader may keep the name it read for a serial for as long as it follows that
-  instance.
+  instance, but the slot's name can change after a reader reads it: a sender can register its name
+  after its first lines, or update it.
   A retired slot that is dropped takes its entries with it, so every entry in the history has its
   slot, and its name, at the moment it is read.
 - **Name.** An entry carries no name. A sink renders the name of the entry's slot, with the
   instance number of § Display names, at the moment it renders.
+- **Name generation.** logd counts each slot's name registrations, a 32-bit count from 0 that only
+  rises, and an entry carries its slot's count at the moment the entry was retained, so a reader
+  that keeps a slot's name knows when the name it keeps is older than the entry it renders.
 - **Time.** `us` is monotonic. Wall time is `us` plus the boot wall offset (§ Wall time), applied
   when a sink renders, so a record needs no wall clock to be kept.
 - **Origin.** A `relayed` entry was written to the console by init-logd before the handover; a
@@ -228,7 +231,8 @@ An external sink:
    applies its own level itself: the walk is unfiltered so that every missing `seq` between two
    entries it reads is an evicted entry, which it counts as dropped;
 3. names each entry, and learns its badge, from its slot serial, reading `QUERY_SLOTS` for a serial
-   it has not seen; a serial no longer in the table is rendered as the unnamed sender `?`;
+   it has not seen or whose kept name generation is below the entry's; a serial no longer in the
+   table is rendered as the unnamed sender `?`, with no badge;
 4. renders each entry in its format and writes it;
 5. waits on its Notification and its event queue together (§ Subscriptions), and on a signal goes
    back to 2.
@@ -297,7 +301,8 @@ The default console line, the same on serial and the framebuffer:
 ```
 
 - **Fields.** The default is `time:level:name:msg`: `[sec.usfrac]`, the level tag, `[name]`, the
-  message. `host` shows the host name and `procid` the sender's badge in hex. The fields are
+  message. `host` shows the host name and `procid` the sender's badge in hex, `?` when an external
+  sink cannot resolve the entry's slot (§ External sinks). The fields are
   separated by one space, and the tag is padded to six columns, so every line's name starts in one
   column while the seconds are below 100000.
 - **Time.** Uptime: the seconds right-aligned to five columns, as Linux's `dmesg` writes them, wider
@@ -364,7 +369,7 @@ A sink in the `rfc5424` format writes each entry as one RFC 5424 message:
 | TIMESTAMP | `us` plus the boot wall offset, RFC 3339 UTC with microseconds; `-` while no offset is known and for a `previous` entry |
 | HOSTNAME | `LOGD_HOSTNAME` (or the external sink's own setting), `-` when unset |
 | APP-NAME | the slot's display name without the instance number; each byte outside printable US-ASCII (33 to 126) written `_`, at most 48 bytes; `-` for an unnamed sender |
-| PROCID | the badge in lower-case hex; it tells instances of one name apart |
+| PROCID | the badge in lower-case hex; it tells instances of one name apart; `-` when the sink cannot resolve the entry's slot (§ External sinks) |
 | MSGID | `-` |
 | STRUCTURED-DATA | `[timeQuality tzKnown="1" isSynced="0"]` while the offset comes from an unsynchronised clock, `-` once it is synchronised |
 | MSG | the byte order mark, then the console format's message field, each byte of an invalid UTF-8 sequence written `\xNN` as the record renderer writes it, so MSG is valid UTF-8 |
@@ -460,9 +465,10 @@ capability space.
   `QUERY_STALE` (4) when it is not its own, and 0 asks no check.
 - An entry in the reply carries its slot serial in word 2, in place of the badge, which the slot's
   `QUERY_SLOTS` row carries, so an entry keeps its four header words and the longest still fits one
-  reply; the origin is in bits 12-15 of its kind field (bits 8-11 the kind).
-- `QUERY_SLOTS` rows carry the instance number in bits 32-63 of word 1 and the slot serial in a
-  tenth word, so `SLOTS_PAGE` is 6.
+  reply; the origin is in bits 12-15 of its kind field (bits 8-11 the kind), and the name generation
+  in bits 32-63 of word 3.
+- `QUERY_SLOTS` rows carry the instance number in bits 32-63 of word 1, the slot serial in a tenth
+  word and the name generation in an eleventh, so `SLOTS_PAGE` is 5.
 - The severity filter serves interactive reads, which count no gap; a reader that counts gaps walks
   unfiltered (§ External sinks).
 

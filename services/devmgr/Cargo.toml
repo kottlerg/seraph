@@ -20,8 +20,10 @@ death-set = { path = "../../shared/death-set" }
 driver-binding = { path = "../../shared/driver-binding" }
 # The section-header walk that locates a driver's declaration note.
 elf = { path = "../../shared/elf" }
-# ACPI / DTB table parsers, extracted so they are host-testable.
+# ACPI / DTB table interpretation, extracted so it is host-testable.
 firmware = { path = "firmware", package = "devmgr-firmware" }
+# The firmware tables' format decoders, and the ECAM window they yield.
+firmware-tables = { path = "../../shared/firmware-tables" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
 # The `seraph` note owner and the driver note's type.

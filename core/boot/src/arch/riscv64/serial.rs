@@ -9,11 +9,15 @@
 //! virt with EDK2) or Device Tree (ns16550a-compatible node), with a fallback
 //! to the QEMU virt default of 0x10000000.
 //!
-//! Call `discover_uart(st)` before `serial_init()` to update the base. If
-//! discovery is skipped or fails, the hardcoded QEMU default is used silently.
+//! Call `discover_uart(st, tables)` before `serial_init()` to update the base.
+//! If discovery is skipped or fails, the hardcoded QEMU default is used
+//! silently.
 
-use super::acpi_spcr::find_spcr_base;
-use crate::uefi::{EFI_ACPI_20_TABLE_GUID, EFI_DTB_TABLE_GUID, EfiSystemTable};
+use boot_firmware::dtb::Tree;
+
+use super::acpi_kernel_mmio::spcr_uart_base;
+use crate::tables::{Acpi, TableMap, device_tree};
+use crate::uefi::{EFI_ACPI_20_TABLE_GUID, EFI_DTB_TABLE_GUID, EfiSystemTable, find_config_table};
 
 /// UART MMIO base address; updated by `discover_uart` before first use.
 ///
@@ -26,76 +30,39 @@ const UART_LSR: usize = 5; // line status register
 
 // ── UART discovery ────────────────────────────────────────────────────────────
 
-/// Find the UART base from a Device Tree (ns16550a-compatible node).
-///
-/// Returns `None` if `dtb_addr` is invalid or no ns16550a node has a `reg`
-/// entry.
+/// Set the UART base from the firmware tables, each read through `tables`:
+/// the first ACPI SPCR with a memory-mapped base (EDK2 on QEMU virt provides
+/// ACPI, not a DTB), else the first `ns16550a` node's window in the device
+/// tree (bare-metal RISC-V, or firmware that provides a DTB). When neither
+/// names one, the QEMU default (0x10000000) stays.
 ///
 /// # Safety
-/// `dtb_addr` must be a physical address of a valid, identity-mapped FDT blob.
-unsafe fn find_dtb_uart_base(dtb_addr: u64) -> Option<u64>
+/// `st` must be a valid UEFI system table pointer, and the tables `tables`
+/// bounds meet [`TableMap::view`]'s contract.
+pub unsafe fn discover_uart(st: *mut EfiSystemTable, tables: TableMap<'_>)
 {
-    // SAFETY: dtb_addr is a valid identity-mapped FDT blob physical address; caller guarantees validity.
-    let fdt = unsafe { crate::dtb::Fdt::from_raw(dtb_addr) }?;
-    let mut base: Option<u64> = None;
-    fdt.for_each_compatible(b"ns16550a", |node| {
-        if base.is_none() && node.reg_count > 0
-        {
-            base = Some(node.reg_entries[0].0);
-        }
+    // SAFETY: st is valid (caller contract).
+    let rsdp = unsafe { find_config_table(st, &EFI_ACPI_20_TABLE_GUID) }.map_or(0, |p| p as u64);
+    // SAFETY: caller contract.
+    let spcr = unsafe { Acpi::new(tables, rsdp) }.and_then(|acpi| spcr_uart_base(&acpi));
+    let base = spcr.or_else(|| {
+        // SAFETY: st is valid (caller contract).
+        let dtb = unsafe { find_config_table(st, &EFI_DTB_TABLE_GUID) }.map_or(0, |p| p as u64);
+        // SAFETY: caller contract.
+        let tree = unsafe { device_tree(tables, dtb) }.and_then(Tree::new)?;
+        tree.uart().map(|(base, _)| base)
     });
-    base
-}
-
-/// Discover the UART MMIO base from ACPI SPCR or Device Tree.
-///
-/// Tries ACPI SPCR first (primary path for QEMU virt with EDK2), then DTB
-/// (ns16550a-compatible node). Falls back to 0x10000000 silently if both fail.
-///
-/// Must be called before `serial_init()` and `serial_write_byte()`.
-///
-/// # Safety
-/// `st` must be a valid pointer to the UEFI system table.
-pub unsafe fn discover_uart(st: *mut EfiSystemTable)
-{
-    // Try ACPI SPCR first (EDK2 on QEMU virt provides ACPI, not DTB).
-    // SAFETY: st is a valid UEFI system table pointer; caller guarantees validity.
-    if let Some(rsdp_ptr) = unsafe { crate::uefi::find_config_table(st, &EFI_ACPI_20_TABLE_GUID) }
+    if let Some(base) = base
     {
-        // SAFETY: rsdp obtained from UEFI config table; identity-mapped during boot.
-        if let Some(base) = unsafe { find_spcr_base(rsdp_ptr as u64) }
-        {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "usize is 64-bit on all supported UEFI targets, so the cast is exact"
-            )]
-            // SAFETY: single-threaded boot phase; no concurrent access to static mut.
-            unsafe {
-                UART_BASE_ADDR = base as usize;
-            };
-            return;
-        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "usize is 64-bit on all supported UEFI targets, so the cast is exact"
+        )]
+        // SAFETY: single-threaded boot phase; no concurrent access to static mut.
+        unsafe {
+            UART_BASE_ADDR = base as usize;
+        };
     }
-
-    // Try Device Tree (bare-metal RISC-V or non-EDK2 firmware with DTB).
-    // SAFETY: st is a valid UEFI system table pointer; caller guarantees validity.
-    if let Some(dtb_ptr) = unsafe { crate::uefi::find_config_table(st, &EFI_DTB_TABLE_GUID) }
-    {
-        let dtb_addr = dtb_ptr as u64;
-        // SAFETY: dtb_addr obtained from UEFI config table; identity-mapped and accessible during boot.
-        if let Some(base) = unsafe { find_dtb_uart_base(dtb_addr) }
-        {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "usize is 64-bit on all supported UEFI targets, so the cast is exact"
-            )]
-            // SAFETY: single-threaded boot phase; no concurrent access to static mut.
-            unsafe {
-                UART_BASE_ADDR = base as usize;
-            };
-        }
-    }
-    // Both failed: UART_BASE_ADDR retains the QEMU default (0x10000000).
 }
 
 /// Return the currently configured UART MMIO base address.

@@ -3,24 +3,29 @@
 
 // services/devmgr/firmware/src/property/dtb.rs
 
-//! The checks of [`crate::dtb`]: the flattened device tree's header,
-//! its structure block's tokens and the PCI ECAM windows of its
+//! The checks of [`crate::dtb`]: the PCI ECAM windows of the flattened device
+//! tree's
 //! `pci-host-ecam-generic` nodes, read from the Devicetree Specification
 //! 0.4 chapter 5 (the blob) and § 2.3 (`reg`, `#address-cells`,
-//! `#size-cells`), with the rules [`Fdt::find_pci_ecams`] documents.
+//! `#size-cells`), with the rules [`PciEcams::find_pci_ecams`] documents. The
+//! blob's header, its tokens, a `reg` and the `compatible` match are checked in
+//! `firmware-tables`; a check here calls the decoder of the format, which is
+//! proven there.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
 
-use super::bytes_at;
-use crate::EcamLocation;
-use crate::dtb::{self, Fdt, FdtEvent, NodeRead, Scan, ScanStep};
+use firmware_tables::EcamLocation;
+use firmware_tables::fdt::{self as format, Fdt, FdtEvent};
 
-/// Check the header and, for a blob it accepts, the ECAM windows.
+use super::bytes_at;
+use crate::dtb::{self, NodeRead, PciEcams, Scan, ScanStep};
+
+/// Check, for a blob [`Fdt::new`] accepts, the ECAM windows.
 pub(crate) fn dtb_holds(input: &[u8])
 {
-    if let Some(fdt) = header_holds(input)
+    if let Some(fdt) = Fdt::new(input)
     {
         windows_holds(&fdt);
     }
@@ -30,128 +35,6 @@ pub(crate) fn dtb_holds(input: &[u8])
 fn be32(bytes: &[u8], at: usize) -> Option<u32>
 {
     bytes_at(bytes, at).map(u32::from_be_bytes)
-}
-
-/// [`Fdt::new`] accepts a blob of at least the 40-byte header whose magic
-/// (at 0) is `0xD00D_FEED`, whose `totalsize` (at 4) lies inside it, and whose
-/// structure block (offset at 8, size at 36) ends inside `totalsize`; the
-/// strings block's offset is at 12. Returns the view.
-pub(crate) fn header_holds(input: &[u8]) -> Option<Fdt<'_>>
-{
-    let read = || {
-        if input.len() < 40 || be32(input, 0)? != 0xD00D_FEED
-        {
-            return None;
-        }
-        let total = usize::try_from(be32(input, 4)?).ok()?;
-        let structure = usize::try_from(be32(input, 8)?).ok()?;
-        let structure_len = usize::try_from(be32(input, 36)?).ok()?;
-        let strings = usize::try_from(be32(input, 12)?).ok()?;
-        (total <= input.len() && structure.checked_add(structure_len)? <= total).then_some((
-            structure,
-            structure_len,
-            strings,
-        ))
-    };
-    let expected = read();
-    let fdt = Fdt::new(input);
-    assert_eq!(
-        fdt.as_ref()
-            .map(|f| (f.dt_struct_off, f.dt_struct_len, f.dt_strings_off)),
-        expected,
-        "a device tree's header judged against its fields"
-    );
-    fdt
-}
-
-/// The bytes of `fdt`'s strings block from `off` to the first NUL or the
-/// blob's end; empty past the blob.
-fn name<'a>(fdt: &Fdt<'a>, off: usize) -> &'a [u8]
-{
-    let blob = fdt.blob;
-    let Some(start) = fdt
-        .dt_strings_off
-        .checked_add(off)
-        .filter(|&s| s <= blob.len())
-    else
-    {
-        return &[];
-    };
-    let mut nul = start;
-    while nul < blob.len() && blob.get(nul) != Some(&0)
-    {
-        nul = nul.saturating_add(1);
-    }
-    blob.get(start..nul).unwrap_or(&[])
-}
-
-/// The next 4-byte boundary at or after `at`.
-const fn align(at: usize) -> usize
-{
-    at.saturating_add(3) & !3
-}
-
-/// The token at `off` of a structure block that ends at `end`, past any
-/// `FDT_NOP` (4): `FDT_BEGIN_NODE` (1) with the node's name after it, up to
-/// its NUL (or `end`) and padded to 4 bytes; `FDT_END_NODE` (2);
-/// `FDT_PROP` (3) with the value's length and the name's offset in the
-/// strings block, then the value, padded to 4 bytes. Any other token, or one
-/// that runs past `end`, ends the block.
-fn token<'a>(fdt: &Fdt<'a>, off: usize, end: usize) -> Option<(FdtEvent<'a>, usize)>
-{
-    let blob = fdt.blob;
-    let mut at = off;
-    loop
-    {
-        let after = at.checked_add(4).filter(|&a| a <= end)?;
-        match be32(blob, at)?
-        {
-            1 =>
-            {
-                let mut nul = after;
-                while nul < end && blob.get(nul) != Some(&0)
-                {
-                    nul = nul.saturating_add(1);
-                }
-                return Some((
-                    FdtEvent::BeginNode { start: at },
-                    align(nul.saturating_add(1)),
-                ));
-            }
-            2 => return Some((FdtEvent::EndNode, after)),
-            3 =>
-            {
-                let data = after.checked_add(8).filter(|&d| d <= end)?;
-                let len = usize::try_from(be32(blob, after)?).ok()?;
-                let nameoff = usize::try_from(be32(blob, after.checked_add(4)?)?).ok()?;
-                let data_end = data.checked_add(len).filter(|&e| e <= end)?;
-                let event = FdtEvent::Prop {
-                    name: name(fdt, nameoff),
-                    data: blob.get(data..data_end)?,
-                };
-                return Some((event, align(data_end)));
-            }
-            4 => at = after,
-            _ => return None,
-        }
-    }
-}
-
-/// [`dtb::next_event`] reads the token at `off` of a structure block that
-/// ends at `end` as [`token`] does. Returns it.
-pub(crate) fn token_holds<'a>(
-    fdt: &Fdt<'a>,
-    off: usize,
-    end: usize,
-) -> Option<(FdtEvent<'a>, usize)>
-{
-    let expected = token(fdt, off, end);
-    assert_eq!(
-        dtb::next_event(fdt, off, end),
-        expected,
-        "a device tree token judged against the block"
-    );
-    expected
 }
 
 /// A cell value of 1 or 2 big-endian cells at `at`.
@@ -165,22 +48,11 @@ fn cells(data: &[u8], at: usize, count: usize) -> Option<u64>
     }
 }
 
-/// [`dtb::reg_pair`], [`dtb::bus_range`] and [`dtb::pci_domain`] read a
-/// property's `data`: `reg` as an address of `addr_cells` and a size of
-/// `size_cells` cells (1 or 2 each), `bus-range` as two big-endian `u32`,
-/// `linux,pci-domain` as a big-endian `u32` of at most 65535.
-pub(crate) fn properties_hold(data: &[u8], addr_cells: usize, size_cells: usize)
+/// [`dtb::bus_range`] and [`dtb::pci_domain`] read a property's `data`:
+/// `bus-range` as two big-endian `u32`, `linux,pci-domain` as a big-endian
+/// `u32` of at most 65535.
+pub(crate) fn properties_hold(data: &[u8])
 {
-    let reg = || {
-        let base = cells(data, 0, addr_cells)?;
-        let size = cells(data, addr_cells.checked_mul(4)?, size_cells)?;
-        Some((base, size))
-    };
-    assert_eq!(
-        dtb::reg_pair(data, addr_cells, size_cells),
-        reg(),
-        "a reg judged against its cells"
-    );
     let bus = || Some((be32(data, 0)?, be32(data, 4)?));
     assert_eq!(
         dtb::bus_range(data),
@@ -268,9 +140,9 @@ pub(crate) fn node_step_holds(
             want.depth = want.depth.saturating_sub(1);
             Some(want.depth > 0)
         }
-        FdtEvent::Prop { name, data } if want.depth == 1 =>
+        FdtEvent::Prop { name, data, .. } if want.depth == 1 =>
         {
-            properties_hold(data, cells.0, cells.1);
+            properties_hold(data);
             let mut read = || -> Option<()> {
                 match name
                 {
@@ -312,14 +184,14 @@ fn node_window(
     cells: (usize, usize),
 ) -> Option<(Window, bool)>
 {
-    let (_, mut off) = token_holds(fdt, start, end)?;
+    let (_, mut off) = format::next_event(fdt, start, end)?;
     let mut node = NodeRead::new();
     assert_eq!(
         (node.depth, node.reg, node.bus, node.domain),
         (1, None, None, None),
         "an ECAM node's read starts empty"
     );
-    while let Some((event, next)) = token_holds(fdt, off, end)
+    while let Some((event, next)) = format::next_event(fdt, off, end)
     {
         off = next;
         if !node_step_holds(&mut node, &event, cells)?
@@ -393,7 +265,7 @@ pub(crate) fn scan_step_holds(scan: &mut Scan, event: &FdtEvent<'_>) -> ScanStep
                 want.depth = depth.saturating_sub(1);
             }
         }
-        FdtEvent::Prop { name, data } if depth > 0 =>
+        FdtEvent::Prop { name, data, .. } if depth > 0 =>
         {
             let value = usize::try_from(be32(data, 0).unwrap_or(0)).unwrap_or(usize::MAX);
             let parent = want.cells.get(depth.saturating_sub(1)).copied();
@@ -427,7 +299,7 @@ pub(crate) fn scan_step_holds(scan: &mut Scan, event: &FdtEvent<'_>) -> ScanStep
     answer
 }
 
-/// [`Fdt::find_pci_ecams`] finds, in block order, the window of every node
+/// [`PciEcams::find_pci_ecams`] finds, in block order, the window of every node
 /// at most 16 levels deep (the root node is level 1) whose `compatible`
 /// list holds `pci-host-ecam-generic`, read once, at the first such
 /// `compatible` of the node, its `reg` read in its parent's
@@ -439,7 +311,7 @@ pub(crate) fn scan_step_holds(scan: &mut Scan, event: &FdtEvent<'_>) -> ScanStep
 /// judged by [`scan_step_holds`] on the way.
 fn windows_holds(fdt: &Fdt<'_>)
 {
-    let end = fdt.dt_struct_off.saturating_add(fdt.dt_struct_len);
+    let end = fdt.struct_end();
     // Each open node's start, the cells its children read `reg` in, and
     // whether its window has been read.
     let mut open: Vec<(usize, (usize, usize), bool)> = Vec::new();
@@ -450,8 +322,8 @@ fn windows_holds(fdt: &Fdt<'_>)
         "a walk starts with no node open"
     );
     let mut found = Vec::new();
-    let mut off = fdt.dt_struct_off;
-    while let Some((event, next)) = token_holds(fdt, off, end)
+    let mut off = fdt.struct_off();
+    while let Some((event, next)) = format::next_event(fdt, off, end)
     {
         off = next;
         scan_step_holds(&mut scan, &event);
@@ -465,12 +337,8 @@ fn windows_holds(fdt: &Fdt<'_>)
                     break;
                 }
             }
-            FdtEvent::Prop { name, data } =>
+            FdtEvent::Prop { name, data, .. } =>
             {
-                if name == b"compatible"
-                {
-                    compatible_holds(data, b"pci-host-ecam-generic");
-                }
                 let value = || usize::try_from(be32(data, 0).unwrap_or(0)).unwrap_or(usize::MAX);
                 let depth = open.len();
                 let parent = depth
@@ -534,21 +402,6 @@ fn windows_holds(fdt: &Fdt<'_>)
     assert_eq!(
         got, want,
         "a device tree's ECAM windows judged against its nodes"
-    );
-}
-
-/// [`dtb::compatible_contains`] finds the non-empty `needle` exactly when
-/// it is one of the NUL-separated entries of `data` ([`holds_entry`]).
-pub(crate) fn compatible_holds(data: &[u8], needle: &[u8])
-{
-    if needle.is_empty()
-    {
-        return;
-    }
-    assert_eq!(
-        dtb::compatible_contains(data, needle),
-        holds_entry(data, needle),
-        "a compatible list judged against its entries"
     );
 }
 

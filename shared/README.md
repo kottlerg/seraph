@@ -15,6 +15,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`device-tracker/`](device-tracker/README.md) | A device class's current driver, followed across a driver restart, for `std` clients (terminal, gdbstub, debug-echo) |
 | [`driver-binding/`](driver-binding/README.md) | Driver declarations in the ELF note `.note.seraph.driver` (`driver_declaration!`) and the resource list devmgr delivers a bound driver |
 | [`elf/`](elf/README.md) | ELF64 parser — header validation, segment enumeration |
+| [`firmware-tables/`](firmware-tables/README.md) | Decoders of the firmware tables' formats — ACPI RSDP, XSDT, MCFG and MADT structures, DMAR remapping structures, SPCR, and the flattened device tree — shared by devmgr and the bootloader, `no_std`, no allocation |
 | [`font/`](font/README.md) | Embedded 9×20 bitmap font shared by every framebuffer console |
 | [`gdb-rsp/`](gdb-rsp/README.md) | GDB remote serial protocol — packet framing, packet parse and encode, and the target descriptions a stub serves |
 | [`hwrng-protocol/`](hwrng-protocol/README.md) | Wire protocol of the `hwrng` device class: the `READ(n)` label, its reply bound, and the `READ_AUTHORITY` verb bit |

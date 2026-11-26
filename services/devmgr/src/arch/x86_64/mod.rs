@@ -11,8 +11,8 @@ use crate::IrqRangeAllocator;
 use crate::caps::{DevmgrCaps, Firmware};
 use crate::reply_status;
 use crate::tables::{locate_table_by_sig, with_acpi_table};
-use firmware::EcamLocation;
 use firmware::acpi::SourceOverride;
+use firmware_tables::EcamLocation;
 
 /// Arch-specific authority caps devmgr holds after bootstrap.
 pub struct ArchCaps

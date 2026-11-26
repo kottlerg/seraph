@@ -5,11 +5,17 @@ Higher-level flow (how ACPI parsing feeds the boot sequence) is owned by
 [firmware-parsing.md](firmware-parsing.md); this document owns the
 invariants internal to the ACPI walker itself.
 
-The implementation lives in [`core/boot/src/acpi.rs`](../src/acpi.rs), with the arch-specific
-extractors in
-[`core/boot/src/arch/x86_64/acpi_kernel_mmio.rs`](../src/arch/x86_64/acpi_kernel_mmio.rs),
-[`core/boot/src/arch/riscv64/acpi_kernel_mmio.rs`](../src/arch/riscv64/acpi_kernel_mmio.rs), and
-[`core/boot/src/arch/riscv64/acpi_spcr.rs`](../src/arch/riscv64/acpi_spcr.rs).
+The decoders are slice-taking functions: the format layer (RSDP, SDT header, XSDT, the MADT and DMAR
+structure steps, MCFG, SPCR) in
+[`shared/firmware-tables`](../../../shared/firmware-tables/README.md), and the bootloader's readings
+(CPU IDs, AIA, RHCT, TPM2, VMGENID, the aperture seeds) in
+[`core/boot/firmware/src/acpi.rs`](../firmware/src/acpi.rs) and
+[`core/boot/firmware/src/seeds.rs`](../firmware/src/seeds.rs). The walk from the RSDP to each
+table's bytes is [`core/boot/src/tables.rs`](../src/tables.rs)'s `Acpi`, which views every table
+through the memory map ([firmware-parsing.md](firmware-parsing.md) § Table Bounds), and the
+arch-specific extractors are
+[`core/boot/src/arch/x86_64/acpi_kernel_mmio.rs`](../src/arch/x86_64/acpi_kernel_mmio.rs) and
+[`core/boot/src/arch/riscv64/acpi_kernel_mmio.rs`](../src/arch/riscv64/acpi_kernel_mmio.rs).
 
 ---
 
@@ -59,22 +65,22 @@ The XSDT pointer at RSDP offset 24 is the authoritative table root; the
 | MCFG | `"MCFG"` | Aperture seeds for each ECAM window and the derived 32-bit / 64-bit PCI BAR windows (QEMU-layout heuristic: real hardware advertises these windows through the host bridge's `_CRS`, which the bootloader does not evaluate; see [firmware-parsing.md](firmware-parsing.md) §"Parsing Depth"). An absent MCFG contributes no seed; the arch's platform defaults below are appended either way. The ECAM windows are named seeds; the PCI BAR windows are heuristic windows, which reach `mmio_apertures` only where the memory map leaves them undescribed or reports MMIO (see [firmware-parsing.md](firmware-parsing.md) §"Firmware exclusion"). |
 | DMAR | `"DMAR"` | x86-64 VT-d platforms: an aperture seed for each DMA Remapping Hardware Unit's register set (DRHD, type 0: its register base and `2^size` pages). No other table names those pages, and devmgr hands each to the VT-d IOMMU driver as an `Mmio` cap ([docs/device-management.md](../../../docs/device-management.md#iommu-discovery-and-programming) § IOMMU Discovery and Programming). A DRHD with a zero or unaligned base is skipped. The bootloader reads nothing else from the DMAR; devmgr walks it for the units' scopes. |
 | TPM2 | `"TPM2"` | An aperture seed for the TPM's register window, the arch's (`arch::current::tpm_register_window`: on x86-64 the PC Client TPM range, `0xFED4_0000` for `0x5000` bytes, its five localities; none on riscv64), when the table's start method is 6 (the FIFO interface) or 7 (the CRB interface started through its start register) with the CRB control area inside that window. The table names no range of its own, no other table names the TPM's pages, and devmgr hands them to the TPM driver as an `Mmio` cap ([services/drivers/docs/tpm.md](../../../services/drivers/docs/tpm.md) § Discovery). Any other start method, a table too short to hold one, or a control area outside the window seeds nothing. The bootloader reads nothing else from the TPM2 table. |
-| SPCR | `"SPCR"` | RISC-V only: `BootInfo.kernel_mmio.uart_base` (from the Generic Address Structure when the address-space identifier is MMIO). `uart_size` is set to the ns16550a conventional 0x100 (SPCR does not carry a region size; the later DTB pass fills `uart_base` / `uart_size` only when ACPI left `uart_base` zero). The pre-Step-1 serial-init path uses the same walk to pick up a UART base for early diagnostics (see [console.md](console.md)). |
+| SPCR | `"SPCR"` | RISC-V only: `BootInfo.kernel_mmio.uart_base` (from the Generic Address Structure of the first SPCR, of at least the 80 bytes through its GSI field, whose address-space identifier is MMIO). `uart_size` is set to the ns16550a conventional 0x100 (SPCR does not carry a region size; the later DTB pass fills `uart_base` / `uart_size` only when ACPI left `uart_base` zero). The pre-Step-1 serial-init path uses the same walk to pick up a UART base for early diagnostics (see [console.md](console.md)). |
 | RHCT | `"RHCT"` | RISC-V only, Step 9 (`populate_kernel_mmio`): `BootInfo.kernel_mmio.timebase_freq` from the time-base-frequency field, and the `HART_CAP_*` bits (Sstc, Svpbmt, Svinval, Svnapot, Ssaia) named by every ISA-string node (a per-bit AND; zero when no ISA-string node exists). |
 | SSDT | `"SSDT"` | Every architecture where an RSDP is present, Step 9: `BootInfo.vmgenid_paddr`, the non-zero, 4 KiB-aligned `VGIA` named-DWORD value plus the 40-byte GUID offset; an SSDT whose OEM table ID starts with `VMGENID` is preferred, otherwise the first SSDT carrying the pattern. No AML is evaluated. |
 
-After the table walk, `parse_aperture_seed` appends the arch's platform defaults whenever the RSDP
-revision and the XSDT validate, MCFG present or absent: the register windows
-(`arch::current::default_mmio_apertures`) as named seeds and the PCI windows
+After the table walk, the seeder (`core/boot/src/tables.rs::aperture_seeds`) appends the arch's
+platform defaults whenever the RSDP revision and the XSDT validate, MCFG present or absent: the
+register windows (`arch::current::default_mmio_apertures`) as named seeds and the PCI windows
 (`arch::current::default_pci_windows`) as heuristic windows. Both lists are empty on x86-64; on
 riscv64 the register windows are the QEMU virt ECAM window and the ns16550a UART and Goldfish RTC
-register pages (`parse_aperture_seed` reads only MADT, MCFG, DMAR, and TPM2, so no table seeds
-those two pages; the aperture seeder does not read SPCR), and the PCI windows are the 32-bit and
-64-bit windows. Any overlap with the MCFG-derived seeds is collapsed by `derive_mmio_apertures` (see
+register pages (the seeder reads only MADT, MCFG, DMAR, and TPM2, so no table seeds those two pages;
+the aperture seeder does not read SPCR), and the PCI windows are the 32-bit and 64-bit windows. Any
+overlap with the MCFG-derived seeds is collapsed by `derive_mmio_apertures` (see
 [firmware-parsing.md](firmware-parsing.md) §"`mmio_apertures` construction"). Like the MCFG
 heuristic windows, the default PCI windows ignore the memory map (the riscv64 64-bit window `[16
-GiB, 32 GiB)` covers RAM on a virt guest with more than about 14 GiB); `derive_mmio_apertures`
-keeps only the parts of a heuristic window the map leaves undescribed or reports as MMIO (see
+GiB, 32 GiB)` covers RAM on a virt guest with more than about 14 GiB); `derive_mmio_apertures` keeps
+only the parts of a heuristic window the map leaves undescribed or reports as MMIO (see
 [firmware-parsing.md](firmware-parsing.md) §"Firmware exclusion").
 
 Every signature outside this table is ignored by the bootloader. Userspace consumes
@@ -85,6 +91,9 @@ the remaining ACPI tree via `BootInfo.acpi_rsdp`; see [firmware-parsing.md](firm
 ## Error Handling
 
 Malformed tables are skipped, not fatal:
+- A table the memory map refuses reads as absent, with a diagnostic naming it, its range and
+  the memory type or hole that refused it ([firmware-parsing.md](firmware-parsing.md) § Table
+  Bounds); a refused RSDP or XSDT reads as no ACPI.
 - A bad XSDT length or a short read yields empty extractor output (for the CPU
   topology, the single-CPU fallback: `cpu_count = 1`, `cpu_ids[0] = bsp_id`; for the
   aperture seeds, no platform defaults either).
@@ -99,7 +108,7 @@ Malformed tables are skipped, not fatal:
   window whose start or end overflows a 64-bit physical address is skipped, along with its
   derived PCI BAR windows.
 
-No diagnostic is logged for a malformed or absent table; the walkers'
+No diagnostic is logged for a malformed or absent table; beside the refusals above, the walkers'
 only diagnostics report surplus entries (more than `MAX_CPUS` enabled
 CPUs, on x86-64 more than `MAX_IOAPICS` IOAPICs, or aperture seeds past
 the seed buffers) and, on RISC-V, an IMSIC file off its layout. The

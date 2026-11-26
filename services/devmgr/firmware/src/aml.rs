@@ -32,7 +32,7 @@ use ::aml::encoding::{
 };
 use ::aml::resource::{self, AddressWidth, Resource, SPACE_MEMORY};
 
-use crate::acpi::{SDT_HDR_LEN, sdt_length};
+use firmware_tables::acpi::{SDT_HDR_LEN, sdt_length};
 
 // ── Bounds ────────────────────────────────────────────────────────────
 

@@ -16,9 +16,9 @@
 //! device is refused on that basis here. Operates on a caller-mapped byte
 //! slice of the table, as [`crate::acpi`] does. No alloc.
 
-use crate::acpi::{SDT_HDR_LEN, sdt_length, sdt_signature};
-use crate::bytes::{read_u8, read_u16, read_u32};
 use crate::dmar::{Bdf, Resolved};
+use firmware_tables::acpi::{SDT_HDR_LEN, sdt_length, sdt_signature};
+use firmware_tables::bytes::{read_u8, read_u16, read_u32};
 
 // ── Layout constants ──────────────────────────────────────────────────
 

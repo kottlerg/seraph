@@ -2672,8 +2672,8 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// Mint reclaimable `Memory` capabilities over bootloader scratch ranges.
 ///
 /// Walks `boot_info.reclaim_ranges` — the `BootInfo` page, module
-/// descriptor array, memory-map entry array, the raw UEFI memory-map buffer
-/// (zeroed by the bootloader after its last read), MMIO aperture array, the
+/// descriptor array, memory-map entry array, the raw UEFI memory-map buffers
+/// (each zeroed by the bootloader after its last read), MMIO aperture array, the
 /// reclaim-array page itself, the CPU-id pages, the bootloader's
 /// transient page-table frames, and the bundle's non-module pages (header +
 /// entry table + pad, init ELF source body, inter-module and trailing slack —

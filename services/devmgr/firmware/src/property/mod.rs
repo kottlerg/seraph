@@ -7,32 +7,34 @@
 //! input, [`firmware_holds`], which the fuzz target `devmgr-firmware`
 //! (`xtask/fuzz/targets`) drives and the replay test of the checked-in
 //! inputs under `fuzz/devmgr-firmware/` runs on every `cargo xtask test`;
-//! the `proofs` modules of `acpi.rs`, `dmar.rs`, `rimt.rs`, `platform.rs`,
-//! `aml.rs` and `dtb.rs` prove its checks of each step of the decode on every
-//! input up to their bounds (docs/testing.md § Fuzzing, § Bounded
-//! verification).
+//! the `proofs` modules of `acpi.rs`, `dmar.rs`, `rimt.rs`, `aml.rs` and
+//! `dtb.rs` prove its checks of each step of the decode on every input up to
+//! their bounds (docs/testing.md § Fuzzing, § Bounded verification). The
+//! formats under the interpretations, the ACPI RSDP, SDT header, XSDT, MCFG
+//! and MADT structures, the DMAR's remapping structures, the SPCR and the
+//! flattened device tree's blob, are checked by `firmware_tables::property`,
+//! which `firmware-tables` drives and proves; a check here calls the
+//! decoder of a format it builds on.
 //!
-//! The input is read as every table the crate decodes: an RSDP, an SDT
-//! header, an XSDT, a FADT, an MCFG, a MADT, a DMAR, a RIMT, an SPCR, a DSDT
-//! or SSDT's AML with the resource template of each device it reports, a
-//! resource template, and a flattened device tree. Each ACPI decoder judges
-//! the signature and the tree's the magic, so one input drives the decoder
-//! it names and the refusal of every other; the AML walk reads any table
-//! with an SDT header, and the template any bytes. Each check judges a
-//! decoder against a reading of the table's layout written apart from the
-//! decoder's, from the specifications its module names (ACPI 6.5 § 5.2,
-//! Intel VT-d 4.1 chapter 8, the RISC-V IO Mapping Table 1.0, the Serial
-//! Port Console Redirection Table, ACPI 6.5 § 20 and § 6.4 for the AML and
-//! its resource templates, the Devicetree Specification 0.4), with the skip
-//! and end rules each decoder documents: the walk's steps one by one, and
-//! every iterator the decoder builds on the walk, in step with it.
+//! The input is read as every table the crate interprets: a FADT, a MADT, a
+//! DMAR, a RIMT, a DSDT or SSDT's AML with the resource template of each
+//! device it reports, a resource template, and a flattened device tree. Each
+//! ACPI decoder judges the signature and the tree's the magic, so one input
+//! drives the decoder it names and the refusal of every other; the AML walk
+//! reads any table with an SDT header, and the template any bytes. Each check
+//! judges a decoder against a reading of the table's layout written apart
+//! from the decoder's, from the specifications its module names (ACPI 6.5
+//! § 5.2, Intel VT-d 4.1 chapter 8, the RISC-V IO Mapping Table 1.0, ACPI
+//! 6.5 § 20 and § 6.4 for the AML and its resource templates, the
+//! Devicetree Specification 0.4), with the skip and end rules each decoder
+//! documents: the walk's steps one by one, and every iterator the decoder
+//! builds on the walk, in step with it.
 
 pub(crate) mod acpi;
 pub(crate) mod aml;
 pub(crate) mod dmar;
 pub(crate) mod dtb;
 pub(crate) mod rimt;
-pub(crate) mod spcr;
 
 /// Check the contract of every firmware-table decoder on `input`.
 ///
@@ -44,7 +46,6 @@ pub fn firmware_holds(input: &[u8])
     acpi::acpi_holds(input);
     dmar::dmar_holds(input);
     rimt::rimt_holds(input);
-    spcr::spcr_holds(input);
     aml::aml_holds(input);
     dtb::dtb_holds(input);
 }

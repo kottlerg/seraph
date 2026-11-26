@@ -31,6 +31,7 @@ pub use paging::BootPageTable;
 
 use crate::error::BootError;
 use crate::firmware::FirmwareInfo;
+use crate::tables::{Acpi, TableMap};
 use crate::uefi::{EfiBootServices, EfiSystemTable, allocate_pages_max_addr};
 use boot_protocol::KernelMmio;
 use elf::EM_X86_64;
@@ -81,11 +82,11 @@ pub unsafe fn allocate_kernel_span(bs: *mut EfiBootServices, pages: usize)
 /// UART base to discover before `serial_init`.
 ///
 /// # Safety
-/// `_st` is unused; the function is safe to call at any point.
-pub unsafe fn pre_serial_init(_st: *mut EfiSystemTable) {}
+/// `_st` and `_tables` are unused; the function is safe to call at any point.
+pub unsafe fn pre_serial_init(_st: *mut EfiSystemTable, _tables: TableMap<'_>) {}
 
 /// Negotiate the paging depth: 5-level when CPUID reports LA57, else 4-level
-/// (see [`paging::negotiate_paging`]). The DTB and boot hart arguments belong
+/// (see [`paging::negotiate_paging`]). The DTB, map and boot hart arguments belong
 /// to the riscv64 hook, which selects Sv39/Sv48/Sv57 from the DTB `mmu-type`
 /// plus a `satp` write-probe; x86-64 publishes no DTB.
 ///
@@ -100,6 +101,7 @@ pub unsafe fn pre_serial_init(_st: *mut EfiSystemTable) {}
 pub unsafe fn negotiate_paging(
     bs: *mut EfiBootServices,
     _dtb_addr: u64,
+    _tables: TableMap<'_>,
     _boot_hart_id: u64,
 ) -> Result<(), crate::error::BootError>
 {
@@ -115,14 +117,17 @@ pub unsafe fn negotiate_paging(
 /// to its compiled-in defaults.
 ///
 /// # Safety
-/// `firmware.acpi_rsdp`, if non-zero, must be the physical address of a
-/// valid, identity-mapped ACPI RSDP.
-pub unsafe fn populate_kernel_mmio(firmware: &FirmwareInfo, km: &mut KernelMmio)
+/// As [`TableMap::view`] for the tables `tables` bounds.
+pub unsafe fn populate_kernel_mmio(
+    firmware: &FirmwareInfo,
+    tables: TableMap<'_>,
+    km: &mut KernelMmio,
+)
 {
-    if firmware.acpi_rsdp != 0
+    // SAFETY: caller contract.
+    if let Some(acpi) = unsafe { Acpi::new(tables, firmware.acpi_rsdp) }
     {
-        // SAFETY: caller guarantees acpi_rsdp is valid when non-zero.
-        unsafe { acpi_kernel_mmio::parse_kernel_mmio(firmware.acpi_rsdp, km) };
+        acpi_kernel_mmio::parse_kernel_mmio(&acpi, km);
     }
 }
 
@@ -239,7 +244,7 @@ pub fn default_mmio_apertures() -> &'static [(u64, u64)]
 /// 4 KiB localities from `0xFED4_0000`, which a PC Client TPM decodes
 /// whichever interface, FIFO or CRB, it presents. The ACPI `TPM2` table
 /// names the interface but not this range, so
-/// [`crate::acpi::parse_aperture_seed`] seeds it for a table naming an
+/// [`crate::tables::aperture_seeds`] seeds it for a table naming an
 /// interface the TPM driver speaks (`core/boot/docs/acpi.md` § Tables
 /// Consumed).
 #[expect(
@@ -267,7 +272,7 @@ pub fn default_pci_windows() -> &'static [(u64, u64)]
 /// extended leaf is not advertised by the CPU (very old hardware), fall
 /// back to the IA-32e architectural minimum of 36 bits. The result
 /// determines where firmware and hypervisors place the 64-bit PCI MMIO
-/// window — see [`crate::acpi::parse_aperture_seed`].
+/// window — see [`crate::tables::aperture_seeds`].
 #[cfg(not(test))]
 pub fn max_phys_addr_bits() -> u8
 {

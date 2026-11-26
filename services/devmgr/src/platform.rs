@@ -21,8 +21,9 @@
 //! (`aml`, `platform`, `records`).
 
 use firmware::aml::{self, CrsResource};
-use firmware::platform::{PlatformResource, PlatformTable, SpcrBase};
+use firmware::platform::{PlatformResource, PlatformTable};
 use firmware::records::{Added, DeviceInfo, Identity, PlatformKey, PlatformRecords};
+use firmware_tables::spcr::{SpcrBase, spcr};
 use ipc::devmgr_labels::PLATFORM_TABLES_PATH;
 use syscall_abi::PAGE_SIZE;
 
@@ -62,7 +63,7 @@ pub fn enumerate(
     attach_century(caps, &mut records);
     if let Some(spcr) = acpi
         .spcr
-        .and_then(|t| tables::with_acpi_table(&caps.firmware, t, firmware::platform::spcr))
+        .and_then(|t| tables::with_acpi_table(&caps.firmware, t, spcr))
     {
         let identity = Identity {
             spcr: Some(spcr.interface),

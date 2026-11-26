@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/devmgr/firmware/src/property/spcr.rs
+// shared/firmware-tables/src/property/spcr.rs
 
-//! The check of [`crate::platform::spcr`]: the Serial Port Console
+//! The check of [`crate::spcr::spcr`]: the Serial Port Console
 //! Redirection table's interface type, base address and interrupt, read from
 //! the Microsoft Serial Port Console Redirection Table specification.
 
 use super::{byte, le32, le64};
-use crate::platform::{self, Spcr, SpcrBase, SpcrInterrupt};
+use crate::spcr::{self, Spcr, SpcrBase, SpcrInterrupt};
 
-/// [`platform::spcr`] reads a table of signature `SPCR` and at least 80
+/// [`spcr::spcr`] reads a table of signature `SPCR` and at least 80
 /// bytes: the interface type at 36, and the base address's Generic Address
 /// Structure at 40, its space id 0 (system memory) or 1 (system I/O, an
 /// address of at most 16 bits) and its address at 44 not zero; the interrupt
@@ -56,7 +56,7 @@ pub(crate) fn spcr_holds(input: &[u8])
         })
     };
     assert_eq!(
-        platform::spcr(input),
+        spcr::spcr(input),
         read(),
         "an SPCR judged against its fields"
     );

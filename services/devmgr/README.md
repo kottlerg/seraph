@@ -11,7 +11,8 @@ discovery, and driver binding.
 devmgr/
 ├── Cargo.toml
 ├── README.md
-├── firmware/                       # `devmgr-firmware`: host-tested ACPI / DTB parsers, PCI scan,
+├── firmware/                       # `devmgr-firmware`: host-tested ACPI / DTB interpretations
+│                                   #   (over `shared/firmware-tables`' formats), PCI scan,
 │                                   #   aperture / IRQ range-cap table, driver-settle roster,
 │                                   #   served-driver ordinal table (tombstones),
 │                                   #   class watcher lists,

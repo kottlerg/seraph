@@ -22,7 +22,6 @@
 core::arch::global_asm!(include_str!("header.S"));
 
 pub mod acpi_kernel_mmio;
-pub mod acpi_spcr;
 pub mod dtb_kernel_mmio;
 pub mod handoff;
 pub mod paging;
@@ -32,9 +31,11 @@ pub use paging::{BootPageTable, negotiate_paging};
 
 use crate::error::BootError;
 use crate::firmware::FirmwareInfo;
+use crate::tables::{Acpi, TableMap, device_tree, report_limits};
 use crate::uefi::{
     EFI_SUCCESS, EfiBootServices, EfiGuid, EfiStatus, EfiSystemTable, allocate_pages,
 };
+use boot_firmware::dtb::Tree;
 use boot_protocol::KernelMmio;
 use elf::EM_RISCV;
 
@@ -67,11 +68,12 @@ pub const EXPECTED_ELF_MACHINE: u16 = EM_RISCV;
 /// Tries ACPI SPCR first, then DTB, then falls back to the QEMU default.
 ///
 /// # Safety
-/// `st` must be a valid pointer to the UEFI system table.
-pub unsafe fn pre_serial_init(st: *mut EfiSystemTable)
+/// `st` must be a valid pointer to the UEFI system table, and the tables
+/// `tables` bounds meet [`TableMap::view`]'s contract.
+pub unsafe fn pre_serial_init(st: *mut EfiSystemTable, tables: TableMap<'_>)
 {
-    // SAFETY: st is valid; discover_uart reads UEFI configuration tables.
-    unsafe { serial::discover_uart(st) };
+    // SAFETY: caller contract.
+    unsafe { serial::discover_uart(st, tables) };
 }
 
 /// Return the MMIO base address of the discovered UART for identity mapping.
@@ -100,19 +102,23 @@ pub fn default_direct_map_base() -> u64
 /// `core/boot/docs/boot-flow.md` § Step 9: Populate `BootInfo`.
 ///
 /// # Safety
-/// `firmware.acpi_rsdp` and `firmware.device_tree`, when non-zero, must
-/// each be the physical address of a valid, identity-mapped RSDP / FDT.
-pub unsafe fn populate_kernel_mmio(firmware: &FirmwareInfo, km: &mut KernelMmio)
+/// As [`TableMap::view`] for the tables `tables` bounds.
+pub unsafe fn populate_kernel_mmio(
+    firmware: &FirmwareInfo,
+    tables: TableMap<'_>,
+    km: &mut KernelMmio,
+)
 {
-    if firmware.acpi_rsdp != 0
+    // SAFETY: caller contract.
+    if let Some(acpi) = unsafe { Acpi::new(tables, firmware.acpi_rsdp) }
     {
-        // SAFETY: caller guarantees acpi_rsdp is valid when non-zero.
-        unsafe { acpi_kernel_mmio::parse_kernel_mmio(firmware.acpi_rsdp, km) };
+        acpi_kernel_mmio::parse_kernel_mmio(&acpi, km);
     }
-    if firmware.device_tree != 0
+    // SAFETY: caller contract.
+    if let Some(tree) = unsafe { device_tree(tables, firmware.device_tree) }.and_then(Tree::new)
     {
-        // SAFETY: caller guarantees device_tree is valid when non-zero.
-        unsafe { dtb_kernel_mmio::parse_kernel_mmio(firmware.device_tree, km) };
+        dtb_kernel_mmio::parse_kernel_mmio(&tree, km);
+        report_limits(&tree);
     }
 
     // The kernel timer and paging init refuse to boot without these; log
@@ -238,10 +244,10 @@ pub unsafe fn allocate_kernel_span(bs: *mut EfiBootServices, pages: usize)
 ///
 /// Fixed rather than discovered: EDK2 on the seraph boot path does not
 /// re-publish the DTB via a UEFI configuration table, so
-/// [`crate::dtb::parse_aperture_seed`] sees no DTB; some firmware builds
+/// [`crate::tables::aperture_seeds`] sees no DTB; some firmware builds
 /// publish no MCFG; and no table the ACPI aperture seeder reads (MADT,
 /// MCFG) names the UART or Goldfish RTC page. When
-/// [`crate::acpi::parse_aperture_seed`] appends these is specified in
+/// [`crate::tables::aperture_seeds`] appends these is specified in
 /// `core/boot/docs/acpi.md` § Tables Consumed.
 ///
 /// The UART and Goldfish RTC entries each cover one 4 KiB page so devmgr
@@ -267,7 +273,7 @@ pub fn default_mmio_apertures() -> &'static [(u64, u64)]
 /// reported, so [`crate::memory_map::derive_mmio_apertures`] keeps only the
 /// parts the memory map leaves undescribed or reports as MMIO
 /// (`core/boot/docs/firmware-parsing.md` § Firmware exclusion). Appended by
-/// [`crate::acpi::parse_aperture_seed`] with [`default_mmio_apertures`].
+/// [`crate::tables::aperture_seeds`] with [`default_mmio_apertures`].
 pub fn default_pci_windows() -> &'static [(u64, u64)]
 {
     const ENTRIES: &[(u64, u64)] = &[(0x4000_0000, 0x4000_0000), (0x4_0000_0000, 0x4_0000_0000)];
@@ -276,7 +282,7 @@ pub fn default_pci_windows() -> &'static [(u64, u64)]
 
 /// No TPM register window on riscv64: no platform profile the bootloader
 /// targets places a TPM at a fixed range, so a `TPM2` table seeds no
-/// aperture ([`crate::acpi::parse_aperture_seed`]).
+/// aperture ([`crate::tables::aperture_seeds`]).
 pub fn tpm_register_window() -> Option<(u64, u64)>
 {
     None
@@ -291,9 +297,10 @@ pub fn tpm_register_window() -> Option<(u64, u64)>
 /// the safe upper bound.
 ///
 /// Provided for arch-dispatch symmetry with x86-64. The current
-/// QEMU virt RISC-V machine has a fixed, well-known PCI MMIO layout
-/// that [`crate::acpi::parse_aperture_seed`] handles via its
-/// virt-machine branch, so this value is not consumed today. When
+/// QEMU virt RISC-V machine has a fixed, well-known PCI MMIO layout,
+/// which the aperture seeds' virt-machine branch
+/// (`boot_firmware::seeds::pci_windows`, for an ECAM below 2 GiB) places,
+/// so this value reaches no seed on QEMU virt. When
 /// RISC-V boards diverge from QEMU virt and need MAXPHYADDR-derived
 /// apertures, this function is the dispatch point.
 pub fn max_phys_addr_bits() -> u8

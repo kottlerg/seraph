@@ -10,10 +10,12 @@
 # The binaries, as one array rather than `[[bin]]` tables, so each target is
 # one line; a root key, so it comes before the first table.
 bin = [
+    { name = "boot-firmware", path = "src/bin/boot-firmware.rs", test = false },
     { name = "boot-protocol", path = "src/bin/boot-protocol.rs", test = false },
     { name = "devmgr-firmware", path = "src/bin/devmgr-firmware.rs", test = false },
     { name = "driver-binding", path = "src/bin/driver-binding.rs", test = false },
     { name = "elf", path = "src/bin/elf.rs", test = false },
+    { name = "firmware-tables", path = "src/bin/firmware-tables.rs", test = false },
     { name = "gpt", path = "src/bin/gpt.rs", test = false },
     { name = "hwrng-protocol", path = "src/bin/hwrng-protocol.rs", test = false },
     { name = "init-protocol", path = "src/bin/init-protocol.rs", test = false },
@@ -33,10 +35,12 @@ publish.workspace = true
 autobins = false
 
 [dependencies]
+boot-firmware = { path = "../../../core/boot/firmware" }
 boot-protocol = { path = "../../../abi/boot-protocol" }
 devmgr-firmware = { path = "../../../services/devmgr/firmware" }
 driver-binding = { path = "../../../shared/driver-binding" }
 elf = { path = "../../../shared/elf" }
+firmware-tables = { path = "../../../shared/firmware-tables" }
 fuzz-engine = { path = "../engine" }
 hwrng-protocol = { path = "../../../shared/hwrng-protocol" }
 init-protocol = { path = "../../../abi/init-protocol" }

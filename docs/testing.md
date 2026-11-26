@@ -717,7 +717,11 @@ lines between `whole-lines begin` and `whole-lines end senders=4 lines=N` for up
 cannot read its own serial output, so `cargo xtask run --whole-lines <TAG>` checks a passing run's
 log: between `<TAG> begin` and `<TAG> end ...` every line is one console line and each sender's
 numbered lines arrive whole, in order, none missing. A run whose check fails is `FAIL`; a
-`QEMU-CRASH` run is not checked. The svctest cell's CI boot passes `--whole-lines whole-lines`
+`QEMU-CRASH` run is not checked. svctest's `serial_transmit` phase, right after it, writes numbered
+lines to the serial driver itself between `serial-burst begin` and `serial-burst end senders=1
+lines=N` while the driver's transmitter is stopped, so their bytes wait in the driver's transmit
+ring until it is started again, and the same check reads them. The svctest cell's CI boot passes
+`--whole-lines whole-lines --whole-lines serial-burst`
 ([docs/console-model.md](console-model.md);
 [xtask/README.md](../xtask/README.md#classified-boots---runs)).
 

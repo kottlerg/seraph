@@ -552,6 +552,9 @@ jobs:
           # its senders, crashd and the kernel wrote at once: svctest's
           # `console_whole_lines` phase brackets its lines with
           # `whole-lines begin` and `whole-lines end` (`--whole-lines`).
+          # It checks the same of the lines svctest's `serial_transmit` phase
+          # writes to the serial driver while its transmitter is stopped,
+          # bracketed with `serial-burst begin` and `serial-burst end`.
           # The usertest boot also checks the log-level configuration its
           # staging packed: a debug line of vfsd and of the fatfs vfsd spawns,
           # and none of devmgr or procmgr. The ktest boot also checks the
@@ -561,7 +564,7 @@ jobs:
           checks=()
           case "${{ matrix.tester }}" in
             svctest)
-              checks=(--whole-lines whole-lines) ;;
+              checks=(--whole-lines whole-lines --whole-lines serial-burst) ;;
             usertest)
               checks=(--require 'DEBUG  \[vfsd\] ' --require 'DEBUG  \[fatfs\] '
                       --fail-also 'DEBUG  \[(devmgr|procmgr)\] ') ;;

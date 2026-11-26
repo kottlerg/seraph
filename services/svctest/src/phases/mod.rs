@@ -172,6 +172,7 @@ pub mod random;
 pub mod recv_guard;
 pub mod recv_pool;
 pub mod restore;
+pub mod serial_transmit;
 pub mod sessiond;
 pub mod shmem;
 pub mod snapshot;
@@ -317,6 +318,10 @@ fn ordered() -> Vec<Phase>
     // past the sink's queue are dropped by design, which the whole-lines
     // check would read as lines lost.
     out.extend_from_slice(console_whole_lines::phases());
+    // Beside console_whole_lines, whose console check it shares; it writes
+    // its lines to the serial driver itself, so logd_sinks's drops do not
+    // touch them and it has no order of its own.
+    out.extend_from_slice(serial_transmit::phases());
     out.extend_from_slice(logd_sinks::phases());
     out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());

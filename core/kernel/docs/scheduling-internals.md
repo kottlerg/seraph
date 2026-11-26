@@ -838,9 +838,12 @@ which `sys_thread_start`'s commit also takes, and holds it across its writes.
 `select_target_cpu` reads `cpu_affinity` without `sched_lock`; the link re-reads it under the lock
 (the `cpu_affinity` enforcement invariant below). Its synchronous rule reads `priority`, of the
 woken thread and of the waker running on its own CPU, and its RT rule the woken thread's, without
-`sched_lock`, as placement hints: a read that races a priority change misjudges one placement,
-which the rules after it and the idle pull bound (§ Wake Protocol Invariants, "Target CPU
-selection"), and `enqueue_and_wake` links the thread at the `priority` it reads under the lock.
+`sched_lock`, as placement hints (the synchronous rule reads the woken thread's `serves_reply_recv`
+and the waker's `cpu_affinity` so too, the Reply prediction row below, and the waker's own
+`in_fault_delivery`, which the waker wrote itself before its delivery): a read that races a
+priority change misjudges one placement, which the rules after it and the idle pull bound (§ Wake
+Protocol Invariants, "Target CPU selection"), and `enqueue_and_wake` links the thread at the
+`priority` it reads under the lock.
 
 | Field group | Fields | Owning lock | Cross-CPU access rule |
 |---|---|---|---|
@@ -856,6 +859,7 @@ selection"), and `enqueue_and_wake` links the thread at the `priority` it reads 
 | **Death observers** | `death_observers`, `exit_reason`, `sleep_deadline`, `sleep_node`, `sleep_expiry` | The thread's own `sched_lock` for the `death_observers` chain head (`sys_thread_bind_notification` pushes a node under it, taking the node's reference on its `EventQueueObject` in the same hold; `post_death_notification` reads the head under it and walks the chain after, whose links behind the head never change; `dealloc_object(Thread)` takes the chain without it at drain step 13, returning each node to its queue's pool and releasing each observer's reference, since the thread is then off every CPU and unpinnable, so no other path reaches the fields); for `exit_reason`, the all-locks hold of the `Exited` commit (`exit_under_all_locks`, `commit_cancelling_park`), whose every write holds the thread's `sched_lock` and every CPU's `scheduler.lock`; for `sleep_deadline` (an `AtomicU64`), the owner's `tcb.sleep_deadline` row in [thread-lifecycle-and-sleep.md § Atomic Ordering for Sleep List and Lifecycle](thread-lifecycle-and-sleep.md#atomic-ordering-for-sleep-list-and-lifecycle): `SLEEP_LIST_LOCK` for every load-bearing read and every clear except a parker's own rollback of a deadline it never listed, the parker's own store before its park commit for a plain sleep, and the source IPC lock for a timed wait's arming store and the wakers' prechecks ([thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants)); for `sleep_node`, `SLEEP_LIST_LOCK`, under which `sleep_list_add`, `sleep_list_remove`, and the timer pop link and unlink it; for `sleep_expiry`, the timer pop's batch: the pop writes it under `SLEEP_LIST_LOCK` and the same batch reads it after, on CPU0's non-reentrant timer path. | Cross-CPU writes follow the per-field rule above. A reader of `exit_reason` holds one of the locks its writer holds: `CAP_INFO_THREAD_STATE` the local CPU's `scheduler.lock`, `sys_thread_bind_notification` the thread's `sched_lock`. |
 | **Spurious-resume tripwire** (debug builds only) | `park_episode`, `deposit_episode` (`AtomicU32`) | None: lock-free counters. `park_episode` is bumped (Relaxed) by the thread itself when it opens a call or fault park episode (`open_call_episode` in `syscall/ipc.rs`, `ipc::fault::fault_dispatch`), before the park makes it claimable; `deposit_episode` is stamped (Relaxed) to `park_episode` by the episode's exclusive claim winner (`stamp_park_deposit`, `stamp_deposit_episode`), before that winner's Release of the disposition or fault outcome. | Read only by the resumed thread itself, after its Acquire of the disposition or fault outcome, in a `debug_assert!` that the two are equal (the #352-class spurious-resume tripwire); no other path reads them and no control flow depends on them. |
 | **Idle-halt mark** | `idle_halts_mark_cpu`, `idle_halts_mark` | The thread itself: written only by its own `SYS_SYSTEM_INFO(IdleHalts)` call (`sched::idle_halts_since_mark`), Relaxed, and set unmarked (`NO_IDLE_HALTS_MARK`) by every TCB construction: the Thread retype, the idle threads' and init's. | Read and written only by that call, on the CPU the thread runs on; no other CPU and no other path reads them. |
+| **Reply prediction** | `serves_reply_recv` | The thread itself: written only by its own receive (`receive_on`), Relaxed, before the receive can link it on a recv queue, and cleared by every TCB construction. | Read Relaxed without a lock by `select_target_cpu`'s synchronous rule, on the wake of a call that dequeued the thread from that queue under `ep.lock`, which orders the write before the read, and only with an unpinned waker outside a fault delivery; a placement hint (§ Wake Protocol Invariants, "Target CPU selection"). |
 | **Registry** | `registry` (its `next` and `prev` links) | `THREAD_REGISTRY_LOCK` (§ Thread Registry): spliced in at construction and out at dealloc under it. | Every registry walk (the softlockup watchdog's, the object-teardown, hold, release and `IoPort` walks) reads the links only under that lock. |
 
 **`sched_lock` (`core/kernel/src/sched/thread.rs`).** A per-TCB IRQ-disabling ticket `Spinlock` (the
@@ -1320,26 +1324,58 @@ placed on the waker's CPU k when k is eligible and the guard holds:
   both classes. An RT recipient is not placed ahead of a lower RT or fair thread queued on k: that
   thread would wait behind it while the recipient's own CPU idles, and one pinned to k has no pull
   to bound the wait.
-- **The woken thread does not outrank the waker** (`run_queue::outranks` on the two `priority`
-  values: one run queue above the other). A fair waker's reply wake returns it to k, by its
-  affinity or its sticky `preferred_cpu`; a recipient that outranks it and serves a backlog
-  without parking would hold it off past any slice, since slice expiry never hands the CPU to a
-  lower RT level or from an RT thread to a fair one ([scheduler.md](scheduler.md) § Time Slice
-  Policy). An RT waker's plain reply wake goes by rank (the RT rule, below): it leaves k when the
-  recipient runs there at the waker's level or above. At or below the waker, the recipient is
-  preempted by the reply wake or shares k with the waker within one slice; at the waker's level, a
-  recipient serving a backlog without parking holds a fair waker's `SYS_IPC_REPLY` wake that long,
-  sends an RT waker's to another CPU, and holds a `SYS_IPC_REPLY_RECV` wake not at all (below).
+-  **The woken thread does not outrank the waker** (`run_queue::outranks` on the two `priority`
+  values: one run queue above the other), **or its latest receive was a `SYS_IPC_REPLY_RECV`'s and
+  the waker can leave k** (the waker's `cpu_affinity` `AFFINITY_ANY` and `in_fault_delivery` clear,
+  `WakerMobility` through `WakeView::waker_can_move`, read only when the woken thread outranks the
+  waker; then `serves_reply_recv`, read only when, in addition, the waker can move). A fair waker's
+  reply wake returns it to k, by its affinity or its sticky `preferred_cpu`; a recipient that
+  outranks it and serves a backlog without parking would hold it off past any slice, since slice
+  expiry never hands the CPU to a lower RT level or from an RT thread to a fair one
+  ([scheduler.md](scheduler.md) § Time Slice Policy). An RT waker's plain reply wake goes by rank
+  (the RT rule, below): it leaves k when the recipient runs there at the waker's level or above. At
+  or below the waker, the recipient is preempted by the reply wake or shares k with the waker within
+  one slice; at the waker's level, a recipient serving a backlog without parking holds a fair
+  waker's `SYS_IPC_REPLY` wake that long, sends an RT waker's to another CPU, and holds an unpinned
+  caller's `SYS_IPC_REPLY_RECV` wake not at all (below). That last is why the second branch admits a
+  recipient that outranks the waker: a `SYS_IPC_REPLY_RECV` wakes its caller after its receive, with
+  `Sync` when the receive parks, onto k with the server gone, and with `WakerRuns` when it runs on,
+  which `wake_replied` places with k excluded when the server outranks the caller (below), so an
+  unpinned caller goes to another CPU. A waker that cannot leave k is not admitted: one with hard
+  affinity, which rule 1 returns to k ahead of any exclusion, so that it would wait behind a
+  recipient serving a backlog there, and a thread in a fault delivery, whose resume reply wakes it
+  at once (`reply_to_fault`, `WakeHint::None`), before the handler's receive, and so by rule 4 to k
+  behind the handler. When the recipient outranks such a waker, the other rules place it with k
+  excluded, as `select_target_cpu_excluding` excludes a CPU, the RT rule's preferred pick included,
+  so the recipient's preferred CPU being k (where it last ran beside an unpinned caller) does not
+  return it there. The waker's two fields are read without a lock: `in_fault_delivery` is its own,
+  written by the waker before its delivery and read on its own CPU in the syscall that wakes the
+  recipient, and `cpu_affinity` is a placement hint, as the woken thread's is; an affinity change
+  racing the call misjudges one placement, which the pull bounds. The bit is the recipient's own
+  prediction of how it replies, written by the thread itself (`receive_on`, Relaxed) before its
+  receive can link it on the recv queue: true from `sys_ipc_reply_recv`, false from `sys_ipc_recv`.
+  The call that wakes it dequeued it under `ep.lock`, which orders the write before the guard's
+  Relaxed read. A recipient that received through `SYS_IPC_REPLY_RECV` and answers with
+  `SYS_IPC_REPLY` after all leaves that caller's reply wake to rule 4 and the RT rule as a plain
+  reply does, queued on k behind it until it parks or an idle CPU pulls the caller
+  ([scheduler.md](scheduler.md) § Thread Assignment). On the `Sync` wake of a `SYS_IPC_REPLY_RECV`
+  whose receive parked, the woken thread is the caller and the bit its own latest receive's; the
+  waker, parked in a receive, awaits no reply wake that the woken thread could hold off on k, so the
+  bit decides nothing the rank check protects there.
 
 **The waker that runs on (rule 4's exception).** The reply of a `SYS_IPC_REPLY_RECV` whose receive
 did not park (it bound a queued caller, a try-once found none, its park was refused, or it failed)
 passes `WakeHint::WakerRuns`: the server runs on, so its CPU k is busy whatever its load reads.
+When the server outranks the caller, `wake_replied` places the wake with k excluded
+(`reply_wake_exclusion`, `select_target_cpu_excluding`): every rule after rule 1 leaves k out,
+since the server keeps k past any slice the caller could wait for, and only a caller pinned to k
+lands there.
 Rule 4 then skips k when it is the caller's `preferred_cpu`, and the caller goes to its preferred
 CPU when that is another and within the threshold, and by least load otherwise. The RT rule skips
 k as a preferred pick the same way: an RT caller goes to its preferred CPU when that is another
-where it runs at once, and to the CPU of the lowest rank otherwise. Rules 1, 2 and 5, and the RT
-rule's scan, may still place it on k. When one does, and the server does not outrank the caller,
-`wake_replied` reports it and the server yields to the caller (`schedule(Requeue::Always)`, at
+where it runs at once, and to the CPU of the lowest rank otherwise. For a server that does not
+outrank the caller, rules 1, 2 and 5, and the RT rule's scan, may still place it on k. When one
+does, `wake_replied` reports it and the server yields to the caller (`schedule(Requeue::Always)`, at
 the tail of its level) before it returns to user mode, after
 delivering a bound message or before returning an error; a refused park yields through its own
 `schedule()` ([ipc-internals.md](ipc-internals.md) § Reply-and-Receive Path). A caller placed
@@ -1379,19 +1415,21 @@ affinity mask, less the excluded CPU), the rule returns:
   the fewest busy SMT siblings, then to the lowest index (`least_loaded_cpu` over the key of rank
   and load).
 
-It returns nothing only when no CPU is eligible, and rules 4 and 5 then decide as for a fair wake.
+It returns nothing only when no CPU is eligible, or when the only eligible CPU is the waker's CPU k
+that a `Sync` wake leaves out of the scan, and rules 4 and 5 then decide as for a fair wake.
 A thread placed behind a thread of its own level shares the CPU within a slice; one placed behind a
 higher level waits for it to block, which the rule chooses only when every eligible CPU runs or
 queues its level or above.
 
 A `Sync` wake reaches the rule only when the guard failed. k's `current_level` still names the
 waker, whose park has committed, so the rule ranks k by its queued threads alone
-(`CpuRanks::queued`). When the guard failed because the woken thread outranks the waker, the
-lowest-rank scan leaves k out, so the rule does not place on k a thread the guard kept off it; the
-first branch still returns k when it is the thread's preferred CPU and the thread runs there at
-once, as rule 4 returns it within the threshold. On a `WakerRuns` wake the server runs on, so k
-ranks by the server's recorded level, and a caller the scan places on k still has
-`wake_replied`'s yield (above).
+(`CpuRanks::queued`). When the guard failed because the woken thread outranks the waker (k queued a
+thread, or the thread's latest receive was a plain one), the lowest-rank scan leaves k out, so the
+rule does not place on k a thread the guard kept off it; the first branch still returns k when it is
+the thread's preferred CPU and the thread runs there at once, as rule 4 returns it within the
+threshold, except for a waker that cannot leave k, for which every rule leaves k out (above). On a
+`WakerRuns` wake the server runs on, so k ranks by the server's recorded level, and a caller the
+scan places on k still has `wake_replied`'s yield (above).
 
 The rule reads every eligible CPU's `current_level` and `non_empty` Relaxed, holding no lock
 (§ Lock-free readers of a CPU's run queues). The sample is a hint that no locked step re-reads: a

@@ -63,7 +63,9 @@ The three operations of the serial protocol, with the labels, wire shapes, and v
 [services/drivers/serial/README.md](../../serial/README.md) § Messages specifies:
 
 - `SERIAL_WRITE_BYTES` sends the bytes through the transmit queue and replies once the device
-  has taken them. The wait has no bound of its own, as a UART's wait for its transmit register
+  has taken them, with `SERIAL_WRITE_SENT` or without: the driver reads the opcode and the length
+  and ignores the flag, since its reply already waits for the device. The wait has no bound of its
+  own, so it never replies `STALLED`, as a UART's wait for its transmit register
   has none. QEMU's `virtconsole` port completes each transmission at once and drops the bytes
   its host end cannot take then (no client connected, or the client's socket buffer full),
   since QEMU holds bytes back only for a port other than port 0, which needs

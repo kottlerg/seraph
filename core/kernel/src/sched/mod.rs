@@ -2850,6 +2850,95 @@ fn idle_saved_state(cpu: usize, stack_top: u64) -> crate::arch::current::context
     saved
 }
 
+/// CPU `cpu`'s idle thread, running on the idle kernel stack whose top is
+/// `stack_top`, with its initial context at [`idle_thread_entry`].
+#[cfg(not(test))]
+fn idle_tcb(cpu: usize, stack_top: u64) -> ThreadControlBlock
+{
+    ThreadControlBlock {
+        state: ThreadState::Running,
+        priority: IDLE_PRIORITY,
+        slice_remaining: 0,
+        cpu_affinity: cpu as u32,
+        preferred_cpu: cpu as u32,
+        placement: crate::sched::thread::PlacementCounts::new(),
+        serves_reply_recv: core::sync::atomic::AtomicBool::new(false),
+        run_queue_next: None,
+        queued_on: core::sync::atomic::AtomicI16::new(-1),
+        #[cfg(debug_assertions)]
+        last_enqueue: None,
+        sched_lock: crate::sync::Spinlock::new(),
+        wake_pending: false,
+        park_started_tick: 0,
+        park_seq: core::sync::atomic::AtomicU32::new(0),
+        start_seq: 0,
+        hold: crate::sched::hold::HoldMark::None,
+        ipc_state: IpcThreadState::None,
+        ipc_msg: crate::ipc::message::Message::default(),
+        reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        park_disposition: core::sync::atomic::AtomicU8::new(thread::PARK_DISPOSITION_NONE),
+        #[cfg(debug_assertions)]
+        park_episode: core::sync::atomic::AtomicU32::new(0),
+        #[cfg(debug_assertions)]
+        deposit_episode: core::sync::atomic::AtomicU32::new(0),
+        ipc_wait_next: None,
+        ipc_wait_prev: core::ptr::null_mut(),
+        ipc_wait_queue: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        recv_park_slot: core::ptr::null(),
+        fault_handlers: [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) };
+            crate::ipc::fault::FAULT_CLASSES],
+        fault_badges: [const { core::sync::atomic::AtomicU64::new(0) };
+            crate::ipc::fault::FAULT_CLASSES],
+        fault_outcome: core::sync::atomic::AtomicU8::new(0),
+        fault_redirect: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        in_fault_delivery: false,
+        fault_delivery_class: 0,
+        fault_rebound: false,
+        upcall_pending: core::sync::atomic::AtomicBool::new(false),
+        upcall_cookie: core::sync::atomic::AtomicU64::new(0),
+        upcall_any_instruction: core::sync::atomic::AtomicBool::new(false),
+        upcall_masked: core::sync::atomic::AtomicBool::new(false),
+        is_user: false,
+        saved_state: idle_saved_state(cpu, stack_top),
+        kernel_stack_top: stack_top,
+        // Phase 4 made the idle guard before any other CPU ran.
+        guard_epoch: 0,
+        trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
+        address_space: core::ptr::null_mut(),
+        cspace: core::ptr::null_mut(),
+        cspace_id: 0,
+        cspace_epoch: 0,
+        ipc_buffer: 0,
+        wakeup_value: 0,
+        wakeup_tag: 0,
+        timed_out: false,
+        iopb: core::ptr::null_mut(),
+        blocked_on_object: core::ptr::null_mut(),
+        thread_id: alloc_thread_id(),
+        context_saved: core::sync::atomic::AtomicU32::new(1),
+        wake_in_flight: core::sync::atomic::AtomicU32::new(0),
+        death_observers: thread::DeathObserverChain::new(),
+        exit_reason: 0,
+        sleep_deadline: core::sync::atomic::AtomicU64::new(0),
+        sleep_node: crate::sched::deadline_heap::DeadlineNode::new(),
+        sleep_expiry: crate::sched::thread::SleepExpiry::EMPTY,
+        extended: thread::ExtendedState::empty(),
+        // Idle TCBs stay off the registry: they bind no CSpace
+        // or address space (null above), so the object-teardown
+        // walk never needs to stop one — and that same null
+        // binding is what keeps phase 2's bound-`current` scan
+        // from seeing an idle `current` as an unmarked bound
+        // thread it would loop back to a phase 1 that cannot
+        // mark it. They are never deallocated or `Blocked`, and
+        // the watchdog's per-CPU `current` dump already shows them.
+        registry: crate::sched::registry_list::RegistryLinks::new(),
+        idle_halts_mark_cpu: core::sync::atomic::AtomicU32::new(thread::NO_IDLE_HALTS_MARK),
+        idle_halts_mark: core::sync::atomic::AtomicU64::new(0),
+        magic: thread::TCB_MAGIC,
+    }
+}
+
 /// Initialise per-CPU scheduler state and idle threads for `cpu_count` CPUs.
 ///
 /// The idle kernel stacks are allocated earlier, in [`init_per_cpu_storage`]
@@ -2884,9 +2973,6 @@ pub unsafe fn init(cpu_count: u32) -> u32
         // SAFETY: the slot was written by init_per_cpu_storage.
         let stack_top = unsafe { *top_slot };
 
-        // Build idle TCB.
-        let saved = idle_saved_state(cpu, stack_top);
-
         // Initialise this CPU's idle TCB in place inside the dynamic slab.
         // SAFETY: single-threaded boot init; the slot for this cpu is
         // exclusively owned by this iteration. The slab was zero-filled
@@ -2895,96 +2981,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
         // SAFETY: tcb_slot is a valid pointer to MaybeUninit<TCB>.
         let tcb = unsafe { (*tcb_slot).as_mut_ptr() };
         // SAFETY: tcb is a valid uninitialized ThreadControlBlock slot.
-        unsafe {
-            core::ptr::write(
-                tcb,
-                ThreadControlBlock {
-                    state: ThreadState::Running,
-                    priority: IDLE_PRIORITY,
-                    slice_remaining: 0,
-                    cpu_affinity: cpu as u32,
-                    preferred_cpu: cpu as u32,
-                    placement: crate::sched::thread::PlacementCounts::new(),
-                    run_queue_next: None,
-                    queued_on: core::sync::atomic::AtomicI16::new(-1),
-                    #[cfg(debug_assertions)]
-                    last_enqueue: None,
-                    sched_lock: crate::sync::Spinlock::new(),
-                    wake_pending: false,
-                    park_started_tick: 0,
-                    park_seq: core::sync::atomic::AtomicU32::new(0),
-                    start_seq: 0,
-                    hold: crate::sched::hold::HoldMark::None,
-                    ipc_state: IpcThreadState::None,
-                    ipc_msg: crate::ipc::message::Message::default(),
-                    reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                    park_disposition: core::sync::atomic::AtomicU8::new(
-                        thread::PARK_DISPOSITION_NONE,
-                    ),
-                    #[cfg(debug_assertions)]
-                    park_episode: core::sync::atomic::AtomicU32::new(0),
-                    #[cfg(debug_assertions)]
-                    deposit_episode: core::sync::atomic::AtomicU32::new(0),
-                    ipc_wait_next: None,
-                    ipc_wait_prev: core::ptr::null_mut(),
-                    ipc_wait_queue: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                    recv_park_slot: core::ptr::null(),
-                    fault_handlers: [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) };
-                        crate::ipc::fault::FAULT_CLASSES],
-                    fault_badges: [const { core::sync::atomic::AtomicU64::new(0) };
-                        crate::ipc::fault::FAULT_CLASSES],
-                    fault_outcome: core::sync::atomic::AtomicU8::new(0),
-                    fault_redirect: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                    in_fault_delivery: false,
-                    fault_delivery_class: 0,
-                    fault_rebound: false,
-                    upcall_pending: core::sync::atomic::AtomicBool::new(false),
-                    upcall_cookie: core::sync::atomic::AtomicU64::new(0),
-                    upcall_any_instruction: core::sync::atomic::AtomicBool::new(false),
-                    upcall_masked: core::sync::atomic::AtomicBool::new(false),
-                    is_user: false,
-                    saved_state: saved,
-                    kernel_stack_top: stack_top,
-                    // Phase 4 made the idle guard before any other CPU ran.
-                    guard_epoch: 0,
-                    trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                    syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
-                    address_space: core::ptr::null_mut(),
-                    cspace: core::ptr::null_mut(),
-                    cspace_id: 0,
-                    cspace_epoch: 0,
-                    ipc_buffer: 0,
-                    wakeup_value: 0,
-                    wakeup_tag: 0,
-                    timed_out: false,
-                    iopb: core::ptr::null_mut(),
-                    blocked_on_object: core::ptr::null_mut(),
-                    thread_id: alloc_thread_id(),
-                    context_saved: core::sync::atomic::AtomicU32::new(1),
-                    wake_in_flight: core::sync::atomic::AtomicU32::new(0),
-                    death_observers: thread::DeathObserverChain::new(),
-                    exit_reason: 0,
-                    sleep_deadline: core::sync::atomic::AtomicU64::new(0),
-                    sleep_node: crate::sched::deadline_heap::DeadlineNode::new(),
-                    sleep_expiry: crate::sched::thread::SleepExpiry::EMPTY,
-                    extended: thread::ExtendedState::empty(),
-                    // Idle TCBs stay off the registry: they bind no CSpace
-                    // or address space (null above), so the object-teardown
-                    // walk never needs to stop one — and that same null
-                    // binding is what keeps phase 2's bound-`current` scan
-                    // from seeing an idle `current` as an unmarked bound
-                    // thread it would loop back to a phase 1 that cannot
-                    // mark it. They are never deallocated or `Blocked`, and
-                    // the watchdog's per-CPU `current` dump already shows them.
-                    registry: crate::sched::registry_list::RegistryLinks::new(),
-                    idle_halts_mark_cpu: core::sync::atomic::AtomicU32::new(
-                        thread::NO_IDLE_HALTS_MARK,
-                    ),
-                    idle_halts_mark: core::sync::atomic::AtomicU64::new(0),
-                    magic: thread::TCB_MAGIC,
-                },
-            );
-        }
+        unsafe { core::ptr::write(tcb, idle_tcb(cpu, stack_top)) };
 
         // Register in per-CPU scheduler.
         // SAFETY: cpu < cpu_count and init_per_cpu_storage has run (Phase 4).
@@ -7091,14 +7088,16 @@ pub enum WakeHint
     /// mode: the call rendezvous, the fault delivery, and the reply of a
     /// `SYS_IPC_REPLY_RECV` whose receive parked. The woken thread then runs
     /// on this CPU when nothing else waits there and it does not outrank the
-    /// waker (core/kernel/docs/scheduling-internals.md § Wake Protocol
-    /// Invariants, "Target CPU selection").
+    /// waker, or does but last received through `SYS_IPC_REPLY_RECV` and the
+    /// waker is an unpinned caller (core/kernel/docs/scheduling-internals.md
+    /// § Wake Protocol Invariants, "Target CPU selection").
     Sync,
     /// The waker is the thread running on this CPU and runs on past the wake:
     /// the reply of a `SYS_IPC_REPLY_RECV` whose receive did not park. The
     /// preferred-CPU rules then skip this CPU, so the woken thread goes to its
     /// preferred CPU only when that is another, and otherwise by rank (an RT
-    /// thread) or least load.
+    /// thread) or least load; when the waker outranks it, the wake leaves this
+    /// CPU out altogether ([`reply_wake_exclusion`]).
     WakerRuns,
 }
 
@@ -7130,9 +7129,10 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock, hint: WakeHint) ->
 /// UNLESS hard `cpu_affinity` names it (affinity is a correctness constraint
 /// that overrides the placement hint) or it is the only CPU.
 ///
-/// `dealloc_object(Thread)`'s deferred reply-wake passes `exclude = Some(dealloc_cpu)`;
-/// the rationale is in core/kernel/docs/scheduling-internals.md § Wake Protocol
-/// Invariants, "Target CPU selection".
+/// `dealloc_object(Thread)`'s deferred reply-wake passes `exclude = Some(dealloc_cpu)`,
+/// and a reply-and-receive's reply wake the exclusion [`reply_wake_exclusion`]
+/// returns; the rationale is in core/kernel/docs/scheduling-internals.md § Wake
+/// Protocol Invariants, "Target CPU selection".
 ///
 /// # Safety
 /// As for [`select_target_cpu`].
@@ -7144,6 +7144,46 @@ pub unsafe fn select_target_cpu_excluding(
 ) -> usize
 {
     place_wake(&KernelWake { tcb }, exclude, hint)
+}
+
+/// What [`WakeView::waker_can_move`] reads of the waker.
+#[derive(Clone, Copy)]
+struct WakerMobility
+{
+    /// The waker is in a fault delivery.
+    in_fault_delivery: bool,
+    /// The waker's hard affinity, `AFFINITY_ANY` when it has none.
+    affinity: u32,
+}
+
+impl WakerMobility
+{
+    /// Whether the waker can leave its CPU when a woken thread that outranks
+    /// it runs on there: it has no hard affinity, which would return its reply
+    /// wake to that CPU, and is not in a fault delivery, whose reply wakes it
+    /// at once, before the handler's receive.
+    fn can_move(self) -> bool
+    {
+        !self.in_fault_delivery && self.affinity == AFFINITY_ANY
+    }
+}
+
+/// The CPU a reply wake of `hint` leaves out of its placement
+/// ([`select_target_cpu_excluding`]): `this_cpu`, the server's, on a
+/// [`WakeHint::WakerRuns`] wake whose server (at `server_level`) outranks the
+/// caller (at `caller_level`), since the server runs on there and slice expiry
+/// never hands that CPU down to the caller; `None` otherwise. Hard affinity
+/// still places a caller pinned to `this_cpu` there.
+#[must_use]
+pub fn reply_wake_exclusion(
+    hint: WakeHint,
+    server_level: u8,
+    caller_level: u8,
+    this_cpu: usize,
+) -> Option<usize>
+{
+    (hint == WakeHint::WakerRuns && run_queue::outranks(server_level, caller_level))
+        .then_some(this_cpu)
 }
 
 /// The synchronous wake rule's decision for one wake that reached it, which
@@ -7184,6 +7224,15 @@ trait WakeView
     /// running on this CPU, the waker for a [`WakeHint::Sync`] wake
     /// (`run_queue::outranks`).
     fn outranks_waker(&self) -> bool;
+    /// Whether the woken thread's latest receive came through
+    /// `SYS_IPC_REPLY_RECV` (`ThreadControlBlock::serves_reply_recv`): a
+    /// prediction that it answers its waker's call with one, whose reply wake
+    /// waits for its receive.
+    fn replies_with_receive(&self) -> bool;
+    /// Whether the waker, the thread running on this CPU, can leave it
+    /// ([`WakerMobility`]): it has no hard affinity and is not in a fault
+    /// delivery.
+    fn waker_can_move(&self) -> bool;
     /// Count the synchronous wake rule's decision in the woken thread's
     /// placement counters: one wake that reached the rule, and one placed on
     /// the waker's CPU when `decision` is [`SyncDecision::WakersCpu`].
@@ -7239,14 +7288,25 @@ fn place_unpinned(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) 
     }
 
     // A synchronous wake runs the woken thread on the waker's CPU when that CPU
-    // queues nothing else and the woken thread does not outrank the waker: it is
-    // then the thread this CPU's `schedule()` dispatches when the waker blocks,
-    // and the waker's reply wake, which returns it here, does not wait behind
-    // it past a slice.
-    if hint == WakeHint::Sync
+    // queues nothing else and the woken thread does not outrank the waker, or
+    // outranks it but answers a caller that can move with
+    // `SYS_IPC_REPLY_RECV`: it is then the thread this CPU's `schedule()`
+    // dispatches when the waker blocks, and the waker's reply wake, which
+    // returns it here, does not wait behind it past a slice, since a
+    // reply-and-receive that runs on sends the caller to another CPU
+    // (wake_replied). A waker that cannot move (hard affinity, or a fault
+    // delivery, whose reply wakes it before the handler's receive) is never
+    // left behind a woken thread that outranks it: the other rules then leave
+    // this CPU out. The prediction is read only when the rank check fails and
+    // the waker can move.
+    let exclude = if hint == WakeHint::Sync
     {
         let this_cpu = view.this_cpu();
-        let decision = if eligible(this_cpu) && !view.this_cpu_queues() && !view.outranks_waker()
+        let outranks = view.outranks_waker();
+        let waker_stays = outranks && !view.waker_can_move();
+        let decision = if eligible(this_cpu)
+            && !view.this_cpu_queues()
+            && (!outranks || (!waker_stays && view.replies_with_receive()))
         {
             SyncDecision::WakersCpu
         }
@@ -7259,7 +7319,23 @@ fn place_unpinned(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) 
         {
             return this_cpu;
         }
+        if waker_stays { Some(this_cpu) } else { exclude }
     }
+    else
+    {
+        exclude
+    };
+
+    place_by_rank_and_load(view, exclude, hint)
+}
+
+/// [`place_unpinned`] past the save-window pin and the synchronous wake: the
+/// RT rule, the sticky preferred CPU and the least load, with `exclude`
+/// ineligible.
+fn place_by_rank_and_load(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) -> usize
+{
+    let cpu_count = view.cpu_count();
+    let eligible = |c: usize| -> bool { c < cpu_count && Some(c) != exclude };
 
     if let Some(cpu) = place_rt_wake(view, cpu_count, exclude, hint)
     {
@@ -7320,10 +7396,13 @@ fn place_unpinned(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) 
 /// The waker's CPU is read as the hint says. On a [`WakeHint::Sync`] wake the
 /// waker's park has committed, so its CPU ranks by its queued threads alone;
 /// when the woken thread outranks the waker, the scan leaves that CPU out, as
-/// the synchronous wake's guard keeps such a thread off its caller's CPU, which
-/// stays its pick only as its preferred CPU. On a [`WakeHint::WakerRuns`] wake
-/// the waker runs on, so its CPU is no preferred-CPU pick and ranks by the
-/// waker in the scan.
+/// the synchronous wake's guard kept such a thread off its caller's CPU (that
+/// CPU queues other work, or the thread does not answer with
+/// `SYS_IPC_REPLY_RECV`), which stays its pick only as its preferred CPU. A
+/// caller that cannot move is the third reason: [`place_unpinned`] then
+/// passes its CPU as `exclude`, so it is no pick at all, the preferred one
+/// included. On a [`WakeHint::WakerRuns`] wake the waker runs on, so its CPU
+/// is no preferred-CPU pick and ranks by the waker in the scan.
 fn place_rt_wake(
     view: &impl WakeView,
     cpu_count: usize,
@@ -7462,6 +7541,38 @@ impl WakeView for KernelWake
         // on, so it stays allocated across the read; read as for `level`.
         let waker_level = unsafe { (*waker).priority };
         run_queue::outranks(level, waker_level)
+    }
+
+    fn replies_with_receive(&self) -> bool
+    {
+        // SAFETY: tcb is valid (select_target_cpu's contract); the mark is an
+        // atomic, read as a prediction (ThreadControlBlock::serves_reply_recv).
+        unsafe {
+            (*self.tcb)
+                .serves_reply_recv
+                .load(core::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    fn waker_can_move(&self) -> bool
+    {
+        let waker = Self::scheduler(self.this_cpu()).current();
+        if waker.is_null()
+        {
+            return true;
+        }
+        // SAFETY: waker is the thread running on this CPU, which the wake runs
+        // on: its in_fault_delivery is its own, written by it before its
+        // delivery.
+        let in_fault_delivery = unsafe { (*waker).in_fault_delivery };
+        // SAFETY: as above; cpu_affinity is read as a placement hint, as
+        // select_target_cpu reads the woken thread's.
+        let affinity = unsafe { (*waker).cpu_affinity };
+        WakerMobility {
+            in_fault_delivery,
+            affinity,
+        }
+        .can_move()
     }
 
     fn note_sync(&self, decision: SyncDecision)
@@ -10457,7 +10568,7 @@ mod placement_tests
     use super::run_queue::{CpuRanks, level_rank};
     use super::{
         AFFINITY_ANY, IDLE_PRIORITY, RT_PRIORITY_MIN, SyncDecision, WakeHint, WakeView,
-        least_loaded_cpu, link_cpu, place_wake,
+        WakerMobility, least_loaded_cpu, link_cpu, place_wake, reply_wake_exclusion,
     };
 
     // The defect caught: a link that keeps the waker's target after a
@@ -10528,6 +10639,10 @@ mod placement_tests
     /// A wake as a host test models it: the woken thread and the CPUs, how
     /// often the rule read the waker's CPU, and the synchronous wake rule's
     /// counts (`note_sync`): decisions reached, and of those placed locally.
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "the model holds one field per independent yes-or-no read of WakeView"
+    )]
     struct Wake
     {
         affinity: u32,
@@ -10537,6 +10652,9 @@ mod placement_tests
         this_cpu: usize,
         this_cpu_queues: bool,
         outranks_waker: bool,
+        replies_with_receive: bool,
+        waker_can_move: bool,
+        prediction_reads: core::cell::Cell<u32>,
         loads: Vec<u32>,
         ranks: Vec<CpuRanks>,
         waker_reads: core::cell::Cell<u32>,
@@ -10548,7 +10666,7 @@ mod placement_tests
         /// An unpinned, saved thread at a fair level preferring CPU
         /// `preferred`, woken from CPU `this_cpu`, which queues nothing and
         /// runs a waker the thread does not outrank, with every CPU's load 0 and
-        /// every CPU idle.
+        /// every CPU idle; its latest receive was a plain one.
         fn new(cpus: usize, preferred: usize, this_cpu: usize) -> Self
         {
             Self {
@@ -10559,6 +10677,9 @@ mod placement_tests
                 this_cpu,
                 this_cpu_queues: false,
                 outranks_waker: false,
+                replies_with_receive: false,
+                waker_can_move: true,
+                prediction_reads: core::cell::Cell::new(0),
                 loads: vec![0; cpus],
                 ranks: vec![runs(IDLE_PRIORITY); cpus],
                 waker_reads: core::cell::Cell::new(0),
@@ -10608,6 +10729,15 @@ mod placement_tests
             self.waker_reads.set(self.waker_reads.get() + 1);
             self.outranks_waker
         }
+        fn replies_with_receive(&self) -> bool
+        {
+            self.prediction_reads.set(self.prediction_reads.get() + 1);
+            self.replies_with_receive
+        }
+        fn waker_can_move(&self) -> bool
+        {
+            self.waker_can_move
+        }
         fn load(&self, cpu: usize) -> u32
         {
             self.loads[cpu]
@@ -10646,8 +10776,9 @@ mod placement_tests
 
     // The defect caught: the woken thread placed on the waker's CPU ahead of a
     // thread queued there (of any class) while another CPU idles, or ahead of
-    // a waker it outranks, whose reply wake would then wait behind it past a
-    // slice; each falls through to the sticky and least-load rules.
+    // a waker it outranks and answers with a plain reply, whose reply wake
+    // would then wait behind it past a slice; each falls through to the sticky
+    // and least-load rules.
     #[test]
     fn a_queued_thread_or_an_outranked_waker_sends_a_sync_wake_to_the_other_rules()
     {
@@ -10862,6 +10993,160 @@ mod placement_tests
         assert_eq!(outranking.place(None, WakeHint::Sync), 0);
         outranking.preferred = 2;
         assert_eq!(outranking.place(None, WakeHint::Sync), 2);
+    }
+
+    // The defect caught (#1560): an RT server that answers with
+    // SYS_IPC_REPLY_RECV, called by an unpinned fair client, left on the idle
+    // preferred CPU another server's wake gave it, so the pair stays apart and
+    // every round trip wakes a halted CPU; its reply-and-receive places the
+    // reply wake by whether it parks, and sends the unpinned caller off this
+    // CPU when it runs on, so the hazard the rank check keeps off does not
+    // arise. Or a wake the admission refuses placed there, or a waker's CPU
+    // the wake excludes.
+    #[test]
+    fn an_admitted_outranking_receiver_runs_on_the_wakers_cpu()
+    {
+        let mut server = rt_wake([IDLE_PRIORITY; 4]);
+        server.outranks_waker = true;
+        server.replies_with_receive = true;
+        assert_eq!(server.place(None, WakeHint::Sync), 0);
+        assert_eq!(server.syncs.get(), (1, 1));
+        server.replies_with_receive = false;
+        assert_eq!(server.place(None, WakeHint::Sync), 1);
+        assert_eq!(server.syncs.get(), (2, 1));
+        server.replies_with_receive = true;
+        assert_eq!(server.place(Some(0), WakeHint::Sync), 1);
+        assert_eq!(server.syncs.get(), (3, 1));
+    }
+
+    // The defect caught: the admission overriding the queue condition, so an
+    // RT server answering with SYS_IPC_REPLY_RECV runs ahead of a thread
+    // queued on its caller's CPU while other CPUs idle, or chases each of
+    // several callers onto a CPU with work queued; it follows a caller only to
+    // a CPU that queues nothing, and otherwise the RT rule leaves the
+    // caller's CPU out.
+    #[test]
+    fn an_admitted_outranking_receiver_follows_only_callers_with_empty_queues()
+    {
+        let mut server = rt_wake([IDLE_PRIORITY; 4]);
+        server.outranks_waker = true;
+        server.replies_with_receive = true;
+        server.this_cpu = 2;
+        assert_eq!(server.place(None, WakeHint::Sync), 2);
+        server.preferred = 2;
+        server.this_cpu = 3;
+        server.this_cpu_queues = true;
+        server.ranks[3].queued = level_rank(FAIR);
+        assert_eq!(server.place(None, WakeHint::Sync), 2);
+        server.ranks[2] = runs(TOP);
+        assert_eq!(server.place(None, WakeHint::Sync), 0);
+        assert_eq!(server.syncs.get(), (3, 1));
+    }
+
+    // The defect caught: the prediction read on every synchronous wake, a
+    // cost on the call path of every pair of one rank that only a receiver
+    // outranking its caller uses.
+    #[test]
+    fn only_an_outranking_sync_wake_reads_the_reply_prediction()
+    {
+        let wake = Wake::new(4, 1, 2);
+        assert_eq!(wake.place(None, WakeHint::Sync), 2);
+        assert_eq!(wake.prediction_reads.get(), 0);
+        let mut outranking = Wake::new(4, 1, 2);
+        outranking.outranks_waker = true;
+        outranking.place(None, WakeHint::Sync);
+        assert_eq!(outranking.prediction_reads.get(), 1);
+    }
+
+    // The defect caught: a waker pinned to its CPU, or in a fault delivery
+    // (whose reply wakes it before the handler's receive), counted as one
+    // that can move, so an outranking server is admitted beside it; or an
+    // unpinned waker outside a fault delivery counted as one that cannot.
+    #[test]
+    fn only_an_unpinned_waker_outside_a_fault_delivery_can_move()
+    {
+        let free = WakerMobility {
+            in_fault_delivery: false,
+            affinity: AFFINITY_ANY,
+        };
+        assert!(free.can_move());
+        for stays in [
+            WakerMobility {
+                in_fault_delivery: true,
+                ..free
+            },
+            WakerMobility {
+                affinity: 0,
+                ..free
+            },
+            WakerMobility {
+                affinity: 3,
+                ..free
+            },
+        ]
+        {
+            assert!(!stays.can_move());
+        }
+    }
+
+    // The defect caught (review of PR #1699): an outranking server whose
+    // caller cannot move placed on the caller's CPU after all, by the RT
+    // rule's preferred pick (the server's preferred CPU being the caller's,
+    // where it last ran beside an unpinned caller), by the admission, or by
+    // the least load, so the caller's reply wake, which hard affinity or the
+    // fault reply returns there, waits behind a server serving a backlog; or
+    // the prediction read for such a waker.
+    #[test]
+    fn an_outranking_receiver_never_runs_on_the_cpu_of_a_caller_that_cannot_move()
+    {
+        let mut server = rt_wake([IDLE_PRIORITY; 4]);
+        server.outranks_waker = true;
+        server.replies_with_receive = true;
+        server.waker_can_move = false;
+        server.preferred = 0;
+        assert_eq!(server.place(None, WakeHint::Sync), 1);
+        assert_eq!(server.syncs.get(), (1, 0));
+        assert_eq!(server.prediction_reads.get(), 0);
+        server.this_cpu_queues = true;
+        assert_eq!(server.place(None, WakeHint::Sync), 1);
+        let mut busy = rt_wake([TOP; 4]);
+        busy.ranks[0] = runs(IDLE_PRIORITY);
+        busy.outranks_waker = true;
+        busy.waker_can_move = false;
+        busy.preferred = 0;
+        assert_ne!(busy.place(None, WakeHint::Sync), 0);
+        let mut moves = rt_wake([IDLE_PRIORITY; 4]);
+        moves.outranks_waker = true;
+        moves.preferred = 0;
+        assert_eq!(moves.place(None, WakeHint::Sync), 0);
+        let mut below = Wake::new(4, 0, 0);
+        below.waker_can_move = false;
+        assert_eq!(below.place(None, WakeHint::Sync), 0);
+    }
+
+    // The defect caught: a reply-and-receive that runs on sending its caller
+    // back to the server's CPU, behind a server that outranks it and serves a
+    // backlog there past any slice, by the least-load tie or the RT scan; or
+    // the exclusion applied to a wake whose server does not outrank the
+    // caller (wake_replied's yield covers that one), to a parked server's
+    // wake, or ahead of hard affinity.
+    #[test]
+    fn a_reply_wake_leaves_out_the_cpu_of_an_outranking_server_that_runs_on()
+    {
+        let exclusion = |hint, server, caller| reply_wake_exclusion(hint, server, caller, 2);
+        assert_eq!(exclusion(WakeHint::WakerRuns, WOKEN, FAIR), Some(2));
+        assert_eq!(exclusion(WakeHint::WakerRuns, HIGHER, WOKEN), Some(2));
+        assert_eq!(exclusion(WakeHint::WakerRuns, WOKEN, WOKEN), None);
+        assert_eq!(exclusion(WakeHint::WakerRuns, FAIR, WOKEN), None);
+        assert_eq!(exclusion(WakeHint::Sync, WOKEN, FAIR), None);
+        assert_eq!(exclusion(WakeHint::None, WOKEN, FAIR), None);
+
+        let mut caller = Wake::new(4, 2, 2);
+        caller.loads = vec![1, 1, 0, 1];
+        assert_eq!(caller.place(None, WakeHint::WakerRuns), 2);
+        assert_eq!(caller.place(Some(2), WakeHint::WakerRuns), 0);
+        caller.affinity = 2;
+        assert_eq!(caller.place(Some(2), WakeHint::WakerRuns), 2);
     }
 
     // The defect caught: a reply-and-receive whose server runs on keeping its

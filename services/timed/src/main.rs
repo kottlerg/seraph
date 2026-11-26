@@ -11,6 +11,7 @@
 //! clock, and serves [`timed_labels::GET_WALL_TIME`] from `offset +
 //! system_info(ElapsedUs)` thereafter.
 
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, rtc_errors, rtc_labels, timed_errors, timed_labels};
 use std::os::seraph::startup_info;
 use syscall_abi::SystemInfoType;
@@ -65,11 +66,12 @@ fn kernel_elapsed_us() -> u64
     syscall::system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0)
 }
 
-/// Reply to a single request. `offset` is `Some` once the RTC has been
-/// successfully sampled; `None` means the boot-time lookup failed.
-fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64, offset: Option<u64>)
+/// Answer a single request, leaving the reply for the loop's next receive.
+/// `offset` is `Some` once the RTC has been successfully sampled; `None`
+/// means the boot-time lookup failed.
+fn handle_request(msg: &IpcMessage, offset: Option<u64>, reply: &mut Reply)
 {
-    let reply = match (msg.label, offset)
+    let answer = match (msg.label, offset)
     {
         (timed_labels::GET_WALL_TIME, Some(off)) =>
         {
@@ -86,8 +88,7 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64, offset: Option<u64>)
         }
         _ => IpcMessage::new(timed_errors::UNKNOWN_OPCODE),
     };
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(answer);
 }
 
 fn service_loop(service_ep: u64, ipc_buf: *mut u64, offset: Option<u64>) -> !
@@ -101,10 +102,11 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, offset: Option<u64>) -> !
         std::os::seraph::log!("ready, no RTC — replies WALL_CLOCK_UNAVAILABLE");
     }
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -114,7 +116,7 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, offset: Option<u64>) -> !
             }
         };
         guard.on_success();
-        handle_request(&msg, ipc_buf, offset);
+        handle_request(&msg, offset, &mut reply);
     }
 }
 

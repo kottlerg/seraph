@@ -339,9 +339,10 @@ pub trait NamespaceBackend
 /// caller-rights / visibility / name-validation checks documented in
 /// `docs/namespace-model.md`, calls into `backend` for the underlying
 /// storage operation, mints child caps from `namespace_endpoint` via
-/// `cap_derive_badge`, and writes the reply through `ipc_reply`.
+/// `cap_derive_badge`, and leaves the reply in `reply` for the caller's
+/// loop to send with its next receive (`ipc::serve`).
 ///
-/// Each namespace server owns its own `ipc_recv` loop — the receive
+/// Each namespace server owns its own receive loop — the receive
 /// surface is not bundled here because every realistic backend
 /// multiplexes other protocol layers on the same endpoint (filesystems
 /// receive their service-level and file-IO opcodes alongside `NS_*`;
@@ -362,25 +363,19 @@ pub trait NamespaceBackend
 /// `NS_*` request carries, and every cap of a request it answers without
 /// taking it, such as one with a label it does not serve (README § Wire
 /// labels).
-///
-/// # Safety
-///
-/// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC
-/// buffer page as registered via `syscall::ipc_buffer_set`.
-pub unsafe fn dispatch_request<B: NamespaceBackend>(
+pub fn dispatch_request<B: NamespaceBackend>(
     backend: &mut B,
     received: &ipc::IpcMessage,
     namespace_endpoint: u64,
-    ipc_buf: *mut u64,
+    reply: &mut ipc::serve::Reply,
 )
 {
-    let reply = request_reply(backend, received, namespace_endpoint);
-    // SAFETY: `ipc_buf` is the registered IPC buffer page per the
-    // function-level safety contract.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    // An `NS_LOOKUP` reply's cap is minted for the caller and kept by no
+    // one, so a reply that is not delivered deletes it.
+    reply.set_or_delete_caps(request_reply(backend, received, namespace_endpoint));
 }
 
-/// The reply [`dispatch_request`] sends for `received`.
+/// The reply [`dispatch_request`] leaves for `received`.
 fn request_reply<B: NamespaceBackend>(
     backend: &mut B,
     received: &ipc::IpcMessage,

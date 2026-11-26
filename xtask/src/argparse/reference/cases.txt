@@ -651,7 +651,7 @@ ok build wait_host=["7"] host_override
 ok build arch=["x86_64"] release component=["kernel"] debug=["kernel"] skip_lints wait_host=["7"] host_override
 
 ["run"]
-ok-all run arch=default["x86_64"] cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default icount=default gdb=default debug_listen=default verbose=default parallel=default["1"] timeout=default["30"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] hold_on_hang=default fail_grace_secs=default["10"] host_override=default alone=default timing=default
+ok-all run arch=default["x86_64"] cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default icount=default ktest_only_ok=default gdb=default debug_listen=default verbose=default parallel=default["1"] timeout=default["30"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] hold_on_hang=default fail_grace_secs=default["10"] host_override=default alone=default timing=default
 
 ["run","-h"]
 help xtask run -h
@@ -4000,7 +4000,7 @@ UnknownArgument
 error: unexpected argument 'extra' found
 
 ["run","--parallel","1","--runs","1"]
-ok-all run arch=default["x86_64"] cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default icount=default runs=["1"] gdb=default debug_listen=default verbose=default parallel=["1"] timeout=default["30"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] hold_on_hang=default fail_grace_secs=default["10"] host_override=default alone=default timing=default
+ok-all run arch=default["x86_64"] cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default icount=default runs=["1"] ktest_only_ok=default gdb=default debug_listen=default verbose=default parallel=["1"] timeout=default["30"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] hold_on_hang=default fail_grace_secs=default["10"] host_override=default alone=default timing=default
 
 ["run","--parallel","1","--runs","1","-h"]
 help xtask run -h
@@ -27031,7 +27031,7 @@ ok trust-request clear
 ok trust-request arch=["riscv64"] add=["s"] revoke=["00"] sign out=["f"]
 
 ["kani"]
-ok-all kani list=default plan=default pin=default host_override=default
+ok-all kani list=default plan=default skip_passed=default pin=default host_override=default
 
 ["kani","-h"]
 help xtask kani -h
@@ -27229,3 +27229,31 @@ help xtask path-account write -h
 
 ["build","--limited-debug","kernel,ktest","--debug","kernel"]
 ok build debug=["kernel"] limited_debug=["kernel","ktest"]
+
+["build","--opt-level","shmem=3"]
+ok build opt_level=["shmem=3"]
+
+["build","--release","--opt-level","shmem=3,framebuffer=s"]
+ok build release opt_level=["shmem=3","framebuffer=s"]
+
+["build","--opt-level","shmem=3","--opt-level","virtio-blk=z"]
+ok build opt_level=["shmem=3","virtio-blk=z"]
+
+["build","--opt-level","shmem"]
+ValueValidation
+error: invalid value 'shmem' for '--opt-level <PKG=LEVEL>': "shmem" is not <package>=<level>
+
+["build","--opt-level","shmem=4"]
+ValueValidation
+error: invalid value 'shmem=4' for '--opt-level <PKG=LEVEL>': no opt-level "4"; expected one of: 0, 1, 2, 3, s, z
+
+["build","--opt-level","=3"]
+ValueValidation
+error: invalid value '=3' for '--opt-level <PKG=LEVEL>': "" is not a package name
+
+["build","--opt-level"]
+InvalidValue
+error: a value is required for '--opt-level <PKG=LEVEL>' but none was supplied
+
+["build","--debug","kernel","--opt-level","shmem=3"]
+ok build debug=["kernel"] opt_level=["shmem=3"]

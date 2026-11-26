@@ -104,7 +104,7 @@ Build Seraph components and populate `sysroot/`.
 ```
 cargo xtask build [--arch x86_64|riscv64] [--release] \
     [--component <name>|all] [--debug <comp>[,...]] [--limited-debug <comp>[,...]] \
-    [--ktest-bench-only]
+    [--opt-level <pkg>=<level>[,...]] [--ktest-bench-only | --ktest-only <prefix>[,...]]
 ```
 
 | Option | Default | Description |
@@ -114,7 +114,9 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 | `--component` | `all` | Build a single component: `boot`, the crate name of any component the build installs (an entry of the `SPECS` table in `xtask/src/commands/build.rs`: `kernel`, `init`, `ktest`, each service, driver, program, fixture, and tester crate), or `all` |
 | `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, each named as `--component` names it, e.g. `--debug kernel,crashme`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
 | `--limited-debug` | (none) | Emit limited debuginfo (`debug="limited"`: line tables and function frames, inlined ones included, without types or variables) for the named component(s), at the active profile's own opt-level, so their instructions are a plain build's; a component `--debug` also names takes `--debug`. `path-account` reads the kernel's and ktest's. See [Debuginfo is opt-in](../docs/build-system.md#debuginfo-is-opt-in). |
+| `--opt-level` | (none) | Build the named workspace package(s) at another opt-level within the active profile, as `<package>=<level>` with the level one of `0`, `1`, `2`, `3`, `s`, `z`, e.g. `--opt-level shmem=3,framebuffer=3`: `--config profile.<active>.package."<pkg>".opt-level=<level>` on every cargo build of the build, so a library takes it wherever it is compiled, `-Z build-std`'s crates included. Refused for a package the workspace does not have, for one named twice, and for a component `--debug` names (`all` names every component, not the libraries), which builds it at opt-level 1. Under `--release`, fat LTO optimizes the merged module at the linking binary's level, so a library's override may not survive into the image. `compare-images` builds each commit without `--opt-level`: whether an override survives is read by committing it as a `[profile.<p>.package."<pkg>"]` table in a scratch commit and comparing that commit with its parent. See [Opt-level overrides](../docs/build-system.md#opt-level-overrides). |
 | `--ktest-bench-only` | off | Build ktest with its `bench-only` feature, which runs Tier 3 alone at its benchmark iteration count ([core/ktest/README.md](../core/ktest/README.md#compile-time-options) § Compile-time options); refused with a `--component` other than `ktest` or `all` |
+| `--ktest-only` | (none) | Build a focused ktest, which runs only the tests whose names start with one of the comma-separated prefixes, each of ASCII letters, digits, `_` and `:` ([core/ktest/README.md](../core/ktest/README.md#test-selection) § Test selection): ktest's compile reads them from `SERAPH_KTEST_ONLY`, which every other build clears, and the build records them in `sysroot/.ktest-selection`, which a build of the full ktest removes. `run --runs` refuses the image without `--ktest-only-ok`. Refused with `--ktest-bench-only` and with a `--component` other than `ktest` or `all` |
 
 Before it compiles, the build checks that the workspace's Rust source is formatted as
 `cargo fmt` formats it (`cargo fmt --all --check`) and fails on a file that is not, printing
@@ -260,8 +262,8 @@ cargo xtask run [--arch x86_64|riscv64] \
 
 cargo xtask run --runs N [launch options] [--display framebuffer|headless] [--debug-listen] \
     [--parallel N] [--timeout SECONDS] [--pass REGEX] [--fail REGEX] [--fail-also REGEX] \
-    [--require REGEX]... [--crash-reports reports|none] [--whole-lines TAG] \
-    [--fail-grace-secs SECONDS] [--hold-on-hang] [--save-logs DIR]
+    [--require REGEX]... [--crash-reports reports|none] [--whole-lines TAG]... \
+    [--fail-grace-secs SECONDS] [--hold-on-hang] [--save-logs DIR] [--ktest-only-ok]
 ```
 
 The launch options, the same in both modes:
@@ -422,21 +424,23 @@ from its log by patterns in the syntax of § Pattern syntax. Each run boots its 
 disk images (and of the riscv64 firmware variables), so the runs of a wave never share a writable
 drive. The options below require `--runs`; `--debug-port` requires `--parallel 1` (one host
 port), and `--debug-target` stages the GDB stub, repacking the images in the layout they have,
-before the runs copy them, and removes it after the last run.
+before the runs copy them, and removes it after the last run; it is refused for an image that
+boots ktest, which runs no svcmgr to launch the stub.
 
 | Option | Default | Description |
 |---|---|---|
 | `--runs` | (interactive boot) | Total runs, dispatched in waves of `--parallel`; selects the classified boot |
 | `--parallel` | `1` | Concurrency: QEMU instances in flight at once |
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
-| `--pass` | the marker of the image's harness | Regex marking a successful run. The default is `\[<harness>\] ALL TESTS PASSED`, the terminal marker ([docs/testing.md](../docs/testing.md) § Reporting marker) of the one harness the image boots, which its pack recorded in `sysroot/.image-harness`: `ktest` for the ktest bundle, otherwise each of `svctest`, `usertest` and `ubench` whose recipe was staged on a layer the image holds. An image that boots no harness, or several, has no default, and `--runs` refuses to start without `--pass`; an image with no record is refused until it is packed again (`cargo xtask mkdisk`). On match, and every `--require`, `--crash-reports` and `--whole-lines` check holding, the log is discarded and the run is classified `PASS` |
+| `--pass` | the marker of the image's harness | Regex marking a successful run. The default is `\[<harness>\] ALL TESTS PASSED`, the terminal marker ([docs/testing.md](../docs/testing.md) § Reporting marker) of the one harness the image boots, which its pack recorded in `sysroot/.image-harness`: `ktest` for the ktest bundle, otherwise each of `svctest`, `usertest` and `ubench` whose recipe was staged on a layer the image holds. An image that boots no harness, or several, has no default, and `--runs` refuses to start without `--pass`; an image with no record is refused until it is packed again (`cargo xtask mkdisk`). An image of a focused ktest runs only with `--ktest-only-ok`, and its default is `\[ktest\] SELECTED TESTS PASSED`. On match, and every `--require`, `--crash-reports` and `--whole-lines` check holding, the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
 | `--require` | (none) | A regex a line of the log must match for the run to pass; repeatable, each must match a line. A run whose `--pass` matched but whose log has no line matching one of them is `FAIL`, its reason naming the pattern |
 | `--crash-reports` | (none) | Check the crash service's report blocks in each passing run's log: every block must be complete and hold the fields its kind, thread, and status require, read with `shared/crash-report`, the crate crashd emits them with ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)). `reports` also requires one `vm` and one `exception` block of the `crashme` fixture's main thread and one `exception` block of a `spawned` thread (its `worker` mode), found through the badge logd's `reclaim:` line names it by, each complete, its walk starting at its instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` line, and carrying the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the block read the thread the kernel killed; the `vm` block's `addr` must also be the faulting address that dump prints (`cr2` on x86_64, `stval` on riscv64). `none` requires no block at all. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `reports`, its `crash-endpoint` svctest boot and its usertest boot `none`; the model is in [docs/testing.md](../docs/testing.md) § Crash reports |
-| `--whole-lines` | (none) | Check the console in each passing run's log between the lines `<TAG> begin` and `<TAG> end ...`: every line there is one console line, and each sender's numbered lines arrive whole, in order, none missing. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `--whole-lines whole-lines`, the tag svctest's `console_whole_lines` phase logs ([services/svctest/README.md](../services/svctest/README.md); the console is in [docs/console-model.md](../docs/console-model.md)) |
+| `--whole-lines` | (none) | Check the console in each passing run's log between the lines `<TAG> begin` and `<TAG> end ...`: every line there is one console line, and each sender's numbered lines arrive whole, in order, none missing. Repeatable: each tag's window is checked. A run whose check fails is `FAIL`, its reason the check's, naming the tag; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `--whole-lines whole-lines --whole-lines serial-burst`, the tags svctest's `console_whole_lines` and `serial_transmit` phases log ([services/svctest/README.md](../services/svctest/README.md); the console is in [docs/console-model.md](../docs/console-model.md)) |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, or the first death line of rule 2 below, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
+| `--ktest-only-ok` | off | Accept an image whose ktest a focused build made (`build --ktest-only`), as the image's pack recorded it in `sysroot/.image-harness`, whatever ktest a later build installed: without it `--runs` refuses such an image, since a focused boot validates nothing, and with it the default `--pass` is the focused run's marker. Refused for an image that boots no focused ktest |
 | `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> icount=<on\|off> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing`, `bench-check` and `bench-baseline` read |
 
 The default `--fail` regex matches the cross-harness terminal marker
@@ -1618,8 +1622,9 @@ verification) with the pinned Kani release.
 
 ```
 cargo xtask kani [--component <CRATE> [--harness <NAME> | --shard <K/N>]] [--list]
+cargo xtask kani --component <CRATE> --shard <K/N> --pass-record <DIR>
 cargo xtask kani --since <COMMIT> [--list]
-cargo xtask kani --plan [--since <COMMIT>] [--github-output <FILE>]
+cargo xtask kani --plan [--since <COMMIT>] [--skip-passed] [--github-output <FILE>]
 cargo xtask kani --pin
 ```
 
@@ -1631,6 +1636,8 @@ cargo xtask kani --pin
 | `--shard <K/N>` | every harness | Verify the K-th of N parts of the crate's harnesses (below); needs `--component`, takes no `--harness` |
 | `--list` | `false` | Print the package of each crate the run would verify, one a line, and exit, verifying nothing; needs no Kani |
 | `--plan` | `false` | Print the jobs CI's matrix runs for the crates the run would verify (below), one `<package> <K/N>` a line, and exit, verifying nothing; needs no Kani; takes `--since` only |
+| `--skip-passed` | `false` | With `--plan`, leave out each job whose pass a run of this repository stored (below), printing the run that proved it; reads GitHub with `gh` |
+| `--pass-record <DIR>` | none | With `--shard`, when the harnesses judged are exactly the shard's and all passed, write the record of the job's pass to `DIR/kani-pass-<key>.txt` (below) |
 | `--github-output <FILE>` | none | With `--plan`, append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): `matrix`, an `include` list of `package` and `shard`, and `owed`, whether it holds a job |
 | `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
 
@@ -1649,20 +1656,20 @@ gives the path dependencies (of every kind and target: a superset of what its te
 or is a file one of those packages names in an `include!`, `include_str!`, `include_bytes!` or
 `#[path]` string literal, Markdown included: a document no source reads changes no build. Every
 crate is affected when a changed file is an input of every proof, one that can change a harness's
-verdict: an input of every build (the workspace `Cargo.toml` and `Cargo.lock`,
-`rust-toolchain.toml`, `.cargo/config.toml`), or the command's own source,
+verdict or what is stored as one: an input of every build (the workspace `Cargo.toml` and
+`Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`), the command's own source,
 `xtask/src/commands/kani.rs`, which holds the Kani pin, the arguments and the memory limit it runs
-`cargo kani` with, and the judge of Kani's output. What decides only which crates are verified, or
-whether and where a job runs them (the selection in `xtask/src/affected.rs`, the workflows), is not
-one, and a change to it alone selects no crate, save one: a change to `.github/workflows/kani.yml`
-or `.github/workflows/build-test.yml`, whose steps run CI's `kani` jobs, that selects no crate
-otherwise selects the crate with the fewest harnesses (the first by directory among equals), so the
-jobs' install, setup and run steps run. The change is taken from the merge base of `<COMMIT>` and
-`HEAD`, so a branch behind `<COMMIT>` is charged its own change alone. A package's build script,
-features and `cfg` settings lie in its directory or the workspace manifest, so a change to them
-selects it. A commit the checkout does not hold fails the command, so a shallow clone never narrows
-the run. With no crate affected the command verifies nothing and does not check the installed
-release.
+`cargo kani` with, and the judge of Kani's output, or `.github/workflows/kani.yml`, whose `prove`
+job runs the command and stores its pass. What decides only which crates are verified, or whether a
+job runs them (the selection in `xtask/src/affected.rs`, the other workflows), is not one, and a
+change to it alone selects no crate, save one: a change to `.github/workflows/build-test.yml`, which
+calls CI's `kani` jobs, also selects the crate with the fewest harnesses (the first by directory
+among equals), whose jobs `--skip-passed` keeps whatever passes are stored, so the call is
+exercised. The change is taken from the merge base of `<COMMIT>` and `HEAD`, so a branch behind
+`<COMMIT>` is charged its own change alone. A package's build script, features and `cfg` settings
+lie in its directory or the workspace manifest, so a change to them selects it. A commit the
+checkout does not hold fails the command, so a shallow clone never narrows the run. With no crate
+affected the command verifies nothing and does not check the installed release.
 
 It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
@@ -1676,6 +1683,21 @@ harness exactly once, and a harness added to the crate joins a shard with no cha
 crate, or one for each shard of a crate `SHARDS` in the command's source splits, never more shards
 than the crate's harnesses; it fails on an entry of `SHARDS` that names no crate that holds a
 harness.
+
+A job's pass key ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification,
+Stored passes) is the first 64 hex digits of the SHA-512 of `PASS_SCHEME`, the package, the shard,
+the Kani release, the arguments of `cargo kani` for the crate, the memory limit, and the path and
+content of each tracked file whose change `--since` counts as selecting the crate, the inputs of
+every proof among them. With `--pass-record`, the command takes the key before Kani runs, and after
+a run in which every harness of the shard ran and passed, and no other, writes
+`kani-pass-<key>.txt`: the key's fields, the run GitHub Actions names in its environment, and each
+harness with its time. It writes nothing when a harness did not pass, and fails, naming the
+harnesses, when the run judged other harnesses than the shard's. With `--skip-passed`, the plan asks
+GitHub (`gh api`, `GET /repos/{owner}/{repo}/actions/artifacts` with the name) for each job's
+`kani-pass-<key>`, and leaves the job out when the reply holds an artifact of exactly that name that
+has not expired and whose run's head repository is the repository itself; a failed request leaves
+the job in. It prints each job with its pass, and a job left out with the run that proved it. The
+jobs of a crate selected for a change to `build-test.yml` (above) stay in whatever is stored.
 
 For each selected crate it runs `cargo kani --tests -p <package>` (with `--harness` when given),
 which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies each
@@ -1700,14 +1722,17 @@ each crate's harness count and the sum of its harnesses' verification times, whi
 (a `--shard` run labels the crate with its shard, `<package> K/N`, the sum being that shard's),
 and fails naming each crate that failed.
 
-CI's `kani` jobs (`.github/workflows/kani.yml`) run the command. Their `plan` job runs `--plan`
-with `--github-output`: in `build-test.yml`, `--since` the base its `select` job found, with
-`cargo xtask cells --since-covered` on a pull request and `--since-green` on a push to `master`, or
-a dispatch's `kani-since` input, and with no `--since` when there is none; in `burnin.yml` with no
-`--since`. When the plan holds no job it says so in a notice on the run and no `prove` job runs;
-otherwise each `prove` job installs the release `--pin` prints and runs `--component <package>
---shard <K/N>`, and `kani-result` judges them
-([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
+CI's `kani` jobs (`.github/workflows/kani.yml`) run the command. Their `plan` job runs `--plan` with
+`--github-output`, and with `--skip-passed` unless a dispatch's `kani-prove-all` input asks for
+every job: in `build-test.yml`, `--since` the base its `select` job found, with `cargo xtask cells
+--since-covered` on a pull request and `--since-green` on a push to `master`, or a dispatch's
+`kani-since` input, and with no `--since` when there is none; in `burnin.yml` with no `--since`.
+When the plan holds no job it says so in a notice on the run and no `prove` job runs; otherwise each
+`prove` job installs the release `--pin` prints, runs `--component <package> --shard <K/N>
+--pass-record`, and uploads the record as the artifact `kani-pass-<key>`, kept 90 days, and
+`kani-result` judges them ([docs/build-system.md](../docs/build-system.md#continuous-integration) §
+Continuous Integration). The release host runs run the command with no option, which reads no stored
+pass.
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
 session runs `cargo xtask kani` there. A session installs nothing (`cargo install` is outside the
@@ -1927,7 +1952,7 @@ bootloader). The `FLAG` column comes first; the table ends with the count of fla
 |---|---|
 | `format` | `1`, the format version; a file of another version is refused |
 | `arch`, `cpus` | The log's architecture and width |
-| `marker` | ktest's terminal marker (`ALL TESTS PASSED`), or `-` |
+| `marker` | ktest's terminal marker (`ALL TESTS PASSED`, or `SELECTED TESTS PASSED` for a focused ktest), or `-` |
 | `commit` | The full hash of `--commit` |
 | `ktest-commit` | Present only when it is another commit: the newest commit at or before `commit` that changed anything outside Markdown, `.claude/`, `.github/`, and `xtask/baselines/` (conservatively: every change that could alter the boot image or its QEMU launch moves it, and so do some that cannot), so a baseline refreshed after a documentation-only change names the code it times |
 | `date` | The UTC date the file was written |

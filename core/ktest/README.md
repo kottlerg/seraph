@@ -42,7 +42,7 @@ core/ktest/
 └── src/
     ├── main.rs             # _start, InitInfo intake, TestContext, run_test!, tier dispatch,
     │                       # summary, shutdown
-    ├── cmdline.rs          # Compile-time configuration (KtestConfig::DEFAULT)
+    ├── cmdline.rs          # Compile-time configuration (KtestConfig::DEFAULT, BENCH, SELECTED)
     ├── cspace_geometry.rs  # Mirrors of the kernel's CSpace directory geometry
     ├── serial.rs           # Direct serial output
     ├── framebuffer.rs      # Direct framebuffer output
@@ -216,10 +216,11 @@ concurrent notification and queue events.
 | `irq_shared_line.rs` | Each scenario routes the UART's interrupt line through a route-holding copy; then two derivations of the line (the stand-in device: setting its transmit-empty interrupt enable raises the line), bound to two notifications, are each signalled by one raise; the line stays masked until both acknowledge, an acknowledgement through an unbound derivation changes nothing, deleting an owing derivation unmasks the line for the other, and a rebind keeps one binding; the line holds 64 bindings and refuses a 65th with `QuotaExceeded`, and deleting the only cap of the one notification all 64 name removes no binding (a further copy is still refused), while once the 64 are rebound to a fresh notification and all acknowledge, a raise signals it; last, the line's route records the trigger and polarity mode (level-triggered, active-high), a first binding passing it binds, a binding or a rebind of another mode is refused with `InvalidArgument` and binds nothing (with the first acknowledged, a raise signals it alone), a second binding of the same mode binds and signals both, both are signalled again at the unmask while the line is held asserted across their acknowledgements (which an edge-triggered line would not), once the bindings are gone the holder keeps the route and its mode (a route in another mode is refused), once the holder goes a new route takes another mode, and a mode with a bit outside `IRQ_MODE_MASK` is refused ([core/kernel/docs/syscalls.md § `SYS_IRQ_REGISTER`](../kernel/docs/syscalls.md#sys_irq_register-30)) |
 | `priority_preemption.rs` | A runnable RT-class thread runs ahead of a CPU-bound spinner at the highest fair level on its CPU within a wall-clock budget, which does not resolve the preemption at the wake from a slice expiry (host-tested instead, and checked by `rt_wake_preempt.rs`) ([core/kernel/docs/scheduler.md § Scheduling Classes](../kernel/docs/scheduler.md#scheduling-classes)) |
 | `rt_wake_preempt.rs` | A self-wake of a level-26 waiter by a level-22 waker pinned to the same CPU runs the waiter before the waker's `notification_send` returns; a level-26 waiter woken from CPU 0 onto CPU 1, which a level-22 spinner keeps busy, runs within a median of 2 ms over 200 wakes, logging `rt_wake_preempt: wake-to-run median_us=`, `p99_us=` and `worst_us=` ([core/kernel/docs/scheduler.md § Wake Preemption](../kernel/docs/scheduler.md#wake-preemption)) (≥ 2 CPUs) |
+| `rt_wake_placement.rs` | A level-24 worker whose preferred CPU, CPU 1, runs a yielding level-24 spinner is woken 16 times from the harness at level 30 on CPU 0, while CPU 2 runs a floor-level spinner and CPU 3 a level-24 one, every busy CPU reading the same load: no wake lands on CPU 0 or CPU 3, and at least half leave CPU 1, an RT wake going to a CPU where it runs at once ([core/kernel/docs/scheduler.md § Thread Assignment](../kernel/docs/scheduler.md#thread-assignment)); logs `ktest: rt_wake_placement placed=..` (≥ 4 CPUs and `SchedControl`) |
 | `fair_share_progress.rs` | A thread at the lowest fair level runs beside a CPU-bound one at the highest fair level on its CPU within a wall-clock budget, which strict priority across the fair levels would not let it ([core/kernel/docs/scheduler.md § Scheduling Classes](../kernel/docs/scheduler.md#scheduling-classes)) |
 | `idle_pull_starved_ready.rs` | An unpinned RT thread queued behind a higher-level thread spinning on the last CPU with no syscall runs within a wall-clock budget while the other CPUs idle, over 8 rounds of a fresh thread each: an idle CPU pulls it, though one queued thread is below the balancer's imbalance threshold ([core/kernel/docs/scheduler.md § Load Balancing](../kernel/docs/scheduler.md#load-balancing)) (≥ 2 CPUs) |
 | `smt_siblings.rs` | Pinned to each CPU in turn, the test reads the core key the CPU reports in user mode (`crate::arch::core_key`: on x86-64 from CPUID leaf 1FH or 0BH, on riscv64 the CPU index), and requires each `SmtSibling` ring to be exactly its key group in ascending index order, wrapping; logs `ktest: smt cores=.. threads_per_core=.. on .. CPUs` |
-| `busy_cpu_placement.rs` | A worker on the last CPU, whose load floor-level spinners pinned there keep past the imbalance threshold, parks and is woken 32 times, each wake placed by least load, while a yielding spinner keeps CPU 0 busy with nothing queued: no wake lands on CPU 0, whose linked idle thread counts in its load ([core/kernel/docs/scheduler.md § Load Balancing](../kernel/docs/scheduler.md#load-balancing)), and, when a core holds neither CPU 0 nor the last CPU, none lands beside them (§ SMT Awareness); logs `ktest: busy_cpu_placement placed=..` (≥ 3 CPUs) |
+| `busy_cpu_placement.rs` | A floor-level worker on the last CPU, whose load floor-level spinners pinned there keep past the imbalance threshold, parks and is woken 32 times, each wake placed by least load, while a yielding spinner keeps CPU 0 busy with nothing queued: no wake lands on CPU 0, whose linked idle thread counts in its load ([core/kernel/docs/scheduler.md § Load Balancing](../kernel/docs/scheduler.md#load-balancing)), and, when a core holds neither CPU 0 nor the last CPU, none lands beside them (§ SMT Awareness); logs `ktest: busy_cpu_placement placed=..` (≥ 3 CPUs) |
 | `thread_placement.rs` | `SYS_CAP_INFO` `CAP_INFO_THREAD_PLACEMENT` refuses a non-Thread cap and an unknown view past `THREAD_PLACEMENT_SYNC_LOCAL` (`InvalidArgument`) and reads the calling thread's CPU below the CPU count; a child pinned to CPU 1 parked in an `ipc_call` and replied to by the harness on CPU 0 counts one remote wake, no wake move and no pull, at most one idle wake, and reads CPU 1 ([core/kernel/docs/scheduler.md § Placement Counters](../kernel/docs/scheduler.md#placement-counters)) (remote-wake check needs ≥ 2 CPUs) |
 | `sync_ipc_placement.rs` | A call that finds its server parked places the server on the caller's CPU K when K queues no thread but its idle thread and the server does not outrank the caller, and leaves it to the other rules otherwise ([core/kernel/docs/scheduler.md § Thread Assignment](../kernel/docs/scheduler.md#thread-assignment)): the harness on CPU 0 starts a caller pinned to K = 2 and an unpinned server last run on CPU 1, and over 8 round trips per case the server reads its own `CAP_INFO_THREAD_PLACEMENT` counts around each receive. Every round whose wake reached the rule is judged: it is placed on K and runs there (unless pulled) for two fair threads and for two RT threads of one level; it is not placed on K with a fair spinner pinned to K queued behind the caller (fair and RT pairs) or with an RT server called by a fair caller. No round of those cases runs on K unless a pull moved the server there, and a case the rule allows fails with no round counted (needs ≥ 3 CPUs and `SchedControl`) |
 | `reply_recv_placement.rs` | `SYS_IPC_REPLY_RECV` wakes its caller after its receive has decided ([core/kernel/docs/scheduler.md § Thread Assignment](../kernel/docs/scheduler.md#thread-assignment)): the harness on CPU 0 starts a server pinned to CPU 1 (P) that serves a fair caller C with `ipc_reply_recv`, and over 8 calls per case C reads its own `CAP_INFO_THREAD_PLACEMENT` counts around each call. When the reply-and-receive parks (C last ran on CPU 2), every round whose wake reached the synchronous wake rule is placed on P and runs there unless pulled. When it binds a second caller pinned to CPU 2 that queued while the server held C's request (C last ran on P), no round reaches the rule and none runs on P unless pulled. With C pinned to P at the server's level, C returns from its call before the server returns from its reply-and-receive in every round. A case fails with no round counted (needs ≥ 3 CPUs and `SchedControl`) |
@@ -343,7 +344,8 @@ the preemption budget of `integration::priority_preemption`; the acknowledgement
 slice wait it tells a wake apart from does not grow with the width; the
 progress budget of `integration::fair_share_progress`; the pull budget and the exit polls of
 `integration::idle_pull_starved_ready`; the park and report polls of
-`integration::busy_cpu_placement`; the expiry and report bounds of
+`integration::busy_cpu_placement` and `integration::rt_wake_placement`; the expiry and report
+bounds of
 `integration::queued_waiters_fifo`; the observation window and finish wait of
 `integration::irq_preserves_user_regs`; the delivery waits of `integration::irq_shared_line`; the
 child waits of `integration::stop_read_regs_remote`; the barrier wait of
@@ -519,7 +521,8 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
 
 - `TestResult` — `Result<(), &'static str>` — no heap, no allocation.
 - `run_test!(name, body)` — macro that logs the test name, runs `body`,
-  records PASS or FAIL (with reason), and never panics. `body` runs in a
+  records PASS or FAIL (with reason), and never panics; in a focused build it skips a test the
+  selection does not select ([§ Test selection](#test-selection)). `body` runs in a
   frame of its own (`run_isolated`, never inlined), so the stack a tier
   needs is that of its deepest test, not one `run_all` frame holding the
   locals of every test it registers.
@@ -616,7 +619,9 @@ The boot protocol carries no kernel command line
 knobs live in `KtestConfig::DEFAULT` in [`src/cmdline.rs`](src/cmdline.rs) and are baked in at
 compile time. A build with the `bench-only` cargo feature, which
 `cargo xtask build --ktest-bench-only` sets, bakes in `KtestConfig::BENCH` instead: `DEFAULT`
-with Tier 3 alone, at 4096 iterations per benchmark, for a run whose result lines are compared.
+with Tier 3 alone, at 4096 iterations per benchmark, for a run whose result lines are compared. A
+build with a selection, which `cargo xtask build --ktest-only` makes, bakes in
+`KtestConfig::SELECTED` ([§ Test selection](#test-selection)).
 To flip them, edit the constant, rebuild ktest
 (`cargo xtask build --component ktest`), then re-compose the bundle
 (`cargo xtask mkdisk --harness ktest`, per [§ Activating ktest](#activating-ktest))
@@ -633,6 +638,7 @@ until it is re-composed.
 | `run_integration` | `bool` | `true` | Run Tier 2 (`src/integration/`) |
 | `run_stress` | `bool` | `true` | Run Tier S (`src/stress/`) |
 | `run_bench` | `bool` | `true` | Run Tier 3 (`src/bench/`) |
+| `selection` | `Option<&str>` | `None` | The test-name prefixes of a focused build, set only through the build environment ([§ Test selection](#test-selection)) |
 | `bench_iters` | `u32` | `8` | Number of iterations per benchmark, cut to `MAX_ITERS` (4096, [`src/bench/mod.rs`](src/bench/mod.rs)): a functional boot's Tier 3 is a smoke run that no check compares; `KtestConfig::BENCH` sets `MAX_ITERS` |
 
 The defaults are picked for CI: every tier runs, the VM exits cleanly
@@ -658,7 +664,38 @@ On RISC-V shutdown uses SBI SRST via the `SYS_SBI_CALL` syscall.
 
 Each tier has its own flag (`run_unit`, `run_integration`, `run_stress`,
 `run_bench`), all `true` by default, so every tier runs. Clearing flags
-before recompiling is how a narrower-scope run is produced.
+before recompiling is how a run of fewer tiers is produced; a run of named tests is a focused
+build ([§ Test selection](#test-selection)).
+
+### Test selection
+
+`cargo xtask build --ktest-only <prefix>[,<prefix>...]`
+([xtask/README.md](../../xtask/README.md#cargo-xtask-build) § `cargo xtask build`) builds a
+ktest that runs only the tests whose names start with one of the prefixes, so a race in one test
+is chased by repeating a boot of a few seconds (`cargo xtask run --runs N --ktest-only-ok`)
+rather than a boot of every tier. `--ktest-only stress::stop_` selects every Tier S cell whose
+name starts `stress::stop_`, and `--ktest-only stress::mutual_stop` that one cell. A test run
+alone is a meaningful run: each test reaps what it creates, and the frame-pool check after every
+test (`frame_pool::check_slots`, [§ Test infrastructure](#test-infrastructure)) holds it to that.
+
+- The build passes the prefixes to ktest's compile in the environment variable
+  `SERAPH_KTEST_ONLY`, which `KtestConfig::SELECTED` reads; `cargo xtask build` clears the
+  variable for every other build, so a full build cannot be focused by the caller's environment.
+- `run_test!` and `run_integration_test!` skip a test the selection does not select, with no
+  log line and no count, so `passed=` and `failed=` count the selected tests alone. Tier 3 does
+  not run: a benchmark is not a named test.
+- ktest logs `ktest: selection <prefixes>` before Tier 1. A selection that matches no test logs
+  `ktest: selection matched no test` and ends the run `[ktest] SOME TESTS FAILED`, so a mistyped
+  prefix cannot pass.
+- A focused run that passes ends `[ktest] SELECTED TESTS PASSED`, never
+  `[ktest] ALL TESTS PASSED` ([docs/testing.md](../../docs/testing.md#reporting-marker)
+  § Reporting marker), so no focused boot can pass as a full one.
+- The build records the selection in `sysroot/.ktest-selection`, and a build of the full ktest
+  removes it; each pack copies the selection of the ktest it packs into the image's own record,
+  `sysroot/.image-harness`. `cargo xtask run --runs` reads only the image's record, so a later
+  build that does not repack changes nothing it decides: it refuses an image of a focused ktest
+  without `--ktest-only-ok`, with which it passes on the focused marker. CI never builds with a
+  selection.
 
 ---
 

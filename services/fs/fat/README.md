@@ -13,7 +13,7 @@ fat/
 ├── fat-parse/                  # `fatfs-parse`: BPB/dir decoders, slot scans, cluster bounds,
 │                               #   FAT entries, file positions, name encoding, LFN slots
 │                               #   and tails, node slab, cache bounds and victim pick,
-│                               #   session pool (records in client-paid pages),
+│                               #   page index, session pool (records in client-paid pages),
 │                               #   session sweep schedule, a file write's sector runs
 ├── docs/
 │   ├── crash-safety.md         # Per-op write ordering and post-crash visible states
@@ -102,9 +102,9 @@ device's logical blocks, 512 to 4096 bytes. Each component's behavior is specifi
 ## Slow requests
 
 One thread serves every request of a mount, so a request it holds delays every request queued
-behind it. A request held 5 seconds or longer, from its receipt to the end of its dispatch after
-the reply, is logged once that turn ends, as a warning naming its label and saying how much of
-its time its block calls took and how many it made:
+behind it. A request held 5 seconds or longer, from its receipt to the end of its turn, which can
+come before a reply left for the next receive is sent, is logged once that turn ends, as a warning
+naming its label and saying how much of its time its block calls took and how many it made:
 
 ```text
 slow request: FS_REMOVE (label 14) held 12034 ms, 11870 ms of it in 2311 block calls

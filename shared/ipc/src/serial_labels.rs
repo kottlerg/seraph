@@ -26,13 +26,33 @@
 /// `byte_len.div_ceil(8)` words. The caller's badge must carry
 /// [`WRITE_AUTHORITY`]. Reply: empty body, status code in the reply label.
 ///
+/// The reply means the bytes are queued in order behind every earlier
+/// write: the serial driver answers once they are in its transmit ring, and
+/// the transmit interrupt drains the ring. A caller that must know its bytes
+/// are on the line (output a power-off or reset may follow) sets
+/// [`SERIAL_WRITE_SENT`]. A write that waits on a transmitter that makes no
+/// progress (a full ring, or a `SERIAL_WRITE_SENT` wait) is answered
+/// [`super::serial_errors::STALLED`] after the driver's stall bound.
+///
 /// # Label encoding
 /// - Bits 0-15: label ID (`SERIAL_WRITE_BYTES`)
 /// - Bits 16-31: byte length of the payload in this call (0..=512).
+/// - Bit 32: [`SERIAL_WRITE_SENT`].
 ///
 /// 512 is the whole data area (`MSG_DATA_WORDS_MAX * 8`); callers split a
 /// longer write over more calls.
 pub const SERIAL_WRITE_BYTES: u64 = 1;
+
+/// Flag of [`SERIAL_WRITE_BYTES`]: the reply waits until the write's bytes,
+/// and every byte queued before them, have left the transport. The serial
+/// driver answers once the UART reports its transmitter empty (LSR TEMT:
+/// the transmit FIFO and the shift register), so nothing of the write is
+/// left in the UART when a power-off cuts it. A zero-length write with the
+/// flag is a barrier for everything written before it. logd sets it on
+/// every serial write, so a line is on the line before logd's caller goes
+/// on. The virtio-console driver answers every write once the device has
+/// taken it, and needs no flag.
+pub const SERIAL_WRITE_SENT: u64 = 1 << 32;
 
 /// Read the bytes currently received: the UART receive FIFO, or the debug
 /// port's received bytes.
@@ -52,18 +72,19 @@ pub const SERIAL_READ_BYTES: u64 = 2;
 /// Register a notification kicked when receive data becomes ready.
 ///
 /// Request: the client's notification cap in cap slot 0; the caller's badge
-/// must carry [`READ_AUTHORITY`]. The serial (UART) driver binds the UART
-/// interrupt to that notification and arms it; the IRQ is masked on each
-/// fire and re-armed by the next [`SERIAL_READ_BYTES`]. The virtio-console
-/// driver instead signals the notification from its interrupt-service
-/// thread on each interrupt of its device. Either way a client loops:
-/// drain with `SERIAL_READ_BYTES`, then wait on its notification with a
-/// bounded timeout, so a byte racing the re-arm (the serial driver
-/// registers the x86 UART line edge-triggered, mode 0) or a lost
-/// interrupt is recovered by the timeout-driven re-drain. Reply: empty
-/// body, status in the reply label
-/// ([`super::serial_errors::REGISTER_FAILED`] if the driver holds no IRQ
-/// cap or the binding fails).
+/// must carry [`READ_AUTHORITY`]. The driver keeps the notification and
+/// signals it when received bytes arrive: the serial (UART) driver from its
+/// transmitter thread, which takes bytes out of the UART on its receive
+/// interrupt, the virtio-console driver from its interrupt-service thread on
+/// each interrupt of its device. A later registration replaces the
+/// notification kept before. Either way a client loops: drain with
+/// `SERIAL_READ_BYTES`, then wait on its notification with a bounded
+/// timeout, so an interrupt the driver lost (the serial driver's x86 UART
+/// line is edge-triggered, mode 0) is recovered by the timeout-driven
+/// re-drain. Reply: empty body, status in the reply label
+/// ([`super::serial_errors::REGISTER_FAILED`] if the driver has no
+/// interrupt to signal from, or the cap is not a notification it may
+/// signal).
 pub const SERIAL_REGISTER_RX_NOTIFY: u64 = 3;
 
 /// Authority bit in the serial-service-endpoint badge's high u64 bit.

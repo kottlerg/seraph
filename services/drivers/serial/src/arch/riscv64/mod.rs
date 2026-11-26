@@ -6,41 +6,34 @@
 //! RISC-V serial I/O via a memory-mapped NS16550 UART.
 //!
 //! The driver maps the `Mmio` range devmgr delivered (the range the UART's
-//! device record names; `0x10000000` on QEMU virt) into its own address space, then
-//! writes the transmit register and drains the receive register after polling
-//! the line status register. Registers are byte-addressed (reg-shift 0),
-//! matching the bootloader's NS16550 access. The UART was programmed by an
-//! earlier boot stage and that state persists; the one piece that must be
-//! re-enabled here is the receive-data interrupt (every boot stage left
-//! `IER = 0`), so RX raises the APLIC source the driver routes to its client.
+//! device record names; `0x10000000` on QEMU virt) into its own address
+//! space and reaches the registers with volatile byte accesses ([`Uart`]).
+//! Registers are byte-addressed (reg-shift 0), matching the bootloader's
+//! NS16550 access.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::marker::PhantomData;
 use std::os::seraph::{mmio_map_funded, reserve_pages};
 
 use driver_binding::resources::Resource;
+use serial::uart;
 use syscall_abi::PAGE_SIZE;
 
-/// NS16550 register offsets (byte-addressed).
-const UART_RX: u64 = 0; // receive holding register
-const UART_TX: u64 = 0; // transmit holding register
-const UART_IER: u64 = 1; // interrupt enable register (bit 0 = ERBFI)
-const UART_LSR: u64 = 5; // line status register
-
-/// Mapped UART base virtual address, set once by [`serial_init`].
-static UART_BASE: AtomicU64 = AtomicU64::new(0);
-
-/// The address of the UART register at `offset` from the mapped page at
-/// `base`. Every offset lies inside the page, so the sum never saturates.
-fn register(base: u64, offset: u64) -> u64
+/// The UART's register file, mapped by [`serial_init`] for the process's
+/// lifetime. Not `Send`, as on x86-64, where the register access is the
+/// setting-up thread's alone, so the driver's threads are the same on both.
+#[derive(Clone, Copy)]
+pub struct Uart
 {
-    base.saturating_add(offset)
+    /// The virtual address the UART's page is mapped at.
+    base: u64,
+    /// Keeps the handle on its thread.
+    _thread: PhantomData<*const ()>,
 }
 
 /// Reserve a VA page and map the UART's `Mmio` range, `registers`, into it.
-/// The reservation lives for the process's lifetime. `self_thread` is unused on
-/// RISC-V. Returns `false` if `registers` is not a page-aligned `Mmio` range
-/// of at most one page holding the registers, or reservation or mapping
-/// fails.
+/// The reservation lives for the process's lifetime. `self_thread` is unused
+/// on RISC-V. `None` if `registers` is not a page-aligned `Mmio` range of at
+/// most one page holding the registers, or reservation or mapping fails.
 ///
 /// # Safety
 /// `self_aspace` must be this process's own address space, and `registers`
@@ -48,7 +41,8 @@ fn register(base: u64, offset: u64) -> u64
 /// base to the page end, so a range of at most one page keeps the
 /// whole-region mapping inside the one-page reservation
 /// (`syscall::mmio_map`'s contract).
-pub unsafe fn serial_init(_self_thread: u64, self_aspace: u64, registers: &Resource) -> bool
+pub unsafe fn serial_init(_self_thread: u64, self_aspace: u64, registers: &Resource)
+-> Option<Uart>
 {
     let Resource::Mmio {
         cap: mmio_cap,
@@ -58,18 +52,14 @@ pub unsafe fn serial_init(_self_thread: u64, self_aspace: u64, registers: &Resou
     } = *registers
     else
     {
-        return false;
+        return None;
     };
-    if phys % PAGE_SIZE != 0 || !(UART_LSR + 1..=PAGE_SIZE).contains(&bytes)
+    if phys % PAGE_SIZE != 0 || !(u64::from(uart::REGISTERS)..=PAGE_SIZE).contains(&bytes)
     {
-        return false;
+        return None;
     }
-    let Ok(range) = reserve_pages(1)
-    else
-    {
-        return false;
-    };
-    let base_va = range.va_start();
+    let range = reserve_pages(1).ok()?;
+    let base = range.va_start();
     // SAFETY: `range` is a fresh one-page reservation from the per-process
     // arena, owned for the process's lifetime, and the caller's contract
     // bounds the region to one page, so the whole-region mapping stays
@@ -78,70 +68,40 @@ pub unsafe fn serial_init(_self_thread: u64, self_aspace: u64, registers: &Resou
     // volatile loads and stores, never a reference, and the reservation
     // stays held for the process's lifetime (`mmio_map` § Safety), mapped
     // or not.
-    if unsafe { mmio_map_funded(self_aspace, mmio_cap, base_va, 1) }.is_err()
-    {
-        return false;
-    }
-    UART_BASE.store(base_va, Ordering::Release);
-    true
-}
-
-/// Enable the Received Data Available interrupt (ERBFI). Earlier boot stages
-/// left IER cleared; without this the NS16550 never raises its APLIC source.
-/// The driver calls it only when it holds the UART's IRQ cap; without the
-/// cap, RX polls. No-ops if [`serial_init`] never mapped the UART.
-pub fn serial_enable_rx_interrupt()
-{
-    let base = UART_BASE.load(Ordering::Acquire);
-    if base == 0
-    {
-        return;
-    }
-    // SAFETY: `base` is the page `serial_init` mapped the UART into, held for
-    // the process's lifetime; IER is within the page.
-    unsafe { core::ptr::write_volatile(register(base, UART_IER) as *mut u8, 0x01) };
-}
-
-/// Read one byte from the UART if the receive register holds data, else
-/// `None`. No-ops to `None` if [`serial_init`] never mapped the UART.
-pub fn serial_read_byte() -> Option<u8>
-{
-    let base = UART_BASE.load(Ordering::Acquire);
-    if base == 0
+    if unsafe { mmio_map_funded(self_aspace, mmio_cap, base, 1) }.is_err()
     {
         return None;
     }
-    let lsr = register(base, UART_LSR) as *const u8;
-    let rx = register(base, UART_RX) as *const u8;
-    // SAFETY: `base` was mapped via mmio_map in serial_init; the LSR offset is
-    // within the mapped page and byte-aligned. Reading it is side-effect-free.
-    if unsafe { core::ptr::read_volatile(lsr) } & 0x01 == 0
-    {
-        return None;
-    }
-    // SAFETY: same mapping; reading the RBR returns the next received byte and
-    // clears the data-ready bit.
-    Some(unsafe { core::ptr::read_volatile(rx) })
+    Some(Uart {
+        base,
+        _thread: PhantomData,
+    })
 }
 
-/// Write one byte to the UART, spinning until the transmit holding register
-/// is empty (LSR bit `0x20`). No-ops if [`serial_init`] never mapped the
-/// UART.
-pub fn serial_write_byte(byte: u8)
+impl Uart
 {
-    let base = UART_BASE.load(Ordering::Acquire);
-    if base == 0
+    /// Read the register at `offset` (one of [`uart`]'s, below
+    /// [`uart::REGISTERS`]).
+    pub fn read(self, offset: u8) -> u8
     {
-        return;
+        // SAFETY: `serial_init` mapped the UART's page at `base` for the
+        // process's lifetime, and the register lies inside it, byte-aligned.
+        unsafe { core::ptr::read_volatile(self.register(offset)) }
     }
-    let tx = register(base, UART_TX) as *mut u8;
-    let lsr = register(base, UART_LSR) as *const u8;
-    // SAFETY: `base` was mapped via mmio_map in serial_init; both offsets are
-    // within the mapped page and byte-aligned.
-    while unsafe { core::ptr::read_volatile(lsr) } & 0x20 == 0
-    {}
-    // SAFETY: same mapping; writing one byte to the transmit register.
-    unsafe {
-        core::ptr::write_volatile(tx, byte);
+
+    /// Write `value` to the register at `offset` (one of [`uart`]'s, below
+    /// [`uart::REGISTERS`]).
+    pub fn write(self, offset: u8, value: u8)
+    {
+        // SAFETY: as for `read`.
+        unsafe { core::ptr::write_volatile(self.register(offset).cast_mut(), value) };
+    }
+
+    /// The address of the register at `offset`; every register lies inside
+    /// the mapped page, so the sum never saturates.
+    fn register(self, offset: u8) -> *const u8
+    {
+        self.base
+            .saturating_add(u64::from(offset % uart::REGISTERS)) as *const u8
     }
 }

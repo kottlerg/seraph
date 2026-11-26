@@ -15,15 +15,18 @@
 //!
 //! ## Ordering
 //!
-//! Every slot word is an atomic accessed `Relaxed`. The table has no lock of
-//! its own: each access that decides an outcome holds the lock of the endpoint
-//! the slot names, which orders it. The owning CPU records and looks up under
-//! the lock of the endpoint it parks on or calls, with interrupts off, so no
-//! other access of its own interleaves with either. A remover on any CPU clears
-//! a slot by a compare-and-swap of its receiver word from the removed receiver
-//! to null, never a plain store, under the lock of the endpoint it removes the
-//! receiver from. A slot naming that endpoint has no other writer meanwhile,
-//! since its owner records into it only under the same lock.
+//! Every slot word is an atomic accessed `Relaxed`, but for the owning CPU's
+//! plain reads of its queue words, which no other CPU reads or writes, so no
+//! access runs beside such a read; a cross-CPU access of a queue word would
+//! need `RecvParkTable::named` back on an atomic load. The table has no lock
+//! of its own: each access that decides an outcome holds the lock of the
+//! endpoint the slot names, which orders it. The owning CPU records and looks
+//! up under the lock of the endpoint it parks on or calls, with interrupts off,
+//! so no other access of its own interleaves with either. A remover on any CPU
+//! clears a slot by a compare-and-swap of its receiver word from the removed
+//! receiver to null, never a plain store, under the lock of the endpoint it
+//! removes the receiver from. A slot naming that endpoint has no other writer
+//! meanwhile, since its owner records into it only under the same lock.
 //!
 //! A slot the owner has since given to another endpoint, under that
 //! endpoint's lock, is the one place accesses under different locks meet: the
@@ -39,7 +42,7 @@ use super::WaitQueue;
 use crate::sched::thread::ThreadControlBlock;
 
 /// Slots in each CPU's [`RecvParkTable`]: the endpoints a CPU keeps a parked
-/// receiver for at once. A lookup compares at most this many words.
+/// receiver for at once. A lookup compares this many words.
 pub const RECV_PARK_SLOTS: usize = 4;
 
 /// One slot of a [`RecvParkTable`]: a receive queue, the receiver last parked
@@ -47,8 +50,8 @@ pub const RECV_PARK_SLOTS: usize = 4;
 struct RecvParkSlot
 {
     /// The receive queue the slot names (its address, compared, never
-    /// dereferenced), or null for a slot never used. Written only by the
-    /// owning CPU.
+    /// dereferenced), or null for a slot never used. Written and read only by
+    /// the owning CPU.
     queue: AtomicPtr<RecvQueue>,
     /// The receiver, or null once it has left the queue or before any park.
     /// Non-null only while that receiver is on `queue`: every removal from a
@@ -72,6 +75,13 @@ impl RecvParkSlot
         }
     }
 }
+
+/// The slot [`RecvParkTable::named`] returns when no slot of the table names
+/// the queue: it names no queue and records no receiver, and nothing writes it,
+/// since a record takes a slot of the table ([`RecvParkTable::slot_for`]).
+/// A lookup that finds no slot reads its null receiver word, so the search
+/// returns a slot whether or not one matched and the lookup needs no test.
+static NO_SLOT: RecvParkSlot = RecvParkSlot::new();
 
 /// One CPU's parked-receiver table: for up to [`RECV_PARK_SLOTS`] endpoints,
 /// the receiver most recently parked on the endpoint from this CPU, while it is
@@ -119,13 +129,49 @@ impl RecvParkTable
         &slot.receiver
     }
 
+    /// The slot naming `queue`, or [`NO_SLOT`] when none does. At most one
+    /// slot names a queue, since a record takes the slot naming its queue when
+    /// one does ([`Self::slot_for`]).
+    ///
+    /// Every slot's queue word is compared, whichever slot names `queue`, so a
+    /// call's lookup and a park's record of an endpoint the table names run the
+    /// same instructions whichever slot that is. The slot is set by the order
+    /// of the CPU's earlier parks on other endpoints, which the machine's
+    /// timing decides, and a search that stopped at the match would make the
+    /// cost of every round trip through the endpoint depend on it.
+    ///
+    /// The caller is this table's CPU, with interrupts off.
+    fn named(&self, queue: *const RecvQueue) -> &RecvParkSlot
+    {
+        // One more than the index of the slot naming `queue`, or 0: each
+        // slot ORs in its own number masked by whether it matches, and at most
+        // one matches. The compiler makes each step a select of the number or
+        // zero, which both targets build without a branch (a conditional move
+        // on x86_64, a negated set-if-equal and an AND on riscv64), so every
+        // slot runs the same instructions. A select between two slots instead
+        // becomes branches on riscv64, which has no conditional move, and its
+        // instruction count then follows the slot that matched.
+        let mut number: usize = 0;
+        for (slot, index) in self.slots.iter().zip(1usize..)
+        {
+            // SAFETY: only this table's CPU writes a queue word (`record`),
+            // and the caller is that CPU with interrupts off, so no write runs
+            // beside this read. A plain read lets the compiler fold it into
+            // the comparison, which an atomic load does not.
+            let named = unsafe { slot.queue.as_ptr().read() };
+            let matches = usize::from(core::ptr::eq(named, queue)).wrapping_neg();
+            number |= index & matches;
+        }
+        // A miss wraps to `usize::MAX`, which no slot has: whether some slot
+        // matched, never which, decides this one branch.
+        self.slots.get(number.wrapping_sub(1)).unwrap_or(&NO_SLOT)
+    }
+
     /// The slot a record for `queue` takes ([`Self::record`]).
     fn slot_for(&self, queue: *const RecvQueue) -> &RecvParkSlot
     {
-        let named = self
-            .slots
-            .iter()
-            .find(|slot| core::ptr::eq(slot.queue.load(Relaxed), queue));
+        let named = self.named(queue);
+        let named = (!core::ptr::eq(named, &raw const NO_SLOT)).then_some(named);
         let free = || {
             self.slots
                 .iter()
@@ -147,17 +193,15 @@ impl RecvParkTable
         named.or_else(free).unwrap_or_else(oldest)
     }
 
-    /// The receiver this table records for `queue`, or null. Compares only
-    /// the slots' queue words, and loads a receiver word only on a match.
+    /// The receiver this table records for `queue`, or null. Compares every
+    /// slot's queue word ([`Self::named`]) and loads the receiver word of the
+    /// slot it returns, [`NO_SLOT`]'s null when none names `queue`.
     ///
     /// The caller is this table's CPU and holds the lock of the endpoint that
     /// owns `queue`, with interrupts off.
     fn lookup(&self, queue: *const RecvQueue) -> *mut ThreadControlBlock
     {
-        self.slots
-            .iter()
-            .find(|slot| core::ptr::eq(slot.queue.load(Relaxed), queue))
-            .map_or(core::ptr::null_mut(), |slot| slot.receiver.load(Relaxed))
+        self.named(queue).receiver.load(Relaxed)
     }
 }
 
@@ -382,6 +426,14 @@ mod tests
             self.index_of(tcb)
         }
 
+        /// The index of the slot table `cpu` names `queue` in.
+        fn named_slot(&self, cpu: usize, queue: *const RecvQueue) -> Option<usize>
+        {
+            let table = &self.tables[cpu];
+            let slot = table.named(queue);
+            table.slots.iter().position(|s| core::ptr::eq(s, slot))
+        }
+
         /// Whether TCB `t` points at no slot.
         fn slotless(&self, t: usize) -> bool
         {
@@ -470,6 +522,34 @@ mod tests
         assert!(f.slotless(1));
         assert_eq!(f.recorded(0, 0), Some(2));
         assert_eq!(f.take(0, Some(0)), Some(2));
+    }
+
+    #[test]
+    fn a_lookup_finds_its_endpoint_in_every_slot_and_no_other()
+    {
+        // CPU 0's table names queues 0 to 3, in slots 0 to 3; queue 4 is
+        // parked on from CPU 1 only.
+        let mut f = Fixture::new(5, 5, 2);
+        for q in 0..4
+        {
+            f.park(q, q, 0);
+        }
+        f.park(4, 4, 1);
+        for q in 0..4
+        {
+            let queue = core::ptr::from_ref(&f.queues[q]);
+            assert_eq!(f.named_slot(0, queue), Some(q));
+            assert_eq!(f.recorded(0, q), Some(q));
+        }
+        let queue4 = core::ptr::from_ref(&f.queues[4]);
+        assert_eq!(f.named_slot(0, queue4), None);
+        assert_eq!(f.recorded(0, 4), None);
+        // A park on an endpoint the table names takes its slot again, here
+        // after its receiver left, which keeps the slot's queue word.
+        assert!(f.remove(2, 2));
+        f.park(2, 2, 0);
+        assert_eq!(f.named_slot(0, core::ptr::from_ref(&f.queues[2])), Some(2));
+        assert_eq!(f.recorded(0, 2), Some(2));
     }
 
     #[test]

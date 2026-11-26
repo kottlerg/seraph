@@ -477,9 +477,11 @@ pub(super) fn bootloader_under(
         component: BuildComponent::Boot,
         debug: Vec::new(),
         limited_debug: Vec::new(),
+        opt_level: Vec::new(),
         // The lint pass is the build's; this compiles the tree it checked.
         skip_lints: true,
         ktest_bench_only: false,
+        ktest_only: None,
         host: args.host.common.clone(),
     };
     // The case boots, so `main` admitted no build: the compile is admitted

@@ -300,7 +300,7 @@ pub mod blk_labels;
 
 /// Wire-protocol version of [`serial_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SERIAL_LABELS_VERSION: u32 = 2;
+pub const SERIAL_LABELS_VERSION: u32 = 3;
 pub mod serial_labels;
 
 pub mod serial_errors;
@@ -381,6 +381,8 @@ pub mod log_query;
 pub mod log_record;
 
 pub mod recv_guard;
+
+pub mod serve;
 
 pub mod bootstrap_errors;
 
@@ -1169,20 +1171,41 @@ pub unsafe fn ipc_reply_recv(
     timeout_ms: u64,
 ) -> Result<IpcMessage, i64>
 {
+    // SAFETY: this fn's contract is reply_recv_delivery's.
+    let delivery = unsafe { reply_recv_delivery(ep, reply, ipc_buf, timeout_ms) }?;
+    // SAFETY: `ipc_buf` is the registered IPC buffer; the kernel wrote a
+    // message beyond MSG_REGS_DATA_MAX words and any delivered cap handles
+    // there before return.
+    Ok(unsafe { IpcMessage::from_delivery(ipc_buf, &delivery) })
+}
+
+/// [`ipc_reply_recv`] up to the kernel's return: the delivery the message is
+/// read from, for a caller that reads it once, after choosing among several
+/// syscalls ([`serve::next_request`]).
+///
+/// # Safety
+/// As [`ipc_reply_recv`].
+///
+/// # Errors
+/// As [`ipc_reply_recv`].
+#[inline]
+pub(crate) unsafe fn reply_recv_delivery(
+    ep: u64,
+    reply: &IpcMessage,
+    ipc_buf: *mut u64,
+    timeout_ms: u64,
+) -> Result<syscall::IpcDelivery, i64>
+{
     // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
     let regs = unsafe { reply.stage_send(ipc_buf) };
-    let delivery = syscall::raw_ipc_reply_recv(
+    syscall::raw_ipc_reply_recv(
         ep,
         reply.label,
         reply.word_count(),
         reply.caps().len(),
         timeout_ms,
         &regs,
-    )?;
-    // SAFETY: `ipc_buf` is the registered IPC buffer; the kernel wrote a
-    // message beyond MSG_REGS_DATA_MAX words and any delivered cap handles
-    // there before return.
-    Ok(unsafe { IpcMessage::from_delivery(ipc_buf, &delivery) })
+    )
 }
 
 #[cfg(test)]

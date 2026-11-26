@@ -22,6 +22,7 @@
 //! hardware) can stand in for it, so the consumer never learns the
 //! transport.
 
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, devmgr_labels, memmgr_errors, memmgr_labels, serial_errors, serial_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -561,7 +562,7 @@ impl Console
     /// Serve one request. Every cap the request carries and the driver does
     /// not keep (all of them but an accepted RX notification) is deleted
     /// before the reply, so no request leaves a slot taken.
-    fn handle(&mut self, msg: &IpcMessage, ipc_buf: *mut u64)
+    fn handle(&mut self, msg: &IpcMessage, out: &mut Reply)
     {
         let op = msg.label & 0xFFFF;
         let authorized = virtio_console::authorized(msg.label, msg.badge);
@@ -604,8 +605,7 @@ impl Console
         {
             IpcMessage::new(serial_errors::UNKNOWN_OPCODE)
         };
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        out.set(reply);
     }
 
     /// Have the interrupt-service thread signal `notification` on each
@@ -743,10 +743,11 @@ fn start_interrupts(
 fn service_loop(service_ep: u64, ipc_buf: *mut u64, console: &mut Console) -> !
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -756,7 +757,7 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, console: &mut Console) -> !
             }
         };
         guard.on_success();
-        console.handle(&msg, ipc_buf);
+        console.handle(&msg, &mut reply);
     }
 }
 

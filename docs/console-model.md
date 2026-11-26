@@ -111,7 +111,11 @@ direct console paths remain as fallbacks for the life of the system.
    its own panic / alloc-error output, routed here via a `std::os::seraph::set_panic_sink` sink
    rather than the log endpoint logd serves (logd deletes its seeded `log_send_cap` at startup so a
    fault cannot self-IPC into it). Every line reaches the driver through logd's serial sink: a
-   bounded queue drained by one writer thread, the only logd thread that waits on the driver. A
+   bounded queue drained by one writer thread, the only logd thread that waits on the driver. The
+   writer writes each line with `serial_labels::SERIAL_WRITE_SENT`, which the driver answers once
+   the line's bytes have left the UART, so a line counts as written when it is on the wire, before
+   its sender goes on, a power-off included; a write without the flag, such as the terminal's, is
+   answered once its bytes are in the driver's transmit ring. A
    line's producer waits for its write for at most `SINK_STALL_MS`, so a driver that is stopped
    or dead holds the log stream for that bound once and then costs it nothing until it writes
    again. A sink whose writer logd could not spawn is written by each line's producer instead, and
@@ -206,9 +210,13 @@ direct console paths remain as fallbacks for the life of the system.
 The serial driver owns the platform UART authority cap end-to-end — an
 `IoPort` for COM1 on x86-64, an `Mmio` for the NS16550 on RISC-V, plus the
 UART interrupt cap — delegated by devmgr at spawn. It is a device driver, not a
-console daemon: no name registry, no log routing, no VT/ANSI. It carries a
-minimal interrupt-driven read path (the terminal's serial input source) but no
-line editing or cooked-mode processing — those live in the terminal. Clients
+console daemon: no name registry, no log routing, no VT/ANSI. With the interrupt it moves bytes
+through a transmit ring and a receive ring: a write is answered once its bytes are in the
+transmit ring, or with `SERIAL_WRITE_SENT` once they have left the UART, and a read, the
+terminal's serial input source, takes what the receive ring holds without waiting on a write
+([services/drivers/serial/README.md](../services/drivers/serial/README.md#transmit-and-receive)
+§ Transmit and receive). It has no line editing or cooked-mode processing — those live in the
+terminal. Clients
 obtain a read/write capability through devmgr (a device authority), not through
 svcmgr (a service registry): a UART is a device, not a service. The driver's IPC
 contract is specified in [services/drivers/serial/README.md](../services/drivers/serial/README.md).

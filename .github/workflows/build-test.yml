@@ -24,6 +24,12 @@ on:
           empty proves every crate
         required: false
         default: ''
+      kani-prove-all:
+        description: >-
+          Prove every job the kani plan selects, stored passes or not
+        type: boolean
+        required: false
+        default: false
       cells-since:
         description: >-
           The commit the select job computes the owed cells from; empty
@@ -166,10 +172,16 @@ jobs:
     # verification); burnin.yml proves every crate. On a pull request or a
     # push, from the base the select job found, so a proof a red or
     # cancelled master run left unproven stays owed; on a dispatch from its
-    # input. None proves every crate.
+    # input. None proves every crate. A job whose pass a run of this
+    # repository stored is not run again unless the dispatch's kani-prove-all
+    # asks; reading the stored passes needs `actions: read`.
     needs: select
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/kani.yml
     with:
+      skip-passed: ${{ !inputs.kani-prove-all }}
       since: >-
         ${{ github.event_name != 'workflow_dispatch' && needs.select.outputs.base
         || inputs.kani-since }}
@@ -540,6 +552,9 @@ jobs:
           # its senders, crashd and the kernel wrote at once: svctest's
           # `console_whole_lines` phase brackets its lines with
           # `whole-lines begin` and `whole-lines end` (`--whole-lines`).
+          # It checks the same of the lines svctest's `serial_transmit` phase
+          # writes to the serial driver while its transmitter is stopped,
+          # bracketed with `serial-burst begin` and `serial-burst end`.
           # The usertest boot also checks the log-level configuration its
           # staging packed: a debug line of vfsd and of the fatfs vfsd spawns,
           # and none of devmgr or procmgr. The ktest boot also checks the
@@ -549,7 +564,7 @@ jobs:
           checks=()
           case "${{ matrix.tester }}" in
             svctest)
-              checks=(--whole-lines whole-lines) ;;
+              checks=(--whole-lines whole-lines --whole-lines serial-burst) ;;
             usertest)
               checks=(--require 'DEBUG  \[vfsd\] ' --require 'DEBUG  \[fatfs\] '
                       --fail-also 'DEBUG  \[(devmgr|procmgr)\] ') ;;

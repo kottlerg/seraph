@@ -406,6 +406,15 @@ args! {
         #[arg(long, value_delimiter = ',', value_parser = parse_build_component)]
         pub limited_debug: Vec<BuildComponent>,
 
+        /// Build the named workspace package(s) at another opt-level within
+        /// the active profile, as `<package>=<level>`, the level one of 0, 1,
+        /// 2, 3, s or z. Comma-separated, e.g. `--opt-level shmem=3,framebuffer=3`.
+        /// A package is any of the workspace, a library included: it applies
+        /// wherever the build compiles it. Refused for a component `--debug`
+        /// names (`all` names every component), which sets its opt-level to 1.
+        #[arg(long, value_name = "PKG=LEVEL", value_delimiter = ',', value_parser = parse_opt_level)]
+        pub opt_level: Vec<OptLevelOverride>,
+
         /// Skip the formatting check (`cargo fmt --check`) and the
         /// per-component `cargo check` (clippy), which would otherwise double
         /// the cargo invocations per component. The build of a `StdUser`
@@ -423,6 +432,18 @@ args! {
         /// build that includes ktest (`--component all` or `ktest`).
         #[arg(long)]
         pub ktest_bench_only: bool,
+
+        /// Build ktest focused on the tests whose names start with one of
+        /// these comma-separated prefixes (`stress::stop_`, `cap::,ipc::`):
+        /// it runs only those, and no benchmark, ends a passing run with
+        /// `[ktest] SELECTED TESTS PASSED` in place of the full run's marker,
+        /// and fails a run whose selection matches no test (core/ktest/README.md
+        /// "Test selection"). The build records the selection in the sysroot,
+        /// and `run --runs` refuses an image of it without `--ktest-only-ok`.
+        /// Needs a build that includes ktest (`--component all` or `ktest`);
+        /// refused with `--ktest-bench-only`.
+        #[arg(long, value_name = "PREFIXES", value_parser = parse_ktest_selection)]
+        pub ktest_only: Option<String>,
 
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
@@ -470,6 +491,12 @@ impl Leaf for BuildComponent
 
 plain_field!(BuildComponent);
 
+/// A `--ktest-only` value, checked as [`crate::sysroot::check_ktest_selection`] checks it.
+fn parse_ktest_selection(text: &str) -> Result<String, String>
+{
+    crate::sysroot::check_ktest_selection(text).map(|()| text.to_string())
+}
+
 /// The value parser of a [`BuildComponent`]: `boot`, `all`, or the crate
 /// name of a spec-table entry.
 fn parse_build_component(text: &str) -> Result<BuildComponent, String>
@@ -488,6 +515,54 @@ fn parse_build_component(text: &str) -> Result<BuildComponent, String>
                 )
             }),
     }
+}
+
+/// The opt-levels `--opt-level` accepts: Cargo's `profile.opt-level` values.
+pub const OPT_LEVELS: [&str; 6] = ["0", "1", "2", "3", "s", "z"];
+
+/// An `--opt-level` override: a workspace package, by its name, and the
+/// opt-level of [`OPT_LEVELS`] it is built at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptLevelOverride
+{
+    pub package: String,
+    pub level: &'static str,
+}
+
+impl Leaf for OptLevelOverride
+{
+    fn parse(text: &str) -> Result<Self, String>
+    {
+        parse_opt_level(text)
+    }
+}
+
+/// The value parser of an [`OptLevelOverride`]: `<package>=<level>`. The
+/// package name is checked to be one Cargo accepts (ASCII letters, digits,
+/// `-` and `_`), so it is one TOML key segment when quoted; whether the
+/// workspace has it is checked by the build, which reads the workspace.
+fn parse_opt_level(text: &str) -> Result<OptLevelOverride, String>
+{
+    let (package, level) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not <package>=<level>"))?;
+    if package.is_empty()
+        || !package
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!("{package:?} is not a package name"));
+    }
+    let level = OPT_LEVELS.iter().find(|l| **l == level).ok_or_else(|| {
+        format!(
+            "no opt-level {level:?}; expected one of: {}",
+            OPT_LEVELS.join(", ")
+        )
+    })?;
+    Ok(OptLevelOverride {
+        package: package.to_owned(),
+        level,
+    })
 }
 
 // ── Run ───────────────────────────────────────────────────────────────────────
@@ -653,6 +728,14 @@ args! {
         #[arg(long, value_name = "N")]
         pub runs: Option<u32>,
 
+        /// Accept an image whose ktest a focused build made (`cargo xtask build
+        /// --ktest-only`): `--runs` refuses one without it, since a focused run
+        /// validates nothing, and with it the default `--pass` is the focused
+        /// run's marker `[ktest] SELECTED TESTS PASSED`. Refused for an image that
+        /// boots no focused ktest.
+        #[arg(long, requires = "runs")]
+        pub ktest_only_ok: bool,
+
         /// What the guest presents for display. `window` attaches QEMU std VGA
         /// and shows it in a window; `framebuffer` attaches it with no window
         /// (`-display none`), so the framebuffer driver runs on a host without a
@@ -703,9 +786,11 @@ args! {
         /// discarded and the run is classified PASS. The default is the
         /// terminal marker `[<harness>] ALL TESTS PASSED`
         /// ([`docs/testing.md`](../../docs/testing.md)) of the one harness the
-        /// image boots, as its pack recorded it; an image that boots no harness,
-        /// or several, has none, and `--runs` then needs this option. Override
-        /// for other rootfs configurations.
+        /// image boots, as its pack recorded it, or `[ktest] SELECTED TESTS
+        /// PASSED` for a focused ktest, which `--runs` takes only with
+        /// `--ktest-only-ok`; an image that boots no harness, or several, has
+        /// none, and `--runs` then needs this option. Override for other rootfs
+        /// configurations.
         #[arg(long, requires = "runs")]
         pub pass: Option<String>,
 
@@ -753,10 +838,12 @@ args! {
         /// Check that the console stayed whole in each passing run's log:
         /// between the lines `<TAG> begin` and `<TAG> end ...`, every line is
         /// one console line, and each sender's numbered lines arrive whole, in
-        /// order, none missing (svctest's `console_whole_lines` phase). A run
-        /// whose check fails is FAIL; a QEMU-CRASH run is not checked.
+        /// order, none missing (svctest's `console_whole_lines` and
+        /// `serial_transmit` phases); repeatable, each tag's window is
+        /// checked. A run whose check fails is FAIL; a QEMU-CRASH run is not
+        /// checked.
         #[arg(long, value_name = "TAG", requires = "runs")]
-        pub whole_lines: Option<String>,
+        pub whole_lines: Vec<String>,
 
         /// On a hard-timeout HANG of `--runs`, do not kill the QEMU instance:
         /// print the attach instructions and block until it is terminated
@@ -1106,10 +1193,11 @@ args! {
         /// Verify only the crates the change from the merge base of COMMIT and
         /// HEAD to the working tree can affect: each crate whose package, a
         /// package in its dependency closure, or a file one of them reads, the
-        /// change touches; every crate when it touches an input of every
-        /// build; and, when it selects no crate otherwise but touches
-        /// `.github/workflows/kani.yml` or `build-test.yml`, the crate with the
-        /// fewest harnesses.
+        /// change touches; every crate when it touches an input of every proof
+        /// (an input of every build, this command's source, or
+        /// `.github/workflows/kani.yml`); and, when it touches
+        /// `.github/workflows/build-test.yml`, the crate with the fewest
+        /// harnesses, whose jobs run whatever passes are stored.
         #[arg(long, value_name = "COMMIT", conflicts_with_all = ["component", "harness"])]
         pub since: Option<String>,
 
@@ -1135,13 +1223,25 @@ args! {
         #[arg(long, conflicts_with_all = ["component", "harness", "shard", "list"])]
         pub plan: bool,
 
+        /// With --plan, leave out each job whose pass a run of this repository
+        /// stored (an artifact named by the job's key, read with gh), printing
+        /// the run that proved it.
+        #[arg(long, requires = "plan")]
+        pub skip_passed: bool,
+
+        /// With --shard, when the harnesses judged are exactly the shard's and
+        /// all passed, write the record of the job's pass to DIR, as the file
+        /// CI stores it as: kani-pass-<key>.txt.
+        #[arg(long, value_name = "DIR", requires = "shard")]
+        pub pass_record: Option<PathBuf>,
+
         /// With --plan, append the workflow's outputs to FILE
         /// (`$GITHUB_OUTPUT`): the matrix and whether it holds a job.
         #[arg(long, value_name = "FILE", requires = "plan")]
         pub github_output: Option<PathBuf>,
 
         /// Print the pinned Kani release and exit, verifying nothing.
-        #[arg(long, conflicts_with_all = ["component", "harness", "since", "list", "shard", "plan"])]
+        #[arg(long, conflicts_with_all = ["component", "harness", "since", "list", "shard", "plan", "pass_record"])]
         pub pin: bool,
 
         /// The shared host's launch rules (see xtask/README.md "Host launch
@@ -2124,6 +2224,37 @@ mod tests
         assert_eq!(parse_build_component("boot"), Ok(BuildComponent::Boot));
         assert_eq!(parse_build_component("all"), Ok(BuildComponent::All));
         parse_build_component("no-such-crate").unwrap_err();
+    }
+
+    // Defect caught: an `--opt-level` value with a level Cargo does not
+    // know, or a package name that would not be one quoted TOML key segment
+    // of the `--config` flag the build writes from it.
+    #[test]
+    fn an_opt_level_override_takes_a_package_name_and_a_cargo_level()
+    {
+        for level in OPT_LEVELS
+        {
+            assert_eq!(
+                parse_opt_level(&format!("virtio-blk={level}")),
+                Ok(OptLevelOverride {
+                    package: "virtio-blk".into(),
+                    level,
+                })
+            );
+        }
+        for refused in [
+            "shmem",
+            "shmem=",
+            "shmem=4",
+            "shmem=O3",
+            "=3",
+            "sh\"mem=3",
+            "sh mem=3",
+            "shmem.x=3",
+        ]
+        {
+            parse_opt_level(refused).unwrap_err();
+        }
     }
 
     /// The host options `main` admits a parsed command line with as a build.

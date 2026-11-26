@@ -551,6 +551,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
 pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 {
     sysroot::check_arch(ctx, args.arch)?;
+    check_opt_levels(ctx, args)?;
     if !args.skip_lints
     {
         step("Checking formatting");
@@ -558,14 +559,7 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         clippy_host(ctx)?;
     }
 
-    if args.ktest_bench_only
-        && !matches!(
-            args.component,
-            BuildComponent::All | BuildComponent::Spec("ktest")
-        )
-    {
-        bail!("--ktest-bench-only builds ktest: give --component all or --component ktest");
-    }
+    check_ktest_options(args)?;
 
     match args.component
     {
@@ -731,6 +725,7 @@ pub fn compile_boot(ctx: &BuildContext, args: &BuildArgs, store: &Path, out: &Pa
     let mut cmd = cargo(&ctx.root);
     cmd.arg("build").args(&flags);
     cmd.args(debug_config_flags(args, "boot"));
+    cmd.args(opt_level_config_flags(args));
     cmd.envs(env);
     run_cmd(&mut cmd)?;
 
@@ -911,7 +906,8 @@ fn build_group(
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let env_owned = profile_env(args.arch, profile);
+    let mut env_owned = profile_env(args.arch, profile);
+    env_owned.extend(selection_env(args, &names));
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if !args.skip_lints
     {
@@ -928,6 +924,7 @@ fn build_group(
     {
         cmd.args(debug_config_flags(args, pkg));
     }
+    cmd.args(opt_level_config_flags(args));
     cmd.envs(env.iter().copied());
     if let Some(s) = seraph.as_ref()
     {
@@ -948,18 +945,73 @@ fn build_group(
             );
         }
         check_frame_bound(args.arch, profile, &cargo_out)?;
-        for dst in install_paths(ctx, spec)
-        {
-            if let Some(parent) = dst.parent()
-            {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            install(ctx, args.arch, spec, &cargo_out, &dst)?;
-            step(&format!("{}: {}", spec.name, dst.display()));
-        }
+        install_spec(ctx, args, spec, &cargo_out)?;
     }
 
+    Ok(())
+}
+
+/// The build environment variable that carries a focused ktest build's
+/// selection to ktest's compile (`core/ktest/src/cmdline.rs`,
+/// `KtestConfig::SELECTED`). [`cargo`] clears it on every invocation, so only
+/// `--ktest-only` sets it ([`selection_env`]).
+const KTEST_SELECTION_VAR: &str = "SERAPH_KTEST_ONLY";
+
+/// Refuse the ktest options of `args` on a build they cannot apply to:
+/// `--ktest-bench-only` or `--ktest-only` with a component other than `all` or
+/// `ktest`, and the two together, since a bench-only ktest runs no named test
+/// a selection could select.
+fn check_ktest_options(args: &BuildArgs) -> Result<()>
+{
+    let builds_ktest = matches!(
+        args.component,
+        BuildComponent::All | BuildComponent::Spec("ktest")
+    );
+    if args.ktest_bench_only && args.ktest_only.is_some()
+    {
+        bail!("--ktest-only and --ktest-bench-only: a bench-only ktest runs no named test");
+    }
+    if args.ktest_bench_only && !builds_ktest
+    {
+        bail!("--ktest-bench-only builds ktest: give --component all or --component ktest");
+    }
+    if args.ktest_only.is_some() && !builds_ktest
+    {
+        bail!("--ktest-only builds ktest: give --component all or --component ktest");
+    }
+    Ok(())
+}
+
+/// The environment entry that focuses a build of the components `names` on
+/// `--ktest-only`'s selection ([`KTEST_SELECTION_VAR`]) when ktest is among
+/// them; `None` otherwise, which leaves the variable cleared.
+fn selection_env(args: &BuildArgs, names: &[&str]) -> Option<(&'static str, String)>
+{
+    args.ktest_only
+        .as_ref()
+        .filter(|_| names.contains(&"ktest"))
+        .map(|selection| (KTEST_SELECTION_VAR, selection.clone()))
+}
+
+/// Install `spec`'s link output `cargo_out` at each of its install paths;
+/// for ktest, record the build's selection beside it
+/// ([`sysroot::record_ktest_selection`]), so the record always names the
+/// ktest the sysroot holds.
+fn install_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec, cargo_out: &Path) -> Result<()>
+{
+    for dst in install_paths(ctx, spec)
+    {
+        if let Some(parent) = dst.parent()
+        {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        install(ctx, args.arch, spec, cargo_out, &dst)?;
+        step(&format!("{}: {}", spec.name, dst.display()));
+    }
+    if spec.name == "ktest"
+    {
+        sysroot::record_ktest_selection(&ctx.sysroot, args.ktest_only.as_deref())?;
+    }
     Ok(())
 }
 
@@ -1044,7 +1096,8 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let env_owned = profile_env(args.arch, spec.profile);
+    let mut env_owned = profile_env(args.arch, spec.profile);
+    env_owned.extend(selection_env(args, &[spec.name]));
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if !args.skip_lints
     {
@@ -1055,6 +1108,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     let mut cmd = cargo(&ctx.root);
     cmd.arg("build").args(&flags_ref);
     cmd.args(debug_config_flags(args, spec.name));
+    cmd.args(opt_level_config_flags(args));
     cmd.envs(env.iter().copied());
     if let Some(s) = seraph.as_ref()
     {
@@ -1081,18 +1135,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
         );
     }
     check_frame_bound(args.arch, spec.profile, &cargo_out)?;
-
-    for dst in install_paths(ctx, spec)
-    {
-        if let Some(parent) = dst.parent()
-        {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        install(ctx, args.arch, spec, &cargo_out, &dst)?;
-        step(&format!("{}: {}", spec.name, dst.display()));
-    }
-
-    Ok(())
+    install_spec(ctx, args, spec, &cargo_out)
 }
 
 /// Install `spec`'s link output `cargo_out`, built for `arch`, at `dst`, and
@@ -1480,12 +1523,15 @@ fn std_member_lint_flags(triple: &str, build_std: &str, profile: Profile) -> Vec
 }
 
 /// Construct a `cargo` Command with the working directory set to the workspace
-/// root and [`crate::util::CI_CARGO_ENV`] applied.
+/// root, [`crate::util::CI_CARGO_ENV`] applied, and [`KTEST_SELECTION_VAR`]
+/// cleared, so a variable the caller's environment holds cannot focus a
+/// build (a caller sets it after, [`selection_env`]).
 fn cargo(root: &Path) -> Command
 {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root);
     cmd.envs(crate::util::CI_CARGO_ENV);
+    cmd.env_remove(KTEST_SELECTION_VAR);
     cmd
 }
 
@@ -1540,10 +1586,184 @@ fn debug_config_flags(args: &BuildArgs, pkg: &str) -> Vec<String>
     }
 }
 
+/// Refuse the `--opt-level` overrides of `args` when the build cannot honour
+/// one ([`opt_level_refusal`]), reading the workspace's packages only when
+/// there is an override.
+///
+/// # Errors
+/// The refusal, or a failure to read the workspace.
+fn check_opt_levels(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
+{
+    if args.opt_level.is_empty()
+    {
+        return Ok(());
+    }
+    let workspace = crate::affected::Workspace::load(&ctx.root)?;
+    match opt_level_refusal(args, |name| workspace.package(name).is_some())
+    {
+        Some(reason) => bail!("{reason}"),
+        None => Ok(()),
+    }
+}
+
+/// Why the `--opt-level` overrides of `args` cannot be honoured, `known`
+/// telling the workspace's package names: an override of a package the
+/// workspace does not have, which Cargo would pass over with a warning; of a
+/// component `--debug` selects, which it builds at opt-level 1 (`--debug`
+/// sets the level of components alone, so `--debug all` leaves a library's
+/// to its override); or a second override of one package. `None` when every
+/// override can be.
+fn opt_level_refusal(args: &BuildArgs, known: impl Fn(&str) -> bool) -> Option<String>
+{
+    for (i, o) in args.opt_level.iter().enumerate()
+    {
+        let given = format!("--opt-level {}={}", o.package, o.level);
+        if !known(&o.package)
+        {
+            return Some(format!(
+                "{given}: the workspace has no package {}",
+                o.package
+            ));
+        }
+        let component = o.package == "boot" || spec_name(&o.package).is_some();
+        if component && selects(&args.debug, &o.package)
+        {
+            return Some(format!(
+                "{given}: --debug also names {}, and builds it at opt-level 1",
+                o.package
+            ));
+        }
+        if args
+            .opt_level
+            .iter()
+            .take(i)
+            .any(|p| p.package == o.package)
+        {
+            return Some(format!("{given}: --opt-level names {} twice", o.package));
+        }
+    }
+    None
+}
+
+/// `--config` flags setting the opt-level of each package `--opt-level`
+/// names within the active profile. Every cargo build of the build takes them
+/// all: a library is compiled inside the build of each component that links
+/// it, `-Z build-std`'s included, and an override of a package outside one
+/// build's graph changes nothing in it. The package segment is quoted as in
+/// [`debug_config_flags`]; `s` and `z` are TOML strings, the digits integers.
+fn opt_level_config_flags(args: &BuildArgs) -> Vec<String>
+{
+    let profile = args.profile().cargo_profile();
+    args.opt_level
+        .iter()
+        .flat_map(|o| {
+            let value = if o.level.bytes().all(|b| b.is_ascii_digit())
+            {
+                o.level.to_owned()
+            }
+            else
+            {
+                format!("\"{}\"", o.level)
+            };
+            [
+                "--config".to_owned(),
+                format!(
+                    "profile.{profile}.package.\"{}\".opt-level={value}",
+                    o.package
+                ),
+            ]
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    /// A build of `component` with `--ktest-only` set to `ktest_only`, every
+    /// other option at its default.
+    fn build_args(component: BuildComponent, ktest_only: Option<&str>) -> BuildArgs
+    {
+        BuildArgs {
+            arch: Arch::X86_64,
+            release: false,
+            component,
+            debug: Vec::new(),
+            limited_debug: Vec::new(),
+            opt_level: Vec::new(),
+            skip_lints: true,
+            ktest_bench_only: false,
+            ktest_only: ktest_only.map(str::to_string),
+            host: crate::cli::HostArgs::default(),
+        }
+    }
+
+    // Defect caught: a focused build whose ktest compile does not see the
+    // selection (so it runs every test under a focused record), or a
+    // selection passed to the compile of a group without ktest.
+    #[test]
+    fn the_selection_reaches_ktest_builds_only()
+    {
+        let focused = build_args(BuildComponent::All, Some("stress::stop_"));
+        assert_eq!(
+            selection_env(&focused, &["init", "ktest"]),
+            Some((KTEST_SELECTION_VAR, "stress::stop_".to_string()))
+        );
+        assert_eq!(selection_env(&focused, &["init", "procmgr"]), None);
+        assert_eq!(
+            selection_env(&build_args(BuildComponent::All, None), &["ktest"]),
+            None
+        );
+    }
+
+    // Defect caught: a caller's `SERAPH_KTEST_ONLY` reaching a cargo
+    // invocation that `--ktest-only` did not ask to focus, so a CI or
+    // validation build would bake in a selection.
+    #[test]
+    fn every_cargo_invocation_clears_the_selection_variable()
+    {
+        let cmd = cargo(Path::new("."));
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == KTEST_SELECTION_VAR && value.is_none())
+        );
+    }
+
+    // Defect caught: a ktest option accepted on a build that does not build
+    // ktest (where it would do nothing, silently), or a focused bench-only
+    // build, whose selection no test of its tier could match.
+    #[test]
+    fn the_ktest_options_are_refused_where_they_cannot_apply()
+    {
+        let kernel = BuildComponent::Spec("kernel");
+        let ktest = BuildComponent::Spec("ktest");
+        check_ktest_options(&build_args(ktest, Some("cap::"))).unwrap();
+        check_ktest_options(&build_args(BuildComponent::All, Some("cap::"))).unwrap();
+        let error = check_ktest_options(&build_args(kernel, Some("cap::"))).unwrap_err();
+        assert!(
+            error.to_string().contains("--ktest-only builds ktest"),
+            "{error}"
+        );
+        let bench_only = |component| BuildArgs {
+            ktest_bench_only: true,
+            ..build_args(component, None)
+        };
+        check_ktest_options(&bench_only(ktest)).unwrap();
+        let error = check_ktest_options(&bench_only(kernel)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--ktest-bench-only builds ktest"),
+            "{error}"
+        );
+        let both = BuildArgs {
+            ktest_bench_only: true,
+            ..build_args(ktest, Some("cap::"))
+        };
+        let error = check_ktest_options(&both).unwrap_err();
+        assert!(error.to_string().contains("--ktest-bench-only"), "{error}");
+    }
 
     // Defect caught: `--ktest-bench-only` building ktest without its
     // `bench-only` feature, or passing the feature to a build without ktest,
@@ -1552,14 +1772,8 @@ mod tests
     fn the_bench_only_feature_goes_to_ktest_builds_only()
     {
         let build = |ktest_bench_only| BuildArgs {
-            arch: Arch::X86_64,
-            release: false,
-            component: BuildComponent::All,
-            debug: Vec::new(),
-            limited_debug: Vec::new(),
-            skip_lints: true,
             ktest_bench_only,
-            host: crate::cli::HostArgs::default(),
+            ..build_args(BuildComponent::All, None)
         };
         let none: [String; 0] = [];
         assert_eq!(
@@ -1568,6 +1782,106 @@ mod tests
         );
         assert_eq!(feature_flags(&build(true), &["init", "procmgr"]), none);
         assert_eq!(feature_flags(&build(false), &["ktest"]), none);
+    }
+
+    /// A build's arguments with `--debug` and `--opt-level` as given.
+    fn with_opt_levels(
+        profile: Profile,
+        debug: Vec<BuildComponent>,
+        opt_level: &[(&str, &'static str)],
+    ) -> BuildArgs
+    {
+        BuildArgs {
+            arch: Arch::X86_64,
+            release: profile == Profile::Release,
+            component: BuildComponent::All,
+            debug,
+            limited_debug: Vec::new(),
+            opt_level: opt_level
+                .iter()
+                .map(|(package, level)| crate::cli::OptLevelOverride {
+                    package: (*package).to_owned(),
+                    level,
+                })
+                .collect(),
+            skip_lints: true,
+            ktest_bench_only: false,
+            ktest_only: None,
+            host: crate::cli::HostArgs::default(),
+        }
+    }
+
+    // Defect caught: an `--opt-level` override written to the other
+    // profile's table, or with `s` or `z` unquoted, which Cargo's TOML
+    // parser refuses.
+    #[test]
+    fn an_opt_level_override_sets_its_package_in_the_active_profile()
+    {
+        let flags = opt_level_config_flags(&with_opt_levels(
+            Profile::Release,
+            Vec::new(),
+            &[("shmem", "3"), ("virtio-blk", "s")],
+        ));
+        assert_eq!(
+            flags,
+            [
+                "--config",
+                "profile.release.package.\"shmem\".opt-level=3",
+                "--config",
+                "profile.release.package.\"virtio-blk\".opt-level=\"s\"",
+            ]
+        );
+        let dev = opt_level_config_flags(&with_opt_levels(
+            Profile::Debug,
+            Vec::new(),
+            &[("shmem", "z")],
+        ));
+        assert_eq!(
+            dev,
+            ["--config", "profile.dev.package.\"shmem\".opt-level=\"z\""]
+        );
+        let none: [String; 0] = [];
+        assert_eq!(
+            opt_level_config_flags(&with_opt_levels(Profile::Debug, Vec::new(), &[])),
+            none
+        );
+    }
+
+    // Defect caught: an `--opt-level` override honoured beside the
+    // `--debug` that sets the same package to opt-level 1, so the build's
+    // level depends on the order of Cargo's `--config` flags; one of a
+    // package the workspace lacks, which Cargo passes over with a warning; or
+    // two of one package; or a library's override refused beside `--debug
+    // all`, which sets the level of components alone.
+    #[test]
+    fn an_opt_level_override_is_refused_where_the_build_cannot_honour_it()
+    {
+        let known = |name: &str| ["shmem", "framebuffer", "boot"].contains(&name);
+        let refused = |debug: Vec<BuildComponent>, levels: &[(&str, &'static str)]| {
+            opt_level_refusal(&with_opt_levels(Profile::Debug, debug, levels), known)
+        };
+        assert_eq!(
+            refused(Vec::new(), &[("shmem", "3"), ("framebuffer", "3")]),
+            None
+        );
+        assert_eq!(
+            refused(vec![BuildComponent::Spec("init")], &[("framebuffer", "3")]),
+            None
+        );
+        let reason = refused(
+            vec![BuildComponent::Spec("framebuffer")],
+            &[("framebuffer", "3")],
+        );
+        assert!(reason.is_some_and(|r| r.contains("--debug also names framebuffer")));
+        let reason = refused(vec![BuildComponent::All], &[("framebuffer", "3")]);
+        assert!(reason.is_some_and(|r| r.contains("--debug also names framebuffer")));
+        assert_eq!(refused(vec![BuildComponent::All], &[("shmem", "3")]), None);
+        let reason = refused(vec![BuildComponent::Boot], &[("boot", "1")]);
+        assert!(reason.is_some_and(|r| r.contains("--debug also names boot")));
+        let reason = refused(Vec::new(), &[("shmem", "3"), ("shmem", "2")]);
+        assert!(reason.is_some_and(|r| r.contains("names shmem twice")));
+        let reason = refused(Vec::new(), &[("no-such-crate", "3")]);
+        assert!(reason.is_some_and(|r| r.contains("no package no-such-crate")));
     }
 
     // Defect caught: one cargo invocation building the components of two

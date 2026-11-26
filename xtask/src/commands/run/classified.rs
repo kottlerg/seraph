@@ -20,7 +20,10 @@
 //! ([`crate::sysroot::recorded_image_harnesses`]): the default `--pass` is the
 //! terminal marker of the one harness the image boots, and svcmgr's line for
 //! the death of a harness it launches, before the run's pass marker, fails
-//! the run ([`harness_death`]).
+//! the run ([`harness_death`]). An image whose ktest a focused build made, as
+//! its pack recorded it (`crate::sysroot::recorded_image_ktest_selection`),
+//! runs only with `--ktest-only-ok`, and then passes on the focused run's
+//! marker ([`check_focus`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -141,7 +144,19 @@ pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
 {
     let display = validate_args(args, runs)?;
     validate_sysroot_for_launch(ctx, args.launch.arch)?;
-    let markers = Markers::for_image(args, &crate::sysroot::recorded_image_harnesses(ctx)?)?;
+    let harnesses = crate::sysroot::recorded_image_harnesses(ctx)?;
+    let recorded = crate::sysroot::recorded_image_ktest_selection(ctx)?;
+    check_stub_image(args.launch.debug_target.as_deref(), &harnesses)?;
+    let accepted = if args.ktest_only_ok
+    {
+        KtestFocus::Selected
+    }
+    else
+    {
+        KtestFocus::Full
+    };
+    let focus = check_focus(image_selection(&harnesses, recorded.as_deref()), accepted)?;
+    let markers = Markers::for_image(args, &harnesses, focus)?;
     // Held until the command returns, after the last wave's QEMUs have
     // exited; a wave runs `--parallel` QEMUs side by side.
     let _host =
@@ -182,7 +197,7 @@ fn run_waves(
     let checks = Arc::new(PassChecks::new(
         &args.require,
         args.crash_reports,
-        args.whole_lines.clone(),
+        &args.whole_lines,
     )?);
 
     // Resolve qemu binary once, up front: missing-tool errors should
@@ -544,16 +559,16 @@ struct Markers
 
 impl Markers
 {
-    /// The markers of `args` for an image that boots `harnesses`: `--pass`,
-    /// or by default the terminal pass marker of the image's one harness
-    /// ([`default_pass`]); `--fail` with `--fail-also`; and the harnesses
-    /// among `harnesses` that svcmgr launches.
-    fn for_image(args: &RunArgs, harnesses: &[ImageHarness]) -> Result<Self>
+    /// The markers of `args` for an image that boots `harnesses`, its ktest
+    /// at `focus`: `--pass`, or by default the terminal pass marker of the
+    /// image's one harness ([`default_pass`]); `--fail` with `--fail-also`;
+    /// and the harnesses among `harnesses` that svcmgr launches.
+    fn for_image(args: &RunArgs, harnesses: &[ImageHarness], focus: KtestFocus) -> Result<Self>
     {
         let pass = match &args.pass
         {
             Some(pass) => pass.clone(),
-            None => default_pass(harnesses)?,
+            None => default_pass(harnesses, focus)?,
         };
         Ok(Self {
             pass: Regex::new(&pass).with_context(|| format!("invalid --pass regex {pass:?}"))?,
@@ -567,14 +582,74 @@ impl Markers
     }
 }
 
+/// Which tests of ktest a run accepts the image's ktest to run: every test,
+/// or a focused build's selection (`--ktest-only-ok`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KtestFocus
+{
+    Full,
+    Selected,
+}
+
+/// The pass marker of a focused ktest run (docs/testing.md § Reporting
+/// marker), which a focused ktest prints in place of the full run's.
+const KTEST_SELECTED_PASS: &str = r"\[ktest\] SELECTED TESTS PASSED";
+
+/// The selection of the focused ktest the image boots: `recorded`, the
+/// selection the image's pack recorded, when `harnesses` include ktest, and
+/// `None` when the image boots no ktest or a full one.
+fn image_selection<'a>(harnesses: &[ImageHarness], recorded: Option<&'a str>) -> Option<&'a str>
+{
+    recorded.filter(|_| harnesses.contains(&ImageHarness::Ktest))
+}
+
+/// Refuse `--debug-target` on an image that boots ktest: svcmgr launches the
+/// stub, and a ktest image runs none, while the stage's repack would pack the
+/// installed ktest, not the one the image's record names.
+fn check_stub_image(debug_target: Option<&str>, harnesses: &[ImageHarness]) -> Result<()>
+{
+    if debug_target.is_some() && harnesses.contains(&ImageHarness::Ktest)
+    {
+        bail!(
+            "--debug-target stages a stub svcmgr launches, and the image boots ktest, which runs none"
+        );
+    }
+    Ok(())
+}
+
+/// The focus of the image's ktest, refused unless it is the one the run
+/// accepts: an image of a focused ktest (`selection`) is no validation boot,
+/// so a run takes one only with `--ktest-only-ok`, and `--ktest-only-ok` on
+/// any other image is refused.
+fn check_focus(selection: Option<&str>, accepted: KtestFocus) -> Result<KtestFocus>
+{
+    match (selection, accepted)
+    {
+        (None, KtestFocus::Full) => Ok(KtestFocus::Full),
+        (Some(_), KtestFocus::Selected) => Ok(KtestFocus::Selected),
+        (Some(selection), KtestFocus::Full) => bail!(
+            "the image boots a ktest focused on {selection} (`cargo xtask build --ktest-only`), \
+             which no validation run boots: pass --ktest-only-ok to run it, or rebuild ktest \
+             without --ktest-only and repack"
+        ),
+        (None, KtestFocus::Selected) =>
+        {
+            bail!("--ktest-only-ok, but the image boots no ktest a focused build made")
+        }
+    }
+}
+
 /// The default `--pass` regex: the terminal pass marker
 /// `[<harness>] ALL TESTS PASSED` (docs/testing.md § Reporting marker) of
-/// the one harness in `harnesses`. Refused for an image that boots no
-/// harness or several, since no one marker then ends its boot.
-fn default_pass(harnesses: &[ImageHarness]) -> Result<String>
+/// the one harness in `harnesses`, or for a ktest at
+/// [`KtestFocus::Selected`], the focused run's [`KTEST_SELECTED_PASS`].
+/// Refused for an image that boots no harness or several, since no one
+/// marker then ends its boot.
+fn default_pass(harnesses: &[ImageHarness], focus: KtestFocus) -> Result<String>
 {
     match harnesses
     {
+        [ImageHarness::Ktest] if focus == KtestFocus::Selected => Ok(KTEST_SELECTED_PASS.into()),
         [harness] => Ok(format!(r"\[{}\] ALL TESTS PASSED", harness.name())),
         [] => bail!(
             "the image boots no harness, so --pass has no default: name the run's pass marker \
@@ -653,8 +728,8 @@ struct PassChecks
     /// Each `--require` pattern, as given and compiled.
     require: Vec<(String, Regex)>,
     crash_reports: Option<CrashReportExpect>,
-    /// The `--whole-lines` tag.
-    whole_lines: Option<String>,
+    /// The `--whole-lines` tags.
+    whole_lines: Vec<String>,
 }
 
 impl PassChecks
@@ -662,7 +737,7 @@ impl PassChecks
     fn new(
         require: &[String],
         crash_reports: Option<CrashReportExpect>,
-        whole_lines: Option<String>,
+        whole_lines: &[String],
     ) -> Result<Self>
     {
         let require = require
@@ -676,7 +751,7 @@ impl PassChecks
         Ok(Self {
             require,
             crash_reports,
-            whole_lines,
+            whole_lines: whole_lines.to_vec(),
         })
     }
 
@@ -706,10 +781,12 @@ impl PassChecks
         {
             return (Status::Fail, Some(format!("--crash-reports: {err:#}")));
         }
-        if let Some(tag) = &self.whole_lines
-            && let Err(err) = crate::whole_lines::check_log(log, tag)
+        for tag in &self.whole_lines
         {
-            return (Status::Fail, Some(format!("--whole-lines: {err:#}")));
+            if let Err(err) = crate::whole_lines::check_log(log, tag)
+            {
+                return (Status::Fail, Some(format!("--whole-lines {tag}: {err:#}")));
+            }
         }
         (status, matched)
     }
@@ -1834,7 +1911,8 @@ mod tests
     #[test]
     fn the_default_pass_marker_is_the_one_harness_of_the_image()
     {
-        let pass = Regex::new(&default_pass(&[ImageHarness::Svctest]).unwrap()).unwrap();
+        let pass =
+            Regex::new(&default_pass(&[ImageHarness::Svctest], KtestFocus::Full).unwrap()).unwrap();
         let markers = Markers {
             pass,
             ..markers(&[ImageHarness::Svctest])
@@ -1860,12 +1938,84 @@ mod tests
                 "{log}"
             );
         }
-        let none = default_pass(&[]).unwrap_err().to_string();
+        let none = default_pass(&[], KtestFocus::Full).unwrap_err().to_string();
         assert!(none.contains("no harness"), "{none}");
-        let several = default_pass(&[ImageHarness::Svctest, ImageHarness::Ubench])
+        let several = default_pass(
+            &[ImageHarness::Svctest, ImageHarness::Ubench],
+            KtestFocus::Full,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(several.contains("svctest, ubench"), "{several}");
+    }
+
+    // Defect caught: `--debug-target` accepted on a ktest image, whose stage
+    // repacks the installed ktest under the image record's selection.
+    #[test]
+    fn the_gdb_stub_is_refused_on_a_ktest_image()
+    {
+        let error = check_stub_image(Some("vfsd"), &[ImageHarness::Ktest])
             .unwrap_err()
             .to_string();
-        assert!(several.contains("svctest, ubench"), "{several}");
+        assert!(error.contains("ktest"), "{error}");
+        check_stub_image(Some("vfsd"), &[ImageHarness::Svctest]).unwrap();
+        check_stub_image(None, &[ImageHarness::Ktest]).unwrap();
+    }
+
+    // Defect caught: a plain `--runs` accepting an image of a focused ktest,
+    // so a run of a few selected tests stands as a validation boot; a focused
+    // image whose run still passes on the full run's marker; or
+    // `--ktest-only-ok` accepted on a full image, so a focused run's
+    // acceptance masks a full image.
+    #[test]
+    fn a_focused_ktest_image_runs_only_when_accepted_and_on_its_own_marker()
+    {
+        let ktest = [ImageHarness::Ktest];
+        let focused = image_selection(&ktest, Some("stress::stop_"));
+        assert_eq!(focused, Some("stress::stop_"));
+        // The record of a focused ktest focuses no image that boots another harness.
+        assert_eq!(
+            image_selection(&[ImageHarness::Svctest], Some("stress::stop_")),
+            None
+        );
+
+        let refused = check_focus(focused, KtestFocus::Full)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("--ktest-only-ok") && refused.contains("stress::stop_"),
+            "{refused}"
+        );
+        let unfocused = check_focus(None, KtestFocus::Selected)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unfocused.contains("no ktest a focused build made"),
+            "{unfocused}"
+        );
+        assert_eq!(
+            check_focus(None, KtestFocus::Full).unwrap(),
+            KtestFocus::Full
+        );
+        let focus = check_focus(focused, KtestFocus::Selected).unwrap();
+        assert_eq!(focus, KtestFocus::Selected);
+
+        let markers = Markers {
+            pass: Regex::new(&default_pass(&ktest, focus).unwrap()).unwrap(),
+            ..markers(&ktest)
+        };
+        let run = |log: &str| classify(0, true, log, &markers).0;
+        assert!(matches!(
+            run("[2.0] [ktest] SELECTED TESTS PASSED\n"),
+            Status::Pass
+        ));
+        assert!(matches!(
+            run("[2.0] [ktest] ALL TESTS PASSED\n"),
+            Status::Hang
+        ));
+        // The full run's default never passes on a focused ktest's marker.
+        let full = Regex::new(&default_pass(&ktest, KtestFocus::Full).unwrap()).unwrap();
+        assert!(!full.is_match("[2.0] [ktest] SELECTED TESTS PASSED"));
     }
 
     // The #350 signature: QEMU killed by SIGSEGV (rc=139) with the guest log
@@ -2041,7 +2191,7 @@ mod tests
     #[test]
     fn a_pass_without_a_required_line_is_a_fail_naming_the_pattern()
     {
-        let checks = PassChecks::new(&["mapredo knob present".to_owned()], None, None).unwrap();
+        let checks = PassChecks::new(&["mapredo knob present".to_owned()], None, &[]).unwrap();
         let log =
             "[0.1] boot: memory map: mapredo knob present\n[2.0] INFO   [ktest] ALL TESTS PASSED\n";
         assert!(matches!(
@@ -2066,7 +2216,7 @@ mod tests
                 "DEBUG  \\[fatfs\\] ".to_owned(),
             ],
             None,
-            None,
+            &[],
         )
         .unwrap();
         let one = "[1.0] DEBUG  [vfsd] mounted\n[2.0] INFO   [usertest] ALL TESTS PASSED\n";
@@ -2083,7 +2233,7 @@ mod tests
     #[test]
     fn the_crash_report_check_fails_a_pass_and_leaves_other_verdicts()
     {
-        let checks = PassChecks::new(&[], Some(CrashReportExpect::Reports), None).unwrap();
+        let checks = PassChecks::new(&[], Some(CrashReportExpect::Reports), &[]).unwrap();
         let no_reports = "[2.0] INFO   [usertest] ALL TESTS PASSED\n";
         let (status, reason) = checks.judge(Status::Pass, None, no_reports);
         assert!(matches!(status, Status::Fail));
@@ -2099,9 +2249,32 @@ mod tests
             checks.judge(Status::Hang, None, no_reports).0,
             Status::Hang
         ));
-        let none = PassChecks::new(&[], Some(CrashReportExpect::None), None).unwrap();
+        let none = PassChecks::new(&[], Some(CrashReportExpect::None), &[]).unwrap();
         assert!(matches!(
             none.judge(Status::Pass, None, no_reports).0,
+            Status::Pass
+        ));
+    }
+
+    // Defect caught: a second --whole-lines tag left unchecked, so a torn
+    // window of the later tag gates as PASS.
+    #[test]
+    fn every_whole_lines_tag_is_checked()
+    {
+        let checks =
+            PassChecks::new(&[], None, &["first".to_owned(), "second".to_owned()]).unwrap();
+        let first = "[1.000000] INFO   [svctest] first begin\n\
+                     [1.000100] INFO   [svctest] first t=0 n=0 len=3 abc\n\
+                     [1.000200] INFO   [svctest] first end senders=1 lines=1\n";
+        let (status, reason) = checks.judge(Status::Pass, None, first);
+        assert!(matches!(status, Status::Fail));
+        assert!(reason.unwrap().starts_with("--whole-lines second: "));
+        let both = format!(
+            "{first}[2.000000] INFO   [svctest] second begin\n\
+             [2.000200] INFO   [svctest] second end senders=0 lines=0\n"
+        );
+        assert!(matches!(
+            checks.judge(Status::Pass, None, &both).0,
             Status::Pass
         ));
     }
@@ -2109,9 +2282,7 @@ mod tests
     #[test]
     fn an_invalid_require_regex_is_refused()
     {
-        let err = PassChecks::new(&["(".to_owned()], None, None)
-            .err()
-            .unwrap();
+        let err = PassChecks::new(&["(".to_owned()], None, &[]).err().unwrap();
         assert!(err.to_string().contains("--require"), "{err}");
     }
 

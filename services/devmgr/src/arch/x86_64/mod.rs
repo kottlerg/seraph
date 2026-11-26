@@ -6,10 +6,10 @@
 //! x86-64 arch-dispatch surface for devmgr.
 
 use ipc::IpcMessage;
+use ipc::serve::Reply;
 
 use crate::IrqRangeAllocator;
 use crate::caps::{DevmgrCaps, Firmware};
-use crate::reply_status;
 use crate::tables::{locate_table_by_sig, with_acpi_table};
 use firmware::acpi::SourceOverride;
 use firmware_tables::EcamLocation;
@@ -231,9 +231,9 @@ pub fn prt_rule(mode: firmware::acpid::PrtMode) -> Option<firmware::acpid::PrtRu
 /// Reply to an authorised, version-checked `QUERY_SHUTDOWN_DEVICE` with
 /// `NO_DEVICE`: on x86-64 pwrmgr reaches the ACPI sleep and reset
 /// registers through acpid, which holds them, and devmgr serves it nothing.
-pub fn reply_shutdown_device(_firmware: &Firmware, _msg: &IpcMessage, ipc_buf: *mut u64)
+pub fn reply_shutdown_device(_firmware: &Firmware, _msg: &IpcMessage, reply: &mut Reply)
 {
-    reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+    reply.set_status(ipc::devmgr_errors::NO_DEVICE);
 }
 
 /// Carve a narrow `IoPort` of `count` ports starting at `base` out of

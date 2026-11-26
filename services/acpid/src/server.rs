@@ -34,6 +34,7 @@ use acpid::hotplug::{self, Event, Held, HotplugJob, HotplugSlots, Outcome};
 use acpid::power::{self, Derived, Request};
 use aml::namespace::NodeId;
 use aml::{Evaluator, Namespace};
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, acpid_errors, acpid_labels, devmgr_errors, devmgr_labels};
 
 use crate::arch::current::{Events, Ports, Power};
@@ -700,10 +701,11 @@ fn receive(service: u64, mailbox: &Mailbox, work: &Sender<Work>) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut slot = Reply::new();
     loop
     {
         // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer.
-        let msg = match unsafe { ipc::ipc_recv(service, ipc_buf) }
+        let msg = match unsafe { next_request(service, &mut slot, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -719,19 +721,21 @@ fn receive(service: u64, mailbox: &Mailbox, work: &Sender<Work>) -> !
         }
         match power::decode(msg.label, msg.badge, msg.word(0), msg.word(1))
         {
-            Ok(Request::WaitEvent) => wait_event(mailbox, work, ipc_buf),
-            Ok(Request::QuerySleep(state)) => reply_sleep_control(ask_sleep(state, work), ipc_buf),
-            Ok(request) => reply(forward(request, work), ipc_buf),
-            Err(code) => reply(code, ipc_buf),
+            Ok(Request::WaitEvent) => wait_event(mailbox, work, ipc_buf, &mut slot),
+            Ok(Request::QuerySleep(state)) =>
+            {
+                reply_sleep_control(ask_sleep(state, work), &mut slot);
+            }
+            Ok(request) => reply(forward(request, work), &mut slot),
+            Err(code) => reply(code, &mut slot),
         }
     }
 }
 
-/// Reply `status` from this thread's IPC buffer `ipc_buf`.
-fn reply(status: u64, ipc_buf: *mut u64)
+/// Reply `status` through `slot`, sent with the loop's next receive.
+fn reply(status: u64, slot: &mut Reply)
 {
-    // SAFETY: `ipc_buf` is this thread's registered IPC buffer.
-    let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(status), ipc_buf) };
+    slot.set_status(status);
 }
 
 /// Forward `request` to the evaluation thread and wait for its status;
@@ -761,13 +765,13 @@ fn ask_sleep(state: u8, work: &Sender<Work>) -> Result<SleepControl, u64>
 /// Reply to a `QUERY_SLEEP` with `control`: its derivation, its register's
 /// port or address, its `SLP_TYPa` and which register it is, or the status
 /// of its refusal. A derivation whose reply
-/// fails, the caller gone, is deleted.
-fn reply_sleep_control(control: Result<SleepControl, u64>, ipc_buf: *mut u64)
+/// fails, the caller gone, is deleted ([`Reply::set_or_delete_caps`]).
+fn reply_sleep_control(control: Result<SleepControl, u64>, slot: &mut Reply)
 {
     let control = match control
     {
         Ok(control) => control,
-        Err(status) => return reply(status, ipc_buf),
+        Err(status) => return reply(status, slot),
     };
     let msg = IpcMessage::builder(acpid_errors::SUCCESS)
         .word(0, control.derived.address)
@@ -775,24 +779,20 @@ fn reply_sleep_control(control: Result<SleepControl, u64>, ipc_buf: *mut u64)
         .word(2, control.derived.register)
         .cap(control.derived.cap)
         .build();
-    // SAFETY: `ipc_buf` is this thread's registered IPC buffer.
-    if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_err()
-    {
-        let _ = syscall::cap_delete(control.derived.cap);
-    }
+    slot.set_or_delete_caps(msg);
 }
 
 /// `WAIT_EVENT`: wait until an event is pending, or a later `WAIT_EVENT`
 /// supersedes this one, and reply. A delivered power-button press is
 /// cleared and the button enabled again; one whose reply fails, its caller
 /// gone, is posted again for the next `WAIT_EVENT`.
-fn wait_event(mailbox: &Mailbox, work: &Sender<Work>, ipc_buf: *mut u64)
+fn wait_event(mailbox: &Mailbox, work: &Sender<Work>, ipc_buf: *mut u64, slot: &mut Reply)
 {
     let mut mail = mailbox.lock();
     if !mail.waitable
     {
         drop(mail);
-        return reply(acpid_errors::NO_DEVICE, ipc_buf);
+        return reply(acpid_errors::NO_DEVICE, slot);
     }
     mail.waiter = mail.waiter.wrapping_add(1);
     let me = mail.waiter;
@@ -815,7 +815,7 @@ fn wait_event(mailbox: &Mailbox, work: &Sender<Work>, ipc_buf: *mut u64)
     drop(mail);
     if events == 0
     {
-        return reply(acpid_errors::SUPERSEDED, ipc_buf);
+        return reply(acpid_errors::SUPERSEDED, slot);
     }
     let msg = IpcMessage::builder(acpid_errors::SUCCESS)
         .word(0, events)
@@ -842,10 +842,11 @@ pub fn refuse(service: u64) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut slot = Reply::new();
     loop
     {
         // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer.
-        let msg = match unsafe { ipc::ipc_recv(service, ipc_buf) }
+        let msg = match unsafe { next_request(service, &mut slot, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -861,7 +862,7 @@ pub fn refuse(service: u64) -> !
         }
         let status = power::decode(msg.label, msg.badge, msg.word(0), msg.word(1))
             .map_or_else(|code| code, |_| acpid_errors::NO_DEVICE);
-        reply(status, ipc_buf);
+        reply(status, &mut slot);
     }
 }
 

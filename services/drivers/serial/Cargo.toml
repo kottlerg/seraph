@@ -4,12 +4,21 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+# Host-testable parts of the driver: the transmit and receive rings, the
+# 16550 register decoding and the bound on a wait for the transmitter (bins
+# are test = false).
+[lib]
+name = "serial"
+path = "src/lib.rs"
+
 [[bin]]
 name = "serial"
 path = "src/main.rs"
 test = false
 
-[dependencies]
+# The binary alone uses these, and it builds for the Seraph targets only, so the
+# host-tested library does not pull them into a host build.
+[target.'cfg(target_os = "seraph")'.dependencies]
 # The binary's declaration note (`driver_declaration!`).
 driver-binding = { path = "../../../shared/driver-binding" }
 ipc = { path = "../../../shared/ipc" }

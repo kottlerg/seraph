@@ -481,11 +481,26 @@ cache-friendly — a thread's TCB is typically hot in CPU N's caches.
 `SYS_CAP_CREATE_THREAD` takes no affinity argument: every thread is created with
 `cpu_affinity = AFFINITY_ANY` and `preferred_cpu = 0`. `SYS_THREAD_START` places it via
 `select_target_cpu`. A hard affinity set by `SYS_THREAD_SET_AFFINITY` before the start wins
-unconditionally. Otherwise the thread stays on `preferred_cpu` if that CPU's load
+unconditionally. Otherwise a fair thread stays on `preferred_cpu` if that CPU's load
 (`current_load()`) is within `LOAD_BALANCE_IMBALANCE_THRESHOLD` of the least-loaded CPU's,
 and goes to the least-loaded CPU if not, a tie going to the CPU with the fewest busy SMT
-siblings (§ SMT Awareness). The placement is recorded in `tcb.preferred_cpu` and used for
-subsequent wakeups.
+siblings (§ SMT Awareness); an RT thread is placed by level first (below). The placement is
+recorded in `tcb.preferred_cpu` and used for subsequent wakeups.
+
+An RT thread is placed where it runs at once. A CPU's rank is the higher of its running thread's
+level and its highest queued thread's, as run queues order them: the idle level lowest, every fair
+level alike above it, the RT levels above those in level order (`run_queue::CpuRanks`). An RT
+thread stays on `preferred_cpu` when its level ranks above that CPU's, so that it preempts or
+runs ahead of everything there (§ Wake Preemption), and otherwise goes to the CPU of the lowest
+rank, a tie going to the lower load, then to the fewest busy SMT siblings, then to the lowest
+index. So an RT wake waits behind a thread of its own level or above only when every eligible CPU
+runs or queues one, and then on the CPU whose thread ranks lowest. A CPU's load does not tell
+these apart: it counts the threads linked on the CPU, not the level of the one it runs, so a CPU
+running an RT thread reads as loaded as one running a fair thread, and the load rule would keep
+an RT thread behind the first while the second could take it at once. A fair thread is placed by
+load alone, every fair level sharing one queue. The ranks are sampled without the CPUs' locks, so
+a dispatch or a link after the sample can leave the thread behind a thread it does not outrank
+(§ Wake Preemption, "Latency bound").
 
 A synchronous wake places its thread by its waker. A call that finds a receiver parked, and a
 fault delivery that finds a handler parked, wake it with `WakeHint::Sync` when the caller's park
@@ -496,27 +511,44 @@ affinity and the save-window pin still come first
 ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). A pair that starts
 apart, or that a pull or an affinity change split, so comes together on its first round trip,
 which then wakes no other CPU: the reply's wake finds the caller's preferred CPU on that CPU, and
-the server's next receive blocks. Two cases stay with the other rules: a call made while other
+the server's next receive blocks. An RT pair stays together so only when its server replies with
+`SYS_IPC_REPLY_RECV` (below). Two cases stay with the other rules: a call made while other
 work is queued on the caller's CPU, whose threads the receiver would otherwise run ahead of while
 its own CPU idles, and a receiver that outranks its caller, such as an RT server called by a fair
 client, which, serving a backlog without parking, would hold off the caller's reply wake past any
 slice (§ Time Slice Policy). The second condition stays though a server can reply with
 `SYS_IPC_REPLY_RECV`: at the call the kernel cannot tell how the receiver will reply, and a
-`SYS_IPC_REPLY`'s wake still goes by the caller's sticky preferred CPU.
+`SYS_IPC_REPLY`'s wake still goes by the caller's preferred CPU (by rank for an RT caller, below).
 
 A reply's wake is placed by what its server does next. A `SYS_IPC_REPLY` passes
 `WakeHint::None`: the kernel cannot tell whether the server blocks next, so a receiver at its
-caller's level that, after its reply, serves other callers' queued calls without parking leaves
-the caller's reply wake queued behind it on that CPU until it parks or its slice expires. A
+fair caller's level that, after its reply, serves other callers' queued calls without parking
+leaves the caller's reply wake queued behind it on that CPU until it parks or its slice expires;
+an RT caller's reply wake goes to another CPU instead (below). A
 `SYS_IPC_REPLY_RECV` wakes its caller after its receive. When the receive parks, the server blocks
 in the same syscall, and the caller is woken with `WakeHint::Sync` onto the server's CPU, under the
 guard above with the server as the waker. Otherwise the server runs on, and the caller is woken
-with `WakeHint::WakerRuns`, for which the sticky rule skips the server's CPU: the caller goes to
-its preferred CPU when that is another, and by least load otherwise. A caller still placed on the
+with `WakeHint::WakerRuns`, for which the preferred-CPU rules skip the server's CPU: the caller
+goes to its preferred CPU when that is another (an RT caller only where it runs at once), and
+otherwise by rank (an RT caller) or least load. A caller still placed on the
 server's CPU, at the server's level or above, runs before the server returns to user mode, the
 server yielding to the tail of its level
 ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). Every other wake
 passes `WakeHint::None`.
+
+An RT caller's plain `SYS_IPC_REPLY` wake therefore leaves its server's CPU when the server runs at
+the caller's level or above: the server runs on past the reply, so that CPU ranks at the server's
+level, and the caller goes to the CPU of the lowest rank, often an idle one, and runs there at once.
+A pair of one level that a call placed together so splits at each plain reply, and its next call
+brings it together again. A pair whose server outranks its caller, which the synchronous wake's
+guard never places on the caller's CPU, stays apart: each call and each plain reply wakes another
+CPU. Kept on the
+server's CPU, the caller would wait behind a server that serves a backlog until it parks or its
+slice ends, the wait the rule exists to remove, and the kernel cannot tell at the reply whether the
+server blocks next. A `SYS_IPC_REPLY_RECV` tells it: when its receive parks, the server has blocked,
+its CPU ranks by its queued threads alone, and the synchronous wake places the caller there, so an
+RT pair whose server replies with `SYS_IPC_REPLY_RECV` and finds no call queued completes its round
+trip on one CPU.
 
 ### Load Balancing
 
@@ -652,8 +684,14 @@ CPU; an asynchronous producer and consumer whose every handoff drains within a t
 there too, since the pull does not spread them either. Two unpinned threads that each wait on a
 thread of another CPU, such as the clients of two servers, can likewise come to share one CPU
 while another idles, and stay there while each wake keeps them there (the sticky preferred CPU of
-`select_target_cpu` stays within the threshold of the least-loaded CPU). What the episode leaves
-is bounded by the threshold: a load above it is pulled at once, so a backlog the pull leaves to
+`select_target_cpu` stays within the threshold of the least-loaded CPU). Two threads of one RT level
+do not stay so: an RT wake leaves a CPU that runs or queues a thread of its level or above for one
+of a lower rank, an idle CPU among them (§ Thread Assignment), unless the save-window pin or a
+synchronous wake's guard keeps it there. An RT thread that outranks the thread it shares a CPU with
+does stay, since it runs there at once, save when its wake is the reply of a server that runs on
+there (`WakeHint::WakerRuns`, § Thread Assignment), and the lower thread waits behind it until it
+blocks or the idle pull takes the lower one. What the episode leaves is bounded by the threshold: a
+load above it is pulled at once, so a backlog the pull leaves to
 break and re-form is one at a load of at most `LOAD_BALANCE_IMBALANCE_THRESHOLD` (2), the
 running thread and one queued behind it. A call or a fault delivery places its receiver by its
 waker, and the reply of a `SYS_IPC_REPLY_RECV` to a `SYS_IPC_CALL` caller places the caller by
@@ -844,11 +882,13 @@ than its idle thread, or queues one. The read is lockless and Relaxed, and a sib
 changes state under it costs one placement its tie-break, never correctness.
 
 - **Placement** (`select_target_cpu`, § Thread Assignment): a tie on the least load goes to
-  the CPU with the fewest busy siblings, then to the lowest index. The rings are walked only for
-  the CPUs that tie on the least load seen so far, and no more once a CPU of an idle core holds
-  it. The sticky preferred CPU is still taken first when its load is within the threshold, since
-  the caches it holds outweigh the spread; a synchronous wake's waker CPU, when its guard holds,
-  comes before it, and a hard affinity still wins.
+  the CPU with the fewest busy siblings, then to the lowest index. An RT thread's key is its rank
+  first and the load second, and its ties go the same way. The rings are walked only for the CPUs
+  that tie on the least key seen so far, and no more once a CPU of an idle core holds it. A fair
+  thread's sticky preferred CPU is still taken first when its load is within the threshold, since
+  the caches it holds outweigh the spread. An RT thread keeps its preferred CPU only when it runs
+  there at once. The save-window pin and a synchronous wake's waker CPU, when its guard holds, come
+  before both, and a hard affinity still wins.
 - **Idle pull** (`try_pull_idle`, § Load Balancing): idle CPUs decide independently, each at
   its own tick, so the preference is a delay. An idle CPU that would pull from its confirmed
   candidate while one of its siblings is busy holds the candidate for one tick, once
@@ -1012,14 +1052,14 @@ A self-wake runs at the waker's syscall or interrupt exit. A timed wake adds the
 deadline to CPU 0's next tick (at most one tick), CPU 0's own interval with interrupts masked,
 and the sleep batch's claims ahead of it
 ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants) § Sleep List
-Invariants, invariant 6). The bound holds for the CPU the wake's placement chose. Placement does not
-weigh levels beyond the synchronous wake's guard (§ Thread Assignment), which places a thread on
-its waker's CPU only when it does not outrank the waker, whose park has committed. So an RT wake
-can be placed behind a running thread of its own or a
-higher level and wait for it to block, yield or expire. Two wakes placed on one CPU at once can
-likewise leave the lower waiting until the higher blocks or expires; closing that residual needs an
-RT pull (a CPU running a lower level taking a waiting RT thread at its tick), which is not
-implemented.
+Invariants, invariant 6). The bound holds for the CPU the wake's placement chose, which for an RT
+thread is one it outranks whenever an eligible CPU runs and queues only lower levels (§ Thread
+Assignment). An RT wake is still placed behind a running thread of its own or a higher level, and
+waits for it to block, yield or expire, when every eligible CPU runs or queues such a thread, when
+hard affinity, the save-window pin or a synchronous wake's guard places it, and when the levels its
+placement sampled went stale before its link: two wakes placed on one CPU at once leave the lower
+waiting until the higher blocks or expires. Closing that residual needs an RT pull (a CPU running a
+lower level taking a waiting RT thread at its tick), which is not implemented.
 
 **Timed wakes** stay on CPU 0's tick (§ Timer-Driven Preemption): every ABI timeout is in
 milliseconds and the tick is 1 ms, so a one-shot timer buys no resolution the ABI can ask for, and
@@ -1146,21 +1186,19 @@ concurrent delete of its last capability frees it only after the call returns.
 
 ### Soft Affinity
 
-`tcb.preferred_cpu` records the CPU the thread was last assigned to. The
-wake-side placement (`select_target_cpu`) honours it as a sticky cache-
-warmth hint: it scans all CPUs for `min_load`, and if `preferred_cpu`'s
-load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD` of `min_load`, the
-thread is re-placed on its preferred CPU. Beyond that threshold the
-thread is migrated to the least-loaded CPU. The threshold is the same
-hysteresis a busy CPU's pull uses to decide an imbalance is real, so
-soft affinity, wake placement, and the busy-CPU pull share one knob; an
-idle CPU pulls below it (§ Load Balancing).
+`tcb.preferred_cpu` records the CPU the thread was last assigned to. The wake-side placement
+(`select_target_cpu`) honours it as a sticky cache- warmth hint. An RT thread keeps it where it runs
+there at once (§ Thread Assignment). For a fair thread the placement scans all CPUs for `min_load`,
+and if `preferred_cpu`'s load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD` of `min_load`, the thread
+is re-placed on its preferred CPU. Beyond that threshold the thread is migrated to the least-loaded
+CPU. The threshold is the same hysteresis a busy CPU's pull uses to decide an imbalance is real, so
+soft affinity, wake placement, and the busy-CPU pull share one knob; an idle CPU pulls below it (§
+Load Balancing).
 
-Hard affinity (`cpu_affinity != AFFINITY_ANY`), save-window pinning
-(`context_saved == 0`) and a synchronous wake whose guard holds
-(§ Thread Assignment) short-circuit ahead of the soft-affinity
-check; see `select_target_cpu` in `core/kernel/src/sched/mod.rs` for
-the full policy.
+Hard affinity (`cpu_affinity != AFFINITY_ANY`), save-window pinning (`context_saved == 0`) and a
+synchronous wake whose guard holds (§ Thread Assignment) short-circuit ahead of the soft-affinity
+check, and an RT thread's rank comes before it; see `select_target_cpu` in
+`core/kernel/src/sched/mod.rs` for the full policy.
 
 The scheduler does not expose soft affinity as a syscall parameter — it is an internal
 optimisation.

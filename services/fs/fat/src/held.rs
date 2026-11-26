@@ -5,13 +5,12 @@
 
 //! The dispatch loop's line for a request it held too long.
 //!
-//! The loop takes a [`HeldRequest`] when it receives a request and drops it
-//! when its turn ends, after the reply. A request held [`SLOW_REQUEST`] or
-//! longer is logged with its label, its time, and how much of that time its
-//! block calls took and how many it made ([`cache::block_call_totals`]), so
-//! the line tells a stall in the block path from one in fatfs or in another
-//! service it calls (README § Slow requests). A request held less costs two
-//! clock reads and two counter reads.
+//! The loop takes a [`HeldRequest`] when it receives a request and drops it when its turn ends,
+//! which is before a reply the handler left for the next receive is sent. A request held
+//! [`SLOW_REQUEST`] or longer is logged with its label, its time, and how much of that time its
+//! block calls took and how many it made ([`cache::block_call_totals`]), so the line tells a stall
+//! in the block path from one in fatfs or in another service it calls (README § Slow requests). A
+//! request held less costs two clock reads and two counter reads.
 
 use std::time::{Duration, Instant};
 

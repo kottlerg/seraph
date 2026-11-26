@@ -21,6 +21,7 @@
 mod decode;
 mod input;
 
+use ipc::serve::{Reply, next_request};
 use ipc::{
     IpcMessage, devmgr_labels, input_errors, input_labels, keysym, memmgr_errors, memmgr_labels,
 };
@@ -517,7 +518,7 @@ struct InputRuntime
 
 /// Handle `INPUT_READ_EVENTS`: drain and decode pending events, blocking until
 /// at least one keysym is produced, then reply with the batch.
-fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
+fn handle_read_events(rt: &mut InputRuntime, out: &mut Reply)
 {
     let mut events = [0u64; keysym::INPUT_MAX_EVENTS_PER_READ];
     let mut count = 0usize;
@@ -564,9 +565,7 @@ fn handle_read_events(ipc_buf: *mut u64, rt: &mut InputRuntime)
     {
         builder = builder.word(i, ev);
     }
-    let reply = builder.build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    out.set(builder.build());
 }
 
 /// Bind `interrupt` to a fresh notification and start the interrupt-service
@@ -657,10 +656,11 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut InputRuntime) -> !
 {
     std::os::seraph::log!("ready, entering service loop");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -679,19 +679,15 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut InputRuntime) -> !
         }
         if !virtio_input::authorized(msg.label, msg.badge)
         {
-            let reply = IpcMessage::new(input_errors::UNAUTHORIZED);
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            reply.set_status(input_errors::UNAUTHORIZED);
         }
         else if msg.label == input_labels::INPUT_READ_EVENTS
         {
-            handle_read_events(ipc_buf, rt);
+            handle_read_events(rt, &mut reply);
         }
         else
         {
-            let reply = IpcMessage::new(input_errors::UNKNOWN_OPCODE);
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            reply.set_status(input_errors::UNKNOWN_OPCODE);
         }
     }
 }

@@ -16,6 +16,7 @@
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]).
 
 use driver_binding::resources::{self, PlatformDelivery, Resource};
+use ipc::serve::{Reply, next_request};
 use ipc::{IpcMessage, rtc_errors, rtc_labels};
 use std::os::seraph::{reserve_pages, startup_info};
 use syscall_abi::PAGE_SIZE;
@@ -90,7 +91,7 @@ fn read_epoch_ns(base_va: u64) -> u64
 
 // ── Service loop ───────────────────────────────────────────────────────────
 
-fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64, base_va: u64)
+fn handle_request(msg: &IpcMessage, base_va: u64, out: &mut Reply)
 {
     let reply = match msg.label
     {
@@ -110,8 +111,7 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64, base_va: u64)
         }
         _ => IpcMessage::new(rtc_errors::UNKNOWN_OPCODE),
     };
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    out.set(reply);
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -135,10 +135,11 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, base_va: u64) -> !
 {
     std::os::seraph::log!("ready");
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    let mut reply = Reply::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -155,7 +156,7 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, base_va: u64) -> !
         {
             let _ = syscall::cap_delete(cap);
         }
-        handle_request(&msg, ipc_buf, base_va);
+        handle_request(&msg, base_va, &mut reply);
     }
 }
 

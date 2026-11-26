@@ -140,6 +140,10 @@ pub fn run_isolated(body: impl FnOnce() -> TestResult) -> TestResult
 /// that hangs identifies itself in the serial log instead of leaving only
 /// the previous test's PASS line as the last output.
 ///
+/// In a focused build, a test whose name the build's selection does not
+/// select ([`cmdline::KtestConfig::selects`]) is skipped: it logs no line and
+/// counts in neither counter.
+///
 /// To add a new unit test: write a function returning `TestResult`, then
 /// call `run_test!("subsystem::test_name", fn_name(ctx))` in the relevant
 /// `run_all` function. An architecture-specific unit test goes under
@@ -147,21 +151,24 @@ pub fn run_isolated(body: impl FnOnce() -> TestResult) -> TestResult
 #[macro_export]
 macro_rules! run_test {
     ($name:literal, $body:expr) => {{
-        $crate::log(concat!("ktest: RUN ", $name));
-        let result: $crate::TestResult = $crate::run_isolated(|| $body);
-        $crate::frame_pool::check_slots();
-        match result
+        if $crate::cmdline::KtestConfig::BUILT.selects($name)
         {
-            Ok(()) =>
+            $crate::log(concat!("ktest: RUN ", $name));
+            let result: $crate::TestResult = $crate::run_isolated(|| $body);
+            $crate::frame_pool::check_slots();
+            match result
             {
-                $crate::log(concat!("ktest: PASS ", $name));
-                $crate::PASS_COUNT.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
-            }
-            Err(reason) =>
-            {
-                $crate::log(concat!("ktest: FAIL ", $name));
-                $crate::log(reason);
-                $crate::FAIL_COUNT.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+                Ok(()) =>
+                {
+                    $crate::log(concat!("ktest: PASS ", $name));
+                    $crate::PASS_COUNT.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+                }
+                Err(reason) =>
+                {
+                    $crate::log(concat!("ktest: FAIL ", $name));
+                    $crate::log(reason);
+                    $crate::FAIL_COUNT.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }};
@@ -169,7 +176,7 @@ macro_rules! run_test {
 
 /// Run a named integration test and update the global pass/fail counters.
 ///
-/// Like [`run_test!`] (the frame-pool check included) but emits a
+/// Like [`run_test!`] (the frame-pool check and the selection included) but emits a
 /// `"ktest: <name> starting"` line before running the test body. Integration tests typically emit step-by-step
 /// progress logs from within their body; the starting line marks their
 /// beginning and the PASS/FAIL line marks their end.
@@ -181,21 +188,24 @@ macro_rules! run_test {
 #[macro_export]
 macro_rules! run_integration_test {
     ($name:literal, $body:expr) => {{
-        $crate::log(concat!("ktest: ", $name, " starting"));
-        let result: $crate::TestResult = $crate::run_isolated(|| $body);
-        $crate::frame_pool::check_slots();
-        match result
+        if $crate::cmdline::KtestConfig::BUILT.selects($name)
         {
-            Ok(()) =>
+            $crate::log(concat!("ktest: ", $name, " starting"));
+            let result: $crate::TestResult = $crate::run_isolated(|| $body);
+            $crate::frame_pool::check_slots();
+            match result
             {
-                $crate::log(concat!("ktest: PASS ", $name));
-                $crate::PASS_COUNT.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
-            }
-            Err(reason) =>
-            {
-                $crate::log(concat!("ktest: FAIL ", $name));
-                $crate::log(reason);
-                $crate::FAIL_COUNT.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+                Ok(()) =>
+                {
+                    $crate::log(concat!("ktest: PASS ", $name));
+                    $crate::PASS_COUNT.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+                }
+                Err(reason) =>
+                {
+                    $crate::log(concat!("ktest: FAIL ", $name));
+                    $crate::log(reason);
+                    $crate::FAIL_COUNT.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }};
@@ -735,6 +745,14 @@ extern "C" fn run(info_ptr: u64) -> !
     klog::attach(ctx.kernel_log_cap);
 
     let config = cmdline::KtestConfig::BUILT;
+    if let Some(selection) = config.selection
+    {
+        // Streamed, since a list of prefixes can outrun a `Line`.
+        // The channels take every write, so the write cannot fail.
+        log_with(|out| {
+            let _ = out.write_fmt(format_args!("ktest: selection {selection}"));
+        });
+    }
 
     // ── Tier 1: per-syscall isolation ─────────────────────────────────────────
     if config.run_unit
@@ -764,22 +782,9 @@ extern "C" fn run(info_ptr: u64) -> !
         bench::run_all(&ctx, config.bench_iters);
     }
 
-    // ── Summary ───────────────────────────────────────────────────────────────
-    let passed = PASS_COUNT.load(Ordering::Relaxed);
-    let failed = FAIL_COUNT.load(Ordering::Relaxed);
-    log_u64("ktest: passed=", passed as u64);
-    log_u64("ktest: failed=", failed as u64);
-    if failed == 0
-    {
-        log("[ktest] ALL TESTS PASSED");
-    }
-    else
-    {
-        log("[ktest] SOME TESTS FAILED");
-    }
+    let all_passed = report(&config);
 
     // ── Shutdown ─────────────────────────────────────────────────────────────
-    let all_passed = failed == 0;
     let should_shutdown = match config.shutdown_policy
     {
         cmdline::ShutdownPolicy::Always => true,
@@ -815,6 +820,39 @@ extern "C" fn run(info_ptr: u64) -> !
     }
 
     syscall::thread_exit()
+}
+
+/// Log the run's summary, the pass and fail counts, then its terminal marker
+/// (docs/testing.md § Reporting marker), and return whether the run passed: no
+/// test failed and, in a focused build, the selection ran a test.
+fn report(config: &cmdline::KtestConfig) -> bool
+{
+    let passed = PASS_COUNT.load(Ordering::Relaxed);
+    let failed = FAIL_COUNT.load(Ordering::Relaxed);
+    log_u64("ktest: passed=", passed as u64);
+    log_u64("ktest: failed=", failed as u64);
+    // A selection that ran no test is a failed run, so a mistyped prefix
+    // cannot pass.
+    let unmatched = config.selection.is_some() && passed == 0 && failed == 0;
+    if unmatched
+    {
+        log("ktest: selection matched no test");
+    }
+    let all_passed = failed == 0 && !unmatched;
+    if !all_passed
+    {
+        log("[ktest] SOME TESTS FAILED");
+    }
+    else if config.selection.is_some()
+    {
+        // A focused run never prints the full run's pass marker.
+        log("[ktest] SELECTED TESTS PASSED");
+    }
+    else
+    {
+        log("[ktest] ALL TESTS PASSED");
+    }
+    all_passed
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────

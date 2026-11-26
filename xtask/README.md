@@ -104,7 +104,7 @@ Build Seraph components and populate `sysroot/`.
 ```
 cargo xtask build [--arch x86_64|riscv64] [--release] \
     [--component <name>|all] [--debug <comp>[,...]] [--limited-debug <comp>[,...]] \
-    [--opt-level <pkg>=<level>[,...]] [--ktest-bench-only]
+    [--opt-level <pkg>=<level>[,...]] [--ktest-bench-only | --ktest-only <prefix>[,...]]
 ```
 
 | Option | Default | Description |
@@ -116,6 +116,7 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 | `--limited-debug` | (none) | Emit limited debuginfo (`debug="limited"`: line tables and function frames, inlined ones included, without types or variables) for the named component(s), at the active profile's own opt-level, so their instructions are a plain build's; a component `--debug` also names takes `--debug`. `path-account` reads the kernel's and ktest's. See [Debuginfo is opt-in](../docs/build-system.md#debuginfo-is-opt-in). |
 | `--opt-level` | (none) | Build the named workspace package(s) at another opt-level within the active profile, as `<package>=<level>` with the level one of `0`, `1`, `2`, `3`, `s`, `z`, e.g. `--opt-level shmem=3,framebuffer=3`: `--config profile.<active>.package."<pkg>".opt-level=<level>` on every cargo build of the build, so a library takes it wherever it is compiled, `-Z build-std`'s crates included. Refused for a package the workspace does not have, for one named twice, and for a component `--debug` names (`all` names every component, not the libraries), which builds it at opt-level 1. Under `--release`, fat LTO optimizes the merged module at the linking binary's level, so a library's override may not survive into the image. `compare-images` builds each commit without `--opt-level`: whether an override survives is read by committing it as a `[profile.<p>.package."<pkg>"]` table in a scratch commit and comparing that commit with its parent. See [Opt-level overrides](../docs/build-system.md#opt-level-overrides). |
 | `--ktest-bench-only` | off | Build ktest with its `bench-only` feature, which runs Tier 3 alone at its benchmark iteration count ([core/ktest/README.md](../core/ktest/README.md#compile-time-options) § Compile-time options); refused with a `--component` other than `ktest` or `all` |
+| `--ktest-only` | (none) | Build a focused ktest, which runs only the tests whose names start with one of the comma-separated prefixes, each of ASCII letters, digits, `_` and `:` ([core/ktest/README.md](../core/ktest/README.md#test-selection) § Test selection): ktest's compile reads them from `SERAPH_KTEST_ONLY`, which every other build clears, and the build records them in `sysroot/.ktest-selection`, which a build of the full ktest removes. `run --runs` refuses the image without `--ktest-only-ok`. Refused with `--ktest-bench-only` and with a `--component` other than `ktest` or `all` |
 
 Before it compiles, the build checks that the workspace's Rust source is formatted as
 `cargo fmt` formats it (`cargo fmt --all --check`) and fails on a file that is not, printing
@@ -262,7 +263,7 @@ cargo xtask run [--arch x86_64|riscv64] \
 cargo xtask run --runs N [launch options] [--display framebuffer|headless] [--debug-listen] \
     [--parallel N] [--timeout SECONDS] [--pass REGEX] [--fail REGEX] [--fail-also REGEX] \
     [--require REGEX]... [--crash-reports reports|none] [--whole-lines TAG]... \
-    [--fail-grace-secs SECONDS] [--hold-on-hang] [--save-logs DIR]
+    [--fail-grace-secs SECONDS] [--hold-on-hang] [--save-logs DIR] [--ktest-only-ok]
 ```
 
 The launch options, the same in both modes:
@@ -430,7 +431,7 @@ before the runs copy them, and removes it after the last run.
 | `--runs` | (interactive boot) | Total runs, dispatched in waves of `--parallel`; selects the classified boot |
 | `--parallel` | `1` | Concurrency: QEMU instances in flight at once |
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
-| `--pass` | the marker of the image's harness | Regex marking a successful run. The default is `\[<harness>\] ALL TESTS PASSED`, the terminal marker ([docs/testing.md](../docs/testing.md) § Reporting marker) of the one harness the image boots, which its pack recorded in `sysroot/.image-harness`: `ktest` for the ktest bundle, otherwise each of `svctest`, `usertest` and `ubench` whose recipe was staged on a layer the image holds. An image that boots no harness, or several, has no default, and `--runs` refuses to start without `--pass`; an image with no record is refused until it is packed again (`cargo xtask mkdisk`). On match, and every `--require`, `--crash-reports` and `--whole-lines` check holding, the log is discarded and the run is classified `PASS` |
+| `--pass` | the marker of the image's harness | Regex marking a successful run. The default is `\[<harness>\] ALL TESTS PASSED`, the terminal marker ([docs/testing.md](../docs/testing.md) § Reporting marker) of the one harness the image boots, which its pack recorded in `sysroot/.image-harness`: `ktest` for the ktest bundle, otherwise each of `svctest`, `usertest` and `ubench` whose recipe was staged on a layer the image holds. An image that boots no harness, or several, has no default, and `--runs` refuses to start without `--pass`; an image with no record is refused until it is packed again (`cargo xtask mkdisk`). An image of a focused ktest runs only with `--ktest-only-ok`, and its default is `\[ktest\] SELECTED TESTS PASSED`. On match, and every `--require`, `--crash-reports` and `--whole-lines` check holding, the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
 | `--require` | (none) | A regex a line of the log must match for the run to pass; repeatable, each must match a line. A run whose `--pass` matched but whose log has no line matching one of them is `FAIL`, its reason naming the pattern |
@@ -438,6 +439,7 @@ before the runs copy them, and removes it after the last run.
 | `--whole-lines` | (none) | Check the console in each passing run's log between the lines `<TAG> begin` and `<TAG> end ...`: every line there is one console line, and each sender's numbered lines arrive whole, in order, none missing. Repeatable: each tag's window is checked. A run whose check fails is `FAIL`, its reason the check's, naming the tag; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `--whole-lines whole-lines --whole-lines serial-burst`, the tags svctest's `console_whole_lines` and `serial_transmit` phases log ([services/svctest/README.md](../services/svctest/README.md); the console is in [docs/console-model.md](../docs/console-model.md)) |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, or the first death line of rule 2 below, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
+| `--ktest-only-ok` | off | Accept an image whose ktest a focused build made (`build --ktest-only`, recorded in `sysroot/.ktest-selection`): without it `--runs` refuses such an image, since a focused boot validates nothing, and with it the default `--pass` is the focused run's marker. Refused for an image that boots no focused ktest |
 | `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> icount=<on\|off> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing`, `bench-check` and `bench-baseline` read |
 
 The default `--fail` regex matches the cross-harness terminal marker
@@ -1949,7 +1951,7 @@ bootloader). The `FLAG` column comes first; the table ends with the count of fla
 |---|---|
 | `format` | `1`, the format version; a file of another version is refused |
 | `arch`, `cpus` | The log's architecture and width |
-| `marker` | ktest's terminal marker (`ALL TESTS PASSED`), or `-` |
+| `marker` | ktest's terminal marker (`ALL TESTS PASSED`, or `SELECTED TESTS PASSED` for a focused ktest), or `-` |
 | `commit` | The full hash of `--commit` |
 | `ktest-commit` | Present only when it is another commit: the newest commit at or before `commit` that changed anything outside Markdown, `.claude/`, `.github/`, and `xtask/baselines/` (conservatively: every change that could alter the boot image or its QEMU launch moves it, and so do some that cannot), so a baseline refreshed after a documentation-only change names the code it times |
 | `date` | The UTC date the file was written |

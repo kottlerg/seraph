@@ -7,11 +7,13 @@
 //!
 //! The boot protocol carries no kernel command line, so every ktest run
 //! uses the configuration baked in at build time, [`KtestConfig::BUILT`]:
-//! [`KtestConfig::DEFAULT`], or [`KtestConfig::BENCH`] in a build with the
-//! `bench-only` feature (`cargo xtask build --ktest-bench-only`). The
+//! [`KtestConfig::DEFAULT`]; [`KtestConfig::BENCH`] in a build with the
+//! `bench-only` feature (`cargo xtask build --ktest-bench-only`); or
+//! [`KtestConfig::SELECTED`] in a build whose environment sets
+//! `SERAPH_KTEST_ONLY` (`cargo xtask build --ktest-only`). The
 //! defaults are picked for CI: every tier runs, the VM auto-shuts down
 //! on completion, and shutdown is immediate. To preserve QEMU for
-//! interactive inspection (or trim the tier set for a focused run),
+//! interactive inspection (or trim the tier set),
 //! edit [`KtestConfig::DEFAULT`], run `cargo xtask build --component ktest`,
 //! then `cargo xtask mkdisk --harness ktest` so the boot bundle
 //! carries the rebuilt binary.
@@ -51,6 +53,10 @@ pub struct KtestConfig
     pub run_stress: bool,
     pub run_bench: bool,
     pub bench_iters: u32,
+    /// The comma-separated name prefixes of the tests a focused build runs,
+    /// `None` in a build that runs every test of its tiers
+    /// ([`KtestConfig::selects`]).
+    pub selection: Option<&'static str>,
 }
 
 impl KtestConfig
@@ -67,6 +73,7 @@ impl KtestConfig
         // A smoke run: each benchmark runs and logs its line, which no
         // functional boot compares; the benchmark image (`BENCH`) measures.
         bench_iters: 8,
+        selection: None,
     };
 
     /// The benchmark image's configuration: Tier 3 alone, each benchmark at
@@ -80,14 +87,45 @@ impl KtestConfig
         ..Self::DEFAULT
     };
 
+    /// A focused build's configuration: [`KtestConfig::DEFAULT`] running only
+    /// the tests whose names start with one of the comma-separated prefixes of
+    /// the build environment's `SERAPH_KTEST_ONLY`, and no benchmark, since a
+    /// benchmark is not a named test; `None` in a build whose environment does
+    /// not set the variable. `cargo xtask build` sets it from `--ktest-only`
+    /// and clears it otherwise, and rustc records the read, so cargo rebuilds
+    /// ktest when the value changes.
+    pub const SELECTED: Option<KtestConfig> = match option_env!("SERAPH_KTEST_ONLY")
+    {
+        Some(selection) => Some(KtestConfig {
+            run_bench: false,
+            selection: Some(selection),
+            ..Self::DEFAULT
+        }),
+        None => None,
+    };
+
     /// The configuration this build runs: [`KtestConfig::BENCH`] with the
-    /// `bench-only` feature, [`KtestConfig::DEFAULT`] without it.
+    /// `bench-only` feature, else [`KtestConfig::SELECTED`] in a focused
+    /// build, else [`KtestConfig::DEFAULT`].
     pub const BUILT: KtestConfig = if cfg!(feature = "bench-only")
     {
         Self::BENCH
     }
     else
     {
-        Self::DEFAULT
+        match Self::SELECTED
+        {
+            Some(selected) => selected,
+            None => Self::DEFAULT,
+        }
     };
+
+    /// Whether the test named `name` runs: every test without a selection,
+    /// and with one, a test whose name starts with one of its prefixes.
+    #[must_use]
+    pub fn selects(&self, name: &str) -> bool
+    {
+        self.selection
+            .is_none_or(|selection| selection.split(',').any(|prefix| name.starts_with(prefix)))
+    }
 }

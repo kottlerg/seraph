@@ -7088,15 +7088,16 @@ pub enum WakeHint
     /// mode: the call rendezvous, the fault delivery, and the reply of a
     /// `SYS_IPC_REPLY_RECV` whose receive parked. The woken thread then runs
     /// on this CPU when nothing else waits there and it does not outrank the
-    /// waker, or does but last received through `SYS_IPC_REPLY_RECV`
-    /// (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
-    /// "Target CPU selection").
+    /// waker, or does but last received through `SYS_IPC_REPLY_RECV` and the
+    /// waker is an unpinned caller (core/kernel/docs/scheduling-internals.md
+    /// § Wake Protocol Invariants, "Target CPU selection").
     Sync,
     /// The waker is the thread running on this CPU and runs on past the wake:
     /// the reply of a `SYS_IPC_REPLY_RECV` whose receive did not park. The
     /// preferred-CPU rules then skip this CPU, so the woken thread goes to its
     /// preferred CPU only when that is another, and otherwise by rank (an RT
-    /// thread) or least load.
+    /// thread) or least load; when the waker outranks it, the wake leaves this
+    /// CPU out altogether ([`reply_wake_exclusion`]).
     WakerRuns,
 }
 
@@ -7128,9 +7129,10 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock, hint: WakeHint) ->
 /// UNLESS hard `cpu_affinity` names it (affinity is a correctness constraint
 /// that overrides the placement hint) or it is the only CPU.
 ///
-/// `dealloc_object(Thread)`'s deferred reply-wake passes `exclude = Some(dealloc_cpu)`;
-/// the rationale is in core/kernel/docs/scheduling-internals.md § Wake Protocol
-/// Invariants, "Target CPU selection".
+/// `dealloc_object(Thread)`'s deferred reply-wake passes `exclude = Some(dealloc_cpu)`,
+/// and a reply-and-receive's reply wake the exclusion [`reply_wake_exclusion`]
+/// returns; the rationale is in core/kernel/docs/scheduling-internals.md § Wake
+/// Protocol Invariants, "Target CPU selection".
 ///
 /// # Safety
 /// As for [`select_target_cpu`].
@@ -7142,6 +7144,48 @@ pub unsafe fn select_target_cpu_excluding(
 ) -> usize
 {
     place_wake(&KernelWake { tcb }, exclude, hint)
+}
+
+/// What [`WakeView::reply_recv_admits`] reads of the woken thread and the
+/// waker.
+#[derive(Clone, Copy)]
+struct ReplyRecvAdmission
+{
+    /// The woken thread's latest receive came through `SYS_IPC_REPLY_RECV`.
+    predicted: bool,
+    /// The waker is in a fault delivery.
+    waker_faulting: bool,
+    /// The waker's hard affinity, `AFFINITY_ANY` when it has none.
+    waker_affinity: u32,
+}
+
+impl ReplyRecvAdmission
+{
+    /// Whether a synchronous wake may run a woken thread that outranks its
+    /// waker on the waker's CPU: the prediction holds, and the waker is not in
+    /// a fault delivery and has no hard affinity.
+    fn admits(self) -> bool
+    {
+        self.predicted && !self.waker_faulting && self.waker_affinity == AFFINITY_ANY
+    }
+}
+
+/// The CPU a reply wake of `hint` leaves out of its placement
+/// ([`select_target_cpu_excluding`]): `this_cpu`, the server's, on a
+/// [`WakeHint::WakerRuns`] wake whose server (at `server_level`) outranks the
+/// caller (at `caller_level`), since the server runs on there and slice expiry
+/// never hands that CPU down to the caller; `None` otherwise. Hard affinity
+/// still places a caller pinned to `this_cpu` there.
+#[must_use]
+pub fn reply_wake_exclusion(
+    hint: WakeHint,
+    server_level: u8,
+    caller_level: u8,
+    this_cpu: usize,
+) -> Option<usize>
+{
+    (hint == WakeHint::WakerRuns && run_queue::outranks(server_level, caller_level))
+        .then_some(this_cpu)
 }
 
 /// The synchronous wake rule's decision for one wake that reached it, which
@@ -7182,10 +7226,14 @@ trait WakeView
     /// running on this CPU, the waker for a [`WakeHint::Sync`] wake
     /// (`run_queue::outranks`).
     fn outranks_waker(&self) -> bool;
-    /// Whether the woken thread's latest receive came through
-    /// `SYS_IPC_REPLY_RECV` (`ThreadControlBlock::serves_reply_recv`): a
-    /// prediction that it answers its waker's call with one.
-    fn replies_with_receive(&self) -> bool;
+    /// Whether a woken thread that outranks the waker may still run on the
+    /// waker's CPU: its latest receive came through `SYS_IPC_REPLY_RECV`
+    /// (`ThreadControlBlock::serves_reply_recv`, a prediction that it answers
+    /// with one, whose reply wake waits for its receive), the waker is not in
+    /// a fault delivery (whose reply wakes it at once), and the waker has no
+    /// hard affinity (a reply wake that finds the woken thread running on
+    /// leaves the waker's CPU only when the waker can move).
+    fn reply_recv_admits(&self) -> bool;
     /// Count the synchronous wake rule's decision in the woken thread's
     /// placement counters: one wake that reached the rule, and one placed on
     /// the waker's CPU when `decision` is [`SyncDecision::WakersCpu`].
@@ -7242,17 +7290,18 @@ fn place_unpinned(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) 
 
     // A synchronous wake runs the woken thread on the waker's CPU when that CPU
     // queues nothing else and the woken thread does not outrank the waker, or
-    // outranks it but answers with `SYS_IPC_REPLY_RECV`: it is then the thread
-    // this CPU's `schedule()` dispatches when the waker blocks, and the waker's
-    // reply wake, which returns it here, does not wait behind it past a slice,
-    // since a reply-and-receive that runs on sends it elsewhere. The prediction
-    // is read only when the rank check fails.
+    // outranks it but answers an unpinned caller with `SYS_IPC_REPLY_RECV`: it
+    // is then the thread this CPU's `schedule()` dispatches when the waker
+    // blocks, and the waker's reply wake, which returns it here, does not wait
+    // behind it past a slice, since a reply-and-receive that runs on sends an
+    // unpinned caller to another CPU (wake_replied). The admission is read only
+    // when the rank check fails.
     if hint == WakeHint::Sync
     {
         let this_cpu = view.this_cpu();
         let decision = if eligible(this_cpu)
             && !view.this_cpu_queues()
-            && (!view.outranks_waker() || view.replies_with_receive())
+            && (!view.outranks_waker() || view.reply_recv_admits())
         {
             SyncDecision::WakersCpu
         }
@@ -7471,15 +7520,33 @@ impl WakeView for KernelWake
         run_queue::outranks(level, waker_level)
     }
 
-    fn replies_with_receive(&self) -> bool
+    fn reply_recv_admits(&self) -> bool
     {
         // SAFETY: tcb is valid (select_target_cpu's contract); the mark is an
         // atomic, read as a prediction (ThreadControlBlock::serves_reply_recv).
-        unsafe {
+        let predicted = unsafe {
             (*self.tcb)
                 .serves_reply_recv
                 .load(core::sync::atomic::Ordering::Relaxed)
+        };
+        let waker = Self::scheduler(self.this_cpu()).current();
+        if !predicted || waker.is_null()
+        {
+            return false;
         }
+        // SAFETY: waker is the thread running on this CPU, which the wake runs
+        // on: its in_fault_delivery is its own, written by it before its
+        // delivery.
+        let faulting = unsafe { (*waker).in_fault_delivery };
+        // SAFETY: as above; cpu_affinity is read as a placement hint, as
+        // select_target_cpu reads the woken thread's.
+        let affinity = unsafe { (*waker).cpu_affinity };
+        ReplyRecvAdmission {
+            predicted,
+            waker_faulting: faulting,
+            waker_affinity: affinity,
+        }
+        .admits()
     }
 
     fn note_sync(&self, decision: SyncDecision)
@@ -10474,8 +10541,8 @@ mod placement_tests
 {
     use super::run_queue::{CpuRanks, level_rank};
     use super::{
-        AFFINITY_ANY, IDLE_PRIORITY, RT_PRIORITY_MIN, SyncDecision, WakeHint, WakeView,
-        least_loaded_cpu, link_cpu, place_wake,
+        AFFINITY_ANY, IDLE_PRIORITY, RT_PRIORITY_MIN, ReplyRecvAdmission, SyncDecision, WakeHint,
+        WakeView, least_loaded_cpu, link_cpu, place_wake, reply_wake_exclusion,
     };
 
     // The defect caught: a link that keeps the waker's target after a
@@ -10559,7 +10626,7 @@ mod placement_tests
         this_cpu: usize,
         this_cpu_queues: bool,
         outranks_waker: bool,
-        replies_with_receive: bool,
+        reply_recv_admits: bool,
         prediction_reads: core::cell::Cell<u32>,
         loads: Vec<u32>,
         ranks: Vec<CpuRanks>,
@@ -10583,7 +10650,7 @@ mod placement_tests
                 this_cpu,
                 this_cpu_queues: false,
                 outranks_waker: false,
-                replies_with_receive: false,
+                reply_recv_admits: false,
                 prediction_reads: core::cell::Cell::new(0),
                 loads: vec![0; cpus],
                 ranks: vec![runs(IDLE_PRIORITY); cpus],
@@ -10634,10 +10701,10 @@ mod placement_tests
             self.waker_reads.set(self.waker_reads.get() + 1);
             self.outranks_waker
         }
-        fn replies_with_receive(&self) -> bool
+        fn reply_recv_admits(&self) -> bool
         {
             self.prediction_reads.set(self.prediction_reads.get() + 1);
-            self.replies_with_receive
+            self.reply_recv_admits
         }
         fn load(&self, cpu: usize) -> u32
         {
@@ -10897,40 +10964,41 @@ mod placement_tests
     }
 
     // The defect caught (#1560): an RT server that answers with
-    // SYS_IPC_REPLY_RECV, called by a fair client, left on the idle preferred
-    // CPU another server's wake gave it, so the pair stays apart and every
-    // round trip wakes a halted CPU; its reply-and-receive places the reply
-    // wake by whether it parks, so the hazard the rank check keeps off does not
-    // arise. Or the prediction admitting a plain-reply server, or a waker's
-    // CPU the wake excludes.
+    // SYS_IPC_REPLY_RECV, called by an unpinned fair client, left on the idle
+    // preferred CPU another server's wake gave it, so the pair stays apart and
+    // every round trip wakes a halted CPU; its reply-and-receive places the
+    // reply wake by whether it parks, and sends the unpinned caller off this
+    // CPU when it runs on, so the hazard the rank check keeps off does not
+    // arise. Or a wake the admission refuses placed there, or a waker's CPU
+    // the wake excludes.
     #[test]
-    fn an_outranking_receiver_that_replies_with_receive_runs_on_the_wakers_cpu()
+    fn an_admitted_outranking_receiver_runs_on_the_wakers_cpu()
     {
         let mut server = rt_wake([IDLE_PRIORITY; 4]);
         server.outranks_waker = true;
-        server.replies_with_receive = true;
+        server.reply_recv_admits = true;
         assert_eq!(server.place(None, WakeHint::Sync), 0);
         assert_eq!(server.syncs.get(), (1, 1));
-        server.replies_with_receive = false;
+        server.reply_recv_admits = false;
         assert_eq!(server.place(None, WakeHint::Sync), 1);
         assert_eq!(server.syncs.get(), (2, 1));
-        server.replies_with_receive = true;
+        server.reply_recv_admits = true;
         assert_eq!(server.place(Some(0), WakeHint::Sync), 1);
         assert_eq!(server.syncs.get(), (3, 1));
     }
 
-    // The defect caught: the prediction overriding the queue condition, so an
+    // The defect caught: the admission overriding the queue condition, so an
     // RT server answering with SYS_IPC_REPLY_RECV runs ahead of a thread
     // queued on its caller's CPU while other CPUs idle, or chases each of
     // several callers onto a CPU with work queued; it follows a caller only to
     // a CPU that queues nothing, and otherwise the RT rule leaves the
     // caller's CPU out.
     #[test]
-    fn an_outranking_receiver_that_replies_with_receive_follows_only_callers_with_empty_queues()
+    fn an_admitted_outranking_receiver_follows_only_callers_with_empty_queues()
     {
         let mut server = rt_wake([IDLE_PRIORITY; 4]);
         server.outranks_waker = true;
-        server.replies_with_receive = true;
+        server.reply_recv_admits = true;
         server.this_cpu = 2;
         assert_eq!(server.place(None, WakeHint::Sync), 2);
         server.preferred = 2;
@@ -10956,6 +11024,69 @@ mod placement_tests
         outranking.outranks_waker = true;
         outranking.place(None, WakeHint::Sync);
         assert_eq!(outranking.prediction_reads.get(), 1);
+    }
+
+    // The defect caught: an outranking server admitted onto the CPU of a
+    // caller pinned there, whose reply wake hard affinity returns to that CPU
+    // behind the server whenever its reply-and-receive binds another call; or
+    // onto a faulting thread's CPU, whose fault reply wakes it at once, before
+    // the handler's receive; or a server that last received with a plain
+    // receive admitted at all.
+    #[test]
+    fn the_admission_takes_a_reply_recv_server_and_an_unpinned_caller()
+    {
+        let admitted = ReplyRecvAdmission {
+            predicted: true,
+            waker_faulting: false,
+            waker_affinity: AFFINITY_ANY,
+        };
+        assert!(admitted.admits());
+        for refused in [
+            ReplyRecvAdmission {
+                predicted: false,
+                ..admitted
+            },
+            ReplyRecvAdmission {
+                waker_faulting: true,
+                ..admitted
+            },
+            ReplyRecvAdmission {
+                waker_affinity: 0,
+                ..admitted
+            },
+            ReplyRecvAdmission {
+                waker_affinity: 3,
+                ..admitted
+            },
+        ]
+        {
+            assert!(!refused.admits());
+        }
+    }
+
+    // The defect caught: a reply-and-receive that runs on sending its caller
+    // back to the server's CPU, behind a server that outranks it and serves a
+    // backlog there past any slice, by the least-load tie or the RT scan; or
+    // the exclusion applied to a wake whose server does not outrank the
+    // caller (wake_replied's yield covers that one), to a parked server's
+    // wake, or ahead of hard affinity.
+    #[test]
+    fn a_reply_wake_leaves_out_the_cpu_of_an_outranking_server_that_runs_on()
+    {
+        let exclusion = |hint, server, caller| reply_wake_exclusion(hint, server, caller, 2);
+        assert_eq!(exclusion(WakeHint::WakerRuns, WOKEN, FAIR), Some(2));
+        assert_eq!(exclusion(WakeHint::WakerRuns, HIGHER, WOKEN), Some(2));
+        assert_eq!(exclusion(WakeHint::WakerRuns, WOKEN, WOKEN), None);
+        assert_eq!(exclusion(WakeHint::WakerRuns, FAIR, WOKEN), None);
+        assert_eq!(exclusion(WakeHint::Sync, WOKEN, FAIR), None);
+        assert_eq!(exclusion(WakeHint::None, WOKEN, FAIR), None);
+
+        let mut caller = Wake::new(4, 2, 2);
+        caller.loads = vec![1, 1, 0, 1];
+        assert_eq!(caller.place(None, WakeHint::WakerRuns), 2);
+        assert_eq!(caller.place(Some(2), WakeHint::WakerRuns), 0);
+        caller.affinity = 2;
+        assert_eq!(caller.place(Some(2), WakeHint::WakerRuns), 2);
     }
 
     // The defect caught: a reply-and-receive whose server runs on keeping its

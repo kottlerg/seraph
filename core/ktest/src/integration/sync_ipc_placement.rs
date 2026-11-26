@@ -5,8 +5,8 @@
 
 //! Integration: a call runs its receiver on the caller's CPU when that CPU
 //! queues no other thread and the receiver does not outrank the caller, or
-//! outranks it but last received through `SYS_IPC_REPLY_RECV`, and leaves it
-//! to the other placement rules otherwise
+//! outranks it but last received through `SYS_IPC_REPLY_RECV` and the caller
+//! has no hard affinity, and leaves it to the other placement rules otherwise
 //! (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
 //! "Target CPU selection").
 //!
@@ -17,10 +17,10 @@
 //! apart and each round trip pays a wake IPI to a halted CPU. With the rule
 //! too wide, the server runs ahead of a thread queued on the caller's CPU
 //! while its own CPU idles, or ahead of a caller it outranks and answers with
-//! a plain reply, whose reply wake then waits behind it. With the rule too
-//! narrow, an RT server that answers its fair callers with
-//! `SYS_IPC_REPLY_RECV` (whose reply wake cannot wait behind it) stays apart
-//! from them.
+//! a plain reply, or calls it from a CPU it is pinned to, whose reply wake
+//! then waits behind it. With the rule too narrow, an RT server that answers
+//! its unpinned fair callers with `SYS_IPC_REPLY_RECV` (which sends such a
+//! caller's reply wake off a CPU the server runs on) stays apart from them.
 //!
 //! ## How this exercises it
 //!
@@ -29,7 +29,9 @@
 //! with a fair spinner pinned beside it when the case asks, and an unpinned
 //! server runs on P (CPU 1), clears its affinity there, and parks in its
 //! receive. The caller waits for the park, lets the server's switch-out
-//! finish, and calls. Around each receive the server reads its own placement
+//! finish, and calls; in a case whose caller is unpinned, it clears its
+//! affinity on K right before the call and pins itself to K again before the
+//! next round's wait. Around each receive the server reads its own placement
 //! counts (`CAP_INFO_THREAD_PLACEMENT`): the wakes that reached the rule, those
 //! the rule placed on the waker's CPU, and the load balancer's pulls. It
 //! records them with the CPU the receive returned on. [`ROUNDS`] rounds per
@@ -97,10 +99,16 @@ const DONE_POLLS: u32 = 4_000;
 const SETTLE_MS: u64 = 2;
 
 /// One case: the levels of the server and the caller, whether a fair spinner
-/// is queued on K, whether the server replies with `SYS_IPC_REPLY_RECV`, and
-/// whether the rule runs the server on K (in a `SYS_IPC_REPLY_RECV` case,
-/// from its second round, the first receive being a plain one).
+/// is queued on K, whether the server replies with `SYS_IPC_REPLY_RECV`,
+/// whether the caller stays pinned to K for its call (or clears its affinity
+/// once on K), and whether the rule runs the server on K (in a
+/// `SYS_IPC_REPLY_RECV` case, from its second round, the first receive being
+/// a plain one).
 #[derive(Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a row of the case table: each flag is one independent condition of the case"
+)]
 struct Case
 {
     name: &'static str,
@@ -108,16 +116,18 @@ struct Case
     caller: u8,
     spinner: bool,
     reply_recv: bool,
+    caller_pinned: bool,
     on_k: bool,
 }
 
-const CASES: [Case; 6] = [
+const CASES: [Case; 7] = [
     Case {
         name: "fair",
         server: FAIR,
         caller: FAIR,
         spinner: false,
         reply_recv: false,
+        caller_pinned: true,
         on_k: true,
     },
     Case {
@@ -126,6 +136,7 @@ const CASES: [Case; 6] = [
         caller: FAIR,
         spinner: true,
         reply_recv: false,
+        caller_pinned: true,
         on_k: false,
     },
     Case {
@@ -134,6 +145,7 @@ const CASES: [Case; 6] = [
         caller: RT,
         spinner: false,
         reply_recv: false,
+        caller_pinned: true,
         on_k: true,
     },
     Case {
@@ -142,6 +154,7 @@ const CASES: [Case; 6] = [
         caller: RT,
         spinner: true,
         reply_recv: false,
+        caller_pinned: true,
         on_k: false,
     },
     Case {
@@ -150,15 +163,26 @@ const CASES: [Case; 6] = [
         caller: FAIR,
         spinner: false,
         reply_recv: false,
+        caller_pinned: true,
         on_k: false,
     },
     Case {
-        name: "RT server replying with reply_recv, fair caller",
+        name: "RT server replying with reply_recv, unpinned fair caller",
         server: RT,
         caller: FAIR,
         spinner: false,
         reply_recv: true,
+        caller_pinned: false,
         on_k: true,
+    },
+    Case {
+        name: "RT server replying with reply_recv, pinned fair caller",
+        server: RT,
+        caller: FAIR,
+        spinner: false,
+        reply_recv: true,
+        caller_pinned: true,
+        on_k: false,
     },
 ];
 
@@ -200,12 +224,16 @@ struct ChildArgs
     ep: u64,
     /// Its slot: its IPC page.
     slot: usize,
+    /// The caller's copy of its own Thread cap when it clears its affinity
+    /// for each call, 0 otherwise (and for the server).
+    own: u64,
 }
 
 static CHILD_ARGS: spawn::ArgBlock<ChildArgs, 2> = spawn::ArgBlock::new(ChildArgs {
     cap: 0,
     ep: 0,
     slot: 0,
+    own: 0,
 });
 
 /// Stacks: the server on 0, the caller on 1, the spinner on 2.
@@ -348,6 +376,7 @@ fn rounds(
                 cap: me,
                 ep: server_ep,
                 slot: 0,
+                own: 0,
             },
         )
     };
@@ -366,6 +395,15 @@ fn rounds(
         .map_err(|_| "sync_ipc_placement: cap_copy done failed")?;
     let caller_ep = cap_copy(ep, caller.cs, syscall_abi::RIGHTS_EP_SEND)
         .map_err(|_| "sync_ipc_placement: cap_copy endpoint failed")?;
+    let own = if case.caller_pinned
+    {
+        0
+    }
+    else
+    {
+        cap_copy(caller.th, caller.cs, syscall_abi::RIGHTS_THREAD_CONTROL)
+            .map_err(|_| "sync_ipc_placement: cap_copy thread failed")?
+    };
     // SAFETY: entry 1 is the caller's alone; it has not started, and the
     // previous case's caller has been deleted.
     let arg = unsafe {
@@ -375,6 +413,7 @@ fn rounds(
                 cap: caller_done,
                 ep: caller_ep,
                 slot: 1,
+                own,
             },
         )
     };
@@ -508,7 +547,9 @@ fn ipc_buffer(slot: usize) -> Option<*mut u64>
 extern "C" fn server_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `rounds` published for the server.
-    let ChildArgs { cap: me, ep, slot } = unsafe { spawn::child_args(arg) };
+    let ChildArgs {
+        cap: me, ep, slot, ..
+    } = unsafe { spawn::child_args(arg) };
     let fail = || {
         CHILD_ERRORS.fetch_add(1, Ordering::AcqRel);
     };
@@ -604,7 +645,8 @@ fn record(round: u32, before: [u32; 3], after: [u32; 3])
 
 /// Each round: wait for the server to announce its park, give its switch-out
 /// [`SETTLE_MS`], call, and record the CPU the reply names; then report on
-/// `done`.
+/// `done`. A caller handed its own Thread cap re-pins itself to K before
+/// the wait and clears its affinity right before the call.
 extern "C" fn caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `rounds` published for the caller.
@@ -612,6 +654,7 @@ extern "C" fn caller_entry(arg: u64) -> !
         cap: done,
         ep,
         slot,
+        own,
     } = unsafe { spawn::child_args(arg) };
     let fail = || {
         CHILD_ERRORS.fetch_add(1, Ordering::AcqRel);
@@ -641,7 +684,19 @@ extern "C" fn caller_entry(arg: u64) -> !
             fail();
             break;
         }
+        // An unpinned caller returns to K, waits there pinned, and clears
+        // its affinity right before the call.
+        if own != 0 && (thread_set_affinity(own, K).is_err() || !reach(K))
+        {
+            fail();
+            break;
+        }
         let _ = thread_sleep(SETTLE_MS);
+        if own != 0 && thread_set_affinity(own, AFFINITY_ANY).is_err()
+        {
+            fail();
+            break;
+        }
         // SAFETY: buf is this thread's registered IPC buffer.
         let Ok(reply) = (unsafe { ipc::ipc_call(ep, &request, buf) })
         else

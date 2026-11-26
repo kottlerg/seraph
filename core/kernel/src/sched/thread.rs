@@ -828,7 +828,8 @@ pub struct ThreadControlBlock
     /// `SYS_IPC_REPLY_RECV`: a prediction that it answers the call that
     /// receive takes with a `SYS_IPC_REPLY_RECV` too, whose reply wake is
     /// placed by whether its receive parks. The synchronous wake rule reads it
-    /// to admit a receiver that outranks its caller to the caller's CPU
+    /// to admit a receiver that outranks its caller to the caller's CPU, when
+    /// the caller has no hard affinity and is not in a fault delivery
     /// (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
     /// "Target CPU selection"). Written only by the thread itself, `Relaxed`,
     /// before its receive can link it on a receive queue, and read `Relaxed`

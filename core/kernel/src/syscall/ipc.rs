@@ -1511,12 +1511,16 @@ pub fn sys_ipc_reply_recv(tf: UserFrame) -> Result<u64, SyscallError>
 }
 
 /// Wake `caller`, whose reply deposit the running server `server` has
-/// stamped, placed by `hint`. Returns whether the server must yield to it
-/// before returning to user mode: the wake is [`WakeHint::WakerRuns`], it
-/// placed the caller on this CPU, and the server does not outrank the caller
-/// (core/kernel/docs/ipc-internals.md § Reply-and-Receive Path). A caller above the
-/// server's rank would preempt it at that return anyway; one at the same
-/// rank would otherwise wait behind it until it blocks or its slice ends.
+/// stamped, placed by `hint`, leaving this CPU out when the server outranks
+/// the caller and runs on ([`reply_wake_exclusion`]). Returns whether the
+/// server must yield to it before returning to user mode: the wake is
+/// [`WakeHint::WakerRuns`], it placed the caller on this CPU, and the server
+/// does not outrank the caller (core/kernel/docs/ipc-internals.md
+/// § Reply-and-Receive Path). A caller above the server's rank would preempt
+/// it at that return anyway; one at the same rank would otherwise wait behind
+/// it until it blocks or its slice ends.
+///
+/// [`reply_wake_exclusion`]: crate::sched::reply_wake_exclusion
 ///
 /// # Safety
 /// `caller` must be pinned by `server`'s won reply claim, its deposit
@@ -1536,13 +1540,15 @@ unsafe fn wake_replied(
     let caller_level = unsafe { (*caller).priority };
     // SAFETY: server is the running thread (contract).
     let server_level = unsafe { (*server).priority };
+    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+    let exclude = crate::sched::reply_wake_exclusion(hint, server_level, caller_level, this_cpu);
     // SAFETY: the contract, which is select_target_cpu's.
-    let target_cpu = unsafe { crate::sched::select_target_cpu(caller, hint) };
+    let target_cpu = unsafe { crate::sched::select_target_cpu_excluding(caller, exclude, hint) };
     // SAFETY: caller is pinned by the claim; target_cpu came from
-    // select_target_cpu.
+    // select_target_cpu_excluding.
     unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
     hint == crate::sched::WakeHint::WakerRuns
-        && target_cpu == crate::arch::current::cpu::current_cpu() as usize
+        && target_cpu == this_cpu
         && !crate::sched::run_queue::outranks(server_level, caller_level)
 }
 

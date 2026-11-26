@@ -9,8 +9,9 @@
 //! (`programs/terminal/src/output.rs`).
 //!
 //! The text is lines of 63 letters and a newline, so a sample of 4096 bytes
-//! draws 64 lines and scrolls the screen with each once it is full: the
-//! warm-up writes fill it first. A boot with no framebuffer (headless, the
+//! draws 64 lines and scrolls the screen with each once it is full. Before
+//! each size's samples the screen is filled with untimed writes, so every
+//! timed write of either size scrolls it, whatever the screen held before. A boot with no framebuffer (headless, the
 //! default of `cargo xtask run --runs`) logs a SKIP line.
 
 use bench::{Counters, Value};
@@ -31,8 +32,12 @@ const MAX_SIZE: usize = 4096;
 /// Bytes per line of the text, its newline included.
 const LINE: usize = 64;
 
-/// Untimed writes before each size's timed ones: enough of the larger size
-/// to fill any screen QEMU's adapter gives, so every timed write scrolls.
+/// Untimed writes of the largest size before each size's samples: 1024
+/// lines, enough to fill any screen QEMU's adapter gives, so every timed
+/// write scrolls.
+const FILL: usize = 16;
+
+/// Untimed writes of each size before its timed ones.
 const WARMUP: usize = 16;
 
 /// Timed writes per size.
@@ -67,11 +72,16 @@ pub fn run(fb_class: u64, counters: &Counters, cpus: u32) -> Outcome
         })
         .collect();
     let mut samples = Vec::with_capacity(ITERS);
+    let text_all = text.as_slice();
     for bytes in SIZES
     {
         let text = text
             .get(..bytes)
             .ok_or_else(|| format!("bytes={bytes} exceeds the text"))?;
+        for _ in 0..FILL
+        {
+            write(driver.cap, text_all, ipc_buf).map_err(|e| format!("bytes={bytes}: {e}"))?;
+        }
         samples.clear();
         let idle = IdleSpan::open();
         for i in 0..WARMUP + ITERS

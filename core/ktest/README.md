@@ -478,10 +478,11 @@ is not a stall to the all-idle detector.
 Cycle-accurate benchmarks, read through [shared/bench](../../shared/bench/README.md)'s
 `Counters`: `rdtsc` on x86-64, `csrr cycle` on RISC-V. Each kernel surface measured has its own
 file under `bench/` (a file may hold several benchmarks), mirroring `unit/`'s one-file-per-surface
-rule (`bench/{null,ipc,notification,cap,mm,thread,event,wait_set,tlb}.rs`). `bench::run_all` pins
-the harness thread to CPU 0 for the tier, which the TLB benchmarks' workers leave to it, and hands
-each benchmark the one sample buffer of `MAX_ITERS` (4096) samples: a benchmark runs
-`bench_iters` iterations, cut to that, and records one sample per measured operation.
+rule (`bench/{null,ipc,notification,cap,mm,thread,event,wait_set,tlb}.rs`), and the counter read's
+own cost has `bench/counter.rs`. `bench::run_all` pins the harness thread to CPU 0 for the tier,
+which the TLB benchmarks' workers leave to it, and hands each benchmark the one sample buffer of
+`MAX_ITERS` (4096) samples: a benchmark runs `bench_iters` iterations, cut to that, and records
+one sample per measured operation.
 
 Each benchmark logs one result line, `bench ktest.<name> ...`, in the form
 [shared/bench/README.md § Result line](../../shared/bench/README.md#result-line) specifies,
@@ -513,6 +514,7 @@ benchmark's measured loop
 | `wait_set_cycle` | Wait set create → add → wait → remove → delete, at most 100 iterations |
 | `tlb_shootdown_unmap` | `mem_unmap` cost when ktest's aspace is `current` on every CPU (spinners pinned per CPU). Extra `workers`: the spinners that ran |
 | `tlb_shootdown_concurrent` | Every pinned worker is a concurrent `mem_map` + `mem_unmap` initiator, the iterations shared among them; one line per operation, variant `op=map` (a fresh map) and `op=unmap`. Extra `workers`: the initiators that ran |
+| `empty_window` | Two counter reads with nothing between them: the offset every other line includes ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)) |
 
 ## Test infrastructure
 

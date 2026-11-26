@@ -613,6 +613,42 @@ measured loop
 fails a gating measurement whose line reports a halt or no count, naming the measurement and its
 halts.
 
+A counter read ([shared/bench/README.md § Counters](../shared/bench/README.md#counters)) bounds
+the region between two reads, the benchmark's measured operation, as follows:
+
+- **Compiler.** On both architectures the read's inline assembly declares that it may read and
+  write memory. The compiler therefore keeps every load and store of the region between the two
+  reads, and every one the program puts outside them outside, for memory that code it cannot see
+  could reach. It does not keep register-only work there, nor work whose result nothing uses, nor
+  accesses to memory it can prove the region alone touches. A benchmark therefore makes its region's
+  result observable after the closing read, as `ubench.shmem_ring` does by comparing the bytes it
+  read with those it wrote.
+- **Under icount.** QEMU retires a vCPU's instructions one at a time in program order, and the
+  counter advances one per instruction. A sample is therefore exactly the instructions retired
+  between the two reads: the region as compiled, and the reads' own instructions on the region's
+  side (on x86-64 the `lfence` after the opening `rdtsc`, and the `mfence; lfence` before the
+  closing one).
+- **On hardware, x86-64.** The read is `mfence; lfence; rdtsc; lfence`. `mfence; lfence` holds
+  `rdtsc` until every earlier instruction has completed and every earlier load and store is
+  globally visible. The last `lfence` holds every later instruction until `rdtsc` has read the
+  counter. A window therefore covers all of its region's execution, its stores' drain included,
+  and none of what precedes or follows it, plus the cost of the fences, as the Intel SDM's `RDTSC`
+  entry gives. AMD's processors give it where `lfence` is dispatch-serializing, which AMD's
+  guidance on `lfence` documents per processor family, with the `DE_CFG` bit that makes it so
+  where it is not by default.
+- **On hardware, riscv64.** `csrr cycle` returns the hart's cycle count at the point where the hart
+  executes it, and two reads on one hart are ordered with each other. RISC-V defines no fence that
+  orders a counter read with the execution of other instructions. An in-order hart reads in program
+  order. An out-of-order hart may overlap a small window's edges with the work around it, so a
+  window shorter than its pipeline's depth measures the region only to within that overlap.
+
+Every sample therefore includes the cost of the reads themselves: their instructions on the
+region's side under icount, and on hardware the cycles of those instructions and of the fences.
+The `empty_window` benchmark of each suite, `ktest.empty_window` and `ubench.empty_window`,
+measures that offset as two reads with nothing between them, in both modes. A line's p50 includes
+the offset its suite's `empty_window` line reports in the same mode. No tool subtracts it: a
+reader who wants the region's cost alone subtracts it.
+
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
 (`--mode host`, x86_64 under KVM, on the release build the cell measures, per-measurement bands

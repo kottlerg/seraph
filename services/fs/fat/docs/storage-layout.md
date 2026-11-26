@@ -27,7 +27,11 @@ each mutation in [crash-safety.md](crash-safety.md).
   computation match the Microsoft FAT specification.
 * **Page cache** (`src/cache.rs`): up to its slot ceiling of single-page slots, fixed at init from
   the RAM memmgr reports (`QUERY_POOL_STATUS`): one slot per `SLOT_RAM_DIVISOR` (512) pages of RAM,
-  never fewer than `SLOT_COUNT` (256; `fat_parse::slot_ceiling`). A miss fills its slot with one
+  never fewer than `SLOT_COUNT` (256; `fat_parse::slot_ceiling`). A lookup finds a cached page
+  through an index of the cached pages' LBA-bases sorted with their slots
+  (`fat_parse::page_index`), a binary search whose steps the slot ceiling alone sets, so it costs
+  the same wherever the page's slot is: a slot's index follows the order of the requests the
+  filesystem served before, which the machine's timing decides. A miss fills its slot with one
   `BLK_READ_INTO_MEMORY` of the page, except an `FS_READ_MEMORY` miss on a sequential scan (the read
   starts where the open's last one ended, or at 0 on a fresh open), which fills a run: one
   `BLK_READ_INTO_MEMORY` of up to `fat_parse::RUN_PAGES` (16) pages from the read's page, bounded by
@@ -121,4 +125,5 @@ each mutation in [crash-safety.md](crash-safety.md).
 
 ## Summarized By
 
+[Userspace Hot-Path Instruction Account](../../../../core/kernel/docs/hot-path-account-userspace.md),
 [services/fs/fat/README.md](../README.md)

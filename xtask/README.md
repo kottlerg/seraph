@@ -1617,8 +1617,9 @@ Run the bounded proofs ([docs/testing.md](../docs/testing.md#bounded-verificatio
 verification) with the pinned Kani release.
 
 ```
-cargo xtask kani [--component <CRATE> [--harness <NAME>]] [--list]
+cargo xtask kani [--component <CRATE> [--harness <NAME> | --shard <K/N>]] [--list]
 cargo xtask kani --since <COMMIT> [--list]
+cargo xtask kani --plan [--since <COMMIT>] [--github-output <FILE>]
 cargo xtask kani --pin
 ```
 
@@ -1627,7 +1628,10 @@ cargo xtask kani --pin
 | `--component <CRATE>` | every crate that holds a harness | Verify the harnesses of this crate only, by its package name |
 | `--harness <NAME>` | every harness | Verify this harness only, by its path in the crate (`cpu_mask::proofs::<name>`); needs `--component` |
 | `--since <COMMIT>` | every crate that holds a harness | Verify the crates the change from this commit to the working tree can affect (below); takes no `--component` |
+| `--shard <K/N>` | every harness | Verify the K-th of N parts of the crate's harnesses (below); needs `--component`, takes no `--harness` |
 | `--list` | `false` | Print the package of each crate the run would verify, one a line, and exit, verifying nothing; needs no Kani |
+| `--plan` | `false` | Print the jobs CI's matrix runs for the crates the run would verify (below), one `<package> <K/N>` a line, and exit, verifying nothing; needs no Kani; takes `--since` only |
+| `--github-output <FILE>` | none | With `--plan`, append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): `matrix`, an `include` list of `package` and `shard`, and `owed`, whether it holds a job |
 | `--pin` | `false` | Print the pinned release (`KANI_VERSION`) and exit, verifying nothing; takes no other option |
 
 The command first finds the crates to verify, keeping no list of them: the crate of every tracked
@@ -1648,26 +1652,39 @@ crate is affected when a changed file is an input of every proof, one that can c
 verdict: an input of every build (the workspace `Cargo.toml` and `Cargo.lock`,
 `rust-toolchain.toml`, `.cargo/config.toml`), or the command's own source,
 `xtask/src/commands/kani.rs`, which holds the Kani pin, the arguments and the memory limit it runs
-`cargo kani` with, and the judge of Kani's output. What decides only which crates are verified (the
-selection in `xtask/src/affected.rs`) is not one, nor is a workflow, and a change to it alone
-selects no crate. The change is taken from the merge base of `<COMMIT>` and `HEAD`,
-so a branch behind `<COMMIT>` is charged its own change alone. A package's build script, features
-and `cfg` settings lie in its directory or the workspace manifest, so a change to them selects it. A
-commit the checkout does not hold fails the command, so a shallow clone never narrows the run. With
-no crate affected the command verifies nothing and does not check the installed release.
+`cargo kani` with, and the judge of Kani's output. What decides only which crates are verified, or
+whether and where a job runs them (the selection in `xtask/src/affected.rs`, the workflows), is not
+one, and a change to it alone selects no crate, save one: a change to `.github/workflows/kani.yml`
+or `.github/workflows/build-test.yml`, whose steps run CI's `kani` jobs, that selects no crate
+otherwise selects the crate with the fewest harnesses (the first by directory among equals), so the
+jobs' install, setup and run steps run. The change is taken from the merge base of `<COMMIT>` and
+`HEAD`, so a branch behind `<COMMIT>` is charged its own change alone. A package's build script,
+features and `cfg` settings lie in its directory or the workspace manifest, so a change to them
+selects it. A commit the checkout does not hold fails the command, so a shallow clone never narrows
+the run. With no crate affected the command verifies nothing and does not check the installed
+release.
 
 It then checks that `cargo kani --version` names `KANI_VERSION`, and
 fails naming the install commands ([docs/build-system.md](../docs/build-system.md#toolchain)
 § Toolchain) on another release or none.
 
+With `--shard K/N`, the command asks Kani for the crate's harnesses (`cargo kani --tests -p
+<package> list --format json`, under the memory limit below), sorts their paths, and verifies every
+N-th from the K-th (`--exact` and one `--harness` a path), so the N shards of a crate take each
+harness exactly once, and a harness added to the crate joins a shard with no change elsewhere. With
+`--plan`, it verifies nothing and prints the jobs of the crates the run would verify: one for each
+crate, or one for each shard of a crate `SHARDS` in the command's source splits, never more shards
+than the crate's harnesses; it fails on an entry of `SHARDS` that names no crate that holds a
+harness.
+
 For each selected crate it runs `cargo kani --tests -p <package>` (with `--harness` when given),
 which builds the crate in its host test configuration, as `cargo xtask test` does, and verifies each
 harness with Kani's unwinding assertions on. It runs `cargo kani` under `prlimit --as` (util-linux),
 which holds each process of the run (`cargo`, the Kani compiler, and the CBMC of each harness, which
-Kani runs one at a time) to 12 GiB of address space (`MEMORY_LIMIT_GIB`), which leaves 4 GB of a
-16 GB machine to its other processes, so a harness whose CBMC needs more fails, named as out of
-memory under the limit, where without it the host would swap or kill processes and the run give no
-verdict. It prints Kani's
+Kani runs one at a time) to 12 GiB of address space (`MEMORY_LIMIT_GIB`). The limit derives from the
+runner CI's `kani` jobs run on (`ubuntu-latest` for a public repository: 4 vCPUs, 16 GB), leaving
+4 GB to the runner's own processes, so a harness whose CBMC needs more fails, named as out of memory
+under the limit, where without it the runner would be shut down with no verdict. It prints Kani's
 output as it comes and judges it as well as Kani's verdict: the crate fails when `cargo kani` exits
 unsuccessfully, when a harness's verdict is not `SUCCESSFUL`, when a harness has an `UNDETERMINED`
 check or a `FAILURE` check (a `#[kani::should_panic]` harness's expected panics aside, which Kani's
@@ -1678,19 +1695,24 @@ wall-clock time, given as its unstable `--harness-timeout` (with `-Z unstable-op
 on with the next harness; the command fails such a harness as over budget, naming it and the limit
 ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification). Every
 selected crate runs, and the command then prints a table of every harness, by package and path,
-with its verdict and verification time, then the same table of the ten slowest, slowest first, and
-fails naming each crate that failed.
+with its verdict and verification time, then the same table of the ten slowest, slowest first, then
+each crate's harness count and the sum of its harnesses' verification times, which size `SHARDS`,
+and fails naming each crate that failed.
 
-No CI workflow runs the command. A pull request whose change can affect a harnessed crate runs
-`--since <merge base>` at its validated head and reports the run in its body, and the release host
-runs run it with no option ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded
-verification).
+CI's `kani` jobs (`.github/workflows/kani.yml`) run the command. Their `plan` job runs `--plan`
+with `--github-output`: in `build-test.yml`, `--since` the base its `select` job found, with
+`cargo xtask cells --since-covered` on a pull request and `--since-green` on a push to `master`, or
+a dispatch's `kani-since` input, and with no `--since` when there is none; in `burnin.yml` with no
+`--since`. When the plan holds no job it says so in a notice on the run and no `prove` job runs;
+otherwise each `prove` job installs the release `--pin` prints and runs `--component <package>
+--shard <K/N>`, and `kani-result` judges them
+([docs/build-system.md](../docs/build-system.md#continuous-integration) § Continuous Integration).
 
 The development host carries the pinned release, which the maintainer installs, and an assistant
 session runs `cargo xtask kani` there. A session installs nothing (`cargo install` is outside the
 permissions `.claude/settings.json` grants) and does not run `cargo kani` itself, which the
 `bash` hook refuses ([§ `cargo xtask hook`](#cargo-xtask-hook)). A new or changed harness is
-sized there, under the limit the command sets, before it is pushed
+sized there, under the limit the command sets, before CI runs it
 ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification).
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`

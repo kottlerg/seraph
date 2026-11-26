@@ -176,7 +176,7 @@ service executes as built, since procmgr verified it.
   request whose change can affect it and the campaign for 30 minutes.
 - The `proofs` module of `shared/hwrng-protocol/src/lib.rs` proves `requested_len` on every request
   and, by induction over a reply's words, `decode_reply` and `encode_reply`
-  ([testing.md](testing.md) § Bounded verification); `cargo xtask kani` runs them.
+  ([testing.md](testing.md) § Bounded verification); CI's `kani` jobs run them.
 - Planned: property functions, fuzz targets and proof harnesses for the decoders of `shared/ipc` and
   `shared/namespace-protocol` (`gate_open`, `compose_forward_lookup_rights`, `validate_name`), in
   [#680](https://github.com/kottlerg/seraph/issues/680) and
@@ -251,8 +251,8 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   job runs it on a pull request whose change can affect it and the campaign for 30 minutes.
 - The `proofs` module of `services/vfsd/gpt/src/lib.rs` proves the property's check of a header and
   of an entry over every input, the choice between the two copies, and, by induction, the CRC32, the
-  entry-array walk and the lookup ([testing.md](testing.md) § Bounded verification);
-  `cargo xtask kani` runs them, and the boot-disk lookup and the named resolution over every disk
+  entry-array walk and the lookup ([testing.md](testing.md) § Bounded verification); CI's
+  `kani` jobs run them, and the boot-disk lookup and the named resolution over every disk
   set they bound.
 - `storage-statement` (`xtask/fuzz/targets/src/bin/storage-statement.rs`) drives
   `storage_statement::property::storage_statement_holds` from the seeds in
@@ -339,7 +339,7 @@ loader reached only through such an image is a defect, not an attack.
   CI's gating `fuzz` job runs it on a pull request whose change can affect it and the campaign for
   30 minutes.
 - The `proofs` module of `shared/elf/src/lib.rs` proves the same property by induction over
-  each walk ([testing.md](testing.md) § Bounded verification); `cargo xtask kani` runs them. A step
+  each walk ([testing.md](testing.md) § Bounded verification); CI's `kani` jobs run them. A step
   proof runs each walk's step on any element and any state (a program header, a dynamic entry and
   any gathered tags, a relocation record, a note record at any offset, a section header), and a
   base proof runs each walk whole on a short table at a fixed place: two program headers at
@@ -355,8 +355,8 @@ loader reached only through such an image is a defect, not an attack.
   gating `fuzz` job runs it on a pull request whose change can affect it and the campaign for 30
   minutes.
 - The `proofs` module of `shared/driver-binding/src/decl.rs` proves the same property by
-  induction over the field walk ([testing.md](testing.md) § Bounded verification);
-  `cargo xtask kani` runs them. The header and the field cut are proven on any descriptor up to
+  induction over the field walk ([testing.md](testing.md) § Bounded verification); CI's
+  `kani` jobs run them. The header and the field cut are proven on any descriptor up to
   their bounds, the step on any field of a payload up to 33 bytes into any builder its invariant
   admits, and the finish on any builder. The loop that drives the steps, and the round trip of a
   declaration taken through `encode`, are left to the fuzz target.
@@ -413,7 +413,7 @@ is.
   `FramebufferInfo::from_bytes` on every record, the bundle's `parse_header` and `entry_at` on every
   input of up to two entries, and, by induction, the walk of the entry headers; that of
   `abi/init-protocol/src/lib.rs` proves the trim of every name and, by induction, `find_module_slot`
-  ([testing.md](testing.md) § Bounded verification). `cargo xtask kani` runs them.
+  ([testing.md](testing.md) § Bounded verification). CI's `kani` jobs run them.
 - `devmgr-firmware` (`xtask/fuzz/targets/src/bin/devmgr-firmware.rs`) drives
   `devmgr_firmware::property::firmware_holds` over an input read as each firmware table devmgr's
   `firmware` crate interprets, from the seeds in
@@ -455,7 +455,7 @@ is.
   window and the SPCR's MMIO base; each aperture seed; the record of a CPU ID and the sizing of the
   CPU-ID array; and the steps of the compatible, CPU and interrupt-controller walks of the device
   tree from any state, the `mmu-type` claim, the time base, the IMSIC files and the ISA string's
-  match. `cargo xtask kani` runs them. The loops that drive the steps are left to the fuzz targets.
+  match. CI's `kani` jobs run them. The loops that drive the steps are left to the fuzz targets.
 
 **Gaps.**
 
@@ -525,7 +525,7 @@ describes the remapping units truly.
   induction over a queue's life, that every chain submitted and every used element taken keeps the
   queue's bookkeeping consistent and frees only an outstanding chain, and the placement of a
   configuration word and the settling of a 64-bit read ([testing.md](testing.md) § Bounded
-  verification); `cargo xtask kani` runs them.
+  verification); CI's `kani` jobs run them.
 - The booted `dma-confinement` and `hotplug` cases test the confinement policy and hot-add
   ([testing.md](testing.md) § Gating).
 
@@ -583,7 +583,7 @@ and the verifier), `shared/crypto` (the primitives), `core/boot/src/main.rs`,
   request whose change can affect it and the campaign for 30 minutes.
 - The `proofs` modules of `shared/objsig/src/trailer.rs`, `attrs.rs`, `cert.rs`, `store.rs` and
   `enrol.rs` prove the same property by induction over each walk ([testing.md](testing.md)
-  § Bounded verification); `cargo xtask kani` runs them. The footer, the record cut and the close
+  § Bounded verification); CI's `kani` jobs run them. The footer, the record cut and the close
   are proven on any input up to their bounds, a record's decode on any fields of each certificate
   length, the attributes on any input of up to 103 bytes, the certificate on any input, each
   store's header layout on any input up to one anchor and one revoked key id, an anchor's check on

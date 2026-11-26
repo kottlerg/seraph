@@ -8,7 +8,7 @@
 # job for each crate it verifies, or for each shard of a crate xtask splits,
 # and kani-result, which judges them. The caller's concurrency group applies,
 # so a pull request's newer push cancels these jobs with the rest of its
-# older run (docs/build-system.md § Continuous Integration).
+# older run (docs/conventions.md § CI Gating).
 
 name: kani
 

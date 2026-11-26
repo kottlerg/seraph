@@ -62,10 +62,11 @@ pub const KANI_VERSION: &str = "0.68.0";
 
 /// The address space, in GiB, each process of a run may map: `cargo`, the
 /// Kani compiler, and each harness's CBMC, which Kani runs one at a time.
-/// A harness gets 12 GiB, which leaves 4 GB of a 16 GB machine to the
-/// host's other processes, so a harness that needs more fails with an
-/// out-of-memory error, which [`Judge`] reports by name, where without the
-/// limit the host would swap or kill processes and the run report nothing.
+/// Derived from the runner CI's `kani` jobs run on (`ubuntu-latest` for a
+/// public repository: 4 vCPUs, 16 GB): a harness gets 12 GiB, and the other
+/// 4 GB stay with the runner's own processes, so a harness that needs more
+/// fails with an out-of-memory error, which [`Judge`] reports by name, where
+/// without the limit the runner is shut down and the job reports nothing.
 const MEMORY_LIMIT_GIB: u64 = 12;
 
 /// The wall-clock time, in seconds, each harness's CBMC may run: Kani's

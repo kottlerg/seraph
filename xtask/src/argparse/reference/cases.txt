@@ -27229,3 +27229,31 @@ help xtask path-account write -h
 
 ["build","--limited-debug","kernel,ktest","--debug","kernel"]
 ok build debug=["kernel"] limited_debug=["kernel","ktest"]
+
+["build","--opt-level","shmem=3"]
+ok build opt_level=["shmem=3"]
+
+["build","--release","--opt-level","shmem=3,framebuffer=s"]
+ok build release opt_level=["shmem=3","framebuffer=s"]
+
+["build","--opt-level","shmem=3","--opt-level","virtio-blk=z"]
+ok build opt_level=["shmem=3","virtio-blk=z"]
+
+["build","--opt-level","shmem"]
+ValueValidation
+error: invalid value 'shmem' for '--opt-level <PKG=LEVEL>': "shmem" is not <package>=<level>
+
+["build","--opt-level","shmem=4"]
+ValueValidation
+error: invalid value 'shmem=4' for '--opt-level <PKG=LEVEL>': no opt-level "4"; expected one of: 0, 1, 2, 3, s, z
+
+["build","--opt-level","=3"]
+ValueValidation
+error: invalid value '=3' for '--opt-level <PKG=LEVEL>': "" is not a package name
+
+["build","--opt-level"]
+InvalidValue
+error: a value is required for '--opt-level <PKG=LEVEL>' but none was supplied
+
+["build","--debug","kernel","--opt-level","shmem=3"]
+ok build debug=["kernel"] opt_level=["shmem=3"]

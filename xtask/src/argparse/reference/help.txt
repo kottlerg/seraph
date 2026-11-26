@@ -92,6 +92,7 @@ Options:
       --component <COMPONENT>          Build only one component (default: all): `boot`, or the crate name of any component the build installs [default: all]
       --debug <DEBUG>                  Emit debuginfo (`debug = 2`, `opt-level = 1`) for the named component(s) only, within the active profile (default or `--release`). Comma-separated, e.g. `--debug kernel,procmgr`; names match `--component`. Only components in the current build are affected
       --limited-debug <LIMITED_DEBUG>  Emit limited debuginfo (`debug = "limited"`: line tables and function frames, inlined ones included, without types or variables) for the named component(s), at the active profile's own opt-level, so the code is the code a build without it emits; a component `--debug` also names takes `--debug`. Comma-separated, names as for `--debug`. `cargo xtask path-account` reads the kernel's and ktest's
+      --opt-level <PKG=LEVEL>          Build the named workspace package(s) at another opt-level within the active profile, as `<package>=<level>`, the level one of 0, 1, 2, 3, s or z. Comma-separated, e.g. `--opt-level shmem=3,framebuffer=3`. A package is any of the workspace, a library included: it applies wherever the build compiles it. Refused for a package `--debug` names, which sets its opt-level to 1
       --ktest-bench-only               Build ktest with its `bench-only` feature: the benchmark tier alone, each benchmark at its full iteration count, for a run whose result lines are compared (core/ktest/README.md "Tier 3"). Needs a build that includes ktest (`--component all` or `ktest`)
       --wait-host <SECS>               When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override                  Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
@@ -124,6 +125,9 @@ Options:
 
       --limited-debug <LIMITED_DEBUG>
           Emit limited debuginfo (`debug = "limited"`: line tables and function frames, inlined ones included, without types or variables) for the named component(s), at the active profile's own opt-level, so the code is the code a build without it emits; a component `--debug` also names takes `--debug`. Comma-separated, names as for `--debug`. `cargo xtask path-account` reads the kernel's and ktest's
+
+      --opt-level <PKG=LEVEL>
+          Build the named workspace package(s) at another opt-level within the active profile, as `<package>=<level>`, the level one of 0, 1, 2, 3, s or z. Comma-separated, e.g. `--opt-level shmem=3,framebuffer=3`. A package is any of the workspace, a library included: it applies wherever the build compiles it. Refused for a package `--debug` names, which sets its opt-level to 1
 
       --ktest-bench-only
           Build ktest with its `bench-only` feature: the benchmark tier alone, each benchmark at its full iteration count, for a run whose result lines are compared (core/ktest/README.md "Tier 3"). Needs a build that includes ktest (`--component all` or `ktest`)

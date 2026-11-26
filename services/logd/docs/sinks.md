@@ -11,8 +11,8 @@ a program reads, follows and steers the log.
 Built: the eight severities and their console tags, the console prefix
 `[sec.usfrac] LEVEL  [name] ` that both receivers write, the kernel's records read and written as
 `[kernel]` lines, the serial and framebuffer outputs as two sinks with a bounded queue and a writer
-thread each, and the serial sink's writes with `SERIAL_WRITE_SENT`
-([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks).
+thread each, and the serial sink's writes of a line as plain chunks and then a zero-length
+`SERIAL_WRITE_SENT` barrier ([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks).
 
 Everything else this document states is design intent, not yet implemented, unless a sentence names
 it as built. Each section names the Issue that builds it. Until an Issue lands,
@@ -213,18 +213,21 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
 - **serial's "written" means sent** (built, #1497). The serial driver answers a plain
   `SERIAL_WRITE_BYTES` once the bytes are in its transmit ring, and a write with the flag
   `SERIAL_WRITE_SENT` (label bit 32) once they, and every byte written before them, have left the
-  UART; a zero-length write with the flag is a barrier for every write before it. Today logd's
-  serial sink writes each chunk of an entry with the flag. The virtio-console driver answers every
-  write once the device has taken it, and needs no flag. The `hold` pace, the `SINK_STALL_MS` bound
-  on a write, the kernel reader's acknowledgement (§ The kernel's lines) and the pass marker and
-  crash reports being on serial before power-off all rest on serial's cursor passing an entry only
-  once its bytes are on the wire.
+  UART; a zero-length write with the flag is a barrier for every write before it. logd's serial sink
+  writes a line's chunks as plain writes and then that barrier (built, #1703). The virtio-console
+  driver answers every write once the device has taken it, and ignores the flag. The `hold` pace,
+  the `SINK_STALL_MS` bound on a write, the kernel reader's acknowledgement (§ The kernel's lines)
+  and the pass marker and crash reports being on serial before power-off all rest on serial's cursor
+  passing an entry only once its bytes are on the wire.
 - **A `STALLED` answer.** The driver answers a write that waited on a transmitter making no
   progress `STALLED` after its `TX_STALL_MS` (1000 ms), the same answer whichever wait stalled.
-  Today logd's writer takes it as it takes any answer (#1703). In this design (#928) the writer
-  writes an entry in two steps whose `STALLED` answers each mean one thing, and a `STALLED` answer
-  does not move serial's cursor: the sink is stalled (§ Pace) and the writer repeats the step that
-  stalled until it is answered without `STALLED`, each attempt bounded by the driver's stall bound.
+  The writer writes an entry in two steps whose `STALLED` answers each mean one thing (built,
+  #1703). Today's writer, which writes from a queue, ends the line on either answer and stalls the
+  sink: a chunk answered `STALLED` drops the line, counted, and a barrier answered `STALLED` ends a
+  line already in the ring, uncounted ([ipc-interface.md](ipc-interface.md) § Output sinks). In
+  this design (#928) a `STALLED` answer does not move serial's cursor: the sink is stalled (§ Pace)
+  and the writer repeats the step that stalled until it is answered without `STALLED`, each attempt
+  bounded by the driver's stall bound.
   1. Each chunk of the entry as a plain write. `STALLED` here means the chunk was not appended to
      the ring, so the writer writes that chunk again and goes on from it, not from the entry's
      first chunk. Without the transmit interrupt the driver writes a chunk byte by byte and stops
@@ -235,7 +238,8 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
   A call that fails, the driver's endpoint withdrawn
   ([serial driver](../../drivers/serial/README.md) § Endpoint), is not a `STALLED` answer: the
   bytes the dead driver accepted died with its ring, so the sink is unserved and the writer writes
-  the entry again from its first chunk on the next driver it resolves. The cursor passes the entry
+  the entry again from its first chunk on the next driver it resolves, where today's writer counts
+  the line as dropped. The cursor passes the entry
   only once the barrier is answered without `STALLED` by the driver that accepted every chunk of
   it, so it never passes an entry unsent.
 - **`LOG_FLUSH`** (#928) waits for serial's cursor, which passes an entry only once it is sent, and
@@ -587,7 +591,7 @@ Each later sink is built against the interface above and changes none of it.
 | Disk (#1496) | every entry in `seq` order from its start, `relayed` and `previous` included; the gaps it could not read; each entry's sender name after the sender died; to learn of a logd restart; wall time for its timestamps | the ascending unfiltered walk from `seq` 0, the oldest, the dense `seq`, the slot serial and `QUERY_SLOTS`, the token and the epoch, its own `timed` seed |
 | Network syslog (#1499, #1500) | the RFC 5424 fields of each entry; the facility, severity and host name; APP-NAME and PROCID per instance; TLS | the record and § The rfc5424 format; its own recipe's settings; the TLS stack in its own process (#1500), none in logd |
 | pstore (#1498) | each entry as a record at memory speed; a way to bring the previous boot's entries back | a device sink inside logd; the `previous` origin |
-| Serial transmit (#1497, built) | nothing from logd's interface; for the serial sink, a write answered once its bytes have left the UART (§ Device sinks), while a plain write is answered once its bytes are in the transmit ring | the serial driver's `SERIAL_WRITE_SENT` flag (label bit 32) on `SERIAL_WRITE_BYTES`, which logd's serial sink writes with, so `LOG_FLUSH` waits for serial's cursor alone |
+| Serial transmit (#1497, built) | nothing from logd's interface; for the serial sink, a write answered once its bytes have left the UART (§ Device sinks), while a plain write is answered once its bytes are in the transmit ring | the serial driver's `SERIAL_WRITE_SENT` flag (label bit 32) on `SERIAL_WRITE_BYTES`, which logd's serial sink ends each line with as a zero-length barrier (#1703, built), so `LOG_FLUSH` waits for serial's cursor alone |
 
 ---
 

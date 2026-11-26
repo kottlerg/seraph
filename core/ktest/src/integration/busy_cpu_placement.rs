@@ -25,10 +25,12 @@
 //! pins itself to the last CPU, P, beside [`P_SPINNERS`] floor-level spinners
 //! pinned there, so P's load stays above the imbalance threshold. One
 //! floor-level spinner, pinned to CPU 0 (B), yields in a loop, so B runs it
-//! with nothing queued. A worker at an RT level runs on P, clears its
+//! with nothing queued. A worker at the floor level runs on P, clears its
 //! affinity, and parks; the harness wakes it, and since its preferred CPU, P,
 //! is past the threshold of the least load, the wake goes to the least-loaded
-//! CPU. The worker records the CPU it wakes on, pins itself back to P, and
+//! CPU. The worker is fair because an RT thread's wake is placed by rank
+//! first, under which B, running a fair thread, never ties an idle CPU (§
+//! Thread Assignment), so an RT worker would not reach the least-load tie. The worker records the CPU it wakes on, pins itself back to P, and
 //! parks again, for [`ROUNDS`] rounds.
 //!
 //! ## Pass criterion
@@ -56,10 +58,6 @@ const ROUNDS: u32 = 32;
 /// the imbalance threshold (2) of an idle CPU's whatever the idle thread's
 /// link, so no wake sticks to P.
 const P_SPINNERS: usize = 4;
-
-/// The worker's level: an RT level below the harness's `INIT_PRIORITY` (30)
-/// and above the floor-level spinners, so it takes a spinner's CPU at once.
-const WORKER_PRIORITY: u8 = 24;
 
 /// `SYS_THREAD_SET_AFFINITY`'s value clearing a hard affinity.
 const AFFINITY_ANY: u32 = u32::MAX;
@@ -223,8 +221,7 @@ fn rounds(
     let worker = worker
         .first_mut()
         .ok_or("busy_cpu_placement: no worker slot")?;
-    *worker = spawn::new_child_at(ctx, ctx.sched_control_cap, WORKER_PRIORITY)
-        .map_err(|_| "busy_cpu_placement: spawn worker failed")?;
+    *worker = spawn::new_child(ctx).map_err(|_| "busy_cpu_placement: spawn worker failed")?;
     let me = cap_copy(worker.th, worker.cs, syscall_abi::RIGHTS_THREAD_CONTROL)
         .map_err(|_| "busy_cpu_placement: cap_copy thread failed")?;
     let worker_go = cap_copy(go, worker.cs, syscall_abi::RIGHTS_NTF_WAIT)

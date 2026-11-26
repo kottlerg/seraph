@@ -413,37 +413,35 @@ skipping levels, risks deadlock.
 **Per-CPU scheduler fields (`core/kernel/src/sched/run_queue.rs`).** Every CPU reaches every
 `PerCpuScheduler` through a shared reference (`sched::scheduler_for`); none is reached through a
 `&mut` another CPU could alias. Its `lock` owns the run queues (the head/tail lists of each RT
-level, of the fair queue, and of the idle level),
-which are its one non-atomic state and are touched only by the methods whose contract is that the
-caller holds that lock (`enqueue`, `enqueue_at_head`, `dequeue_highest`, `remove_from_queue`,
-`relink`, `find_runnable`; the
-single-threaded boot link and dispatch of init are the exception the Scheduling row of § Cross-CPU
-TCB Ownership names). `current` is atomic: written by `init` on the boot CPU before any CPU
-schedules, and by `sched::enter` for CPU 0 without `lock` (its boot dispatch of init, before CPU
-0 first schedules), then only by its own CPU, under `lock`, and read by any CPU under `lock` or
-as a lock-free snapshot that a later check re-decides or another edge (`context_saved`) orders.
-`idle` is written once by `init` before the CPU schedules. `current_level`, the level `current` was
-dispatched at, is written and read only by its own CPU with interrupts masked: written at each
-dispatch (`schedule()`'s dispatch flip under the incoming thread's `sched_lock`, its same-thread
-re-mark under the running thread's, the idle level when it switches to idle, and `sched::enter`'s
-boot dispatch of init) and at the wake preemption's re-record of a stale level, under the running
-thread's `sched_lock`, and read by its `timer_tick`, which may not read the running thread's
-`priority` without that thread's `sched_lock`. `outranking`, the `non_empty` bits of the queues
-above `current_level`'s, is written with it by the same CPU, and by `sys_thread_set_priority` on
-any CPU, with every bit only, under the running thread's `sched_lock`; it is read only by its
-own CPU, by `outranked` at its returns to user mode ([scheduler.md](scheduler.md) § Wake
-Preemption). `saved_lock_flags` is the interrupt
-word an all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_flags`,
+level, of the fair queue, and of the idle level), which are its one non-atomic state and are touched
+only by the methods whose contract is that the caller holds that lock (`enqueue`, `enqueue_at_head`,
+`dequeue_highest`, `remove_from_queue`, `relink`, `find_runnable`; the single-threaded boot link and
+dispatch of init are the exception the Scheduling row of § Cross-CPU TCB Ownership names). `current`
+is atomic: written by `init` on the boot CPU before any CPU schedules, and by `sched::enter` for CPU
+0 without `lock` (its boot dispatch of init, before CPU 0 first schedules), then only by its own
+CPU, under `lock`, and read by any CPU under `lock` or as a lock-free snapshot that a later check
+re-decides or another edge (`context_saved`) orders. `idle` is written once by `init` before the CPU
+schedules. `current_level`, the level `current` was dispatched at, is written only by its own CPU
+with interrupts masked: written at each dispatch (`schedule()`'s dispatch flip under the incoming
+thread's `sched_lock`, its same-thread re-mark under the running thread's, the idle level when it
+switches to idle, and `sched::enter`'s boot dispatch of init) and at the wake preemption's re-record
+of a stale level, under the running thread's `sched_lock`, and read by its `timer_tick`, which may
+not read the running thread's `priority` without that thread's `sched_lock`, and, as a placement
+hint, by an RT wake's placement on any CPU (`PerCpuScheduler::ranks`, § Target CPU selection, "The
+RT rule"). `outranking`, the `non_empty` bits of the queues above `current_level`'s, is written with
+it by the same CPU, and by `sys_thread_set_priority` on any CPU, with every bit only, under the
+running thread's `sched_lock`; it is read only by its own CPU, by `outranked` at its returns to user
+mode ([scheduler.md](scheduler.md) § Wake Preemption). `saved_lock_flags` is the interrupt word an
+all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_flags`,
 `unlock_saved_flags`). `idle_pull_candidate`, the idle pull's confirmation sample,
 `idle_pull_episode`, the backlog episode that sample read, `idle_pull_held`, whether the previous
 idle tick held it for a busy SMT sibling, and `idle_pull_cursor`, where its scan starts
-([scheduler.md](scheduler.md) § Load Balancing, § SMT Awareness), are written and read only by
-their own CPU's `timer_tick`. `backlog_episode`, the CPU's backlog episode, is owned by
-`lock`: written only by `link` and `remove_from_queue`, under it, and read under it by a pull's
-re-check and without it by an idle CPU's sample, which the pull re-decides. `non_empty`, `load`,
-`backlog_episode`, `idle_pull_candidate`, `idle_pull_episode`, `idle_pull_held`,
-`idle_pull_cursor` and the deferred-reclaim head are atomics with their own orderings (§ Atomic
-Ordering Invariants).
+([scheduler.md](scheduler.md) § Load Balancing, § SMT Awareness), are written and read only by their
+own CPU's `timer_tick`. `backlog_episode`, the CPU's backlog episode, is owned by `lock`: written
+only by `link` and `remove_from_queue`, under it, and read under it by a pull's re-check and without
+it by an idle CPU's sample, which the pull re-decides. `non_empty`, `load`, `backlog_episode`,
+`idle_pull_candidate`, `idle_pull_episode`, `idle_pull_held`, `idle_pull_cursor` and the
+deferred-reclaim head are atomics with their own orderings (§ Atomic Ordering Invariants).
 
 **Lock primitive.** All locks above except the derivation tree lock are `crate::sync::Spinlock`
 (IRQ-disabling); the derivation tree lock is a bare spin lock (below). Hold-time MUST be bounded
@@ -839,10 +837,10 @@ set by the all-locks commit, or under the remote run-queue lock the stop protoco
 which `sys_thread_start`'s commit also takes, and holds it across its writes.
 `select_target_cpu` reads `cpu_affinity` without `sched_lock`; the link re-reads it under the lock
 (the `cpu_affinity` enforcement invariant below). Its synchronous rule reads `priority`, of the
-woken thread and of the waker running on its own CPU, without `sched_lock`, as placement hints: a
-read that races a priority change misjudges one placement, which the rules after it and the idle
-pull bound (§ Wake Protocol Invariants, "Target CPU selection"), and `enqueue_and_wake` links the
-thread at the `priority` it reads under the lock.
+woken thread and of the waker running on its own CPU, and its RT rule the woken thread's, without
+`sched_lock`, as placement hints: a read that races a priority change misjudges one placement,
+which the rules after it and the idle pull bound (§ Wake Protocol Invariants, "Target CPU
+selection"), and `enqueue_and_wake` links the thread at the `priority` it reads under the lock.
 
 | Field group | Fields | Owning lock | Cross-CPU access rule |
 |---|---|---|---|
@@ -1282,7 +1280,9 @@ and `commit_blocked`'s `Running→Blocked` commit because all three contend for 
 (`cpu_affinity != AFFINITY_ANY`), (2) save-window pinning to
 `preferred_cpu` while `context_saved == 0` (closes the cross-CPU
 `schedule()` spin against the source CPU's in-flight save), (3) for a
-`WakeHint::Sync` wake, the waker's CPU, under the guard below, (4) sticky
+`WakeHint::Sync` wake, the waker's CPU, under the guard below, then, for a woken
+thread at an RT level, the RT rule below, which places it on its preferred CPU when it
+runs there at once and otherwise on the CPU of the lowest rank, (4) sticky
 `preferred_cpu` when its load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD`
 of the global `min_load`, except, for a `WakeHint::WakerRuns` wake, when
 `preferred_cpu` is the waker's CPU, and (5) the least-loaded CPU, a tie going to
@@ -1357,13 +1357,47 @@ threshold), and the same bound clears it: the woken thread is unpinned (a pinned
 rule 1) and saved (a mid-save one returned at rule 2), so an idle CPU's pull takes it within the
 idle-pull bound of [scheduler.md](scheduler.md) § Load Balancing. The two `priority` reads are
 placement hints taken without `sched_lock` (§ Cross-CPU TCB Ownership); `enqueue_and_wake`
-re-reads the woken thread's under the lock for the link. A rule placing an RT wake on a CPU where
-it runs at once (#824's RT placement rule, not in the tree) goes between rules 3 and 4; it must not
-apply its open-CPU test to k on a `Sync` wake, whose waker's committed park leaves k open though
-k's `current_level` still names the waker.
+re-reads the woken thread's under the lock for the link.
+
+**The RT rule (between rules 3 and 4).** A woken thread whose `priority` is an RT level
+(`RT_PRIORITY_MIN` or above) is placed by rank (`place_rt_wake`). A level's rank is the index of
+its run queue (`run_queue::level_rank`): the idle level 0, every fair level 1, the RT levels above
+in level order. A CPU's ranks (`PerCpuScheduler::ranks`, `run_queue::CpuRanks`) are its
+`current_level`'s rank and the rank of its highest non-empty queue other than the idle queue, and
+its effective rank is the higher. The thread runs at once on a CPU whose effective rank its level's
+rank exceeds ([scheduler.md](scheduler.md) § Wake Preemption). Among the eligible CPUs (the
+affinity mask, less the excluded CPU), the rule returns:
+
+- its `preferred_cpu` when the thread runs there at once, except on a `WakeHint::WakerRuns` wake
+  whose waker's CPU k it is, which rule 4 skips too;
+- otherwise the CPU of the lowest effective rank, a tie going to the lower `current_load`, then to
+  the fewest busy SMT siblings, then to the lowest index (`least_loaded_cpu` over the key of rank
+  and load).
+
+It returns nothing only when no CPU is eligible, and rules 4 and 5 then decide as for a fair wake.
+A thread placed behind a thread of its own level shares the CPU within a slice; one placed behind a
+higher level waits for it to block, which the rule chooses only when every eligible CPU runs or
+queues its level or above.
+
+A `Sync` wake reaches the rule only when the guard failed. k's `current_level` still names the
+waker, whose park has committed, so the rule ranks k by its queued threads alone
+(`CpuRanks::queued`). When the guard failed because the woken thread outranks the waker, the
+lowest-rank scan leaves k out, so the rule does not place on k a thread the guard kept off it; the
+first branch still returns k when it is the thread's preferred CPU and the thread runs there at
+once, as rule 4 returns it within the threshold. On a `WakerRuns` wake the server runs on, so k
+ranks by the server's recorded level, and a caller the scan places on k still has
+`wake_replied`'s yield (above).
+
+The rule reads every eligible CPU's `current_level` and `non_empty` Relaxed, holding no lock
+(§ Lock-free readers of a CPU's run queues). The sample is a hint that no locked step re-reads: a
+dispatch, a link or a dequeue on a CPU after the read, or a priority change of its running thread
+(whose stale mark leaves `current_level` at the old level until the re-record), makes it stale. A
+stale sample places the thread on a CPU where it waits behind a thread it does not outrank, as
+rule 4 can, or on a CPU of a higher rank than another it could have had; the wait is what
+[scheduler.md](scheduler.md) § Wake Preemption's latency bound names as its residual.
 
 `select_target_cpu_excluding(tcb, exclude, hint)` is the same policy with one CPU
-removed from the save-window-pin / synchronous / sticky / min-load branches (hard affinity
+removed from the save-window-pin / synchronous / RT / sticky / min-load branches (hard affinity
 still wins, and the excluded CPU is returned only as a single-CPU fallback).
 `dealloc_object(Thread)`'s deferred reply-wake calls it with
 `exclude = Some(dealloc_cpu)`: the dealloc CPU is wedged in a preempt-disabled
@@ -1736,6 +1770,8 @@ take no lock:
 - `outranked` (Relaxed): the owning CPU alone, at a return to user mode with interrupts masked.
 - `has_queued_thread` (Relaxed), through `has_no_work`: the softlockup watchdog's per-tick idle
   sample (`system_has_no_work`), the SMT core spread, and the idle pull's sibling hold.
+- `ranks` (Relaxed, with `current_level`): an RT wake's placement on any CPU (§ Wake Protocol
+  Invariants, "The RT rule").
 
 Four invariants make their samples sound:
 
@@ -1770,6 +1806,9 @@ Four invariants make their samples sound:
    locked step after it: a missed thread makes the watchdog count the tick idle and restart its
    stall clock (§ Softlockup Watchdog states the cost), and makes the core spread or the sibling
    hold count the sibling idle ([scheduler.md § SMT Awareness](scheduler.md#smt-awareness)).
+   `ranks`' consumer acts on one sample too: a missed thread, or a level the CPU has since left,
+   places an RT wake behind a thread it does not outrank (§ Wake Protocol Invariants, "The RT
+   rule").
    Invariant 2 keeps `relink` from making any reader miss a thread that stays queued.
 
 A new writer of a CPU's run queues MUST keep all four: in particular, it moves a queued thread

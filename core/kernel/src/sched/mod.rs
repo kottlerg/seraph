@@ -29,7 +29,7 @@ pub mod thread_slot;
 #[cfg(not(test))]
 use core::mem::MaybeUninit;
 
-use run_queue::PerCpuScheduler;
+use run_queue::{CpuRanks, PerCpuScheduler};
 use thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 
 use crate::arch::current::context::new_state;
@@ -7096,18 +7096,19 @@ pub enum WakeHint
     Sync,
     /// The waker is the thread running on this CPU and runs on past the wake:
     /// the reply of a `SYS_IPC_REPLY_RECV` whose receive did not park. The
-    /// sticky preferred-CPU rule then skips this CPU, so the woken thread goes
-    /// to its preferred CPU only when that is another, and otherwise by least
-    /// load.
+    /// preferred-CPU rules then skip this CPU, so the woken thread goes to its
+    /// preferred CPU only when that is another, and otherwise by rank (an RT
+    /// thread) or least load.
     WakerRuns,
 }
 
 /// Select target CPU for enqueueing a thread based on affinity, the wake's
 /// hint, soft affinity (cache warmth), and load.
 ///
-/// The policy (hard affinity, save-window pin, the synchronous wake's CPU,
-/// sticky preferred CPU, min load with ties to the CPU with the fewest busy
-/// SMT siblings) is specified in core/kernel/docs/scheduling-internals.md
+/// The policy (hard affinity, save-window pin, the synchronous wake's CPU, an
+/// RT thread's CPU where it runs at once or else of the lowest rank, sticky
+/// preferred CPU, min load with ties to the CPU with the fewest busy SMT
+/// siblings) is specified in core/kernel/docs/scheduling-internals.md
 /// § Wake Protocol Invariants, "Target CPU selection", and decided by
 /// [`place_wake`].
 ///
@@ -7125,7 +7126,7 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock, hint: WakeHint) ->
 }
 
 /// Like [`select_target_cpu`], but treat `exclude` (when `Some`) as ineligible
-/// for the save-window-pin, synchronous-wake, sticky, and min-load branches —
+/// for the save-window-pin, synchronous-wake, RT, sticky, and min-load branches —
 /// UNLESS hard `cpu_affinity` names it (affinity is a correctness constraint
 /// that overrides the placement hint) or it is the only CPU.
 ///
@@ -7169,6 +7170,8 @@ trait WakeView
     fn saving(&self) -> bool;
     /// The woken thread's preferred CPU, possibly stale.
     fn preferred(&self) -> usize;
+    /// The woken thread's level, possibly stale.
+    fn level(&self) -> u8;
     /// The CPU count.
     fn cpu_count(&self) -> usize;
     /// The CPU the wake runs on: the waker's, for a [`WakeHint::Sync`] or a
@@ -7187,6 +7190,8 @@ trait WakeView
     fn note_sync(&self, decision: SyncDecision);
     /// The `current_load` of `cpu`.
     fn load(&self, cpu: usize) -> u32;
+    /// The ranks of `cpu` (`PerCpuScheduler::ranks`).
+    fn ranks(&self, cpu: usize) -> CpuRanks;
     /// How many SMT siblings of `cpu` are at work (`topology::busy_siblings`).
     fn busy_siblings(&self, cpu: usize) -> u32;
 }
@@ -7245,6 +7250,11 @@ fn place_wake(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) -> u
         }
     }
 
+    if let Some(cpu) = place_rt_wake(view, &eligible, hint)
+    {
+        return cpu;
+    }
+
     // Scan ELIGIBLE CPUs for min load, ties going to the CPU with the fewest
     // siblings at work (core/kernel/docs/scheduler.md § SMT Awareness).
     // `usize::MAX` marks "no eligible CPU" (degenerate: cpu_count == 1 and that
@@ -7284,6 +7294,65 @@ fn place_wake(view: &impl WakeView, exclude: Option<usize>, hint: WakeHint) -> u
         "place_wake: load scan returned excluded cpu {min_cpu}",
     );
     min_cpu
+}
+
+/// The RT rule of [`place_wake`], reached past hard affinity, the save-window
+/// pin and a synchronous wake whose guard failed: for a woken thread at an RT
+/// level, its preferred CPU when it runs there at once (its level ranks above
+/// that CPU's effective rank, [`CpuRanks`]), and otherwise the eligible CPU of
+/// the lowest effective rank, a tie going to the lower load, then to the CPU
+/// with the fewest busy SMT siblings, then to the lowest index
+/// (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
+/// "Target CPU selection"). `None` for a fair thread, which the sticky and
+/// least-load rules place, and when no CPU is eligible.
+///
+/// The waker's CPU is read as the hint says. On a [`WakeHint::Sync`] wake the
+/// waker's park has committed, so its CPU ranks by its queued threads alone;
+/// when the woken thread outranks the waker, the scan leaves that CPU out, as
+/// the synchronous wake's guard keeps such a thread off its caller's CPU, which
+/// stays its pick only as its preferred CPU. On a [`WakeHint::WakerRuns`] wake
+/// the waker runs on, so its CPU is no preferred-CPU pick and ranks by the
+/// waker in the scan.
+fn place_rt_wake(
+    view: &impl WakeView,
+    eligible: &impl Fn(usize) -> bool,
+    hint: WakeHint,
+) -> Option<usize>
+{
+    let level = view.level();
+    if level < RT_PRIORITY_MIN
+    {
+        return None;
+    }
+    let level_rank = run_queue::level_rank(level);
+    let waker_cpu = (hint != WakeHint::None).then(|| view.this_cpu());
+    let waker_parked = hint == WakeHint::Sync;
+    let rank = |cpu: usize| -> u32 {
+        let ranks = view.ranks(cpu);
+        if waker_parked && Some(cpu) == waker_cpu
+        {
+            ranks.queued
+        }
+        else
+        {
+            ranks.effective()
+        }
+    };
+
+    let pref = view.preferred();
+    let waker_keeps_pref = hint == WakeHint::WakerRuns && Some(pref) == waker_cpu;
+    if eligible(pref) && !waker_keeps_pref && rank(pref) < level_rank
+    {
+        return Some(pref);
+    }
+
+    let left_out = waker_cpu.filter(|_| waker_parked && view.outranks_waker());
+    least_loaded_cpu(
+        (0..view.cpu_count()).filter(|&cpu| eligible(cpu) && Some(cpu) != left_out),
+        |cpu| (rank(cpu), view.load(cpu)),
+        |cpu| view.busy_siblings(cpu),
+    )
+    .map(|(cpu, _)| cpu)
 }
 
 /// The kernel's [`WakeView`]: the woken thread `tcb`, read without its
@@ -7341,6 +7410,13 @@ impl WakeView for KernelWake
         unsafe { (*self.tcb).preferred_cpu as usize }
     }
 
+    fn level(&self) -> u8
+    {
+        // SAFETY: tcb is valid; priority is read as a placement hint, which
+        // enqueue_and_wake re-reads under sched_lock for the link.
+        unsafe { (*self.tcb).priority }
+    }
+
     fn cpu_count(&self) -> usize
     {
         CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
@@ -7395,6 +7471,11 @@ impl WakeView for KernelWake
         Self::scheduler(cpu).current_load()
     }
 
+    fn ranks(&self, cpu: usize) -> CpuRanks
+    {
+        Self::scheduler(cpu).ranks()
+    }
+
     fn busy_siblings(&self, cpu: usize) -> u32
     {
         crate::topology::busy_siblings(cpu, |sibling| !Self::scheduler(sibling).has_no_work())
@@ -7403,22 +7484,24 @@ impl WakeView for KernelWake
 
 /// The least-loaded CPU of `cpus` by `load` and its load, ties going to the
 /// one with the fewest siblings at work by `busy_siblings`, then to the first
-/// in `cpus`' order; `None` when `cpus` is empty. The placement's core
-/// spread (core/kernel/docs/scheduler.md § SMT Awareness): among CPUs of
-/// equal load, one whose core has no other thread running takes the thread.
+/// in `cpus`' order; `None` when `cpus` is empty. The load is a CPU's
+/// `current_load`, or for an RT wake its effective rank and then its
+/// `current_load` ([`place_rt_wake`]). The placement's core spread
+/// (core/kernel/docs/scheduler.md § SMT Awareness): among CPUs of equal load,
+/// one whose core has no other thread running takes the thread.
 ///
 /// `busy_siblings` is called only for a CPU whose load equals the least seen
 /// so far, at most once each, and not again once a CPU with no busy sibling
 /// holds the least load, so a scan of CPUs whose loads differ, or one that
 /// meets an idle core early, walks few rings.
-fn least_loaded_cpu(
+fn least_loaded_cpu<L: Ord + Copy>(
     cpus: impl Iterator<Item = usize>,
-    load: impl Fn(usize) -> u32,
+    load: impl Fn(usize) -> L,
     busy_siblings: impl Fn(usize) -> u32,
-) -> Option<(usize, u32)>
+) -> Option<(usize, L)>
 {
     // The best CPU, its load, and its busy-sibling count once computed.
-    let mut best: Option<(usize, u32, Option<u32>)> = None;
+    let mut best: Option<(usize, L, Option<u32>)> = None;
     for cpu in cpus
     {
         let cpu_load = load(cpu);
@@ -10358,9 +10441,10 @@ mod idle_pull_tests
 #[cfg(test)]
 mod placement_tests
 {
+    use super::run_queue::{CpuRanks, level_rank};
     use super::{
-        AFFINITY_ANY, RT_PRIORITY_MIN, SyncDecision, WakeHint, WakeView, least_loaded_cpu,
-        link_cpu, place_wake,
+        AFFINITY_ANY, IDLE_PRIORITY, RT_PRIORITY_MIN, SyncDecision, WakeHint, WakeView,
+        least_loaded_cpu, link_cpu, place_wake,
     };
 
     // The defect caught: a link that keeps the waker's target after a
@@ -10435,30 +10519,35 @@ mod placement_tests
     {
         affinity: u32,
         saving: bool,
+        level: u8,
         preferred: usize,
         this_cpu: usize,
         this_cpu_queues: bool,
         outranks_waker: bool,
         loads: Vec<u32>,
+        ranks: Vec<CpuRanks>,
         waker_reads: core::cell::Cell<u32>,
         syncs: core::cell::Cell<(u32, u32)>,
     }
 
     impl Wake
     {
-        /// An unpinned, saved thread preferring CPU `preferred`, woken from CPU
-        /// `this_cpu`, which queues nothing and runs a waker the thread does not
-        /// outrank, with every CPU's load 0.
+        /// An unpinned, saved thread at a fair level preferring CPU
+        /// `preferred`, woken from CPU `this_cpu`, which queues nothing and
+        /// runs a waker the thread does not outrank, with every CPU's load 0 and
+        /// every CPU idle.
         fn new(cpus: usize, preferred: usize, this_cpu: usize) -> Self
         {
             Self {
                 affinity: AFFINITY_ANY,
                 saving: false,
+                level: FAIR,
                 preferred,
                 this_cpu,
                 this_cpu_queues: false,
                 outranks_waker: false,
                 loads: vec![0; cpus],
+                ranks: vec![runs(IDLE_PRIORITY); cpus],
                 waker_reads: core::cell::Cell::new(0),
                 syncs: core::cell::Cell::new((0, 0)),
             }
@@ -10484,6 +10573,10 @@ mod placement_tests
         {
             self.preferred
         }
+        fn level(&self) -> u8
+        {
+            self.level
+        }
         fn cpu_count(&self) -> usize
         {
             self.loads.len()
@@ -10505,6 +10598,10 @@ mod placement_tests
         fn load(&self, cpu: usize) -> u32
         {
             self.loads[cpu]
+        }
+        fn ranks(&self, cpu: usize) -> CpuRanks
+        {
+            self.ranks[cpu]
         }
         fn busy_siblings(&self, _cpu: usize) -> u32
         {
@@ -10642,6 +10739,131 @@ mod placement_tests
         assert_eq!(busy.place(None, WakeHint::WakerRuns), 2);
         let alone = Wake::new(1, 0, 0);
         assert_eq!(alone.place(None, WakeHint::WakerRuns), 0);
+    }
+
+    /// The highest fair level, and RT levels below and above [`WOKEN`], the
+    /// RT level the tests below wake.
+    const FAIR: u8 = RT_PRIORITY_MIN - 1;
+    const WOKEN: u8 = RT_PRIORITY_MIN + 3;
+    const LOWER: u8 = WOKEN - 2;
+    const HIGHER: u8 = WOKEN + 2;
+    const TOP: u8 = WOKEN + 6;
+
+    /// The ranks of a CPU running a thread at `level` with nothing queued.
+    fn runs(level: u8) -> CpuRanks
+    {
+        CpuRanks {
+            running: level_rank(level),
+            queued: 0,
+        }
+    }
+
+    /// An RT thread at [`WOKEN`] preferring CPU 1, woken from CPU 0, on four
+    /// CPUs running threads at `levels` with nothing queued.
+    fn rt_wake(levels: [u8; 4]) -> Wake
+    {
+        let mut wake = Wake::new(4, 1, 0);
+        wake.level = WOKEN;
+        wake.ranks = levels.iter().map(|&level| runs(level)).collect();
+        wake
+    }
+
+    // The defect caught: an RT wake moved off a preferred CPU where it runs at
+    // once (it outranks the fair or lower RT thread there) to a CPU of a lower
+    // rank, giving up cache warmth for nothing; or hard affinity or the
+    // exclusion overridden by the rule.
+    #[test]
+    fn an_rt_wake_keeps_a_preferred_cpu_where_it_runs_at_once()
+    {
+        let fair = rt_wake([IDLE_PRIORITY, FAIR, IDLE_PRIORITY, IDLE_PRIORITY]);
+        assert_eq!(fair.place(None, WakeHint::None), 1);
+        let lower = rt_wake([IDLE_PRIORITY, LOWER, IDLE_PRIORITY, IDLE_PRIORITY]);
+        assert_eq!(lower.place(None, WakeHint::None), 1);
+        assert_eq!(lower.place(Some(1), WakeHint::None), 0);
+        let mut pinned = rt_wake([TOP, TOP, IDLE_PRIORITY, TOP]);
+        pinned.affinity = 3;
+        assert_eq!(pinned.place(None, WakeHint::None), 3);
+    }
+
+    // The defect caught (the rule's purpose): an RT wake left on a preferred
+    // CPU whose running or queued thread it does not outrank, behind it until
+    // it blocks or its slice ends, while another CPU runs lower; the sticky
+    // rule keeps it there, every CPU's load reading alike. A thread queued
+    // above the running one counts, and fair levels rank alike.
+    #[test]
+    fn an_rt_wake_goes_to_the_lowest_ranked_cpu_when_its_preferred_one_is_not_open()
+    {
+        let equal = rt_wake([TOP, WOKEN, FAIR, HIGHER]);
+        assert_eq!(equal.place(None, WakeHint::None), 2);
+        let mut queued = rt_wake([TOP, HIGHER, FAIR, LOWER]);
+        queued.ranks[2].queued = level_rank(HIGHER);
+        assert_eq!(queued.place(None, WakeHint::None), 3);
+        let mut by_rank = rt_wake([FAIR, HIGHER, IDLE_PRIORITY, FAIR]);
+        by_rank.loads = vec![0, 0, 3, 0];
+        assert_eq!(by_rank.place(None, WakeHint::None), 2);
+    }
+
+    // The defect caught: with no CPU where the wake runs at once, a CPU whose
+    // thread outranks the woken one chosen over one at its own level (which
+    // shares the CPU within a slice), or a tie of ranks not broken by load.
+    #[test]
+    fn with_no_open_cpu_an_rt_wake_goes_to_the_lowest_rank_then_the_least_load()
+    {
+        let mut wake = rt_wake([TOP, HIGHER, WOKEN, WOKEN]);
+        wake.loads = vec![0, 0, 2, 1];
+        assert_eq!(wake.place(None, WakeHint::None), 3);
+        wake.ranks[3] = runs(TOP);
+        assert_eq!(wake.place(None, WakeHint::None), 2);
+    }
+
+    // The defect caught: a fair wake placed by rank (the RT rule applied to the
+    // fair class), which moves it off a warm preferred CPU within the load
+    // threshold.
+    #[test]
+    fn a_fair_wake_is_placed_by_load_whatever_the_ranks()
+    {
+        let mut wake = rt_wake([IDLE_PRIORITY, TOP, IDLE_PRIORITY, IDLE_PRIORITY]);
+        wake.level = FAIR;
+        assert_eq!(wake.place(None, WakeHint::None), 1);
+    }
+
+    // The defect caught: on a synchronous wake whose guard failed, the
+    // waker's CPU ranked by the waker, whose park has committed, so a CPU
+    // where the woken thread runs at once is passed over; or, when the woken
+    // thread outranks the waker, pulled onto the waker's CPU by the scan,
+    // which the guard exists to prevent, or refused it as its own preferred
+    // CPU, which today's sticky rule keeps.
+    #[test]
+    fn a_sync_wake_past_its_guard_ranks_the_parked_wakers_cpu_by_its_queue()
+    {
+        let mut queued = rt_wake([TOP, HIGHER, TOP, HIGHER]);
+        queued.this_cpu = 2;
+        queued.this_cpu_queues = true;
+        queued.ranks[2].queued = level_rank(FAIR);
+        assert_eq!(queued.place(None, WakeHint::Sync), 2);
+        assert_eq!(queued.syncs.get(), (1, 0));
+
+        let mut outranking = rt_wake([HIGHER, HIGHER, LOWER, TOP]);
+        outranking.this_cpu = 2;
+        outranking.outranks_waker = true;
+        assert_eq!(outranking.place(None, WakeHint::Sync), 0);
+        outranking.preferred = 2;
+        assert_eq!(outranking.place(None, WakeHint::Sync), 2);
+    }
+
+    // The defect caught: a reply-and-receive whose server runs on keeping its
+    // RT caller on the server's CPU as its preferred one, where it waits
+    // behind the server while another CPU runs lower; or the server's CPU
+    // refused outright when it is the lowest ranked.
+    #[test]
+    fn a_waker_that_runs_on_is_no_preferred_pick_for_an_rt_wake()
+    {
+        let mut wake = rt_wake([IDLE_PRIORITY, LOWER, IDLE_PRIORITY, IDLE_PRIORITY]);
+        wake.this_cpu = 1;
+        assert_eq!(wake.place(None, WakeHint::WakerRuns), 0);
+        wake.ranks = vec![runs(TOP), runs(LOWER), runs(TOP), runs(HIGHER)];
+        assert_eq!(wake.place(None, WakeHint::WakerRuns), 1);
+        assert_eq!(wake.waker_reads.get(), 0);
     }
 
     // The defect caught: rank compared by raw priority, so one fair level

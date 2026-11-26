@@ -424,6 +424,18 @@ args! {
         #[arg(long)]
         pub ktest_bench_only: bool,
 
+        /// Build ktest focused on the tests whose names start with one of
+        /// these comma-separated prefixes (`stress::stop_`, `cap::,ipc::`):
+        /// it runs only those, and no benchmark, ends a passing run with
+        /// `[ktest] SELECTED TESTS PASSED` in place of the full run's marker,
+        /// and fails a run whose selection matches no test (core/ktest/README.md
+        /// "Test selection"). The build records the selection in the sysroot,
+        /// and `run --runs` refuses an image of it without `--ktest-only-ok`.
+        /// Needs a build that includes ktest (`--component all` or `ktest`);
+        /// refused with `--ktest-bench-only`.
+        #[arg(long, value_name = "PREFIXES", value_parser = parse_ktest_selection)]
+        pub ktest_only: Option<String>,
+
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
         #[command(flatten)]
@@ -472,6 +484,12 @@ plain_field!(BuildComponent);
 
 /// The value parser of a [`BuildComponent`]: `boot`, `all`, or the crate
 /// name of a spec-table entry.
+/// A `--ktest-only` value, checked as [`crate::sysroot::check_ktest_selection`] checks it.
+fn parse_ktest_selection(text: &str) -> Result<String, String>
+{
+    crate::sysroot::check_ktest_selection(text).map(|()| text.to_string())
+}
+
 fn parse_build_component(text: &str) -> Result<BuildComponent, String>
 {
     match text
@@ -653,6 +671,14 @@ args! {
         #[arg(long, value_name = "N")]
         pub runs: Option<u32>,
 
+        /// Accept an image whose ktest a focused build made (`cargo xtask build
+        /// --ktest-only`): `--runs` refuses one without it, since a focused run
+        /// validates nothing, and with it the default `--pass` is the focused
+        /// run's marker `[ktest] SELECTED TESTS PASSED`. Refused for an image that
+        /// boots no focused ktest.
+        #[arg(long, requires = "runs")]
+        pub ktest_only_ok: bool,
+
         /// What the guest presents for display. `window` attaches QEMU std VGA
         /// and shows it in a window; `framebuffer` attaches it with no window
         /// (`-display none`), so the framebuffer driver runs on a host without a
@@ -703,9 +729,11 @@ args! {
         /// discarded and the run is classified PASS. The default is the
         /// terminal marker `[<harness>] ALL TESTS PASSED`
         /// ([`docs/testing.md`](../../docs/testing.md)) of the one harness the
-        /// image boots, as its pack recorded it; an image that boots no harness,
-        /// or several, has none, and `--runs` then needs this option. Override
-        /// for other rootfs configurations.
+        /// image boots, as its pack recorded it, or `[ktest] SELECTED TESTS
+        /// PASSED` for a focused ktest, which `--runs` takes only with
+        /// `--ktest-only-ok`; an image that boots no harness, or several, has
+        /// none, and `--runs` then needs this option. Override for other rootfs
+        /// configurations.
         #[arg(long, requires = "runs")]
         pub pass: Option<String>,
 

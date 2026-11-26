@@ -558,14 +558,7 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         clippy_host(ctx)?;
     }
 
-    if args.ktest_bench_only
-        && !matches!(
-            args.component,
-            BuildComponent::All | BuildComponent::Spec("ktest")
-        )
-    {
-        bail!("--ktest-bench-only builds ktest: give --component all or --component ktest");
-    }
+    check_ktest_options(args)?;
 
     match args.component
     {
@@ -911,7 +904,8 @@ fn build_group(
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let env_owned = profile_env(args.arch, profile);
+    let mut env_owned = profile_env(args.arch, profile);
+    env_owned.extend(selection_env(args, &names));
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if !args.skip_lints
     {
@@ -948,18 +942,73 @@ fn build_group(
             );
         }
         check_frame_bound(args.arch, profile, &cargo_out)?;
-        for dst in install_paths(ctx, spec)
-        {
-            if let Some(parent) = dst.parent()
-            {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            install(ctx, args.arch, spec, &cargo_out, &dst)?;
-            step(&format!("{}: {}", spec.name, dst.display()));
-        }
+        install_spec(ctx, args, spec, &cargo_out)?;
     }
 
+    Ok(())
+}
+
+/// The build environment variable that carries a focused ktest build's
+/// selection to ktest's compile (`core/ktest/src/cmdline.rs`,
+/// `KtestConfig::SELECTED`). [`cargo`] clears it on every invocation, so only
+/// `--ktest-only` sets it ([`selection_env`]).
+const KTEST_SELECTION_VAR: &str = "SERAPH_KTEST_ONLY";
+
+/// Refuse the ktest options of `args` on a build they cannot apply to:
+/// `--ktest-bench-only` or `--ktest-only` with a component other than `all` or
+/// `ktest`, and the two together, since a bench-only ktest runs no named test
+/// a selection could select.
+fn check_ktest_options(args: &BuildArgs) -> Result<()>
+{
+    let builds_ktest = matches!(
+        args.component,
+        BuildComponent::All | BuildComponent::Spec("ktest")
+    );
+    if args.ktest_bench_only && args.ktest_only.is_some()
+    {
+        bail!("--ktest-only and --ktest-bench-only: a bench-only ktest runs no named test");
+    }
+    if args.ktest_bench_only && !builds_ktest
+    {
+        bail!("--ktest-bench-only builds ktest: give --component all or --component ktest");
+    }
+    if args.ktest_only.is_some() && !builds_ktest
+    {
+        bail!("--ktest-only builds ktest: give --component all or --component ktest");
+    }
+    Ok(())
+}
+
+/// The environment entry that focuses a build of the components `names` on
+/// `--ktest-only`'s selection ([`KTEST_SELECTION_VAR`]) when ktest is among
+/// them; `None` otherwise, which leaves the variable cleared.
+fn selection_env(args: &BuildArgs, names: &[&str]) -> Option<(&'static str, String)>
+{
+    args.ktest_only
+        .as_ref()
+        .filter(|_| names.contains(&"ktest"))
+        .map(|selection| (KTEST_SELECTION_VAR, selection.clone()))
+}
+
+/// Install `spec`'s link output `cargo_out` at each of its install paths;
+/// for ktest, record the build's selection beside it
+/// ([`sysroot::record_ktest_selection`]), so the record always names the
+/// ktest the sysroot holds.
+fn install_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec, cargo_out: &Path) -> Result<()>
+{
+    for dst in install_paths(ctx, spec)
+    {
+        if let Some(parent) = dst.parent()
+        {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        install(ctx, args.arch, spec, cargo_out, &dst)?;
+        step(&format!("{}: {}", spec.name, dst.display()));
+    }
+    if spec.name == "ktest"
+    {
+        sysroot::record_ktest_selection(&ctx.sysroot, args.ktest_only.as_deref())?;
+    }
     Ok(())
 }
 
@@ -1044,7 +1093,8 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
-    let env_owned = profile_env(args.arch, spec.profile);
+    let mut env_owned = profile_env(args.arch, spec.profile);
+    env_owned.extend(selection_env(args, &[spec.name]));
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if !args.skip_lints
     {
@@ -1081,18 +1131,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
         );
     }
     check_frame_bound(args.arch, spec.profile, &cargo_out)?;
-
-    for dst in install_paths(ctx, spec)
-    {
-        if let Some(parent) = dst.parent()
-        {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        install(ctx, args.arch, spec, &cargo_out, &dst)?;
-        step(&format!("{}: {}", spec.name, dst.display()));
-    }
-
-    Ok(())
+    install_spec(ctx, args, spec, &cargo_out)
 }
 
 /// Install `spec`'s link output `cargo_out`, built for `arch`, at `dst`, and
@@ -1480,12 +1519,15 @@ fn std_member_lint_flags(triple: &str, build_std: &str, profile: Profile) -> Vec
 }
 
 /// Construct a `cargo` Command with the working directory set to the workspace
-/// root and [`crate::util::CI_CARGO_ENV`] applied.
+/// root, [`crate::util::CI_CARGO_ENV`] applied, and [`KTEST_SELECTION_VAR`]
+/// cleared, so a variable the caller's environment holds cannot focus a
+/// build (a caller sets it after, [`selection_env`]).
 fn cargo(root: &Path) -> Command
 {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root);
     cmd.envs(crate::util::CI_CARGO_ENV);
+    cmd.env_remove(KTEST_SELECTION_VAR);
     cmd
 }
 
@@ -1545,6 +1587,89 @@ mod tests
 {
     use super::*;
 
+    /// A build of `component` with `--ktest-only` set to `ktest_only`, every
+    /// other option at its default.
+    fn build_args(component: BuildComponent, ktest_only: Option<&str>) -> BuildArgs
+    {
+        BuildArgs {
+            arch: Arch::X86_64,
+            release: false,
+            component,
+            debug: Vec::new(),
+            limited_debug: Vec::new(),
+            skip_lints: true,
+            ktest_bench_only: false,
+            ktest_only: ktest_only.map(str::to_string),
+            host: crate::cli::HostArgs::default(),
+        }
+    }
+
+    // Defect caught: a focused build whose ktest compile does not see the
+    // selection (so it runs every test under a focused record), or a
+    // selection passed to the compile of a group without ktest.
+    #[test]
+    fn the_selection_reaches_ktest_builds_only()
+    {
+        let focused = build_args(BuildComponent::All, Some("stress::stop_"));
+        assert_eq!(
+            selection_env(&focused, &["init", "ktest"]),
+            Some((KTEST_SELECTION_VAR, "stress::stop_".to_string()))
+        );
+        assert_eq!(selection_env(&focused, &["init", "procmgr"]), None);
+        assert_eq!(
+            selection_env(&build_args(BuildComponent::All, None), &["ktest"]),
+            None
+        );
+    }
+
+    // Defect caught: a caller's `SERAPH_KTEST_ONLY` reaching a cargo
+    // invocation that `--ktest-only` did not ask to focus, so a CI or
+    // validation build would bake in a selection.
+    #[test]
+    fn every_cargo_invocation_clears_the_selection_variable()
+    {
+        let cmd = cargo(Path::new("."));
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == KTEST_SELECTION_VAR && value.is_none())
+        );
+    }
+
+    // Defect caught: a ktest option accepted on a build that does not build
+    // ktest (where it would do nothing, silently), or a focused bench-only
+    // build, whose selection no test of its tier could match.
+    #[test]
+    fn the_ktest_options_are_refused_where_they_cannot_apply()
+    {
+        let kernel = BuildComponent::Spec("kernel");
+        let ktest = BuildComponent::Spec("ktest");
+        check_ktest_options(&build_args(ktest, Some("cap::"))).unwrap();
+        check_ktest_options(&build_args(BuildComponent::All, Some("cap::"))).unwrap();
+        let error = check_ktest_options(&build_args(kernel, Some("cap::"))).unwrap_err();
+        assert!(
+            error.to_string().contains("--ktest-only builds ktest"),
+            "{error}"
+        );
+        let bench_only = |component| BuildArgs {
+            ktest_bench_only: true,
+            ..build_args(component, None)
+        };
+        check_ktest_options(&bench_only(ktest)).unwrap();
+        let error = check_ktest_options(&bench_only(kernel)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--ktest-bench-only builds ktest"),
+            "{error}"
+        );
+        let both = BuildArgs {
+            ktest_bench_only: true,
+            ..build_args(ktest, Some("cap::"))
+        };
+        let error = check_ktest_options(&both).unwrap_err();
+        assert!(error.to_string().contains("--ktest-bench-only"), "{error}");
+    }
+
     // Defect caught: `--ktest-bench-only` building ktest without its
     // `bench-only` feature, or passing the feature to a build without ktest,
     // where cargo refuses a feature of a package it does not build.
@@ -1552,14 +1677,8 @@ mod tests
     fn the_bench_only_feature_goes_to_ktest_builds_only()
     {
         let build = |ktest_bench_only| BuildArgs {
-            arch: Arch::X86_64,
-            release: false,
-            component: BuildComponent::All,
-            debug: Vec::new(),
-            limited_debug: Vec::new(),
-            skip_lints: true,
             ktest_bench_only,
-            host: crate::cli::HostArgs::default(),
+            ..build_args(BuildComponent::All, None)
         };
         let none: [String; 0] = [];
         assert_eq!(

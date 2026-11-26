@@ -11,7 +11,9 @@
 //! clean` first to avoid mixing binaries. The harness whose bundle every pack
 //! composes is recorded in `sysroot/.harness` ([`record_harness`]), and the
 //! harnesses the image of the last complete pack boots in
-//! `sysroot/.image-harness` ([`record_image_harnesses`]).
+//! `sysroot/.image-harness` ([`record_image_harnesses`]), and the selection
+//! of a focused ktest build in `sysroot/.ktest-selection`
+//! ([`record_ktest_selection`]).
 
 use std::collections::HashSet;
 use std::fs;
@@ -127,6 +129,90 @@ impl ImageHarness
             .into_iter()
             .find(|harness| harness.name() == name)
     }
+}
+
+/// The sysroot file that records the selection of the installed ktest, a
+/// focused build's comma-separated test-name prefixes
+/// ([`record_ktest_selection`]); absent when the installed ktest runs every
+/// test.
+pub const KTEST_SELECTION_FILE: &str = ".ktest-selection";
+
+/// Check a ktest selection (`cargo xtask build --ktest-only`): one or more
+/// comma-separated test-name prefixes, each non-empty and made of the
+/// characters a ktest test name holds (ASCII letters, digits, `_` and `:`),
+/// so a stray space or an empty item, which would select every test, is
+/// refused rather than baked into a focused build.
+///
+/// # Errors
+///
+/// A message naming the item that is empty or the character a test name
+/// cannot hold.
+pub fn check_ktest_selection(selection: &str) -> std::result::Result<(), String>
+{
+    for prefix in selection.split(',')
+    {
+        if prefix.is_empty()
+        {
+            return Err(format!(
+                "{selection:?} holds an empty prefix, which would select every test"
+            ));
+        }
+        if let Some(c) = prefix
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == ':'))
+        {
+            return Err(format!(
+                "prefix {prefix:?} holds {c:?}, which no ktest test name holds"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Record `selection` as that of the ktest just installed in `sysroot`: the
+/// focused build's prefixes, or, with `None`, no record, for a ktest that
+/// runs every test.
+///
+/// # Errors
+///
+/// On an I/O failure other than the absence of a record to remove.
+pub fn record_ktest_selection(sysroot: &Path, selection: Option<&str>) -> Result<()>
+{
+    let path = sysroot.join(KTEST_SELECTION_FILE);
+    match selection
+    {
+        Some(selection) => fs::write(&path, format!("{selection}\n"))
+            .with_context(|| format!("writing {}", path.display())),
+        None => match fs::remove_file(&path)
+        {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound =>
+            {
+                Err(e).with_context(|| format!("removing {}", path.display()))
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+/// The selection [`record_ktest_selection`] recorded for the installed
+/// ktest, `None` when it runs every test.
+///
+/// # Errors
+///
+/// When the record cannot be read or holds no valid selection
+/// ([`check_ktest_selection`]).
+pub fn recorded_ktest_selection(sysroot: &Path) -> Result<Option<String>>
+{
+    let path = sysroot.join(KTEST_SELECTION_FILE);
+    let text = match fs::read_to_string(&path)
+    {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let selection = text.trim();
+    check_ktest_selection(selection).map_err(|e| crate::error::err!("{}: {e}", path.display()))?;
+    Ok(Some(selection.to_string()))
 }
 
 /// Remove the record of the image's harnesses, so a pack that does not
@@ -287,7 +373,8 @@ pub fn record_arch(ctx: &BuildContext, arch: Arch) -> Result<()>
 /// files, the repository's data files ([`install_data_files`]) and the
 /// synthesised `data/svctest/` fixtures. The prune pass is
 /// authoritative over these and only these. Build-owned trees (`boot/`, `esp/`,
-/// `services/`, `programs/`, `tests/`) and metadata (`.arch`, `.harness`, `.image-harness`, `NvVars`) are
+/// `services/`, `programs/`, `tests/`) and metadata (`.arch`, `.harness`, `.image-harness`,
+/// `.ktest-selection`, `NvVars`) are
 /// deliberately absent, so a scoping mistake cannot delete a binary.
 const ROOTFS_MANAGED_ROOTS: &[&str] = &["config", "data"];
 
@@ -834,6 +921,54 @@ mod tests
         forget_image_harnesses(&ctx.sysroot).unwrap();
         fs::write(ctx.sysroot.join(IMAGE_HARNESS_FILE), "init\n").unwrap();
         recorded_image_harnesses(&ctx).unwrap_err();
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // Defect caught: an empty item (`--ktest-only stress::,`), which ktest
+    // would read as a prefix of every name, or a character no test name holds
+    // (a space, a typo'd separator), accepted into a focused build that then
+    // runs more, or other, tests than were asked for.
+    #[test]
+    fn a_ktest_selection_is_nonempty_prefixes_of_test_name_characters()
+    {
+        check_ktest_selection("stress::stop_").unwrap();
+        check_ktest_selection("stress::stop_,cap::,ipc").unwrap();
+        for bad in ["", ",", "stress::stop_,", ",cap::", "cap::,,ipc"]
+        {
+            let error = check_ktest_selection(bad).unwrap_err();
+            assert!(error.contains("empty prefix"), "{bad:?}: {error}");
+        }
+        for bad in ["stress::stop_ ", "cap::;ipc", "stress::*"]
+        {
+            let error = check_ktest_selection(bad).unwrap_err();
+            assert!(
+                error.contains("no ktest test name holds"),
+                "{bad:?}: {error}"
+            );
+        }
+    }
+
+    // Defect caught: a focused build's selection that does not read back, a
+    // build of the full ktest that leaves the previous selection recorded (so
+    // `run` would refuse or mislabel a full image), or a tampered record read
+    // as a valid selection.
+    #[test]
+    fn the_ktest_selection_record_reads_back_and_a_full_build_clears_it()
+    {
+        let base = scratch("ktest-selection");
+        fs::create_dir_all(&base).unwrap();
+        assert_eq!(recorded_ktest_selection(&base).unwrap(), None);
+        record_ktest_selection(&base, Some("stress::stop_,cap::")).unwrap();
+        assert_eq!(
+            recorded_ktest_selection(&base).unwrap().as_deref(),
+            Some("stress::stop_,cap::")
+        );
+        record_ktest_selection(&base, None).unwrap();
+        assert_eq!(recorded_ktest_selection(&base).unwrap(), None);
+        // Clearing an absent record is no error.
+        record_ktest_selection(&base, None).unwrap();
+        fs::write(base.join(KTEST_SELECTION_FILE), "stress::stop_,\n").unwrap();
+        recorded_ktest_selection(&base).unwrap_err();
         fs::remove_dir_all(&base).unwrap();
     }
 }

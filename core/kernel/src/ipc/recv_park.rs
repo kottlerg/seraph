@@ -17,15 +17,16 @@
 //!
 //! Every slot word is an atomic accessed `Relaxed`, but for the owning CPU's
 //! plain reads of its queue words, which no other CPU reads or writes, so no
-//! access runs beside such a read. The table has no lock of
-//! its own: each access that decides an outcome holds the lock of the endpoint
-//! the slot names, which orders it. The owning CPU records and looks up under
-//! the lock of the endpoint it parks on or calls, with interrupts off, so no
-//! other access of its own interleaves with either. A remover on any CPU clears
-//! a slot by a compare-and-swap of its receiver word from the removed receiver
-//! to null, never a plain store, under the lock of the endpoint it removes the
-//! receiver from. A slot naming that endpoint has no other writer meanwhile,
-//! since its owner records into it only under the same lock.
+//! access runs beside such a read; a cross-CPU access of a queue word would
+//! need `RecvParkTable::named` back on an atomic load. The table has no lock
+//! of its own: each access that decides an outcome holds the lock of the
+//! endpoint the slot names, which orders it. The owning CPU records and looks
+//! up under the lock of the endpoint it parks on or calls, with interrupts off,
+//! so no other access of its own interleaves with either. A remover on any CPU
+//! clears a slot by a compare-and-swap of its receiver word from the removed
+//! receiver to null, never a plain store, under the lock of the endpoint it
+//! removes the receiver from. A slot naming that endpoint has no other writer
+//! meanwhile, since its owner records into it only under the same lock.
 //!
 //! A slot the owner has since given to another endpoint, under that
 //! endpoint's lock, is the one place accesses under different locks meet: the

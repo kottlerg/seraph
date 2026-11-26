@@ -1,14 +1,14 @@
 # bench baseline, written by `cargo xtask bench-baseline`
 # Format: xtask/README.md (`cargo xtask bench-check`).
-words=0 cpus=1 unit=cycles p50=2337
-words=0 cpus=4 unit=cycles p50=2453
-words=0 fpu=both cpus=1 unit=cycles p50=2342
-words=0 fpu=both cpus=4 unit=cycles p50=2458
-words=0 placement=apart cpus=4 unit=cycles p50=3318
-words=0 placement=fan_in cpus=4 unit=cycles p50=2210
-words=0 placement=same cpus=4 unit=cycles p50=2284
-words=0 placement=unpinned cpus=4 unit=cycles p50=2282
-words=6 cpus=1 unit=cycles p50=2538
-words=6 cpus=4 unit=cycles p50=2654
-words=7 cpus=1 unit=cycles p50=2818
-words=7 cpus=4 unit=cycles p50=2934
+words=0 cpus=1 unit=cycles p50=2377
+words=0 cpus=4 unit=cycles p50=2493
+words=0 fpu=both cpus=1 unit=cycles p50=2382
+words=0 fpu=both cpus=4 unit=cycles p50=2498
+words=0 placement=apart cpus=4 unit=cycles p50=3359
+words=0 placement=fan_in cpus=4 unit=cycles p50=2251
+words=0 placement=same cpus=4 unit=cycles p50=2291
+words=0 placement=unpinned cpus=4 unit=cycles p50=2289
+words=6 cpus=1 unit=cycles p50=2578
+words=6 cpus=4 unit=cycles p50=2694
+words=7 cpus=1 unit=cycles p50=2858
+words=7 cpus=4 unit=cycles p50=2974

@@ -584,7 +584,7 @@ fn github_output(selection: &Selection) -> String
 }
 
 /// Append `text` to `file`, creating it.
-fn append(file: &PathBuf, text: &str) -> Result<()>
+pub(crate) fn append(file: &PathBuf, text: &str) -> Result<()>
 {
     use std::io::Write as _;
     let mut out = std::fs::OpenOptions::new()
@@ -969,6 +969,39 @@ mod tests
             .map(String::as_str),
             Some("c2")
         );
+    }
+
+    // Defect caught: the kani jobs measuring their crates from another base
+    // than the cells, so a proof a red or unfinished master run left
+    // unproven is owed by no later run once an unrelated change turns master
+    // green.
+    #[test]
+    fn the_kani_jobs_select_from_the_base_of_the_cells()
+    {
+        let with = github_output(&Selection {
+            base: Some(("c2".to_owned(), String::new())),
+            placed: Vec::new(),
+            owed: NO_CELL,
+            fuzz: None,
+        });
+        assert!(with.ends_with("\nbase=c2\n"), "{with}");
+        let workflow = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/build-test.yml"),
+        )
+        .unwrap();
+        assert!(workflow.contains("      base: ${{ steps.cells.outputs.base }}\n"));
+        let kani = workflow
+            .split("\n  kani:\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  fuzz:\n").next())
+            .unwrap();
+        assert!(kani.contains("\n    needs: select\n"), "{kani}");
+        assert!(
+            kani.contains("uses: ./.github/workflows/kani.yml"),
+            "{kani}"
+        );
+        assert!(kani.contains("needs.select.outputs.base"), "{kani}");
+        assert!(!kani.contains("github.event.before"), "{kani}");
     }
 
     // Defect caught: a pull request's base found as a push's is, so a run

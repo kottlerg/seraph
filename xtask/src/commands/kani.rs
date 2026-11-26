@@ -16,10 +16,13 @@
 //! process of the run is held to [`MEMORY_LIMIT_GIB`] of address space, so a
 //! harness too large fails by name instead of exhausting the host's memory,
 //! each harness to [`HARNESS_TIME_LIMIT_SECS`], and the run closes with every
-//! harness's verdict and time. The command runs on the development host
-//! only; no CI workflow runs it.
+//! harness's verdict and time. CI's `kani` jobs run it
+//! (`.github/workflows/kani.yml`), and so does the development host.
 //! With `--since`, the run verifies
 //! only the crates the change from a base commit can affect ([`affected`]).
+//! With `--shard k/n`, it verifies one part of one crate's harnesses
+//! ([`Shard`]), and `--plan` prints the parts CI's matrix runs, one job each:
+//! a whole crate, or each shard of a crate [`SHARDS`] splits.
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
@@ -36,9 +39,21 @@ use crate::util::step;
 /// ([`affected::WORKSPACE_WIDE`], the toolchain pin among them): what can
 /// change a harness's verdict. That is this command, which holds the Kani
 /// pin, the arguments and the memory limit it runs `cargo kani` with, and
-/// the judge of Kani's output. What decides only which crates are verified
-/// (the selection in `xtask/src/affected.rs`) is not one.
+/// the judge of Kani's output. What decides only which crates are verified,
+/// or whether and where a job runs them (the selection in
+/// `xtask/src/affected.rs`, the workflows), is not one.
 const KANI_INPUTS: &[&str] = &["xtask/src/commands/kani.rs"];
+
+/// The workflows that run the `kani` jobs: the reusable workflow that holds
+/// them, and build-test.yml, which calls it with the base of its selection. A
+/// change to one moves no harness's verdict, but can break the jobs' own
+/// steps (the plan, installing the pinned release, its setup, the run), which
+/// only a run that verifies a crate exercises. So a change to one that
+/// selects no crate otherwise selects the crate with the fewest harnesses.
+const KANI_JOB: &[&str] = &[
+    ".github/workflows/kani.yml",
+    ".github/workflows/build-test.yml",
+];
 
 /// The Kani release every run uses (docs/build-system.md § Toolchain). A
 /// toolchain bump moves it to the newest release that builds the harnessed
@@ -65,6 +80,15 @@ const HARNESS_TIME_LIMIT_SECS: u32 = 600;
 /// How many harnesses the closing list of the slowest names.
 const SLOWEST: usize = 10;
 
+/// The crates CI verifies in more than one job, each with its number of
+/// shards; every other crate is one job. A crate whose harnesses' times sum
+/// to more than about 10 minutes on CI's runner is split into that sum over
+/// 600 s, rounded up, so that no job's proofs take much longer than the rest
+/// of a run (docs/testing.md § Bounded verification); the closing report's
+/// time per crate gives the sums. `--plan` fails on an entry that names no
+/// crate holding a harness.
+const SHARDS: &[(&str, usize)] = &[("boot-firmware", 3), ("devmgr-firmware", 4), ("elf", 2)];
+
 /// A crate whose proof harnesses the command runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Harnessed
@@ -88,6 +112,10 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
         println!("{KANI_VERSION}");
         return Ok(());
     }
+    if args.plan
+    {
+        return plan(ctx, args);
+    }
     let crates = match args.since.as_deref()
     {
         Some(base) => affected_since(&ctx.root, harnessed(&ctx.root)?, base)?,
@@ -107,11 +135,14 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
         return Ok(());
     }
     check_version(&ctx.root)?;
+    let shard = args.shard.as_deref().map(Shard::parse).transpose()?;
     let mut failed = Vec::new();
     let mut outcomes = Vec::new();
     for harnessed in &crates
     {
-        if let Err(e) = verify(&ctx.root, harnessed, args.harness.as_deref(), &mut outcomes)
+        let run = filter(&ctx.root, harnessed, args.harness.as_deref(), shard)
+            .and_then(|filter| verify(&ctx.root, harnessed, &filter, &mut outcomes));
+        if let Err(e) = run
         {
             failed.push(format!("{e:#}"));
         }
@@ -120,6 +151,8 @@ pub fn run(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
     print!("{}", outcome_table(&outcomes));
     step(&format!("Kani: the {SLOWEST} slowest harnesses"));
     print!("{}", outcome_table(&slowest(&outcomes)));
+    step("Kani: time per crate");
+    print!("{}", crate_times(&outcomes));
     if !failed.is_empty()
     {
         bail!("{}", failed.join("\n"));
@@ -160,6 +193,9 @@ enum Reason
     BuildWide(String),
     /// The change touches an input of the crate's build.
     Input(Input),
+    /// The change touches a workflow that runs the jobs, and the crate holds
+    /// the fewest harnesses.
+    Job(String),
 }
 
 impl Reason
@@ -178,6 +214,10 @@ impl Reason
             {
                 format!("{file} is an input of {package}, which the crate depends on")
             }
+            Self::Job(file) => format!(
+                "{file} runs the jobs, and the crate holds the fewest harnesses, so the jobs' \
+                 steps run once"
+            ),
         }
     }
 }
@@ -186,8 +226,9 @@ impl Reason
 /// `workspace`, with the first reason found, in the order of `crates`:
 /// every crate when a changed file is an input of every verification
 /// ([`affected::WORKSPACE_WIDE`], [`KANI_INPUTS`]), else each crate with a
-/// changed input of its build. Fails naming a crate that is no workspace
-/// package.
+/// changed input of its build, else, when the change touches [`KANI_JOB`],
+/// the first crate with the fewest harnesses. Fails naming a crate that is
+/// no workspace package.
 fn affected_crates(
     crates: Vec<Harnessed>,
     workspace: &Workspace,
@@ -206,6 +247,7 @@ fn affected_crates(
             .map(|h| (h, Reason::BuildWide(file.clone())))
             .collect());
     }
+    let fewest = crates.iter().min_by_key(|h| h.harnesses).cloned();
     let mut selected = Vec::new();
     for harnessed in crates
     {
@@ -216,6 +258,11 @@ fn affected_crates(
         {
             selected.push((harnessed, Reason::Input(input)));
         }
+    }
+    if selected.is_empty()
+        && let (Some(file), Some(harnessed)) = (affected::first_under(changed, KANI_JOB), fewest)
+    {
+        selected.push((harnessed, Reason::Job(file.clone())));
     }
     Ok(selected)
 }
@@ -248,6 +295,205 @@ fn affected_since(root: &Path, crates: Vec<Harnessed>, base: &str) -> Result<Vec
         );
     }
     Ok(picked.into_iter().map(|(h, _)| h).collect())
+}
+
+// ── Shards and the plan ───────────────────────────────────────────────────────
+
+/// One part of a crate's harnesses: of Kani's list of them, sorted by path
+/// and each once, the ones at the positions `index - 1`, `index - 1 +
+/// count`, `index - 1 + 2 * count`, and so on. The parts of one `count`
+/// take every harness exactly once between them, whatever order Kani lists
+/// them in, and spread a module's harnesses, which are often of like cost,
+/// over the parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shard
+{
+    /// Which part, from 1.
+    index: usize,
+    /// How many parts.
+    count: usize,
+}
+
+impl Shard
+{
+    /// The shard `K/N` names, `1 <= K <= N`.
+    fn parse(text: &str) -> Result<Self>
+    {
+        let parsed = text
+            .split_once('/')
+            .and_then(|(k, n)| Some((k.parse::<usize>().ok()?, n.parse::<usize>().ok()?)));
+        match parsed
+        {
+            Some((index, count)) if index >= 1 && index <= count => Ok(Self { index, count }),
+            _ => bail!("--shard takes K/N with 1 <= K <= N, not {text}"),
+        }
+    }
+
+    /// The part of `names` this shard takes, sorted.
+    fn of(self, names: &[String]) -> Vec<String>
+    {
+        let mut sorted = names.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let first = self.index.saturating_sub(1);
+        sorted
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i.checked_rem(self.count) == Some(first))
+            .map(|(_, name)| name)
+            .collect()
+    }
+}
+
+impl std::fmt::Display for Shard
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
+    {
+        write!(f, "{}/{}", self.index, self.count)
+    }
+}
+
+/// `--plan`: print the jobs CI's matrix runs for the crates the run selects
+/// (every crate, or with `--since` the ones the change can affect), one line
+/// each, and with `--github-output` append the matrix to the workflow's
+/// outputs.
+fn plan(ctx: &BuildContext, args: &KaniArgs) -> Result<()>
+{
+    let all = harnessed(&ctx.root)?;
+    let units = plan_units(&all, SHARDS)?;
+    let crates = match args.since.as_deref()
+    {
+        Some(base) => affected_since(&ctx.root, all, base)?,
+        None => all,
+    };
+    let units: Vec<(String, Shard)> = units
+        .into_iter()
+        .filter(|(package, _)| crates.iter().any(|h| &h.package == package))
+        .collect();
+    step(&format!("Kani: {} job(s)", units.len()));
+    for (package, shard) in &units
+    {
+        println!("{package} {shard}");
+    }
+    if let Some(file) = &args.github_output
+    {
+        crate::commands::cells::append(file, &plan_output(&units))?;
+    }
+    Ok(())
+}
+
+/// The jobs of `crates`: each crate once, or once per shard when `table`
+/// splits it, its shards never more than its harnesses. Fails on an entry of
+/// `table` that names no crate of `crates`.
+fn plan_units(crates: &[Harnessed], table: &[(&str, usize)]) -> Result<Vec<(String, Shard)>>
+{
+    if let Some((stale, _)) = table
+        .iter()
+        .find(|(package, _)| !crates.iter().any(|h| h.package == *package))
+    {
+        bail!("Kani: SHARDS names {stale}, which holds no proof harness");
+    }
+    let mut units = Vec::new();
+    for harnessed in crates
+    {
+        let count = table
+            .iter()
+            .find(|(package, _)| *package == harnessed.package)
+            .map_or(1, |(_, count)| *count)
+            .min(harnessed.harnesses)
+            .max(1);
+        for index in 1..=count
+        {
+            units.push((harnessed.package.clone(), Shard { index, count }));
+        }
+    }
+    Ok(units)
+}
+
+/// The plan's workflow outputs (`key=value` lines for `$GITHUB_OUTPUT`): the
+/// matrix of `units` as an `include` list of `package` and `shard`, and
+/// whether it holds a job, since a job of an empty matrix fails.
+fn plan_output(units: &[(String, Shard)]) -> String
+{
+    let include: Vec<String> = units
+        .iter()
+        .map(|(package, shard)| format!(r#"{{"package":"{package}","shard":"{shard}"}}"#))
+        .collect();
+    format!(
+        "matrix={{\"include\":[{}]}}\nowed={}\n",
+        include.join(","),
+        !include.is_empty()
+    )
+}
+
+/// The paths of `package`'s harnesses as Kani lists them for its test
+/// build (`cargo kani list --format json`), under the memory limit. Kani
+/// writes the list to `kani-list.json` in its working directory, which is a
+/// directory of the package's own under `target/xtask/kani/`.
+fn listed_harnesses(root: &Path, package: &str) -> Result<Vec<String>>
+{
+    let dir = root.join("target/xtask/kani/list").join(package);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let list = dir.join("kani-list.json");
+    let _ = std::fs::remove_file(&list);
+    let manifest = root.join("Cargo.toml");
+    let args = [
+        "kani",
+        "--tests",
+        "-p",
+        package,
+        "--manifest-path",
+        &manifest.to_string_lossy(),
+        "list",
+        "--format",
+        "json",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let status = Command::new("prlimit")
+        .args(limited(args))
+        .current_dir(&dir)
+        .status()
+        .context("failed to launch prlimit (util-linux), which runs cargo kani")?;
+    if !status.success()
+    {
+        bail!("Kani: listing the harnesses of {package} failed: cargo kani exited with {status}");
+    }
+    let text =
+        std::fs::read_to_string(&list).with_context(|| format!("reading {}", list.display()))?;
+    listed_names(&text).with_context(|| format!("reading {}", list.display()))
+}
+
+/// The harness paths of a `kani-list.json`: its standard and its contract
+/// harnesses, each listed under its source file.
+fn listed_names(text: &str) -> Result<Vec<String>>
+{
+    let list = json::parse(text).map_err(|e| err!("not JSON: {e}"))?;
+    let mut names = Vec::new();
+    for kind in ["standard-harnesses", "contract-harnesses"]
+    {
+        let Some(json::Value::Object(files)) = list.get(kind)
+        else
+        {
+            bail!("no {kind} object");
+        };
+        for harnesses in files.values()
+        {
+            let json::Value::Array(harnesses) = harnesses
+            else
+            {
+                bail!("a {kind} entry is not a list");
+            };
+            for harness in harnesses
+            {
+                let name = harness
+                    .as_str()
+                    .ok_or_else(|| err!("a {kind} name is not a string"))?;
+                names.push(name.to_owned());
+            }
+        }
+    }
+    Ok(names)
 }
 
 // ── The installed release ─────────────────────────────────────────────────────
@@ -455,12 +701,63 @@ fn limited(args: Vec<String>) -> Vec<String>
     limited
 }
 
-/// The `cargo` arguments that verify `package`'s harnesses, or the one
-/// `harness` names, each under [`HARNESS_TIME_LIMIT_SECS`], which Kani takes
-/// as an unstable option. Kani's unwinding assertions stay on: no
+/// Which of a crate's harnesses a run verifies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Filter
+{
+    /// Every harness.
+    All,
+    /// Those whose path in the crate contains this text, as Kani's
+    /// `--harness` filter matches it.
+    Harness(String),
+    /// Exactly these, by their paths in the crate.
+    Exact(Vec<String>),
+}
+
+/// The harnesses of `harnessed` a run verifies: the one `harness` names, or
+/// the part `shard` takes of the crate's harnesses as Kani lists them, or
+/// every one. Fails when the shard takes none.
+fn filter(
+    root: &Path,
+    harnessed: &Harnessed,
+    harness: Option<&str>,
+    shard: Option<Shard>,
+) -> Result<Filter>
+{
+    if let Some(harness) = harness
+    {
+        return Ok(Filter::Harness(harness.to_owned()));
+    }
+    let Some(shard) = shard
+    else
+    {
+        return Ok(Filter::All);
+    };
+    let names = listed_harnesses(root, &harnessed.package)?;
+    let part = shard.of(&names);
+    if part.is_empty()
+    {
+        bail!(
+            "Kani: shard {shard} of {} holds no harness: Kani lists {}",
+            harnessed.package,
+            names.len()
+        );
+    }
+    step(&format!(
+        "Kani: {} shard {shard}: {} of {} harnesses",
+        harnessed.package,
+        part.len(),
+        names.len()
+    ));
+    Ok(Filter::Exact(part))
+}
+
+/// The `cargo` arguments that verify the harnesses `filter` takes of
+/// `package`, each under [`HARNESS_TIME_LIMIT_SECS`], which Kani takes as an
+/// unstable option. Kani's unwinding assertions stay on: no
 /// `--default-unwind` and no `--no-unwinding-checks`, so a loop a harness's
 /// bound does not cover fails it.
-fn kani_args(package: &str, harness: Option<&str>) -> Vec<String>
+fn kani_args(package: &str, filter: &Filter) -> Vec<String>
 {
     let mut args: Vec<String> = [
         "kani",
@@ -474,9 +771,19 @@ fn kani_args(package: &str, harness: Option<&str>) -> Vec<String>
     ]
     .map(str::to_owned)
     .to_vec();
-    if let Some(harness) = harness
+    match filter
     {
-        args.extend(["--harness".to_owned(), harness.to_owned()]);
+        Filter::All =>
+        {}
+        Filter::Harness(harness) => args.extend(["--harness".to_owned(), harness.clone()]),
+        Filter::Exact(names) =>
+        {
+            args.push("--exact".to_owned());
+            for name in names
+            {
+                args.extend(["--harness".to_owned(), name.clone()]);
+            }
+        }
     }
     args
 }
@@ -487,13 +794,13 @@ fn kani_args(package: &str, harness: Option<&str>) -> Vec<String>
 fn verify(
     root: &Path,
     harnessed: &Harnessed,
-    harness: Option<&str>,
+    filter: &Filter,
     outcomes: &mut Vec<(String, Outcome)>,
 ) -> Result<()>
 {
     step(&format!("Kani: {}", harnessed.package));
     let mut child = Command::new("prlimit")
-        .args(limited(kani_args(&harnessed.package, harness)))
+        .args(limited(kani_args(&harnessed.package, filter)))
         .current_dir(root)
         .stdout(Stdio::piped())
         .spawn()
@@ -615,6 +922,32 @@ fn outcome_table(outcomes: &[(String, Outcome)]) -> String
             outcome.verdict.label(),
             outcome.harness
         );
+    }
+    table
+}
+
+/// Each crate's harnesses and the sum of their verification times, in the
+/// order the crates ran: the sums that size [`SHARDS`].
+fn crate_times(outcomes: &[(String, Outcome)]) -> String
+{
+    let mut crates: Vec<(&str, usize, f64)> = Vec::new();
+    for (package, outcome) in outcomes
+    {
+        let seconds = outcome.seconds.unwrap_or(0.0);
+        match crates.iter_mut().find(|(p, _, _)| p == package)
+        {
+            Some((_, count, sum)) =>
+            {
+                *count = count.saturating_add(1);
+                *sum += seconds;
+            }
+            None => crates.push((package, 1, seconds)),
+        }
+    }
+    let mut table = String::new();
+    for (package, count, sum) in crates
+    {
+        let _ = writeln!(table, "{sum:>9.1}s  {package}: {count} harness(es)");
     }
     table
 }
@@ -1091,7 +1424,10 @@ mod tests
     #[test]
     fn cargo_kani_runs_under_the_memory_limit()
     {
-        let args = limited(kani_args("pkg", Some("a::proofs::one")));
+        let args = limited(kani_args(
+            "pkg",
+            &Filter::Harness("a::proofs::one".to_owned()),
+        ));
         let limit = format!("{HARNESS_TIME_LIMIT_SECS}s");
         assert_eq!(
             args,
@@ -1284,28 +1620,43 @@ mod tests
         }
     }
 
-    // Defect caught: a change that decides no harness's verdict (a
-    // workflow, the selection's module) taken as an input of every
-    // verification, or of a crate, so an edit of it owes a proof run although
-    // no verdict can move.
+    // Defect caught: a change that decides only whether or where the jobs
+    // run, or which crates they select (a workflow, the selection's module),
+    // taken as an input of every verification, so an edit of a workflow
+    // proves every crate although no harness's verdict can move.
     #[test]
     fn a_change_to_the_workflows_or_the_selection_proves_no_crate_for_it()
     {
-        for file in [
-            ".github/workflows/burnin.yml",
-            ".github/workflows/build-test.yml",
-            "xtask/src/affected.rs",
-        ]
+        for file in [".github/workflows/burnin.yml", "xtask/src/affected.rs"]
         {
             assert_eq!(select(&["docs/x.md", file]), [], "{file}");
         }
-        assert_eq!(
-            select(&[
-                "services/gpt/src/lib.rs",
-                ".github/workflows/build-test.yml"
-            ]),
-            [("gpt".to_owned(), input("services/gpt/src/lib.rs", "gpt"))]
-        );
+        for job in KANI_JOB
+        {
+            assert_eq!(
+                select(&["services/gpt/src/lib.rs", job]),
+                [("gpt".to_owned(), input("services/gpt/src/lib.rs", "gpt"))]
+            );
+        }
+    }
+
+    // Defect caught: an edit of a workflow that runs the jobs selecting no
+    // crate, so the plan, install, setup and run steps are skipped on its own
+    // run and on master's, and a broken step lands green; or one that proves
+    // more than the crate with the fewest harnesses.
+    #[test]
+    fn a_change_to_the_jobs_runs_them_on_the_crate_with_the_fewest_harnesses()
+    {
+        for job in [
+            ".github/workflows/kani.yml",
+            ".github/workflows/build-test.yml",
+        ]
+        {
+            assert_eq!(
+                select(&["docs/x.md", job]),
+                [("proto".to_owned(), Reason::Job(job.to_owned()))]
+            );
+        }
     }
 
     // Defect caught: a harness Kani stopped at the time limit passed, or
@@ -1404,7 +1755,7 @@ CBMC timed out. You may want to rerun your proof with a larger timeout or       
     #[test]
     fn a_run_keeps_unwinding_assertions_and_names_its_harness()
     {
-        let args = kani_args("kernel", Some("cpu_mask::proofs::x"));
+        let args = kani_args("kernel", &Filter::Harness("cpu_mask::proofs::x".to_owned()));
         let args: Vec<&str> = args.iter().map(String::as_str).skip(5).collect();
         assert_eq!(
             args,
@@ -1417,9 +1768,190 @@ CBMC timed out. You may want to rerun your proof with a larger timeout or       
             ]
         );
         assert!(
-            !kani_args("kernel", None)
+            !kani_args("kernel", &Filter::All)
                 .iter()
                 .any(|a| a.contains("unwind"))
+        );
+    }
+
+    fn names(count: usize) -> Vec<String>
+    {
+        (0..count).map(|i| format!("m::proofs::h{i:02}")).collect()
+    }
+
+    // Defect caught: shards that leave a harness out of every part, so no
+    // job proves it, or prove one twice; or parts that depend on the order
+    // Kani lists the harnesses in, so two jobs of one run split differently.
+    #[test]
+    fn the_shards_of_a_crate_take_every_harness_exactly_once()
+    {
+        for len in 0..12
+        {
+            let all = names(len);
+            for count in 1..=len.saturating_add(2)
+            {
+                let mut taken: Vec<String> = (1..=count)
+                    .flat_map(|index| Shard { index, count }.of(&all))
+                    .collect();
+                taken.sort();
+                assert_eq!(taken, all, "{len} harnesses in {count} shards");
+            }
+        }
+        let mut reversed = names(7);
+        reversed.reverse();
+        reversed.push(reversed[0].clone());
+        let shard = Shard { index: 2, count: 3 };
+        assert_eq!(shard.of(&reversed), shard.of(&names(7)));
+        assert_eq!(shard.of(&names(7)), ["m::proofs::h01", "m::proofs::h04"]);
+    }
+
+    // Defect caught: a shard outside its count, or a malformed one, taken
+    // as some part, so a job proves a part no plan meant.
+    #[test]
+    fn a_shard_is_k_of_n_with_k_from_1_to_n()
+    {
+        assert_eq!(Shard::parse("2/3").unwrap(), Shard { index: 2, count: 3 });
+        assert_eq!(Shard::parse("1/1").unwrap().to_string(), "1/1");
+        for bad in ["0/3", "4/3", "1/0", "3", "a/b", "1/2/3", ""]
+        {
+            let refused = Shard::parse(bad).unwrap_err().to_string();
+            assert!(refused.contains("K/N"), "{bad}: {refused}");
+        }
+    }
+
+    // Defect caught: a shard run that verifies the whole crate, or a
+    // harness by a partial match of another's path, so two shards prove it.
+    #[test]
+    fn a_shard_runs_exactly_its_harnesses()
+    {
+        let filter = Filter::Exact(vec!["a::proofs::x".to_owned(), "b::proofs::y".to_owned()]);
+        let args = kani_args("pkg", &filter);
+        let args: Vec<&str> = args.iter().map(String::as_str).skip(5).collect();
+        assert_eq!(
+            args,
+            [
+                "--tests",
+                "-p",
+                "pkg",
+                "--exact",
+                "--harness",
+                "a::proofs::x",
+                "--harness",
+                "b::proofs::y"
+            ]
+        );
+    }
+
+    // Defect caught: a list read short (the contract harnesses, or a file's
+    // harnesses after the first), so a shard drops harnesses; or a list of
+    // another shape read as empty, so no shard proves anything.
+    #[test]
+    fn kanis_list_gives_every_standard_and_contract_harness()
+    {
+        let text = r#"{
+            "kani-version": "0.68.0",
+            "file-version": "0.1",
+            "standard-harnesses": {
+                "src/a.rs": ["a::proofs::one", "a::proofs::two"],
+                "src/b.rs": ["b::proofs::three"]
+            },
+            "contract-harnesses": {"src/c.rs": ["c::proofs::four"]},
+            "contracts": [],
+            "totals": {"standard-harnesses": 3, "contract-harnesses": 1}
+        }"#;
+        let mut names = listed_names(text).unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "a::proofs::one",
+                "a::proofs::two",
+                "b::proofs::three",
+                "c::proofs::four"
+            ]
+        );
+        for bad in [
+            "[]",
+            r#"{"standard-harnesses": {}}"#,
+            r#"{"standard-harnesses": {"a": "x"}, "contract-harnesses": {}}"#,
+            r#"{"standard-harnesses": {"a": [1]}, "contract-harnesses": {}}"#,
+            "not json",
+        ]
+        {
+            assert!(listed_names(bad).is_err(), "{bad}");
+        }
+    }
+
+    fn harnessed(package: &str, harnesses: usize) -> Harnessed
+    {
+        Harnessed {
+            package: package.to_owned(),
+            dir: format!("shared/{package}"),
+            harnesses,
+        }
+    }
+
+    // Defect caught: a split crate run as one job, or as more shards than it
+    // has harnesses (an empty shard fails its job); a crate the table does
+    // not name left out; or a table entry for a crate that no longer holds a
+    // harness kept silently.
+    #[test]
+    fn the_plan_runs_each_crate_or_each_of_its_shards_once()
+    {
+        let crates = [
+            harnessed("big", 9),
+            harnessed("few", 2),
+            harnessed("one", 1),
+        ];
+        let units = plan_units(&crates, &[("big", 3), ("few", 4)]).unwrap();
+        let units: Vec<String> = units.iter().map(|(p, s)| format!("{p} {s}")).collect();
+        assert_eq!(
+            units,
+            [
+                "big 1/3", "big 2/3", "big 3/3", "few 1/2", "few 2/2", "one 1/1"
+            ]
+        );
+        let refused = plan_units(&crates, &[("gone", 2)]).unwrap_err().to_string();
+        assert!(refused.contains("SHARDS names gone"), "{refused}");
+    }
+
+    // Defect caught: a matrix the workflow cannot read, or an empty one
+    // reported as owed, so the prove job runs on an empty matrix and fails.
+    #[test]
+    fn the_plan_writes_the_matrix_and_whether_it_holds_a_job()
+    {
+        let units = [
+            ("a".to_owned(), Shard { index: 1, count: 2 }),
+            ("b".to_owned(), Shard { index: 1, count: 1 }),
+        ];
+        assert_eq!(
+            plan_output(&units),
+            "matrix={\"include\":[{\"package\":\"a\",\"shard\":\"1/2\"},\
+             {\"package\":\"b\",\"shard\":\"1/1\"}]}\nowed=true\n"
+        );
+        assert_eq!(plan_output(&[]), "matrix={\"include\":[]}\nowed=false\n");
+    }
+
+    // Defect caught: the per-crate sums that size the shards counting a
+    // crate twice, mixing crates, or dropping a harness without a time.
+    #[test]
+    fn the_time_per_crate_sums_each_crates_harnesses()
+    {
+        let outcome = |seconds| Outcome {
+            harness: "h".to_owned(),
+            verdict: Verdict::Passed,
+            detail: None,
+            seconds,
+        };
+        let outcomes = [
+            ("a".to_owned(), outcome(Some(1.5))),
+            ("b".to_owned(), outcome(Some(2.0))),
+            ("a".to_owned(), outcome(None)),
+            ("a".to_owned(), outcome(Some(3.0))),
+        ];
+        assert_eq!(
+            crate_times(&outcomes),
+            "      4.5s  a: 3 harness(es)\n      2.0s  b: 1 harness(es)\n"
         );
     }
 }

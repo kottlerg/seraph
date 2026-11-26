@@ -18,6 +18,12 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
+      kani-since:
+        description: >-
+          The commit the kani jobs select the affected proof crates from;
+          empty proves every crate
+        required: false
+        default: ''
       cells-since:
         description: >-
           The commit the select job computes the owed cells from; empty
@@ -58,6 +64,7 @@ jobs:
       bench-owed: ${{ steps.cells.outputs.bench-owed }}
       ktest-bench: ${{ steps.cells.outputs.ktest-bench }}
       fuzz-owed: ${{ steps.cells.outputs.fuzz-owed }}
+      base: ${{ steps.cells.outputs.base }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -152,6 +159,20 @@ jobs:
         with:
           mode: save
           name: host-tests
+
+  kani:
+    # The bounded proofs of the crates the change can affect, one job per
+    # crate or shard (.github/workflows/kani.yml; docs/testing.md § Bounded
+    # verification); burnin.yml proves every crate. On a pull request or a
+    # push, from the base the select job found, so a proof a red or
+    # cancelled master run left unproven stays owed; on a dispatch from its
+    # input. None proves every crate.
+    needs: select
+    uses: ./.github/workflows/kani.yml
+    with:
+      since: >-
+        ${{ github.event_name != 'workflow_dispatch' && needs.select.outputs.base
+        || inputs.kani-since }}
 
   # The gating fuzz tier (docs/testing.md § Fuzzing): the engine's self-test,
   # then every target for the default execution count from seed 0, from the
@@ -743,7 +764,7 @@ jobs:
     # change owes it nothing passes. A check that never reports blocks a
     # merge, so the cells, which run only when owed, are not required
     # checks themselves.
-    needs: [select, host-tests, fuzz, qemu-debs, build, validate, bench]
+    needs: [select, host-tests, kani, fuzz, qemu-debs, build, validate, bench]
     if: always()
     runs-on: ubuntu-latest
     steps:

@@ -44,7 +44,9 @@ use logd_codec::hold::HeldLines;
 use logd_codec::kernel::{Accept, Cursor, KERNEL_NAME, KernelLine};
 use logd_codec::reclaim::{Cause, ReclaimLine};
 use logd_codec::record::RENDERED_MAX_BYTES;
-use logd_codec::sink::{HEADER_BYTES, Offer, Popped, SINK_QUEUE_BYTES, SINK_STALL_MS, SinkQueue};
+use logd_codec::sink::{
+    HEADER_BYTES, LineKind, Offer, Popped, SINK_QUEUE_BYTES, SINK_STALL_MS, SinkQueue,
+};
 use recv_pool::{IpcBuf, RecvPool, SpawnError};
 use std::os::seraph::startup_info;
 use syscall::RIGHTS_EQ_POST;
@@ -1346,8 +1348,12 @@ struct Sink
     /// The driver, as resolved through devmgr.
     driver: OutputDriver,
     /// The driver's write label without its length: the opcode
-    /// (`SERIAL_WRITE_BYTES`, `FB_WRITE_BYTES`) and its flags.
+    /// (`SERIAL_WRITE_BYTES`, `FB_WRITE_BYTES`).
     op: u64,
+    /// The flag of the zero-length barrier write that ends each line, which
+    /// the driver answers once the line has left the device
+    /// (`SERIAL_WRITE_SENT`); 0 for a driver that takes none ([`write_line`]).
+    sent: u64,
     /// The sink's name in logd's lines about it.
     what: &'static str,
     /// Lines waiting for the writer.
@@ -1398,11 +1404,12 @@ impl Sink
         reason = "evaluated only at compile time, to initialise the SERIAL and FB statics; no \
                   runtime frame holds the queue"
     )]
-    const fn new(op: u64, what: &'static str) -> Self
+    const fn new(op: u64, sent: u64, what: &'static str) -> Self
     {
         Self {
             driver: OutputDriver::new(),
             op,
+            sent,
             what,
             queue: Mutex::new(SinkQueue::new()),
             queued: Condvar::new(),
@@ -1419,8 +1426,9 @@ impl Sink
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Hand `line` to the sink: queue it for the writer, waiting while the
-    /// queue is full and the writer frees space until `deadline` at most, or
+    /// Hand `line`, of `kind`, to the sink: queue it for the writer, waiting
+    /// while the queue is full and the writer frees space until `deadline` at
+    /// most, or
     /// drop it, counted, once the sink is stalled
     /// ([`logd_codec::sink::SinkQueue::offer`]). While no driver is resolved
     /// the sink is unserved: the line is queued for the driver resolved next
@@ -1432,7 +1440,7 @@ impl Sink
     /// otherwise. Written here by [`Self::write_inline`], by `deadline`,
     /// while no writer runs. Dropped uncounted when the bootstrap carried no
     /// class SEND, so no driver can ever be resolved.
-    fn offer(&self, line: &[u8], deadline: Instant) -> Option<u64>
+    fn offer(&self, line: &[u8], kind: LineKind, deadline: Instant) -> Option<u64>
     {
         if self.driver.class() == 0
         {
@@ -1440,7 +1448,7 @@ impl Sink
         }
         if !self.writer.load(Ordering::Acquire)
         {
-            self.write_inline(line, deadline);
+            self.write_inline(line, kind, deadline);
             return None;
         }
         let mut queue = self.lock();
@@ -1450,11 +1458,11 @@ impl Sink
             let left = deadline.saturating_duration_since(Instant::now());
             let offered = if unserved
             {
-                queue.offer_unserved(line)
+                queue.offer_unserved(line, kind)
             }
             else
             {
-                queue.offer(line, left.is_zero())
+                queue.offer(line, kind, left.is_zero())
             };
             match offered
             {
@@ -1517,11 +1525,12 @@ impl Sink
     /// Write `line` to the driver from the calling thread, with no other
     /// inline write between its calls ([`Self::inline_busy`]): the wait for
     /// that turn and every call end by `deadline`, so the caller waits on
-    /// the sink for [`SINK_STALL_MS`] at most. A line not written whole by
-    /// then is counted, and the count is written ahead of the next line an
-    /// inline write starts. A line with no driver resolved to write it to is
-    /// counted the same way.
-    fn write_inline(&self, line: &[u8], deadline: Instant)
+    /// the sink for [`SINK_STALL_MS`] at most. A line the driver did not
+    /// take whole by then ([`Wrote::Lost`]) is counted, unless it is the other
+    /// sink's drop line ([`LineKind::PeerDrops`]), and the count is written
+    /// ahead of the next line an inline write starts. A line with no driver
+    /// resolved to write it to is counted the same way.
+    fn write_inline(&self, line: &[u8], kind: LineKind, deadline: Instant)
     {
         let ipc_buf = emit_ipc_buf();
         let cap = self.driver.cap();
@@ -1551,17 +1560,20 @@ impl Sink
             }
             *busy = true;
         }
+        let bound = Bound::By(deadline);
         let mut lost = 0u32;
         let dropped = self.inline_dropped.swap(0, Ordering::Relaxed);
         if dropped > 0
         {
             let report = self.drop_report(dropped);
-            if !write_chunks_by(cap, self.op, report.bytes(), ipc_buf, deadline)
+            if write_line(cap, self.op, self.sent, report.bytes(), ipc_buf, bound) == Wrote::Lost
             {
                 lost = dropped;
             }
         }
-        if lost > 0 || !write_chunks_by(cap, self.op, line, ipc_buf, deadline)
+        let line_lost =
+            lost > 0 || write_line(cap, self.op, self.sent, line, ipc_buf, bound) == Wrote::Lost;
+        if line_lost && kind == LineKind::Logged
         {
             lost = lost.saturating_add(1);
         }
@@ -1602,15 +1614,19 @@ impl Sink
     }
 
     /// The writer thread: take each line in order and write it to the driver
-    /// with calls that have no bound, so a line is written once, when the
-    /// driver answers, however long it is stopped; report lines the sink
-    /// dropped where they were dropped ([`Self::report_drops`]). While no
-    /// driver is resolved it waits for one with the line it took, so the lines
-    /// queued meanwhile are written to the next driver resolved. A call that
-    /// fails ends the line, and the next line goes to the driver resolved
-    /// then; a call to a dead driver fails only once devmgr withdraws
-    /// it and revokes its endpoint. Each completed
-    /// write releases the producers waiting for it and ends a stall.
+    /// with calls that have no bound ([`write_line`]), so a line is written
+    /// once, when the driver answers, however long it is stopped; report lines
+    /// the sink dropped where they were dropped ([`Self::report_drops`]).
+    /// While no driver is resolved it waits for one with the line it took, so
+    /// the lines queued meanwhile are written to the next driver resolved. A
+    /// call that fails, or that the driver answers with anything but success,
+    /// ends the line, and the next line goes to the driver resolved then; a
+    /// call to a dead driver fails only once devmgr withdraws it and revokes
+    /// its endpoint. Each completed write releases the producers waiting for
+    /// it and ends a stall. A write given up releases them and leaves a stall
+    /// in place ([`logd_codec::sink::SinkQueue::not_written`]); its line is
+    /// counted as dropped when the driver did not take it ([`Wrote::Lost`]),
+    /// unless it is a drop line, which is not counted again.
     /// `other` is the sink the drop reports are also written to.
     fn run_writer(&self, other: &Sink) -> !
     {
@@ -1618,42 +1634,58 @@ impl Sink
         let mut out = LineBuf::new();
         loop
         {
-            match self.take_next(&mut out.buf)
+            // What the driver did with this pass's write, and whether a line
+            // it did not take counts: a drop line, this sink's or the other
+            // sink's, is not counted again.
+            let (wrote, counted) = match self.take_next(&mut out.buf)
             {
                 Taken::Line(popped) =>
                 {
                     if popped.dropped_before > 0
                     {
-                        self.report_drops(popped.dropped_before, other, ipc_buf);
+                        let _ = self.report_drops(popped.dropped_before, other, ipc_buf);
                     }
-                    self.write_driver(out.buf.get(..popped.len).unwrap_or_default(), ipc_buf);
+                    let line = out.buf.get(..popped.len).unwrap_or_default();
+                    (
+                        self.write_driver(line, ipc_buf),
+                        popped.kind == LineKind::Logged,
+                    )
                 }
-                Taken::Drops(dropped) => self.report_drops(dropped, other, ipc_buf),
+                Taken::Drops(dropped) => (self.report_drops(dropped, other, ipc_buf), false),
+            };
+            match wrote
+            {
+                Wrote::All => self.lock().written(),
+                Wrote::Held => self.lock().not_written(0),
+                Wrote::Lost => self.lock().not_written(u32::from(counted)),
             }
-            self.lock().written();
             self.progress.notify_all();
         }
     }
 
-    /// The writer's write of `bytes` to the driver resolved now, or to the
-    /// next one resolved while none is, unbounded.
-    fn write_driver(&self, bytes: &[u8], ipc_buf: *mut u64)
+    /// The writer's write of the line `bytes` to the driver resolved now, or
+    /// to the next one resolved while none is, unbounded.
+    fn write_driver(&self, bytes: &[u8], ipc_buf: *mut u64) -> Wrote
     {
-        if !ipc_buf.is_null()
+        if ipc_buf.is_null()
         {
-            let cap = self.driver.await_cap();
-            write_chunks(cap, self.op, bytes, ipc_buf, 0);
+            return Wrote::Lost;
         }
+        let cap = self.driver.await_cap();
+        write_line(cap, self.op, self.sent, bytes, ipc_buf, Bound::Unbounded)
     }
 
     /// Write one logd line naming the `dropped` lines this sink did not
     /// take: to this sink's driver from its writer, and to `other` through its
-    /// queue, without waiting for its write.
-    fn report_drops(&self, dropped: u32, other: &Sink, ipc_buf: *mut u64)
+    /// queue, as its [`LineKind::PeerDrops`] line, without waiting for its
+    /// write. What this sink's driver did with it; a report the driver did not
+    /// take is not counted again.
+    fn report_drops(&self, dropped: u32, other: &Sink, ipc_buf: *mut u64) -> Wrote
     {
         let line = self.drop_report(dropped);
-        self.write_driver(line.bytes(), ipc_buf);
-        let _ = other.offer(line.bytes(), stall_deadline());
+        let wrote = self.write_driver(line.bytes(), ipc_buf);
+        let _ = other.offer(line.bytes(), LineKind::PeerDrops, stall_deadline());
+        wrote
     }
 
     /// logd's warning line naming the `dropped` lines this sink did not
@@ -1673,19 +1705,20 @@ impl Sink
     }
 }
 
-/// The serial driver logd writes every line to. Each write waits until its
-/// bytes have left the UART (`SERIAL_WRITE_SENT`), so a line is on the line
-/// when it counts as written: before its caller goes on, which may be to
-/// power the machine off (`services/logd/docs/ipc-interface.md` § Output
-/// sinks).
+/// The serial driver logd writes every line to. Each line's write ends with a
+/// barrier the driver answers once its bytes have left the UART
+/// (`SERIAL_WRITE_SENT`, [`write_line`]), so a line is on the line when it
+/// counts as written: before its caller goes on, which may be to power the
+/// machine off (`services/logd/docs/ipc-interface.md` § Output sinks).
 static SERIAL: Sink = Sink::new(
-    ipc::serial_labels::SERIAL_WRITE_BYTES | ipc::serial_labels::SERIAL_WRITE_SENT,
+    ipc::serial_labels::SERIAL_WRITE_BYTES,
+    ipc::serial_labels::SERIAL_WRITE_SENT,
     "serial",
 );
 /// The framebuffer driver logd mirrors every line to. A headless boot runs
 /// none, so the sink stays unserved: it queues lines up to its queue and
 /// counts the rest, and nothing is written to a screen ([`Sink::offer`]).
-static FB: Sink = Sink::new(ipc::fb_labels::FB_WRITE_BYTES, "framebuffer");
+static FB: Sink = Sink::new(ipc::fb_labels::FB_WRITE_BYTES, 0, "framebuffer");
 
 /// Maximum payload bytes per `SERIAL_WRITE_BYTES` or `FB_WRITE_BYTES` (one
 /// full IPC data area).
@@ -1744,42 +1777,130 @@ fn spawn_writers()
     }
 }
 
-/// Write `bytes` to the driver behind `cap` with one `op` call per
-/// [`SERIAL_CHUNK`] bytes, on the calling thread's page `ipc_buf`, each call
-/// bounded by `timeout_ms` (0: no bound). A failed call ends the write.
-fn write_chunks(cap: u64, op: u64, bytes: &[u8], ipc_buf: *mut u64, timeout_ms: u32)
+/// How long each call of a [`write_line`] may wait for its answer.
+#[derive(Clone, Copy)]
+enum Bound
 {
-    for chunk in bytes.chunks(SERIAL_CHUNK)
+    /// No bound: the writer's calls.
+    Unbounded,
+    /// Each call for this many milliseconds: the panic sink's calls.
+    Each(u32),
+    /// Every call ending by this instant: an inline write's calls.
+    By(Instant),
+}
+
+impl Bound
+{
+    /// The next call's bound in milliseconds (0: none), or `None` once a
+    /// [`Bound::By`] instant has passed.
+    fn next_ms(self) -> Option<u32>
     {
-        if !call_chunk(cap, op, chunk, ipc_buf, timeout_ms)
+        match self
         {
-            return;
+            Self::Unbounded => Some(0),
+            Self::Each(ms) => Some(ms),
+            Self::By(deadline) =>
+            {
+                let left = deadline.saturating_duration_since(Instant::now());
+                // Round up, so a call is never given the unbounded 0.
+                let ms = left.as_micros().div_ceil(1000);
+                (ms > 0).then(|| u32::try_from(ms).unwrap_or(u32::MAX))
+            }
         }
     }
 }
 
-/// [`write_chunks`] with every call ending by `deadline`; whether all of
-/// `bytes` was written.
-fn write_chunks_by(cap: u64, op: u64, bytes: &[u8], ipc_buf: *mut u64, deadline: Instant) -> bool
+/// What a driver did with a line [`write_line`] wrote to it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wrote
 {
-    bytes.chunks(SERIAL_CHUNK).all(|chunk| {
-        let left = deadline.saturating_duration_since(Instant::now());
-        // Round up, so a call is never given the unbounded 0.
-        let ms = left.as_micros().div_ceil(1000);
-        ms > 0
-            && call_chunk(
-                cap,
-                op,
-                chunk,
-                ipc_buf,
-                u32::try_from(ms).unwrap_or(u32::MAX),
-            )
-    })
+    /// The driver took every byte and, with a barrier, saw them leave the
+    /// device: the line is written.
+    All,
+    /// The driver took every byte, but the barrier was answered with anything
+    /// but success (the serial driver's `STALLED` on a transmitter that made
+    /// no progress) or not answered within its bound. The bytes are the
+    /// driver's, and leave the device when its transmitter moves again.
+    Held,
+    /// The driver did not take every byte: a chunk's call failed or was not
+    /// answered within its bound, or the driver answered it with anything but
+    /// success; or the barrier's call failed, so the driver is gone with the
+    /// bytes it took ([`Answer::Failed`]). The line is not written whole.
+    Lost,
+}
+
+/// Write the line `bytes` to the driver behind `cap` with one plain `op`
+/// call per [`SERIAL_CHUNK`] bytes, on the calling thread's page `ipc_buf`,
+/// each call bounded by `bound`; then, when `sent` is not 0, with one
+/// zero-length `op | sent` call, a barrier the driver answers once every byte
+/// written before it has left the device. Two steps, so each of the serial
+/// driver's `STALLED` answers means one thing: a chunk refused `STALLED`
+/// was not appended to the transmit ring, and a barrier refused `STALLED`
+/// was (`services/drivers/serial/README.md` § Label 1). A chunk not taken
+/// ends the write.
+fn write_line(cap: u64, op: u64, sent: u64, bytes: &[u8], ipc_buf: *mut u64, bound: Bound)
+-> Wrote
+{
+    let taken = bytes.chunks(SERIAL_CHUNK).all(|chunk| {
+        bound
+            .next_ms()
+            .is_some_and(|ms| call_chunk(cap, op, chunk, ipc_buf, ms) == Answer::Taken)
+    });
+    if !taken
+    {
+        return Wrote::Lost;
+    }
+    if sent == 0
+    {
+        return Wrote::All;
+    }
+    loop
+    {
+        let Some(ms) = bound.next_ms()
+        else
+        {
+            return Wrote::Held;
+        };
+        match call_chunk(cap, op | sent, &[], ipc_buf, ms)
+        {
+            Answer::Taken => return Wrote::All,
+            Answer::Refused | Answer::Unanswered => return Wrote::Held,
+            // The barrier only waits, so it is asked again: a live driver
+            // answers it, and a dead one's endpoint fails it.
+            Answer::Interrupted =>
+            {}
+            Answer::Failed => return Wrote::Lost,
+        }
+    }
+}
+
+/// How the driver answered one [`call_chunk`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answer
+{
+    /// Success: the driver took the call's bytes, and for a barrier saw them
+    /// leave.
+    Taken,
+    /// Any other answer, the serial driver's `STALLED` among them.
+    Refused,
+    /// No answer within the call's bound (`WouldBlock`): the driver may
+    /// still be serving the call.
+    Unanswered,
+    /// The call was cancelled before its answer (`Interrupted`): the calling
+    /// thread was stopped, or the driver received again before it replied,
+    /// or its serving thread was freed. The driver may have taken the call's bytes, so a chunk
+    /// interrupted is not written again, and its line is counted rather than
+    /// repeated.
+    Interrupted,
+    /// The call failed otherwise: the driver's endpoint is gone, which for a
+    /// resolved driver means devmgr withdrew it.
+    Failed,
 }
 
 /// One `op` call of `chunk` to the driver behind `cap`, bounded by
-/// `timeout_ms` (0: no bound); whether it succeeded.
-fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u32) -> bool
+/// `timeout_ms` (0: no bound), and how the driver answered it
+/// ([`write_line`] says what each answer means of the bytes).
+fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u32) -> Answer
 {
     let label = op | ((chunk.len() as u64) << 16);
     let msg = IpcMessage::builder(label).bytes(0, chunk).build();
@@ -1787,8 +1908,20 @@ fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u3
     // worker calls here (inline) while it serves a request, which was copied
     // out of the page as it was received, and its pending reply stays bound
     // across this call (`docs/ipc-design.md` § Multi-threaded servers).
-    unsafe { ipc::ipc_call_timeout(cap, &msg, ipc_buf, timeout_ms) }.is_ok()
+    match unsafe { ipc::ipc_call_timeout(cap, &msg, ipc_buf, timeout_ms) }
+    {
+        Ok(reply) if reply.label == WRITE_SUCCESS => Answer::Taken,
+        Ok(_) => Answer::Refused,
+        Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => Answer::Unanswered,
+        Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => Answer::Interrupted,
+        Err(_) => Answer::Failed,
+    }
 }
+
+/// The answer to a write that the driver took: `SUCCESS` of the serial and
+/// the framebuffer driver alike, which both sinks' writes compare against.
+const WRITE_SUCCESS: u64 = ipc::serial_errors::SUCCESS;
+const _: () = assert!(WRITE_SUCCESS == ipc::fb_errors::SUCCESS);
 
 /// Longest frame of a line: the prefix [`LineBuf::push_prefix`] writes
 /// (`logd_codec::prefix::PREFIX_MAX`) and the line's `\r\n`.
@@ -1881,9 +2014,9 @@ impl LineBuf
     {
         let line = self.bytes();
         let serial_deadline = stall_deadline();
-        let serial = SERIAL.offer(line, serial_deadline);
+        let serial = SERIAL.offer(line, LineKind::Logged, serial_deadline);
         let fb_deadline = stall_deadline();
-        let fb = FB.offer(line, fb_deadline);
+        let fb = FB.offer(line, LineKind::Logged, fb_deadline);
         SERIAL.await_written(serial, serial_deadline);
         FB.await_written(fb, fb_deadline);
     }
@@ -1911,7 +2044,14 @@ fn panic_to_serial(bytes: &[u8])
     let cap = SERIAL.driver.cap();
     if cap != 0
     {
-        write_chunks(cap, SERIAL.op, bytes, ipc_buf, SINK_STALL_MS);
+        let _ = write_line(
+            cap,
+            SERIAL.op,
+            SERIAL.sent,
+            bytes,
+            ipc_buf,
+            Bound::Each(SINK_STALL_MS),
+        );
     }
 }
 

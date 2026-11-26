@@ -258,11 +258,12 @@ claims.
    Kani run: run `cargo xtask kani --since <merge base> --list` at the PR
    head, the merge base being `git merge-base <head> origin/master`. When it
    lists a crate, `docs/testing.md` § Bounded verification owes a local
-   `cargo xtask kani --since <merge base>` run and `docs/conventions.md`
-   § PR-body checklist discipline owns its report: FAIL when `## Validation`
-   does not give the command, a head that covers the PR head, the crates
-   verified and a passing outcome. When it lists none, FAIL a body that does
-   not say that no Kani run is owed.
+   `cargo xtask kani --since <merge base>` run at the validated head and
+   `docs/conventions.md` § PR-body checklist discipline owns its report:
+   FAIL when `## Validation` does not give the command, the head it ran at,
+   the crates verified and a passing outcome, or when that head is not the
+   validated head X this step accepts. When it lists none, FAIL a body that
+   does not say that no Kani run is owed.
 
    CPU-count width: a non-inert line the PR's own diff adds that introduces
    a structure with one entry or one bit per CPU is on the Boundary surface
@@ -332,6 +333,7 @@ Any FAIL section forces `AUDIT FAIL`.
 ## Tool discipline
 
 Read-only. Read files with `Read` and search with `Grep` and `Glob`. `Bash` is for `git` and
-`gh` read-only subcommands and `cargo xtask pr-check`, and for a `grep`/`find`/`rg`-class shell
-utility only where those tools cannot do the search. No `gh pr edit`, `gh issue edit`,
+`gh` read-only subcommands, `cargo xtask pr-check`, `cargo xtask kani --since <merge base> --list`
+(which only selects and prints crates), and a `grep`/`find`/`rg`-class shell utility only where
+those tools cannot do the search. No `gh pr edit`, `gh issue edit`,
 `gh pr merge`, `git commit`, `git push`. You report; you do not act.

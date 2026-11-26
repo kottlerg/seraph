@@ -99,9 +99,13 @@ receiver stays queued unrecorded. The TCB keeps the address of its slot's receiv
 the Thread dealloc unlink) clears that word by a compare-and-swap from the removed TCB to null,
 which leaves alone a slot a later park has since taken. `RecvQueue` is the only way to the inner
 queue, so no removal skips the clear, and a slot's receiver, read under the endpoint's lock, is a
-thread still parked on that queue. A lookup compares at most four queue words and loads one
-receiver word, and reads no TCB. A table with no record for the endpoint, full or not, leaves
-the call to the longest-waiting receiver: no call is refused for want of a slot.
+thread still parked on that queue. A lookup compares all four queue words, whichever slot names
+the endpoint, loads one receiver word, and reads no TCB; a park's search for the slot naming its
+queue compares all four the same way. The slot an endpoint takes follows the order of the CPU's
+earlier parks on other endpoints, which the machine's timing decides, so a search that stopped
+at the match would make one call cost more or fewer instructions from one boot to the next. A
+table with no record for the endpoint, full or not, leaves the call to the longest-waiting
+receiver: no call is refused for want of a slot.
 
 The table has no lock of its own, and its words are `Relaxed` atomics. A CPU records and looks up
 in its own table only, under the lock of the endpoint it parks on or calls, with interrupts off;

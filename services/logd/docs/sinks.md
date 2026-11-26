@@ -8,10 +8,10 @@ a program reads, follows and steers the log.
 
 ## Implementation status
 
-Built: the eight severities and their console tags, the console prefix
-`[sec.usfrac] LEVEL  [name] ` that both receivers write, the kernel's records read and
-written as `[kernel]` lines, and the serial and framebuffer outputs as two sinks with a bounded queue
-and a writer thread each ([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks).
+Built: the eight severities and their console tags, the console prefix `[sec.usfrac] LEVEL [name] `
+that both receivers write, the kernel's records read and written as `[kernel]` lines, and the serial
+and framebuffer outputs as two sinks with a bounded queue and a writer thread each
+([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks).
 
 Everything else this document states is design intent, not yet implemented, unless a sentence names
 it as built. Each section names the Issue that builds it. Until an Issue lands,
@@ -72,8 +72,9 @@ logd's history entry is the record. Every sink renders from it, and the query in
 - **Slot serial.** logd gives every slot it creates a 32-bit serial, counting up over the life of
   the logd instance. An entry names its sender by it, not by its badge alone: a live and a retired
   slot can share a badge ([ipc-interface.md](ipc-interface.md) § Retired slots), and a reader that
-  lags behind the history must name an entry whose slot has since been retired. The serial wraps;
-  it is unambiguous because at most the live slots and `RETIRED_SLOTS` retired ones exist at once.
+  lags behind the history must name an entry whose slot has since been retired. The serial wraps,
+  and on a wrap logd skips every serial a live or retired slot still holds, so no two slots in the
+  table share one.
   A retired slot that is dropped takes its entries with it, so every entry in the history has its
   slot, and its name, at the moment it is read.
 - **Name.** An entry carries no name. A sink renders the name of the entry's slot, with the
@@ -133,7 +134,7 @@ each in its format, and writes it to its output.
 | `level` | the least severe level the sink shows; an entry more verbose than it is skipped, uncounted |
 | `format` | `console` with a field list, or `rfc5424` |
 | `pace` | `hold` (the sink's progress holds senders back) or `skip` (it never does, and loses entries when it falls behind) |
-| `backlog` | how many entries before the newest the cursor starts at when the sink attaches or a driver comes up |
+| `backlog` | for a `skip` sink: how many entries before the newest its cursor starts at when it attaches or its driver comes up, when it is further behind than that |
 | `relayed` | whether the sink shows `relayed` entries |
 | cursor | the `seq` of the last entry the sink has written or skipped |
 | drop count | the entries the history evicted before the sink reached them |
@@ -154,15 +155,18 @@ each in its format, and writes it to its output.
 - A sink is `hold` or `skip`. Serial is `hold`; the framebuffer, pstore by default, and every
   external sink are `skip`.
 - Each sender slot counts its entries that a served, unstalled `hold` sink has not written. A
-  message that would take the count past `HOLD_WINDOW` (16) is refused with `WINDOW_FULL`, and nothing of
-  it is consumed. Messages at error or more severe have headroom to twice `HOLD_WINDOW`. The reply
-  carries a retry hint, and the sender's library sleeps it and sends the message again within its
-  call's bound ([#928](https://github.com/kottlerg/seraph/issues/928) owns the sender's side).
+  message that would take the count past `HOLD_WINDOW` (16) is refused with `WINDOW_FULL`, and
+  nothing of it is consumed. A slot with nothing unwritten always accepts, so a message that
+  completes more lines than the window holds is taken from an empty window. Messages at error or
+  more severe have headroom to twice `HOLD_WINDOW`. The reply carries a retry hint, and the sender's
+  library sleeps it and sends the message again within its call's bound
+  ([#928](https://github.com/kottlerg/seraph/issues/928) owns the sender's side).
 - A `hold` sink is stalled while it is unserved (no driver resolved), or while its writer's current
   write is older than `SINK_STALL_MS`; a stalled sink counts toward no window, so a stopped driver
   holds no sender.
-- Past `HISTORY_BYTES`, the history evicts an entry a `hold` sink has not written only when no written
-  one is left. `PER_SLOT_HISTORY` drops a slot's own oldest entry whatever the sinks have written.
+- Past `HISTORY_BYTES`, the history evicts an entry a `hold` sink has not written only when no
+  written one is left. `PER_SLOT_HISTORY` drops a slot's own oldest entry whatever the sinks have
+  written.
 - A `skip` sink holds no sender and keeps no entry: what the history evicts before it is read is
   counted as dropped.
 
@@ -187,12 +191,15 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
 
 | Sink | Level | Format | Pace | Backlog | Relayed | Colour |
 |---|---|---|---|---|---|---|
-| `serial` | info | console | `hold` | 0 | no | no |
+| `serial` | info | console | `hold` | none | no | no |
 | `framebuffer` | critical | console | `skip` | 64 | yes | yes |
 | `pstore` | debug | records | `skip` | 0 | no | no |
 
-- **serial.** The authoritative console and the channel CI reads. It skips `relayed` entries, which
-  init-logd wrote to the UART itself, and shows `previous` entries (§ pstore).
+- **serial.** The authoritative console and the channel CI reads. As a `hold` sink it has no
+  backlog: its cursor starts before logd's oldest entry and moves only as it writes, so a driver
+  that comes up late or restarts is written every entry of its absence the history still holds, and
+  the evicted ones are counted as dropped. It skips `relayed` entries, which init-logd wrote to the
+  UART itself, and shows `previous` entries (§ pstore).
 - **framebuffer.** For the person at the screen. Its level is critical, so a healthy boot shows no
   log line on it. When an emergency entry reaches it, the sink first writes the last `backlog`
   entries at info or more severe that precede the emergency entry in the history and that it has
@@ -207,18 +214,19 @@ the serial driver directly, outside the history and with no lock taken.
 ### External sinks
 
 An external sink is a process that follows the history through the query interface
-(§ Queries, follow and control) with a `logd.query` authority its recipe seeds. It is always `skip`.
+(§ Queries, follow and control) with the `logd.follow` authority its recipe seeds, which also
+serves every read of `logd.query`. It is always `skip`.
 logd knows nothing of it but its subscription; logd stays without a namespace, a file system, a
 network stack or a TLS stack.
 
 An external sink:
 
 1. subscribes (`LOG_SUBSCRIBE`) and records the instance epoch and the oldest `seq` the reply names;
-2. reads the history ascending after its cursor, unfiltered, page by page, and applies its own level
-   itself: the walk is unfiltered so that every missing `seq` between two entries it reads is an
-   evicted entry, which it counts as dropped;
-3. names each entry from its slot serial, reading `QUERY_SLOTS` for a serial it has not seen; a serial
-   no longer in the table is rendered as the unnamed sender `?`;
+2. reads the history ascending from the `seq` after its cursor, unfiltered, page by page, and
+   applies its own level itself: the walk is unfiltered so that every missing `seq` between two
+   entries it reads is an evicted entry, which it counts as dropped;
+3. names each entry from its slot serial, reading `QUERY_SLOTS` for a serial it has not seen; a
+   serial no longer in the table is rendered as the unnamed sender `?`;
 4. renders each entry in its format and writes it;
 5. waits on its Notification and its event queue together (§ Subscriptions), and on a signal goes
    back to 2.
@@ -234,8 +242,8 @@ an unknown gap, and starts from the new instance's oldest entry.
 *Design intent (#1493).*
 
 Each device sink's settings come from one `env` entry of logd's recipe
-(`rootfs/config/svcmgr/services/logd.svc`), so they are set per distribution, signed as configuration,
-and replayed on every restart. logd reads no file.
+(`rootfs/config/svcmgr/services/logd.svc`), so they are set per distribution, signed as
+configuration, and replayed on every restart. logd reads no file.
 
 ```
 LOGD_SINK_<NAME>=<key>=<value>,<key>=<value>,...
@@ -300,8 +308,8 @@ The default console line, the same on serial and the framebuffer:
   registered none (§ Display names).
 - **Message.** A text line's bytes, or a record rendered as `message key=value ...` on one line
   ([ipc-interface.md](ipc-interface.md) § `stream_labels::STREAM_RECORD`). A text line longer than
-  `LINE_BUF_SIZE` is retained as several entries, so each part is its own line with the full prefix and
-  its level.
+  `LINE_BUF_SIZE` is retained as several entries, so each part is its own line with the full prefix
+  and its level.
 - **Kernel lines** take the same shape, with the name `kernel` and the record's severity.
 - **Patterns.** Every pattern xtask or CI matches on a console line changes with the format, in the
   same PR as the line it matches.
@@ -310,15 +318,15 @@ The default console line, the same on serial and the framebuffer:
 
 Serial carries no colour: it is captured to files and matched by CI. On the framebuffer, with
 `colour=yes`, only the level tag is coloured, in the terminal's 16-colour palette
-([shared/ansi](../../../shared/ansi/README.md) `ANSI_RGB`): emergency to error red, warning yellow, notice
-bright white, informational the default foreground, debug bright black. The bytes are otherwise
-those serial shows.
+([shared/ansi](../../../shared/ansi/README.md) `ANSI_RGB`): emergency to error red, warning yellow,
+notice bright white, informational the default foreground, debug bright black. The bytes are
+otherwise those serial shows.
 
 The framebuffer driver's colour is one global state that the terminal shares
 ([services/drivers/framebuffer/README.md](../../drivers/framebuffer/README.md) § Label 2:
-`FB_SET_ATTRS`). The sink sets the tag's colour, writes the tag, and sets the driver's default colour
-back before the rest of the line, so a colour the terminal had set is reset by a log line until the
-terminal next sets one. Per-client colour state arrives with the display broker
+`FB_SET_ATTRS`). The sink sets the tag's colour, writes the tag, and sets the driver's default
+colour back before the rest of the line, so a colour the terminal had set is reset by a log line
+until the terminal next sets one. Per-client colour state arrives with the display broker
 ([#153](https://github.com/kottlerg/seraph/issues/153)). At the framebuffer's default level a log
 line reaches the screen rarely. (Pending the maintainer's approval.)
 
@@ -327,9 +335,9 @@ line reaches the screen rarely. (Pending the maintainer's approval.)
 *Design intent (#1492).*
 
 - logd numbers each instance of a display name when its slot registers the name, counting up per
-  name over the life of the logd instance; the first shows as `[name]`, the n-th as `[name#n]`. A `#`
-  in a registered name renders as `_` and is counted under that rendered name, so no label equals
-  another's.
+  name over the life of the logd instance; the first shows as `[name]`, the n-th as `[name#n]`. A
+  `#` in a registered name renders as `_` and is counted under that rendered name, so no label
+  equals another's.
 - init-logd numbers the same way, in place of its `name.N` suffix, and the handover carries each
   slot's number and the counter table, so logd continues init-logd's count. One host-tested type in
   `logd-codec` holds the rule.
@@ -357,7 +365,7 @@ A sink in the `rfc5424` format writes each entry as one RFC 5424 message:
 | PROCID | the badge in lower-case hex; it tells instances of one name apart |
 | MSGID | `-` |
 | STRUCTURED-DATA | `[timeQuality tzKnown="1" isSynced="0"]` while the offset comes from an unsynchronised clock, `-` once it is synchronised |
-| MSG | the byte order mark, then the console format's message field |
+| MSG | the byte order mark, then the console format's message field, each byte of an invalid UTF-8 sequence written `\xNN` as the record renderer writes it, so MSG is valid UTF-8 |
 
 timed sets its offset once, from the RTC, and synchronises to no external source
 ([services/timed/README.md](../../timed/README.md)), so every message carries `timeQuality` today. A
@@ -369,12 +377,13 @@ message longer than the transport carries is cut at a character boundary of MSG.
 
 *Design intent (#1493). The svcmgr change below is #1493's.*
 
-- svcmgr's `log_sink` round gains a slot 6: the SEND of the `timed` publication, absent when no recipe
-  provides `timed` ([service-definitions.md](../../svcmgr/docs/service-definitions.md) § `log_sink`).
-- A helper thread of logd calls `timed_labels::GET_WALL_TIME` once, with no bound, and stores the boot
-  wall offset, the wall time less the uptime of the same instant. timed answers from memory; its own
-  log calls are served by logd's receive workers, which wait on no call of logd's, so the call
-  cannot deadlock. No receive worker and not the main thread calls timed.
+- svcmgr's `log_sink` round gains a slot 6: the SEND of the `timed` publication, absent when no
+  recipe provides `timed` ([service-definitions.md](../../svcmgr/docs/service-definitions.md) §
+  `log_sink`).
+- A helper thread of logd calls `timed_labels::GET_WALL_TIME` once, with no bound, and stores the
+  boot wall offset, the wall time less the uptime of the same instant. timed answers from memory;
+  its own log calls are served by logd's receive workers, which wait on no call of logd's, so the
+  call cannot deadlock. No receive worker and not the main thread calls timed.
 - On the answer, logd logs one notice line giving the wall time and the uptime it corresponds to,
   so every uptime in a capture converts:
   `[    3.201440] NOTICE [logd] wall clock 2026-11-25T09:01:11Z at uptime 3.201440`.
@@ -428,47 +437,58 @@ and waits on serial's progress for no sender.
 
 ## Queries, follow and control
 
-*Design intent (#1494), but for `QUERY_SLOTS` and the descending `QUERY_HISTORY` walk, which are built
-([ipc-interface.md](ipc-interface.md) § Queries). `LOG_LABELS_VERSION` is bumped with the wire changes.*
+*Design intent (#1494), but for `QUERY_SLOTS` and the descending `QUERY_HISTORY` walk, which are
+built ([ipc-interface.md](ipc-interface.md) § Queries). `LOG_LABELS_VERSION` is bumped with the wire
+changes.*
 
 All of these are answered by a receive worker from logd's state under the state lock, with no call
 out, as the queries are today.
 
+All of these are served on SENDs that may carry `GRANT`, so any holder can move logd any
+capability with any label. A receive worker deletes every capability that arrives with a message,
+whatever its label, but the two a `LOG_SUBSCRIBE` it accepts keeps, so no sender can fill logd's
+capability space.
+
 ### Reads
 
-- `QUERY_HISTORY` gains two request flags in `data[1]`: bit 2, an ascending walk after the `seq` in
-  `data[3]` (0: from the oldest entry); bit 3, a severity filter, `data[4]` the least severe level
+- `QUERY_HISTORY` gains two request flags in `data[1]`: bit 2, an ascending walk from the `seq` in
+  `data[3]`, that entry included (0: from the oldest entry), so a reader asks for the `seq` after
+  the last one it read; bit 3, a severity filter, `data[4]` the least severe level
   returned. With bit 2, `data[5]` carries the instance epoch the caller follows; logd answers
   `QUERY_STALE` (4) when it is not its own, and 0 asks no check.
 - An entry in the reply carries the slot serial in bits 32-63 of its word 3 and the origin in bits
   12-15 of its kind field (bits 8-11 the kind).
-- `QUERY_SLOTS` rows carry the slot serial and the instance number in a tenth word, the serial in bits
-  32-63 and the number in bits 0-31, so `SLOTS_PAGE` is 6.
+- `QUERY_SLOTS` rows carry the slot serial and the instance number in a tenth word, the serial in
+  bits 32-63 and the number in bits 0-31, so `SLOTS_PAGE` is 6.
 - The severity filter serves interactive reads, which count no gap; a reader that counts gaps walks
   unfiltered (§ External sinks).
 
 ### Subscriptions
 
-- `LOG_SUBSCRIBE` moves two capabilities to logd over a `logd.query` SEND, which svcmgr mints with
-  `GRANT` for it: a signal capability of a Notification the subscriber made, and a token, a capability
-  to a second object of the subscriber's that nobody waits on. logd checks each capability's type and
-  rights and deletes what it does not keep, since any holder of the name can move it any capability.
-- logd keeps at most `SUBSCRIBERS_MAX` (8) subscriptions (a [docs/limits.md](../../../docs/limits.md) row) and
-  refuses one more with `QUERY_FULL`. The reply carries the subscription's index, the instance epoch
-  (the monotonic time logd started, which no other instance shares), and the oldest and newest
-  `seq` held.
+- `LOG_SUBSCRIBE` moves two capabilities to logd over a `logd.query` or `logd.follow` SEND, which
+  svcmgr mints with `GRANT` for it: a signal capability of a Notification the subscriber made, and a
+  token, a capability to a second object of the subscriber's that nobody waits on. logd checks each
+  capability's type and rights and deletes what it does not keep, since any holder of the name can
+  move it any capability.
+- Subscriptions come from two pools, each a [docs/limits.md](../../../docs/limits.md) row, kept
+  apart by the verb bit of the SEND they arrive on: `SUBSCRIBERS_MAX` (8) for `logd.query`, which
+  every session program may hold (§ Authority to read and steer), and `SINK_SUBSCRIBERS_MAX` (4) for
+  `logd.follow` (`LOG_FOLLOW_AUTHORITY`), which only a recipe seeds, so interactive followers cannot
+  take an external sink's place. A full pool refuses one more with `QUERY_FULL`. The reply carries
+  the subscription's index, the instance epoch (the monotonic time logd started, which no other
+  instance shares), and the oldest and newest `seq` held.
 - logd signals every subscriber's Notification when it retains an entry. The signals coalesce: a
   subscriber reads everything after its cursor on each wake.
-- **A subscriber's end.** logd binds a sole-reference observer
-  (`SYS_CAP_BIND_SOLE_REFERENCE`, [docs/capability-model.md](../../../docs/capability-model.md)) on the
-  token, posting to an event queue of logd's that its wait-set holds, the correlator naming the
-  subscription's index and a generation. When the subscriber dies its slots go, the token falls to
-  logd's one reference, and logd ends the subscription and deletes both capabilities. The token, not
-  the Notification, is observed because the subscriber's wait on the Notification, and its wait-set
-  membership, are references the kernel counts, so the Notification does not fall to one while the
-  subscriber waits on it. Every holder of `logd.query` shares one badge
-  (`log_labels::LOG_QUERY_AUTHORITY`), so a subscriber cannot be told apart by its badge, and the
-  death cascade cannot end it. `LOG_UNSUBSCRIBE` ends a subscription at once.
+- **A subscriber's end.** logd binds a sole-reference observer (`SYS_CAP_BIND_SOLE_REFERENCE`,
+  [docs/capability-model.md](../../../docs/capability-model.md)) on the token, posting to an event
+  queue of logd's that its wait-set holds, the correlator naming the subscription's index and a
+  generation. When the subscriber dies its slots go, the token falls to logd's one reference, and
+  logd ends the subscription and deletes both capabilities. The token, not the Notification, is
+  observed because the subscriber's wait on the Notification, and its wait-set membership, are
+  references the kernel counts, so the Notification does not fall to one while the subscriber waits
+  on it. Every holder of a name shares that name's one badge (`log_labels::LOG_QUERY_AUTHORITY`,
+  `LOG_FOLLOW_AUTHORITY`), so a subscriber cannot be told apart by its badge, and the death cascade cannot end it.
+  `LOG_UNSUBSCRIBE` ends a subscription at once.
 - **logd's end.** The subscriber binds a sole-reference observer on the same token, posting to its
   own event queue. When logd dies, or ends the subscription, the token falls to the subscriber's
   reference and the post tells the subscriber to subscribe again (§ External sinks). The epoch then
@@ -491,8 +511,10 @@ out, as the queries are today.
 
 *Design intent (#1494, #1495, #1501).*
 
-- `logd.query` (reads and subscriptions) and `logd.control` (sink control) are seed-only names svcmgr
-  mints. Only a recipe that seeds a name holds it, and a holder passes it on explicitly.
+- `logd.query` (reads and subscriptions), `logd.follow` (the same, from the external sinks' pool of
+  subscriptions) and `logd.control` (sink control) are seed-only names svcmgr mints. `logd.follow`
+  is seeded only to external sinks' recipes and is never served at `/svc`. Only a recipe that seeds
+  a name holds it, and a holder passes it on explicitly.
 - `programs/log` is the interactive client, in the manner of `journalctl` or a network device's
   `show logging`: it shows, filters and follows the history in the console format and lists and sets
   the sinks. It takes the two authorities as bootstrap caps from its spawner, slot 0 the query
@@ -515,7 +537,7 @@ Each later sink is built against the interface above and changes none of it.
 
 | Sink | Needs | Provided by |
 |---|---|---|
-| Disk (#1496) | every entry in `seq` order from its start, `relayed` and `previous` included; the gaps it could not read; each entry's sender name after the sender died; to learn of a logd restart; wall time for its timestamps | the ascending unfiltered walk from `seq` 0, the dense `seq`, the slot serial and `QUERY_SLOTS`, the token and the epoch, its own `timed` seed |
+| Disk (#1496) | every entry in `seq` order from its start, `relayed` and `previous` included; the gaps it could not read; each entry's sender name after the sender died; to learn of a logd restart; wall time for its timestamps | the ascending unfiltered walk from `seq` 0, the oldest, the dense `seq`, the slot serial and `QUERY_SLOTS`, the token and the epoch, its own `timed` seed |
 | Network syslog (#1499, #1500) | the RFC 5424 fields of each entry; the facility, severity and host name; APP-NAME and PROCID per instance; TLS | the record and § The rfc5424 format; its own recipe's settings; the TLS stack in its own process (#1500), none in logd |
 | pstore (#1498) | each entry as a record at memory speed; a way to bring the previous boot's entries back | a device sink inside logd; the `previous` origin |
 | Serial transmit (#1497) | none from logd: a driver change that answers a write once its bytes are in a transmit ring | the serial driver's own interface, unchanged |

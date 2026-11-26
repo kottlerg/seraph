@@ -324,23 +324,27 @@ fn affected_crates(
     changed: &[String],
 ) -> Result<Vec<(Harnessed, Reason)>>
 {
-    if let Some(file) = affected::first_under(changed, &every_verification())
-    {
-        return Ok(crates
-            .into_iter()
-            .map(|h| (h, Reason::BuildWide(file.clone())))
-            .collect());
-    }
     let fewest = crates.iter().min_by_key(|h| h.harnesses).cloned();
     let mut selected = Vec::new();
-    for harnessed in crates
+    if let Some(file) = affected::first_under(changed, &every_verification())
     {
-        let input = workspace
-            .first_input(&harnessed.dir, changed)
-            .with_context(|| format!("{} holds a proof harness", harnessed.package))?;
-        if let Some(input) = input
+        selected.extend(
+            crates
+                .into_iter()
+                .map(|h| (h, Reason::BuildWide(file.clone()))),
+        );
+    }
+    else
+    {
+        for harnessed in crates
         {
-            selected.push((harnessed, Reason::Input(input)));
+            let input = workspace
+                .first_input(&harnessed.dir, changed)
+                .with_context(|| format!("{} holds a proof harness", harnessed.package))?;
+            if let Some(input) = input
+            {
+                selected.push((harnessed, Reason::Input(input)));
+            }
         }
     }
     if let (Some(file), Some(fewest)) = (affected::first_under(changed, KANI_JOB), fewest)
@@ -2449,7 +2453,8 @@ mod tests
 
     // Defect caught: an edit of the workflow that calls the jobs proving no
     // crate past the stored passes, so the call's inputs go unexercised on
-    // its own run and on master's, and a broken call lands green; or one that
+    // its own run and on master's, and a broken call lands green, also when
+    // the change holds an input of every verification beside it; or one that
     // proves more than the crate with the fewest harnesses for it.
     #[test]
     fn a_change_to_the_jobs_runs_them_on_the_crate_with_the_fewest_harnesses()
@@ -2471,6 +2476,13 @@ mod tests
             assert_eq!(
                 select(&["shared/proto/src/lib.rs", job]),
                 [("proto".to_owned(), Reason::Job(job.to_owned()))]
+            );
+            assert_eq!(
+                select(&["Cargo.lock", job]),
+                [
+                    ("gpt".to_owned(), Reason::BuildWide("Cargo.lock".to_owned())),
+                    ("proto".to_owned(), Reason::Job(job.to_owned())),
+                ]
             );
         }
     }

@@ -686,8 +686,7 @@ mod proofs
     /// field of any length alike, and an anchor's field of 32 bytes adds no
     /// case: each byte is judged alone or within its one sequence. The
     /// validation of UTF-8 over a longer field of any value is past the
-    /// memory limit `cargo xtask kani` sets: 8 bytes ran out of it on CI's
-    /// runner. The loops are the label's: its bytes are walked from the end,
+    /// memory limit `cargo xtask kani` sets: 8 bytes ran out of it. The loops are the label's: its bytes are walked from the end,
     /// searched for a NUL and checked as UTF-8, each at most 4 steps.
     #[kani::proof]
     #[kani::unwind(6)]

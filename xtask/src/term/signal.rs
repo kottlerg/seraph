@@ -20,12 +20,14 @@
 //!
 //! The handler is global for the entire xtask process lifetime, not
 //! bracketed around a single subprocess. xtask is almost entirely a
-//! subprocess orchestrator: every long-running step but two is a
-//! subprocess that receives SIGINT directly from the tty. The two in
-//! xtask itself, the host-lock admission wait (`--wait-host`,
-//! `crate::host_lock::admit`) and the `compare-images` scratch-worktree
-//! lock wait, poll [`interrupted`] between their sleeps and fail when it
-//! is set, so the handler never visibly blocks the user from terminating.
+//! subprocess orchestrator: every long-running step but three is a
+//! subprocess that receives SIGINT directly from the tty. The three, the
+//! host-lock admission wait (`--wait-host`, `crate::host_lock::admit`),
+//! the `compare-images` scratch-worktree lock wait, and the capped fuzz run, whose target runs in a process
+//! group of its own that the tty's SIGINT does not reach
+//! (`crate::commands::fuzz`), poll [`interrupted`] between their sleeps
+//! and fail when it is set, the fuzz run killing its group first, so the
+//! handler never visibly blocks the user from terminating.
 //!
 //! Portability, through the bindings of `crate::sys`:
 //!

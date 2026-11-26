@@ -1742,22 +1742,47 @@ mod proofs
         }
     }
 
-    /// Every template that is one small descriptor the adapter reads reports
-    /// as its fields, after any count of resources, the bound among them: an
-    /// IRQ with and without its flags, an I/O Port and a
-    /// Fixed I/O Port. The loops are an IRQ's 16 lines and the comparison of
-    /// the 8 resources the bound holds.
+    // The four harnesses below are the small descriptors the adapter reads,
+    // one CBMC problem each: an IRQ with and without its flags, an I/O Port
+    // and a Fixed I/O Port. Each fixes the tag byte and the length, and leaves
+    // every other byte and the count of resources to Kani, so together they
+    // cover each of the four templates with every value of its other bytes
+    // and every count; no template has a default case that none of them
+    // reaches. Each asserts `property::descriptor_holds`: the descriptor
+    // reports as its fields after any count of resources, the bound among
+    // them. The loops are an IRQ's 16 lines and the comparison of the 8
+    // resources the bound holds.
+
+    /// Every IRQ descriptor without its flags byte reports as its resources.
     #[kani::proof]
     #[kani::unwind(17)]
-    fn every_small_descriptor_reports_as_its_resources()
+    fn every_irq_descriptor_reports_as_its_resources()
     {
-        match kani::any::<u8>() % 4
-        {
-            0 => small_descriptor_holds::<3>(0x22),
-            1 => small_descriptor_holds::<4>(0x23),
-            2 => small_descriptor_holds::<8>(0x47),
-            _ => small_descriptor_holds::<4>(0x4B),
-        }
+        small_descriptor_holds::<3>(0x22);
+    }
+
+    /// Every IRQ descriptor with its flags byte reports as its resources.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_irq_descriptor_with_flags_reports_as_its_resources()
+    {
+        small_descriptor_holds::<4>(0x23);
+    }
+
+    /// Every I/O Port descriptor reports as its resources.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_io_port_descriptor_reports_as_its_resources()
+    {
+        small_descriptor_holds::<8>(0x47);
+    }
+
+    /// Every Fixed I/O Port descriptor reports as its resources.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_fixed_io_port_descriptor_reports_as_its_resources()
+    {
+        small_descriptor_holds::<4>(0x4B);
     }
 
     /// Every template that is the small descriptor `tag` of `N` bytes

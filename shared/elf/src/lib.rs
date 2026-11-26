@@ -2805,7 +2805,8 @@ mod proofs
     /// `load_segments` yields one item for each `PT_LOAD` header of a table of
     /// at most two, in order, and nothing past the table. `property::segments_holds`
     /// is split over this proof and the two after it, to keep each well within
-    /// CI's `kani` job: this one fixes which item belongs to which header, the
+    /// the per-harness time limit of `cargo xtask kani`
+    /// (docs/testing.md § Bounded verification): this one fixes which item belongs to which header, the
     /// next whether each item is a segment or a refusal, and the third each
     /// segment's fields. Together they are the property whole, and none drops
     /// a case. The longest loop is the walk of the two, so an unwind bound of

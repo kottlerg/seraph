@@ -537,8 +537,7 @@ pub fn build_trees(owed: Owed) -> Vec<(&'static str, &'static str, bool)>
 /// validate matrix, the build matrix of the trees its cells and the bench
 /// cell boot, and the bench matrix, as `include` lists, whether each is owed,
 /// whether the bench cell's ktest boots are, whether the fuzz job is, and the
-/// base commit, empty when there is none, from which the `kani` job selects
-/// its crates.
+/// base commit the selection measured from, empty when there is none.
 fn github_output(selection: &Selection) -> String
 {
     let owed = selection.owed;
@@ -970,35 +969,6 @@ mod tests
             .map(String::as_str),
             Some("c2")
         );
-    }
-
-    // Defect caught: the kani job measuring its crates from another base
-    // than the cells, so a proof a red or unfinished master run left
-    // unproven is owed by no later run once an unrelated change turns master
-    // green.
-    #[test]
-    fn the_kani_job_selects_from_the_base_of_the_cells()
-    {
-        let with = github_output(&Selection {
-            base: Some(("c2".to_owned(), String::new())),
-            placed: Vec::new(),
-            owed: NO_CELL,
-            fuzz: None,
-        });
-        assert!(with.ends_with("\nbase=c2\n"), "{with}");
-        let workflow = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/build-test.yml"),
-        )
-        .unwrap();
-        assert!(workflow.contains("      base: ${{ steps.cells.outputs.base }}\n"));
-        let kani = workflow
-            .split("\n  kani:\n")
-            .nth(1)
-            .and_then(|rest| rest.split("\n  fuzz:\n").next())
-            .unwrap();
-        assert!(kani.contains("\n    needs: select\n"), "{kani}");
-        assert!(kani.contains("${{ needs.select.outputs.base }}"), "{kani}");
-        assert!(!kani.contains("github.event.before"), "{kani}");
     }
 
     // Defect caught: a pull request's base found as a push's is, so a run

@@ -1060,6 +1060,16 @@ args! {
         #[arg(long, value_name = "SECS", conflicts_with_all = ["replay", "minimize"])]
         pub time: Option<u64>,
 
+        /// Fail a target whose run of an execution count takes more than SECS
+        /// seconds of wall-clock time, stopping it there (default: 1200 for a
+        /// run of the default count, none for one of `--runs`).
+        #[arg(
+            long,
+            value_name = "SECS",
+            conflicts_with_all = ["list", "self_test", "time", "replay", "minimize"]
+        )]
+        pub cap: Option<u64>,
+
         /// The seed of the engine's random choices.
         #[arg(long, default_value = "0")]
         pub seed: u64,

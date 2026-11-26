@@ -16,8 +16,10 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 use crate::error::{Context, Result, bail};
 
@@ -35,6 +37,16 @@ const PLANTED_PREFIX: &str = "planted-";
 /// The executions of a run given neither `--runs` nor `--time`: the count
 /// the gating `fuzz` job of CI runs each target for.
 pub const DEFAULT_RUNS: u64 = 200_000;
+
+/// The wall-clock cap, in seconds, of a target's run of [`DEFAULT_RUNS`]: a
+/// backstop of about two and a half times the slowest target's run in the
+/// gating CI job (about 8 minutes), so a target that slows the job fails,
+/// named, in minutes instead of holding it for hours (docs/testing.md
+/// § Fuzzing).
+pub const DEFAULT_CAP_SECS: u64 = 1200;
+
+/// How often a capped run is checked for its end.
+const CAP_POLL: Duration = Duration::from_millis(200);
 
 /// The engine's crate, which the wrapper builds without the coverage flags.
 const ENGINE_CRATE: &str = "fuzz_engine";
@@ -108,15 +120,25 @@ pub fn run(ctx: &BuildContext, args: &FuzzArgs) -> Result<()>
     {
         return self_test(ctx, &bin_dir);
     }
+    let cap = cap(args);
     let mut failed = Vec::new();
+    let mut over = Vec::new();
     for name in &selected
     {
         step(&format!("Fuzzing {name}"));
-        let status = Command::new(bin_dir.join(name))
+        let mut command = Command::new(bin_dir.join(name));
+        command
             .args(engine_args(&ctx.root, &work_dir(ctx, name), args))
-            .env("RUST_BACKTRACE", "1")
-            .status()
-            .with_context(|| format!("running the fuzz target {name}"))?;
+            .env("RUST_BACKTRACE", "1");
+        let Some(status) = run_capped(&mut command, cap, &crate::term::signal::interrupted)
+            .with_context(|| format!("running the fuzz target {name}"))?
+        else
+        {
+            let secs = cap.map_or(0, |c| c.as_secs());
+            eprintln!("fuzz: {name}: over the {secs} s cap");
+            over.push(name.as_str());
+            continue;
+        };
         match status.code()
         {
             Some(0) =>
@@ -126,15 +148,84 @@ pub fn run(ctx: &BuildContext, args: &FuzzArgs) -> Result<()>
             _ => bail!("{name}: the fuzz run failed ({status})"),
         }
     }
+    let mut findings = Vec::new();
     if !failed.is_empty()
     {
-        bail!(
+        findings.push(format!(
             "fuzz targets with a failing input: {} (each report is under \
              target/xtask/fuzz/<target>/crashes/)",
             failed.join(", ")
-        );
+        ));
+    }
+    if !over.is_empty()
+    {
+        findings.push(format!(
+            "fuzz targets over the {} s cap: {}",
+            cap.map_or(0, |c| c.as_secs()),
+            over.join(", ")
+        ));
+    }
+    if !findings.is_empty()
+    {
+        bail!("{}", findings.join("\n"));
     }
     Ok(())
+}
+
+/// The wall-clock cap of each target's run of `args`: `--cap`, else
+/// [`DEFAULT_CAP_SECS`] for a run of the default count, else none.
+fn cap(args: &FuzzArgs) -> Option<Duration>
+{
+    let default_count =
+        args.runs.is_none() && args.time.is_none() && args.replay.is_none() && !args.minimize;
+    args.cap
+        .or(default_count.then_some(DEFAULT_CAP_SECS))
+        .map(Duration::from_secs)
+}
+
+/// Run `command` to its end, or, with a `cap`, until the cap: its exit
+/// status, or `None` when the cap stopped it. The command runs in a process
+/// group of its own, which the cap kills whole, so the search the target
+/// binary supervises in a child of itself stops with it. Outside the
+/// terminal's foreground group, the run does not receive Ctrl+C, so the wait
+/// polls `interrupted` (`crate::term::signal::interrupted`) and, once it
+/// reports Ctrl+C, kills the group the same way and fails.
+fn run_capped(
+    command: &mut Command,
+    cap: Option<Duration>,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<Option<ExitStatus>>
+{
+    let Some(cap) = cap
+    else
+    {
+        return Ok(Some(command.status()?));
+    };
+    let mut child = command.process_group(0).spawn()?;
+    let started = Instant::now();
+    loop
+    {
+        if let Some(status) = child.try_wait()?
+        {
+            return Ok(Some(status));
+        }
+        let over = started.elapsed() >= cap;
+        if over || interrupted()
+        {
+            // The group's id is the child's pid.
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", child.id())])
+                .status();
+            let _ = child.kill();
+            child.wait()?;
+            if !over
+            {
+                bail!("interrupted");
+            }
+            return Ok(None);
+        }
+        std::thread::sleep(CAP_POLL);
+    }
 }
 
 /// Whether `name` is a planted target of the self-test.
@@ -417,6 +508,7 @@ mod tests
             runs: None,
             time: None,
             seed: 7,
+            cap: None,
             replay: None,
             minimize: false,
             host: HostArgs::default(),
@@ -504,5 +596,116 @@ mod tests
                 "{name}"
             );
         }
+    }
+
+    // Defect caught: the gating run of the default count left without its
+    // cap, so a slow target holds the job for hours; or a cap put on a timed
+    // run, a replay or a minimization, or an explicit `--cap` ignored.
+    #[test]
+    fn the_default_count_is_capped_and_an_explicit_cap_wins()
+    {
+        let mut counted = args();
+        assert_eq!(cap(&counted), Some(Duration::from_secs(DEFAULT_CAP_SECS)));
+        counted.runs = Some(5);
+        assert_eq!(cap(&counted), None);
+        counted.cap = Some(7);
+        assert_eq!(cap(&counted), Some(Duration::from_secs(7)));
+        let mut timed = args();
+        timed.time = Some(60);
+        assert_eq!(cap(&timed), None);
+        let mut replay = args();
+        replay.replay = Some("x".into());
+        assert_eq!(cap(&replay), None);
+    }
+
+    // Defect caught: a run past its cap left running, or a child it spawned
+    // (the search a target supervises) left running after the cap; or a run
+    // that ends within its cap reported as over it.
+    #[test]
+    fn a_run_past_its_cap_is_stopped_with_its_children()
+    {
+        let dir = std::env::temp_dir().join(format!("xtask-fuzz-cap-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!("sleep 600 & echo $! > {}; wait", pid_file.display()),
+        ]);
+        let ended = run_capped(&mut command, Some(Duration::from_millis(500)), &|| false).unwrap();
+        assert!(ended.is_none());
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        let stat = Path::new("/proc").join(pid.trim()).join("stat");
+        // The killed grandchild is gone, or a zombie until init reaps it, once
+        // the signal is delivered.
+        let alive = || {
+            fs::read_to_string(&stat).is_ok_and(|s| {
+                !s.rsplit(')')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start()
+                    .starts_with('Z')
+            })
+        };
+        let mut waited = 0;
+        while alive() && waited < 50
+        {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 1;
+        }
+        assert!(!alive(), "the child of the capped run still runs");
+        fs::remove_dir_all(&dir).unwrap();
+        let ended = run_capped(
+            &mut Command::new("true"),
+            Some(Duration::from_secs(60)),
+            &|| false,
+        )
+        .unwrap();
+        assert!(ended.is_some_and(|s| s.success()));
+    }
+
+    // Defect caught: Ctrl+C ignored by a capped run, whose process group the
+    // terminal's SIGINT does not reach, so the run holds until its cap and
+    // `--all` goes on to the next target; or the group left running after it.
+    #[test]
+    fn an_interrupted_capped_run_is_stopped_with_its_children_and_fails()
+    {
+        let dir = std::env::temp_dir().join(format!("xtask-fuzz-int-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!("sleep 600 & echo $! > {}; wait", pid_file.display()),
+        ]);
+        // Interrupted once the grandchild has written its pid.
+        let interrupted = || fs::read_to_string(&pid_file).is_ok_and(|s| s.ends_with('\n'));
+        let started = Instant::now();
+        let error = run_capped(&mut command, Some(Duration::from_secs(60)), &interrupted)
+            .expect_err("an interrupted run fails");
+        assert!(error.to_string().contains("interrupted"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the run held to its cap"
+        );
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        let stat = Path::new("/proc").join(pid.trim()).join("stat");
+        let alive = || {
+            fs::read_to_string(&stat).is_ok_and(|s| {
+                !s.rsplit(')')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start()
+                    .starts_with('Z')
+            })
+        };
+        let mut waited = 0;
+        while alive() && waited < 50
+        {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 1;
+        }
+        assert!(!alive(), "the child of the interrupted run still runs");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

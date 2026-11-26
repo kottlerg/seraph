@@ -4,13 +4,14 @@
 # .github/workflows/fuzz.yml
 
 # The campaign fuzz tier: every target for a fixed time from a seed that
-# changes each run, on a manual dispatch (docs/testing.md § Fuzzing). This
-# workflow's cache carries a working corpus only between runs made within
-# the cache's lifetime, so a run may start from the checked-in inputs alone;
-# what lasts is in the tree, each target's seeds and regressions. It
-# gates no merge; the run the release host runs dispatch gates the tag. A
-# failing input it finds is uploaded, and its fix lands with the minimized
-# input under the target's regressions/.
+# changes each run, one job per target side by side, on a manual dispatch
+# (docs/testing.md § Fuzzing). This workflow's cache carries each target's
+# working corpus only between runs made within the cache's lifetime, so a
+# run may start from the checked-in inputs alone; what lasts is in the
+# tree, each target's seeds and regressions. It gates no merge; the run
+# the release host runs dispatch gates the tag. A failing input it finds is
+# uploaded, and its fix lands with the minimized input under the target's
+# regressions/.
 
 name: fuzz
 
@@ -18,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: Seconds each target runs
+        description: Seconds each target runs, at most 2700
         default: '1800'
 
 concurrency:
@@ -29,8 +30,51 @@ permissions:
   contents: read
 
 jobs:
-  campaign:
+  targets:
+    # The targets, one matrix entry each, once the dispatch's time is known
+    # to fit the campaign job's timeout.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - name: Check the dispatch's time
+        env:
+          SECONDS_INPUT: ${{ inputs.seconds || '1800' }}
+        run: |
+          case "$SECONDS_INPUT" in
+            ''|*[!0-9]*) ok=false ;;
+            *) [ "$SECONDS_INPUT" -ge 1 ] && [ "$SECONDS_INPUT" -le 2700 ] && ok=true || ok=false ;;
+          esac
+          if [ "$ok" != true ]; then
+            echo "::error::seconds is $SECONDS_INPUT; the campaign takes 1 to 2700 seconds per target, which the campaign job's 60-minute timeout holds with its build and minimization"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-10
+
+      - name: List the targets
+        id: list
+        run: |
+          targets=$(cargo xtask fuzz --list | jq -Rsc 'split("\n") | map(select(length > 0))')
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  campaign:
+    # One job per target, side by side, each for the dispatch's time: its
+    # timeout holds the longest time the targets job admits, 2700 seconds,
+    # with room for the build and the minimization.
+    needs: targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.targets) }}
     steps:
       - uses: actions/checkout@v6
 
@@ -45,33 +89,30 @@ jobs:
         with:
           shared-key: fuzz-campaign
 
-      # Each run saves its corpus under a new key and restores the newest
-      # earlier one the cache still holds; with none, the run starts from
-      # the checked-in inputs alone.
-      - name: Restore the working corpora
+      # Each run saves the target's corpus under a new key and restores the
+      # newest earlier one the cache still holds; with none, the run starts
+      # from the checked-in inputs alone.
+      - name: Restore the working corpus
         uses: actions/cache@v6
         with:
-          path: target/xtask/fuzz/*/corpus
-          key: fuzz-corpus-${{ github.run_id }}
-          restore-keys: fuzz-corpus-
+          path: target/xtask/fuzz/${{ matrix.target }}/corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
 
-      - name: cargo xtask fuzz --all
+      - name: cargo xtask fuzz ${{ matrix.target }}
         run: >-
-          cargo xtask fuzz --all
+          cargo xtask fuzz ${{ matrix.target }}
           --time ${{ inputs.seconds || '1800' }}
           --seed ${{ github.run_number }}
 
-      - name: Minimize the working corpora
+      - name: Minimize the working corpus
         if: success()
-        run: |
-          for target in $(cargo xtask fuzz --list); do
-            cargo xtask fuzz "$target" --minimize
-          done
+        run: cargo xtask fuzz ${{ matrix.target }} --minimize
 
       - name: Upload the failing inputs
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: fuzz-crashes-${{ github.run_number }}
-          path: target/xtask/fuzz/*/crashes/
+          name: fuzz-crashes-${{ github.run_number }}-${{ matrix.target }}
+          path: target/xtask/fuzz/${{ matrix.target }}/crashes/
           if-no-files-found: ignore

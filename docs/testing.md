@@ -1397,7 +1397,7 @@ to the tiers below.
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR: the cells its change owes ([conventions.md § CI Gating](conventions.md#ci-gating)) | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof (`cargo xtask kani`, [Bounded verification](#bounded-verification)) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation, the large-memory cell, and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
 
@@ -2349,9 +2349,19 @@ fails as the search did, on any host. The run exits non-zero.
 
 | Tier | Where | When | Runs |
 |---|---|---|---|
-| Gating | CI, the `fuzz` job of `build-test.yml` | a change that can affect a crate it fuzzes, its engine, xtask or the workflows; skipped as not owed otherwise | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone |
-| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, from a seed that changes each run, over the checked-in inputs and the working corpus of an earlier run when the Actions cache still holds one; failing inputs upload as an artifact |
+| Gating | CI, the `fuzz` job of `build-test.yml` | a change that can affect a crate it fuzzes, its engine, xtask or the workflows; skipped as not owed otherwise | `cargo xtask fuzz --self-test`, then every target for the default 200,000 executions from seed 0, from the checked-in inputs alone, each under a wall-clock cap of 20 minutes |
+| Campaign | CI, `fuzz.yml` | a manual dispatch, one of them in the release host runs before each tag (§ Coverage tiers) | every target for 30 minutes, one job per target side by side, from a seed that changes each run, over the checked-in inputs and the target's working corpus of an earlier run when the Actions cache still holds one; failing inputs upload as an artifact |
 | Local | developer host | at will | `cargo xtask fuzz <target>` with `--runs` or `--time` |
+
+**Time.** The gating run's time is a stated budget. Each target's run of the default count is
+capped at 20 minutes of wall-clock time (`DEFAULT_CAP_SECS`), about two and a half times the
+slowest target's run in the gating job (about 8 minutes, of a job of about 19); a target past the
+cap is stopped and fails the job, named as over the cap, and is a defect of the target or of its
+property, made faster before it merges: a property whose checks grow faster than the input,
+over inputs of up to the target's longest, is the usual cause. The job's `timeout-minutes` is the
+backstop for the rest, and every fuzz job sets one. A campaign job's, 60 minutes, holds a
+dispatch's time of up to 2700 seconds per target with the build and the minimization, and
+`fuzz.yml` fails a dispatch of a longer time before any target runs.
 
 The self-test runs the engine on planted defects in `xtask/fuzz/targets` (an eight-byte magic
 compared as one integer, a length field whose add overflows, and a state reached only through
@@ -2387,46 +2397,53 @@ every crate that holds one, each crate built in its host test configuration, wit
 release ([build-system.md](build-system.md#toolchain) § Toolchain). It fails on any failed,
 undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a
 harness that lies in no package. It finds the crates from their harnesses, so a crate's first
-harness adds it to the run. It holds each process of the run to the address space CI's runner can
-give a harness, so a harness that needs more fails, named as out of memory, and it closes with
-every harness's verdict and verification time.
+harness adds it to the run. It holds each process of the run to 12 GiB of address space (Local
+sizing below), so a harness that needs more fails, named as out of memory; it stops each
+harness at a wall-clock time limit, so a harness that runs past it fails, named as over budget;
+and it closes with every harness's verdict and verification time, then the ten slowest.
 
-**Where the proofs run.** On a pull request, CI's `kani` job verifies only the crates the change can
-affect (`cargo xtask kani --since` against the base the `select` job found, the newest commit before
-the run's whose `master` run passed, or has not finished with no newer red or cancelled one;
-[conventions.md](conventions.md#ci-gating)
-§ CI Gating): a crate that holds a harness and whose own package, a workspace package in its
-dependency closure (Markdown aside), or a file those read, the change touches, and every such crate
-when the change touches an input of every proof (the workspace manifest and lock file, Cargo's
-configuration, the toolchain pin, and the command's own source, which holds the Kani pin, the
-arguments and the judge). A change to `build-test.yml`, whose steps run the job, that selects no
-crate otherwise selects the crate with the fewest harnesses, so the job's steps run. That selection
-gates the merge, and a pull request that affects no such
-crate ends the job without installing Kani, with a notice on the run that it verified nothing. On a
-push to `master` the job runs the same selection from the newest commit whose `master` run passed,
-so a harness a red or cancelled `master` run left unproven stays owed until a run proves it. The
-whole set runs in the `kani` job of `burnin.yml`, on each tag push and on a manual dispatch, and in
-the release host runs (§ Coverage tiers), so a change the selection missed is found before a tag
-([build-system.md](build-system.md#continuous-integration) § Continuous Integration).
+**Where the proofs run.** On the development host only: no CI workflow installs or runs Kani. A
+pull request whose change can affect a crate that holds a harness, as
+`cargo xtask kani --since <merge base> --list` selects it, MUST run
+`cargo xtask kani --since <merge base>` at its validated head, under the limits the command sets,
+and its body's `## Validation` section reports the run as it reports any other local run: the
+command, the head, the crates verified and the outcome. The merge base is that of the head and
+`master`. The selection takes a crate that holds a harness and whose own package, a workspace
+package in its dependency closure (Markdown aside), or a file those read, the change touches, and
+every such crate when the change touches an input of every proof (the workspace manifest and lock
+file, Cargo's configuration, the toolchain pin, and the command's own source, which holds the Kani
+pin, the arguments and the judge). A pull request that affects no such crate owes no run. The
+whole set (`cargo xtask kani` with no option) is a release host run (§ Coverage tiers;
+[conventions.md](conventions.md#release-production) § Release Production), so a change the
+selection missed is found before a tag.
 
-**Local sizing.** A harness is sized on the development host before CI runs it. The author of a
+**Local sizing.** A harness is sized on the development host before it is pushed. The author of a
 change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
 with `cargo xtask kani --component <crate> --harness <name>` before the first push that carries
-it, under the limit the command sets on every process of the run: 12 GiB of address space, the share
-of the 16 GB of CI's `kani` runner ([GitHub's standard Linux runner for a public
-repository](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)) that
-leaves 4 GB to the runner's own processes, so a harness that fits under it locally fits on the
-runner. A run that the limit ends (an allocation failure, or a process killed)
-or that does not finish MUST be made to fit before the harness is pushed, by smaller bounds that
-still cover the property or by the induction form of the parser proofs below. A harness is
-also sized to finish well within CI's `kani` job, whose timeout, GitHub's default for a job, is
-the backstop, and is made to fit the same way when it does not. A failed,
+it, under the limit the command sets on every process of the run: 12 GiB of address space, which
+leaves 4 GB of a 16 GB machine to its other processes. A run that the limit ends (an allocation
+failure, or a process killed) or that does not finish MUST be made to fit before the harness is
+pushed, by smaller bounds that still cover the property or by the induction form of the parser
+proofs below. Beside the memory
+limit, each harness has a time limit: the command stops a harness's CBMC after 10 minutes of
+wall-clock time (`HARNESS_TIME_LIMIT_SECS`) and fails it as over budget. The limit is a backstop
+set from the measured full run below, not a bound a harness is sized to: a harness over it is a
+defect of the harness, made to fit the same way, by a narrower bound or a split into harnesses
+that together cover the property. A failed,
 undetermined or unwinding-incomplete check is not a sizing result: it is a defect in the code
 or the harness, fixed as such, and MUST NOT be bounded away. The PR body's `## Validation`
 section states, for each such harness, the verification time Kani reports, the peak resident
 memory of the run (the maximum resident set size of its largest process, as GNU `time -v`
 reports it), and the unwind bounds the harness carries. This run is owed whatever § Coverage
 tiers owes, since a harness change is inert there.
+
+**Measured time.** The whole set, 204 harnesses, took 86 minutes run serially on GitHub's standard
+Linux runner (4 vCPUs, 16 GB; `build-test` run 45738265526), the harnesses' own verification
+times summing to 82 minutes. The slowest,
+devmgr-firmware's proof of the AML IRQ descriptor with its flags byte, took 306 s, and the next
+slowest 234 s. The small AML descriptors are proved one per harness, since all four in one CBMC
+problem took 29 minutes. The time limit of 10 minutes is about twice the slowest harness: room
+for a slower host, and a harness past it costs the run no more than the limit.
 
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
 tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches

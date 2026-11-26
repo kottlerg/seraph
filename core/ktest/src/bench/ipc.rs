@@ -18,6 +18,12 @@
 //! through its SIMD copies: the line without `fpu=` minus this one is the cost
 //! of the FPU and vector state on the IPC path.
 //!
+//! A sixth case, `words=0 server=reply_recv`, is the empty message served by
+//! `ipc_reply_recv`: each sample is one reply-and-receive, the reply to one call
+//! and the receive of the next (core/kernel/docs/syscalls.md
+//! § `SYS_IPC_REPLY_RECV`); the line without `server=` minus this one is what
+//! the one syscall saves.
+//!
 //! Four more cases, variant `words=0 placement=`, measure where the kernel
 //! runs a call's recipient (core/kernel/docs/scheduler.md § Thread
 //! Assignment): the harness thread on CPU 0 calls a child server pinned to
@@ -25,7 +31,10 @@
 //! unpinned (`unpinned`), timing each call on its own side; and three callers
 //! pinned to CPUs 1 to 3 call one unpinned server at once, each timing its own
 //! calls on its own CPU (`fan_in`). They need two CPUs, `fan_in` four, and
-//! log a SKIP line below that.
+//! log a SKIP line below that. Their servers loop `ipc_recv` and
+//! `ipc_reply`; `unpinned` and `fan_in` run again with a server that loops
+//! `ipc_reply_recv`, variant `server=reply_recv`, whose reply wake waits for
+//! its receive's outcome (core/kernel/docs/scheduler.md § Thread Assignment).
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -53,31 +62,131 @@ enum Fpu
     Both,
 }
 
-/// One case: the data words of the request and the reply, and the FPU use.
+/// How a server serves its calls.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Serve
+{
+    /// `ipc_recv`, then `ipc_reply`, per call; the line carries no `server=`.
+    RecvReply,
+    /// One `ipc_recv` first, then one `ipc_reply_recv` per call; the line
+    /// carries `server=reply_recv`.
+    ReplyRecv,
+}
+
+impl Serve
+{
+    /// The line's `server=` parameter, none for [`Serve::RecvReply`].
+    const fn param(self) -> Option<(&'static str, Value<'static>)>
+    {
+        match self
+        {
+            Self::RecvReply => None,
+            Self::ReplyRecv => Some(("server", Value::Word("reply_recv"))),
+        }
+    }
+
+    /// The first slot of this way's placement children in [`PLACE_STACKS`],
+    /// [`PLACE_IPC_PAGES`] and [`SERVER_ARGS`].
+    const fn place_base(self) -> usize
+    {
+        match self
+        {
+            Self::RecvReply => 0,
+            Self::ReplyRecv => PLACE_SET,
+        }
+    }
+
+    /// The first entry of this way's `fan_in` callers in [`FAN_IN_ARGS`].
+    const fn fan_in_base(self) -> usize
+    {
+        match self
+        {
+            Self::RecvReply => 0,
+            Self::ReplyRecv => FAN_IN_CALLERS,
+        }
+    }
+}
+
+/// The SKIP-line suffix of a placement case served the way `serve` says.
+const fn server_suffix(serve: Serve) -> &'static str
+{
+    match serve
+    {
+        Serve::RecvReply => "",
+        Serve::ReplyRecv => " server=reply_recv",
+    }
+}
+
+/// Serve calls on `ep` through the registered IPC buffer `ipc_buf` with an
+/// empty reply, the way `serve` says, until a receive or a reply fails.
+fn serve_calls(ep: u64, ipc_buf: *mut u64, serve: Serve)
+{
+    let reply = payload(0, 0);
+    match serve
+    {
+        Serve::RecvReply => loop
+        {
+            // SAFETY: ipc_buf is this thread's registered IPC buffer.
+            if unsafe { ipc::ipc_recv(ep, ipc_buf) }.is_err()
+            {
+                break;
+            }
+            // SAFETY: as for the receive.
+            if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+            {
+                break;
+            }
+        },
+        Serve::ReplyRecv =>
+        {
+            // SAFETY: ipc_buf is this thread's registered IPC buffer.
+            if unsafe { ipc::ipc_recv(ep, ipc_buf) }.is_err()
+            {
+                return;
+            }
+            // SAFETY: as for the receive.
+            while unsafe { ipc::ipc_reply_recv(ep, &reply, ipc_buf, 0) }.is_ok()
+            {}
+        }
+    }
+}
+
+/// One case: the data words of the request and the reply, the FPU use, and
+/// how the harness serves.
 #[derive(Clone, Copy)]
 struct Case
 {
     words: usize,
     fpu: Fpu,
+    serve: Serve,
 }
 
 /// The cases.
-const CASES: [Case; 4] = [
+const CASES: [Case; 5] = [
     Case {
         words: 0,
         fpu: Fpu::None,
+        serve: Serve::RecvReply,
     },
     Case {
         words: REG_WORDS,
         fpu: Fpu::None,
+        serve: Serve::RecvReply,
     },
     Case {
         words: REG_WORDS + 1,
         fpu: Fpu::None,
+        serve: Serve::RecvReply,
     },
     Case {
         words: 0,
         fpu: Fpu::Both,
+        serve: Serve::RecvReply,
+    },
+    Case {
+        words: 0,
+        fpu: Fpu::None,
+        serve: Serve::ReplyRecv,
     },
 ];
 
@@ -191,11 +300,16 @@ impl core::fmt::Display for Label
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
     {
-        match self.0.fpu
+        write!(f, "words={}", self.0.words)?;
+        if let Fpu::Both = self.0.fpu
         {
-            Fpu::None => write!(f, "words={}", self.0.words),
-            Fpu::Both => write!(f, "words={} fpu=both", self.0.words),
+            write!(f, " fpu=both")?;
         }
+        if let Serve::ReplyRecv = self.0.serve
+        {
+            write!(f, " server=reply_recv")?;
+        }
+        Ok(())
     }
 }
 
@@ -220,9 +334,11 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, h: &mut Harness)
     }
     for layout in [Layout::Same, Layout::Apart, Layout::Unpinned]
     {
-        bench_placement(ctx, h, layout);
+        bench_placement(ctx, h, layout, Serve::RecvReply);
     }
-    bench_fan_in(ctx, h);
+    bench_fan_in(ctx, h, Serve::RecvReply);
+    bench_placement(ctx, h, Layout::Unpinned, Serve::ReplyRecv);
+    bench_fan_in(ctx, h, Serve::ReplyRecv);
 }
 
 /// Run case `case` of [`CASES`], `c`. Returns whether every round trip
@@ -269,7 +385,9 @@ fn bench_case(ctx: &crate::TestContext, h: &mut Harness, case: usize, c: Case) -
 
 /// Start case `case`'s caller child on `ep`, serve [`Harness::iters`] round
 /// trips of `c.words` data words each way, touching a vector register before
-/// each reply when `c.fpu` asks for it, and report the result. Returns
+/// each reply when `c.fpu` asks for it, and report the result. A
+/// [`Serve::ReplyRecv`] case takes one untimed call first, then times each
+/// reply-and-receive, and answers the last call untimed. Returns
 /// whether every round trip completed; returns `false` early, leaving cleanup
 /// to the caller, when the child cannot be set up.
 fn run_round_trips(
@@ -285,6 +403,13 @@ fn run_round_trips(
     use syscall_abi::RIGHTS_EP_SEND_GRANT;
     let label = Label(c);
     let n = u64::from(h.iters());
+    // The calls the child makes: one more for a reply-and-receive case, whose
+    // first call is received untimed.
+    let calls = match c.serve
+    {
+        Serve::RecvReply => n,
+        Serve::ReplyRecv => n.saturating_add(1),
+    };
 
     let Ok(child_ep) = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
     else
@@ -310,7 +435,7 @@ fn run_round_trips(
             CallerArgs {
                 ep: child_ep,
                 done: child_done,
-                n,
+                n: calls,
                 case,
                 words: c.words,
                 fpu: c.fpu,
@@ -334,8 +459,59 @@ fn run_round_trips(
         return false;
     }
 
-    let reply = payload(0, c.words);
     let start = super::Placement::read(ctx.thread_cap, child.th);
+    let (summary, completed) = match c.serve
+    {
+        Serve::RecvReply => serve_recv_reply(ctx, h, ep, c, n),
+        Serve::ReplyRecv => serve_reply_recv(ctx, h, ep, c, n),
+    };
+    let end = super::Placement::read(ctx.thread_cap, child.th);
+
+    // After every round trip the child's last call has returned and it is on
+    // its way to `done`; after an early break it may be parked in `ipc_call`
+    // for good, so the caller's Thread-cap delete ends it instead of a wait.
+    if completed == n
+    {
+        notification_wait(done).ok();
+    }
+
+    let extras = super::placement_extras(start.as_ref(), end.as_ref());
+    let extras = extras.as_ref().map_or(&[][..], |e| &e[..]);
+    let words = ("words", Value::Num(c.words as u64));
+    match (c.fpu, c.serve.param())
+    {
+        (Fpu::None, None) => h.report(NAME, &[words], summary, extras),
+        (Fpu::None, Some(server)) => h.report(NAME, &[words, server], summary, extras),
+        (Fpu::Both, None) => h.report(
+            NAME,
+            &[words, ("fpu", Value::Word("both"))],
+            summary,
+            extras,
+        ),
+        (Fpu::Both, Some(server)) => h.report(
+            NAME,
+            &[words, ("fpu", Value::Word("both")), server],
+            summary,
+            extras,
+        ),
+    }
+    completed == n
+}
+
+/// The timed loop of a [`Serve::RecvReply`] case `c`: `n` round trips on
+/// `ep`, each an `ipc_recv` and an `ipc_reply`, touching a vector register
+/// between them when `c.fpu` asks for it. Returns their measurement and how
+/// many completed.
+#[inline(never)]
+fn serve_recv_reply(
+    ctx: &crate::TestContext,
+    h: &mut Harness,
+    ep: u64,
+    c: Case,
+    n: u64,
+) -> (super::Measured, u64)
+{
+    let reply = payload(0, c.words);
     let (mut samples, counters) = h.recorder();
     let mut completed: u64 = 0;
     for i in 0..n
@@ -356,31 +532,49 @@ fn run_round_trips(
         samples.record(t1.since(&t0).cycles);
         completed = completed.saturating_add(1);
     }
-    let summary = samples.summary();
-    let end = super::Placement::read(ctx.thread_cap, child.th);
+    (samples.summary(), completed)
+}
 
-    // After every round trip the child's last call has returned and it is on
-    // its way to `done`; after an early break it may be parked in `ipc_call`
-    // for good, so the caller's Thread-cap delete ends it instead of a wait.
-    if completed == n
+/// The timed loop of a [`Serve::ReplyRecv`] case `c`: an untimed
+/// `ipc_recv` of the first call on `ep`, then `n` reply-and-receives, each
+/// the reply to one call and the receive of the next, then an untimed
+/// `ipc_reply` to the last. Returns their measurement and how many completed;
+/// none when the last reply fails.
+#[inline(never)]
+fn serve_reply_recv(
+    ctx: &crate::TestContext,
+    h: &mut Harness,
+    ep: u64,
+    c: Case,
+    n: u64,
+) -> (super::Measured, u64)
+{
+    let reply = payload(0, c.words);
+    let (mut samples, counters) = h.recorder();
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    if unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }.is_err()
     {
-        notification_wait(done).ok();
+        return (samples.summary(), 0);
     }
-
-    let extras = super::placement_extras(start.as_ref(), end.as_ref());
-    let extras = extras.as_ref().map_or(&[][..], |e| &e[..]);
-    let words = ("words", Value::Num(c.words as u64));
-    match c.fpu
+    let mut completed: u64 = 0;
+    for _ in 0..n
     {
-        Fpu::None => h.report(NAME, &[words], summary, extras),
-        Fpu::Both => h.report(
-            NAME,
-            &[words, ("fpu", Value::Word("both"))],
-            summary,
-            extras,
-        ),
+        let t0 = counters.read();
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+        if unsafe { ipc::ipc_reply_recv(ep, &reply, ctx.ipc_buf, 0) }.is_err()
+        {
+            break;
+        }
+        let t1 = counters.read();
+        samples.record(t1.since(&t0).cycles);
+        completed = completed.saturating_add(1);
     }
-    completed == n
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    if completed == n && unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }.is_err()
+    {
+        completed = 0;
+    }
+    (samples.summary(), completed)
 }
 
 // ── Placement cases ───────────────────────────────────────────────────────────
@@ -422,7 +616,7 @@ impl Layout
     }
 
     /// The child's slot in [`PLACE_STACKS`], [`PLACE_IPC_PAGES`] and
-    /// [`SERVER_ARGS`].
+    /// [`SERVER_ARGS`], after its way of serving's [`Serve::place_base`].
     const fn slot(self) -> usize
     {
         match self
@@ -440,9 +634,12 @@ const FAN_IN_CALLERS: usize = 3;
 /// The `fan_in` server's slot; its callers take the slots after it.
 const FAN_IN_SERVER: usize = 3;
 
-/// The placement cases' children: a server per 1:1 case, then the `fan_in`
-/// server and its callers.
-const PLACE_CHILDREN: usize = FAN_IN_SERVER + 1 + FAN_IN_CALLERS;
+/// The placement children of one way of serving: a server per 1:1 case, then
+/// the `fan_in` server and its callers.
+const PLACE_SET: usize = FAN_IN_SERVER + 1 + FAN_IN_CALLERS;
+
+/// The placement cases' children: one set per way of serving.
+const PLACE_CHILDREN: usize = 2 * PLACE_SET;
 
 /// The `SYS_THREAD_SET_AFFINITY` argument that clears a thread's hard
 /// affinity.
@@ -463,10 +660,15 @@ struct ServerArgs
     ep: u64,
     /// The child's slot: its IPC page.
     slot: usize,
+    serve: Serve,
 }
 
 static SERVER_ARGS: spawn::ArgBlock<ServerArgs, PLACE_CHILDREN> =
-    spawn::ArgBlock::new(ServerArgs { ep: 0, slot: 0 });
+    spawn::ArgBlock::new(ServerArgs {
+        ep: 0,
+        slot: 0,
+        serve: Serve::RecvReply,
+    });
 
 /// The IPC buffer of placement child `slot`, registered for the calling
 /// thread; `None` when it cannot be.
@@ -480,40 +682,26 @@ fn register_place_page(slot: usize) -> Option<*mut u64>
     Some(buf_addr as *mut u64)
 }
 
-/// A server child: receive and reply with an empty message until a receive or
-/// a reply fails. Its case deletes it, parked in its receive.
+/// A server child: serve calls with an empty reply the way its arguments say
+/// until a receive or a reply fails. Its case deletes it, parked in its
+/// receive.
 extern "C" fn ipc_server_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the bench published for this child.
-    let ServerArgs { ep, slot } = unsafe { spawn::child_args(arg) };
-    let Some(ipc_buf) = register_place_page(slot)
-    else
+    let ServerArgs { ep, slot, serve } = unsafe { spawn::child_args(arg) };
+    if let Some(ipc_buf) = register_place_page(slot)
     {
-        thread_exit()
-    };
-    let reply = payload(0, 0);
-    loop
-    {
-        // SAFETY: ipc_buf was registered as this thread's IPC buffer above.
-        if unsafe { ipc::ipc_recv(ep, ipc_buf) }.is_err()
-        {
-            break;
-        }
-        // SAFETY: as for the receive.
-        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-        {
-            break;
-        }
+        serve_calls(ep, ipc_buf, serve);
     }
     thread_exit()
 }
 
-/// Start a server child on `ep` in `slot`, pinned to `cpu` when it is
-/// `Some`; the error names the step that failed.
+/// Start a server child on `ep` in `slot` that serves the way `serve` says,
+/// pinned to `cpu` when it is `Some`; the error names the step that failed.
 fn start_server(
     ctx: &crate::TestContext,
     ep: u64,
-    slot: usize,
+    (slot, serve): (usize, Serve),
     cpu: Option<u32>,
 ) -> Result<spawn::SpawnedChild, &'static str>
 {
@@ -521,7 +709,16 @@ fn start_server(
     let child_ep = cap_copy(ep, child.cs, syscall_abi::RIGHTS_EP_RECEIVE)
         .map_err(|_| "cap_copy of endpoint failed")?;
     // SAFETY: entry `slot` belongs to this child alone, which has not been started yet.
-    let arg = unsafe { SERVER_ARGS.publish(slot, ServerArgs { ep: child_ep, slot }) };
+    let arg = unsafe {
+        SERVER_ARGS.publish(
+            slot,
+            ServerArgs {
+                ep: child_ep,
+                slot,
+                serve,
+            },
+        )
+    };
     // SAFETY: `PLACE_STACKS` is a static array of stacks, reached only through `addr_of!`.
     let stack_top = unsafe { ChildStack::top_at(core::ptr::addr_of!(PLACE_STACKS), slot) }
         .map_err(|_| "no child stack")?;
@@ -540,15 +737,20 @@ fn start_server(
     Ok(child)
 }
 
-/// Run the 1:1 placement case `layout`: the harness thread, on CPU 0, calls
-/// a server child [`Harness::iters`] times with an empty message, timing each
-/// call, after one untimed call that the server takes on its start CPU.
-fn bench_placement(ctx: &crate::TestContext, h: &mut Harness, layout: Layout)
+/// Run the 1:1 placement case `layout` with a server that serves the way
+/// `serve` says: the harness thread, on CPU 0, calls a server child
+/// [`Harness::iters`] times with an empty message, timing each call, after
+/// one untimed call that the server takes on its start CPU.
+fn bench_placement(ctx: &crate::TestContext, h: &mut Harness, layout: Layout, serve: Serve)
 {
     let word = layout.word();
+    let server_word = server_suffix(serve);
     if h.cpus < 2
     {
-        h.skip(NAME, format_args!("words=0 placement={word}: one CPU"));
+        h.skip(
+            NAME,
+            format_args!("words=0 placement={word}{server_word}: one CPU"),
+        );
         return;
     }
     let Ok(ep) = cap_create_endpoint(ctx.memory_base)
@@ -556,23 +758,30 @@ fn bench_placement(ctx: &crate::TestContext, h: &mut Harness, layout: Layout)
     {
         h.skip(
             NAME,
-            format_args!("words=0 placement={word}: cap_create_endpoint failed"),
+            format_args!("words=0 placement={word}{server_word}: cap_create_endpoint failed"),
         );
         return;
     };
-    match start_server(ctx, ep, layout.slot(), Some(layout.start_cpu()))
+    let slot = serve.place_base().saturating_add(layout.slot());
+    match start_server(ctx, ep, (slot, serve), Some(layout.start_cpu()))
     {
         Ok(mut server) =>
         {
-            if let Err(e) = time_calls(ctx, h, ep, &server, layout)
+            if let Err(e) = time_calls(ctx, h, ep, &server, (layout, serve))
             {
-                h.skip(NAME, format_args!("words=0 placement={word}: {e}"));
+                h.skip(
+                    NAME,
+                    format_args!("words=0 placement={word}{server_word}: {e}"),
+                );
             }
             // The server is parked in its receive; deleting its Thread cap ends it.
             server.delete_thread().ok();
             server.delete_cspace().ok();
         }
-        Err(e) => h.skip(NAME, format_args!("words=0 placement={word}: {e}")),
+        Err(e) => h.skip(
+            NAME,
+            format_args!("words=0 placement={word}{server_word}: {e}"),
+        ),
     }
     cap_delete(ep).ok();
 }
@@ -584,7 +793,7 @@ fn time_calls(
     h: &mut Harness,
     ep: u64,
     server: &spawn::SpawnedChild,
-    layout: Layout,
+    (layout, serve): (Layout, Serve),
 ) -> Result<(), &'static str>
 {
     warm_up(ctx, ep, server, layout)?;
@@ -607,15 +816,13 @@ fn time_calls(
     let end = super::Placement::read(ctx.thread_cap, server.th);
     let extras = super::placement_extras(start.as_ref(), end.as_ref());
     let extras = extras.as_ref().map_or(&[][..], |e| &e[..]);
-    h.report(
-        NAME,
-        &[
-            ("words", Value::Num(0)),
-            ("placement", Value::Word(layout.word())),
-        ],
-        summary,
-        extras,
-    );
+    let words = ("words", Value::Num(0));
+    let placement = ("placement", Value::Word(layout.word()));
+    match serve.param()
+    {
+        None => h.report(NAME, &[words, placement], summary, extras),
+        Some(server) => h.report(NAME, &[words, placement, server], summary, extras),
+    }
     Ok(())
 }
 
@@ -646,20 +853,25 @@ struct FanInArgs
     ep: u64,
     ready: u64,
     done: u64,
-    /// The caller's index: its notification bit, its count in
-    /// [`FAN_IN_COMPLETED`], and its slot after [`FAN_IN_SERVER`].
+    /// The caller's index: its notification bit and its count in
+    /// [`FAN_IN_COMPLETED`].
     index: usize,
+    /// The caller's slot in [`PLACE_STACKS`] and [`PLACE_IPC_PAGES`].
+    slot: usize,
     /// Calls this caller makes, and the length of its sample stripe.
     iters: usize,
 }
 
-static FAN_IN_ARGS: spawn::ArgBlock<FanInArgs, FAN_IN_CALLERS> = spawn::ArgBlock::new(FanInArgs {
-    ep: 0,
-    ready: 0,
-    done: 0,
-    index: 0,
-    iters: 0,
-});
+/// The callers' arguments, one set per way of serving.
+static FAN_IN_ARGS: spawn::ArgBlock<FanInArgs, { 2 * FAN_IN_CALLERS }> =
+    spawn::ArgBlock::new(FanInArgs {
+        ep: 0,
+        ready: 0,
+        done: 0,
+        index: 0,
+        slot: 0,
+        iters: 0,
+    });
 
 /// Release barrier: the callers wait here after their ready bit, so their
 /// calls overlap.
@@ -688,11 +900,12 @@ extern "C" fn fan_in_caller_entry(arg: u64) -> !
         ready,
         done,
         index,
+        slot,
         iters,
     } = unsafe { spawn::child_args(arg) };
     let bit = 1u64 << index;
     let counters = ::bench::Counters::open();
-    let Some(ipc_buf) = register_place_page(FAN_IN_SERVER.saturating_add(1).saturating_add(index))
+    let Some(ipc_buf) = register_place_page(slot)
     else
     {
         notification_send(ready, bit).ok();
@@ -729,13 +942,17 @@ extern "C" fn fan_in_caller_entry(arg: u64) -> !
 }
 
 /// Run the `fan_in` case: [`FAN_IN_CALLERS`] callers pinned to CPUs 1 and up
-/// call one unpinned server child at once, sharing [`Harness::iters`] calls.
-fn bench_fan_in(ctx: &crate::TestContext, h: &mut Harness)
+/// call one unpinned server child, which serves the way `serve` says, at
+/// once, sharing [`Harness::iters`] calls.
+fn bench_fan_in(ctx: &crate::TestContext, h: &mut Harness, serve: Serve)
 {
-    const LABEL: &str = "words=0 placement=fan_in";
+    let suffix = server_suffix(serve);
     if (h.cpus as usize) <= FAN_IN_CALLERS
     {
-        h.skip(NAME, format_args!("{LABEL}: needs 4 CPUs"));
+        h.skip(
+            NAME,
+            format_args!("words=0 placement=fan_in{suffix}: needs 4 CPUs"),
+        );
         return;
     }
     FAN_IN_GO.store(false, Ordering::Relaxed);
@@ -746,7 +963,10 @@ fn bench_fan_in(ctx: &crate::TestContext, h: &mut Harness)
     let Ok(ep) = cap_create_endpoint(ctx.memory_base)
     else
     {
-        h.skip(NAME, format_args!("{LABEL}: cap_create_endpoint failed"));
+        h.skip(
+            NAME,
+            format_args!("words=0 placement=fan_in{suffix}: cap_create_endpoint failed"),
+        );
         return;
     };
     let Ok(ready) = cap_create_notification(ctx.memory_base)
@@ -755,7 +975,7 @@ fn bench_fan_in(ctx: &crate::TestContext, h: &mut Harness)
         cap_delete(ep).ok();
         h.skip(
             NAME,
-            format_args!("{LABEL}: cap_create_notification failed"),
+            format_args!("words=0 placement=fan_in{suffix}: cap_create_notification failed"),
         );
         return;
     };
@@ -766,23 +986,24 @@ fn bench_fan_in(ctx: &crate::TestContext, h: &mut Harness)
         cap_delete(ep).ok();
         h.skip(
             NAME,
-            format_args!("{LABEL}: cap_create_notification failed"),
+            format_args!("words=0 placement=fan_in{suffix}: cap_create_notification failed"),
         );
         return;
     };
     let mut callers = [const { spawn::SpawnedChild::EMPTY }; FAN_IN_CALLERS];
-    match start_server(ctx, ep, FAN_IN_SERVER, None)
+    let server_slot = serve.place_base().saturating_add(FAN_IN_SERVER);
+    match start_server(ctx, ep, (server_slot, serve), None)
     {
         Ok(mut server) =>
         {
-            if let Err(e) = fan_in_rounds(ctx, h, ep, [ready, done], &server, &mut callers)
+            if let Err(e) = fan_in_rounds(ctx, h, (ep, serve), [ready, done], &server, &mut callers)
             {
-                h.skip(NAME, format_args!("{LABEL}: {e}"));
+                h.skip(NAME, format_args!("words=0 placement=fan_in{suffix}: {e}"));
             }
             server.delete_thread().ok();
             server.delete_cspace().ok();
         }
-        Err(e) => h.skip(NAME, format_args!("{LABEL}: {e}")),
+        Err(e) => h.skip(NAME, format_args!("words=0 placement=fan_in{suffix}: {e}")),
     }
     for caller in &mut callers
     {
@@ -800,7 +1021,7 @@ fn bench_fan_in(ctx: &crate::TestContext, h: &mut Harness)
 fn fan_in_rounds(
     ctx: &crate::TestContext,
     h: &mut Harness,
-    ep: u64,
+    (ep, serve): (u64, Serve),
     [ready, done]: [u64; 2],
     server: &spawn::SpawnedChild,
     callers: &mut [spawn::SpawnedChild; FAN_IN_CALLERS],
@@ -811,7 +1032,7 @@ fn fan_in_rounds(
         .min(MAX_SAMPLES / FAN_IN_CALLERS);
     for (index, slot) in callers.iter_mut().enumerate()
     {
-        *slot = start_fan_in_caller(ctx, ep, [ready, done], index, per_caller)?;
+        *slot = start_fan_in_caller(ctx, (ep, serve), [ready, done], index, per_caller)?;
     }
     let all = (1u64 << FAN_IN_CALLERS) - 1;
     let mut arrived = 0u64;
@@ -839,26 +1060,25 @@ fn fan_in_rounds(
         }
     }
     let measured = super::Measured::of_other_cpus(recorder.summary());
-    h.report(
-        NAME,
-        &[
-            ("words", Value::Num(0)),
-            ("placement", Value::Word("fan_in")),
-        ],
-        measured,
-        &[
-            ("callers", FAN_IN_CALLERS as u64),
-            ("server_cpu", server_cpu),
-        ],
-    );
+    let words = ("words", Value::Num(0));
+    let placement = ("placement", Value::Word("fan_in"));
+    let extras = [
+        ("callers", FAN_IN_CALLERS as u64),
+        ("server_cpu", server_cpu),
+    ];
+    match serve.param()
+    {
+        None => h.report(NAME, &[words, placement], measured, &extras),
+        Some(server) => h.report(NAME, &[words, placement, server], measured, &extras),
+    }
     Ok(())
 }
 
-/// Start `fan_in` caller `index`, pinned to CPU `index + 1`, to make
-/// `iters` calls on `ep`.
+/// Start `fan_in` caller `index` of the case served the way `serve` says,
+/// pinned to CPU `index + 1`, to make `iters` calls on `ep`.
 fn start_fan_in_caller(
     ctx: &crate::TestContext,
-    ep: u64,
+    (ep, serve): (u64, Serve),
     [ready, done]: [u64; 2],
     index: usize,
     iters: usize,
@@ -871,17 +1091,23 @@ fn start_fan_in_caller(
         cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY).map_err(|_| "cap_copy failed")?;
     let child_done =
         cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY).map_err(|_| "cap_copy failed")?;
-    let slot = FAN_IN_SERVER.saturating_add(1).saturating_add(index);
+    let slot = serve
+        .place_base()
+        .saturating_add(FAN_IN_SERVER)
+        .saturating_add(1)
+        .saturating_add(index);
     let cpu = u32::try_from(index.saturating_add(1)).map_err(|_| "caller CPU past u32")?;
-    // SAFETY: entry `index` belongs to this caller alone, which has not been started yet.
+    // SAFETY: entry `fan_in_base() + index` belongs to this caller alone, which
+    // has not been started yet.
     let arg = unsafe {
         FAN_IN_ARGS.publish(
-            index,
+            serve.fan_in_base().saturating_add(index),
             FanInArgs {
                 ep: child_ep,
                 ready: child_ready,
                 done: child_done,
                 index,
+                slot,
                 iters,
             },
         )

@@ -64,6 +64,7 @@ pub mod queued_waiters_fifo;
 pub mod range_copy_lineage;
 pub mod read_regs_blocked_syscall;
 pub mod reply_binding_displaced;
+pub mod reply_recv_placement;
 pub mod return_work;
 pub mod retype_over_mapped_refused;
 pub mod retype_reclaim;
@@ -228,6 +229,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::sync_ipc_placement",
         sync_ipc_placement::run(ctx)
+    );
+    run_integration_test!(
+        "integration::reply_recv_placement",
+        reply_recv_placement::run(ctx)
     );
     run_integration_test!(
         "integration::ipc_receiver_order",

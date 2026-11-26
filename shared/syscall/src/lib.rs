@@ -60,18 +60,18 @@ use syscall_abi::{
     SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENDPOINT_BADGE,
     SYS_ENDPOINT_IDENTIFY, SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM,
     SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV,
-    SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE,
-    SYS_IRQ_SPLIT, SYS_KERNEL_LOG_BIND, SYS_KERNEL_LOG_READ, SYS_MEM_MAP, SYS_MEM_PROTECT,
-    SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_MERGE,
-    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
-    SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES,
-    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS,
-    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
-    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError, ipc_delivered_cap_count,
-    ipc_delivered_data_count,
+    SYS_IPC_REPLY, SYS_IPC_REPLY_RECV, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER,
+    SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_KERNEL_LOG_BIND, SYS_KERNEL_LOG_READ,
+    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
+    SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL,
+    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
+    SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER,
+    SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM,
+    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
+    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
+    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
+    ipc_delivered_cap_count, ipc_delivered_data_count,
 };
 
 pub use syscall_abi::{
@@ -108,8 +108,8 @@ pub use syscall_abi::{
 mod arch;
 
 use arch::current::{
-    syscall_ipc_call, syscall_ipc_recv, syscall_ipc_reply, syscall2, syscall2_ret3, syscall3,
-    syscall4, syscall4_any, syscall5, syscall5_ret2, syscall6,
+    syscall_ipc_call, syscall_ipc_recv, syscall_ipc_reply, syscall_ipc_reply_recv, syscall2,
+    syscall2_ret3, syscall3, syscall4, syscall4_any, syscall5, syscall5_ret2, syscall6,
 };
 
 /// Issue syscall `nr` with three argument registers exactly as given, bypassing
@@ -481,6 +481,57 @@ pub fn raw_ipc_reply(
     let ret =
         unsafe { syscall_ipc_reply(SYS_IPC_REPLY, label, data_count_u64, cap_count_u64, *mr) };
     if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Raw `SYS_IPC_REPLY_RECV`: reply to the pending caller as [`raw_ipc_reply`]
+/// does, with `label`, `data_count` words in `mr` or the IPC buffer, and
+/// `cap_count` cap handles in the IPC buffer's cap block, then receive on
+/// `ep` as [`raw_ipc_recv_timeout`] does under its `timeout_ms` policy.
+/// Intended for `shared/ipc`'s `IpcMessage`-snapshot wrapper; other callers
+/// should use that higher-level entry point.
+///
+/// Returns the received message as an [`IpcDelivery`] on success.
+///
+/// # Errors
+/// Returns a negative `i64` error code, per `SYS_IPC_REPLY_RECV` in
+/// `core/kernel/docs/syscalls.md`: first `InvalidCapability` (`ep` is not a
+/// live Endpoint cap), `InsufficientRights` (`ep` lacks Receive),
+/// `QuotaExceeded` or `OutOfMemory` (this thread's `CSpace` cannot be
+/// pre-allocated for an incoming cap transfer), which refuse the call before
+/// the reply, leaving a pending caller bound; then [`raw_ipc_reply`]'s
+/// errors, returned without receiving, after which no reply is pending; then
+/// [`raw_ipc_recv_timeout`]'s receive errors (`NoReceiver`, `Interrupted`,
+/// `WouldBlock`), returned after the reply was made.
+#[doc(hidden)]
+#[inline]
+pub fn raw_ipc_reply_recv(
+    ep: u64,
+    label: u64,
+    data_count: usize,
+    cap_count: usize,
+    timeout_ms: u64,
+    mr: &MsgRegs,
+) -> Result<IpcDelivery, i64>
+{
+    let counts = syscall_abi::ipc_reply_recv_count_arg(data_count as u64, cap_count as u64);
+    // SAFETY: syscall_ipc_reply_recv issues the raw syscall; every argument is
+    // a scalar the kernel validates, and the message registers are values. The
+    // kernel reads a reply beyond MSG_REGS_DATA_MAX words and its cap handles
+    // from this thread's registered IPC buffer page, and writes a received
+    // message beyond MSG_REGS_DATA_MAX words and delivered handles there;
+    // registering it required `ipc_buffer_set`'s contract, under which no Rust
+    // reference into the page is live across this call, which is the
+    // raw-wrapper contract's IPC-buffer clause.
+    let (ret, label, badge, counts, regs) =
+        unsafe { syscall_ipc_reply_recv(SYS_IPC_REPLY_RECV, ep, label, counts, timeout_ms, *mr) };
+    if ret < 0
+    {
+        Err(ret)
+    }
+    else
+    {
+        Ok(IpcDelivery::from_return(label, badge, counts, regs))
+    }
 }
 
 /// Send `bits` to a notification cap. `bits` must be non-zero.
@@ -3028,10 +3079,10 @@ pub fn thread_inherit_fault_handler(
 /// or, with `flags` = `UPCALL_ANY_INSTRUCTION`, at any return to user mode.
 ///
 /// Unless the thread masks upcalls, a block of it in one of the blocking
-/// syscalls (`SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`,
-/// `SYS_WAIT_SET_WAIT`, `SYS_THREAD_SLEEP`) returns `Interrupted`, unless
-/// its wake (a delivery, or the elapsed deadline of a sleep or a timed wait)
-/// was claimed first, and the upcall is delivered at that return; such a
+/// syscalls (`SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`, `SYS_NOTIFICATION_WAIT`,
+/// `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`, `SYS_THREAD_SLEEP`) returns
+/// `Interrupted`, unless its wake (a delivery, or the elapsed deadline of a
+/// sleep or a timed wait) was claimed first, and the upcall is delivered at that return; such a
 /// syscall it enters with the upcall pending returns `Interrupted` at once
 /// instead of blocking, while a try-once (`WAIT_TRY_ONCE`), or a syscall
 /// whose result is already available, returns its own result. A call

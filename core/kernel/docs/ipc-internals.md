@@ -270,7 +270,9 @@ no syscall on either side. Nothing is allocated on the path.
    b. commit_blocked_under_local_lock(current_tcb, BlockedOnRecv, ep); on a
       refusal, unlink current_tcb from the recv queue (clearing its slot), and stamp INTERRUPTED
       if the refusal was a stop or a pending upcall (RefusedStop); on a
-      commit of a bounded receive, arm its sleep-list entry (arm_timed_park)
+      commit of a bounded receive, arm its sleep-list entry (arm_timed_park).
+      endpoint_recv reports a commit as RecvMiss::NoSender and a refusal as
+      RecvMiss::ParkRefused
    c. Release endpoint lock
    d. Call the scheduler whether the park committed or was refused (a
       refused park that left the thread runnable is requeued), then
@@ -333,6 +335,50 @@ released.
 6. enqueue_and_wake(caller_tcb) on its selected CPU; return to the server
 ```
 
+`sys_ipc_reply` runs steps 1 to 5 as `deposit_reply`, which step 2's fault arm leaves having woken
+the faulter itself, then step 6 with `WakeHint::None`.
+
+### Reply-and-Receive Path
+
+`SYS_IPC_REPLY_RECV` execution on the server's thread
+([syscalls.md](syscalls.md) § `SYS_IPC_REPLY_RECV` (77)):
+
+```
+1. Resolve endpoint_cap → verify Receive rights, and pre-allocate the
+   receive's cap-slot headroom, as Receive Path step 1 (preallocate_receive);
+   a failure returns here, replies nothing, and leaves the binding
+2. Reply Path steps 1 to 5 (deposit_reply): a failure returns here without
+   receiving, its pending caller already woken with the
+   IPC_REPLY_TRANSFER_FAILED reply; a fault reply wakes the faulter here.
+   On success the claimed caller stays pinned by the won claim, its
+   deposit stamped, and its wake is owed
+3. Open the park episode and receive, as Receive Path steps 3 to 5
+   (receive_on). Step 2 of the Receive Path is not run: the binding was
+   consumed in step 2. The receive reports a bound sender (step 4), a
+   committed park, or a refused park (endpoint_recv's RecvMiss::ParkRefused),
+   or fails; drop the endpoint pin
+4. Wake the owed caller (wake_replied): with WakeHint::Sync after a
+   committed park, the server then blocking in this syscall's schedule();
+   with WakeHint::WakerRuns otherwise, the server running on
+   (scheduling-internals.md § Target CPU selection). The caller's and the
+   server's levels are read before the wake, after which the caller may
+   run and exit elsewhere
+5. Deliver as SYS_IPC_RECV does: a bound message at once (Receive Path
+   step 4f), a park's message through schedule() and the disposition
+   (step 5d), which also requeues a refused park's server at the tail of
+   its level
+6. When step 4's WakerRuns wake placed the caller on this CPU and the server
+   does not outrank it (run_queue::outranks), yield before the return to
+   user mode, after a bound delivery or before an error:
+   schedule(Requeue::Always) puts the server at the tail of its level,
+   behind the caller
+```
+
+Between steps 2 and 4 the caller is pinned and parked `BlockedOnReply`: its `wake_in_flight` pin
+holds off its `dealloc_object(Thread)`, whose wait spins without a lock, so the receive's endpoint
+lock and `sched_lock` holds cannot deadlock against it, and no canceller can claim it, the
+`reply_tcb` CAS having cleared the binding.
+
 ### Park Dispositions and Episodes
 
 Every park is an **episode**. The TCB carries `park_disposition`
@@ -371,12 +417,12 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 
 | Deposit site | Exclusive claim | Stamp |
 |---|---|---|
-| `sys_ipc_reply` normal arm | `reply_tcb` CAS won in `endpoint_reply` | episode + REPLY (after cap-result writes) |
-| `sys_ipc_reply` payload, cap-validation, pre-allocation, or cap-transfer refusal arm (`deposit_transfer_failed_reply`) | same CAS | episode + REPLY (the synthetic `IPC_REPLY_TRANSFER_FAILED` message, with no reply staged; the server receives the error) |
-| `sys_ipc_reply` fault arm (`reply_to_fault`) | same CAS | episode only (`fault_outcome` carries RESUME, DECLINED, FORWARDED, REDIRECTED, or REDIRECT_REFUSED; a DECLINED, FORWARDED, or REDIRECTED reply's label and word go to `ipc_msg`) |
+| `deposit_reply` normal arm (`SYS_IPC_REPLY`, `SYS_IPC_REPLY_RECV`) | `reply_tcb` CAS won in `endpoint_reply` | episode + REPLY (after cap-result writes) |
+| `deposit_reply` payload, cap-validation, pre-allocation, or cap-transfer refusal arm (`deposit_transfer_failed_reply`) | same CAS | episode + REPLY (the synthetic `IPC_REPLY_TRANSFER_FAILED` message, with no reply staged; the server receives the error) |
+| `deposit_reply` fault arm (`reply_to_fault`) | same CAS | episode only (`fault_outcome` carries RESUME, DECLINED, FORWARDED, REDIRECTED, or REDIRECT_REFUSED; a DECLINED, FORWARDED, or REDIRECTED reply's label and word go to `ipc_msg`) |
 | `release_unreplied_caller` (`SYS_IPC_RECV` entry, a caller bound by an earlier unreplied receive) | `reply_tcb.swap(null)` non-null | episode + INTERRUPTED (faulter: episode + KILL) |
 | `release_displaced_caller` after a try-once receive's rebind (`endpoint_try_recv`, a caller bound by an earlier unreplied receive) | the rebind's `reply_tcb.swap(sender)` returning non-null | episode + INTERRUPTED (faulter: episode + KILL) |
-| `cancel_for_timeout` (the sleep-list timer's expiry of a timed `SYS_IPC_CALL`, `SYS_IPC_RECV`, or `SYS_WAIT_SET_WAIT` park): the `cancel_ipc_block` BlockedOnSend, BlockedOnReply, BlockedOnRecv, and WaitSet arms, never a fault park | the claim of the same arm, gated on the popped park (`ipc_state` and `park_seq` unchanged; for a call, the same `call_episode` in its send or reply park) | episode + TIMED_OUT, with `wake_in_flight = 1` set in the claim's hold (kept, on the BlockedOnReply arm) for the timer's own `enqueue_and_wake`; the woken syscall returns `WouldBlock` ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Sleep List Invariants, invariant 6) |
+| `cancel_for_timeout` (the sleep-list timer's expiry of a timed `SYS_IPC_CALL`, `SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`, or `SYS_WAIT_SET_WAIT` park): the `cancel_ipc_block` BlockedOnSend, BlockedOnReply, BlockedOnRecv, and WaitSet arms, never a fault park | the claim of the same arm, gated on the popped park (`ipc_state` and `park_seq` unchanged; for a call, the same `call_episode` in its send or reply park) | episode + TIMED_OUT, with `wake_in_flight = 1` set in the claim's hold (kept, on the BlockedOnReply arm) for the timer's own `enqueue_and_wake`; the woken syscall returns `WouldBlock` ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Sleep List Invariants, invariant 6) |
 | `cancel_ipc_block` BlockedOnReply / BlockedOnFault arms | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
 | `ipc::fault::claim_fault_park` (a fault-handler binding change, `redeliver_in_flight`), received arm | `reply_tcb` CAS under the faulter's `sched_lock` behind a `blocked_on_object` re-read | episode only (`fault_outcome` carries REDELIVER) |
 | `ipc::fault::claim_fault_park`, queued arm | send-queue unlink of the snapshotted park (`park_seq` equal to the binder's snapshot) under `ep.lock` | episode only (`fault_outcome` carries REDELIVER) |
@@ -446,7 +492,9 @@ decides when it runs. A call rendezvous whose caller's park committed
 CPU, which the placement grants when that CPU queues no thread but its idle
 thread and the receiver does not outrank the caller
 ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection); a
-refused park and a reply pass `WakeHint::None`. A fault delivery to a parked
+refused park and a `SYS_IPC_REPLY` pass `WakeHint::None`. A `SYS_IPC_REPLY_RECV` wakes its replied
+caller after its receive, with `WakeHint::Sync` when the receive parked and
+`WakeHint::WakerRuns` otherwise (§ Reply-and-Receive Path). A fault delivery to a parked
 handler wakes it the same way. A receive first wakes any caller it releases from an
 earlier unreplied binding (its call returns `Interrupted`, a faulter is
 killed, or, on its restartable syscall's user copy, has that syscall fail with

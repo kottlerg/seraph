@@ -34,16 +34,18 @@ Seraph uses the `SYSCALL`/`SYSRET` instructions on x86-64.
 | `r11` | Clobbered by `SYSCALL` (holds saved rflags); not an argument register |
 
 All other registers are preserved across a syscall, except the extra return registers
-the IPC calls name (`r10` for `SYS_IPC_CALL`; `rsi` and `r10` for `SYS_IPC_RECV`; `rsi` for
-`SYS_EVENT_RECV`) and the message registers a delivered message writes (below). The
-callee-saved set matches the System V AMD64 ABI (`rbx`, `rbp`, `r12`–`r15`), so a wrapper of
-`SYS_IPC_CALL` or `SYS_IPC_RECV` declares `r12`–`r15` among its outputs.
+the IPC calls name (`r10` for `SYS_IPC_CALL`; `rsi` and `r10` for `SYS_IPC_RECV` and
+`SYS_IPC_REPLY_RECV`; `rsi` for `SYS_EVENT_RECV`) and the message registers a delivered message
+writes (below). The callee-saved set matches the System V AMD64 ABI (`rbx`, `rbp`, `r12`–`r15`),
+so a wrapper of `SYS_IPC_CALL`, `SYS_IPC_RECV` or `SYS_IPC_REPLY_RECV` declares `r12`–`r15`
+among its outputs.
 
 **Message registers:** MR0..MR5 are `r8`, `r9`, `r12`, `r13`, `r14` and `r15`. A message of
 at most `MSG_REGS_DATA_MAX` (6) data words carries them all in these registers: a sent message's
-word *i* is read from MR*i* (`SYS_IPC_CALL`, `SYS_IPC_REPLY`), and a delivered message's word
-*i* is written to MR*i* (the reply at a `SYS_IPC_CALL`'s return, the message at a
-`SYS_IPC_RECV`'s), the registers past the data count keeping their values. A message of more
+word *i* is read from MR*i* (`SYS_IPC_CALL`, `SYS_IPC_REPLY`, the reply of
+`SYS_IPC_REPLY_RECV`), and a delivered message's word *i* is written to MR*i* (the reply at a
+`SYS_IPC_CALL`'s return, the message at a `SYS_IPC_RECV`'s or a `SYS_IPC_REPLY_RECV`'s), the
+registers past the data count keeping their values. A message of more
 words travels in the IPC buffer page: its message registers are ignored on input and left
 unchanged on output (§ `SYS_IPC_CALL` (0)).
 
@@ -54,7 +56,7 @@ unchanged on output (§ `SYS_IPC_CALL` (0)).
 - `rdx`: secondary return value (e.g. the label from `ipc_recv`, the acquired bits from
   `notification_wait`). A call with no secondary result leaves `rdx` unchanged. The IPC
   calls also return values in `rsi`, `r10` and the message registers: see § `SYS_IPC_CALL` (0),
-  § `SYS_IPC_RECV` (2), and § `SYS_EVENT_RECV` (6).
+  § `SYS_IPC_RECV` (2), § `SYS_IPC_REPLY_RECV` (77), and § `SYS_EVENT_RECV` (6).
 
 **Errno convention:** The kernel returns the error code directly in `rax` as a
 negative `i64`. There is no `errno` global — callers check the sign of `rax`.
@@ -75,7 +77,8 @@ Seraph uses the `ECALL` instruction on RISC-V. The trap handler in `stvec` dispa
 | `a5` | Argument 5 |
 
 All other registers are preserved, except the extra return registers the IPC calls name
-(`a2` for `SYS_IPC_CALL`; `a2` and `a3` for `SYS_IPC_RECV`; `a2` for `SYS_EVENT_RECV`)
+(`a2` for `SYS_IPC_CALL`; `a2` and `a3` for `SYS_IPC_RECV` and `SYS_IPC_REPLY_RECV`; `a2` for
+`SYS_EVENT_RECV`)
 and the message registers a delivered message writes (below).
 Callee-saved registers are `s0`–`s11` and `sp` (matching the RISC-V calling convention); the
 kernel also restores `ra`.
@@ -240,10 +243,11 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  74  SYS_CAP_BIND_SOLE_REFERENCE
                                  75  SYS_KERNEL_LOG_READ
                                  76  SYS_KERNEL_LOG_BIND
+                                 77  SYS_IPC_REPLY_RECV
 ```
 
-**Implementation status.** Every number 0–76 has a handler; every number at or past
-`SYSCALL_NR_BOUND` (77) returns `UnknownSyscall`. The kernel refuses a number at or past the
+**Implementation status.** Every number 0–77 has a handler; every number at or past
+`SYSCALL_NR_BOUND` (78) returns `UnknownSyscall`. The kernel refuses a number at or past the
 bound, then selects the handler with one `match` on the number, clamped as data
 ([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and calls
 it directly. The `match` and a build-time check of its numbers come from one list
@@ -560,6 +564,65 @@ message is still delivered — with zero caps; the sender keeps its capabilities
 
 ---
 
+### `SYS_IPC_REPLY_RECV` (77)
+
+Reply to the caller bound to this thread, as `SYS_IPC_REPLY` does, then wait for a call on an
+endpoint, as `SYS_IPC_RECV` does, in one syscall. The reply's caller is woken only once the
+receive has bound a caller, parked, or failed, so its placement follows what the server does next
+([scheduler.md](scheduler.md) § Thread Assignment).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `endpoint_cap` | Receive capability to the IPC endpoint the receive waits on |
+| 1 | `label` | Reply label |
+| 2 | `data_count`, `cap_count` | The reply's counts: bits 0–31 its number of data words (0–MSG_DATA_WORDS_MAX), bits 32–63 its number of capabilities to transfer (0–MSG_CAP_SLOTS_MAX) (`syscall_abi::ipc_reply_recv_count_arg` packs both) |
+| 3 | `timeout_ms` | The receive's wait policy, as for `SYS_IPC_RECV` |
+| 4, 5 | (unused) | Ignored as arguments: their registers are MR0 and MR1 |
+
+The reply's data words and cap handles are read as for `SYS_IPC_REPLY`, and the received
+message is written as for `SYS_IPC_RECV`: a message of at most `MSG_REGS_DATA_MAX` words in the
+message registers in both directions, a longer one in this thread's registered IPC buffer page,
+which a longer received message overwrites from word 0 (§ Calling Convention).
+
+**Return:** as for `SYS_IPC_RECV`:
+
+- `rax`/`a0`: 0 on success; `SyscallError` on failure
+- `rdx`/`a1`: label from the incoming message
+- `rsi`/`a2`: badge of the incoming message (0 if unbadged)
+- `r10`/`a3`: the delivered counts, packed as for `SYS_IPC_CALL`
+- MR0..MR5: the message's data words, when it carries at most `MSG_REGS_DATA_MAX`
+
+**Order.** The syscall runs in three parts, and an error of each returns before the next:
+
+1. The receive's capability check and its cap-slot pre-allocation, as for `SYS_IPC_RECV`. An
+   error here replies nothing and leaves the binding, so the reply is still owed.
+2. The reply, as `SYS_IPC_REPLY`: it consumes the binding whether it succeeds or fails, and its
+   errors are `SYS_IPC_REPLY`'s, with the same wake of a pending caller with the
+   `IPC_REPLY_TRANSFER_FAILED` label on a payload or cap failure. A reply to a fault-blocked thread
+   resumes it at once, as `SYS_IPC_REPLY` does. An error here returns without receiving.
+3. The receive, as `SYS_IPC_RECV`, with every timeout mode. The binding was consumed in part 2, so
+   the receive releases no pending caller.
+
+The reply's caller is then woken: onto this thread's CPU when the receive parked, under the guard
+of a synchronous wake, and otherwise (the receive bound a queued caller, a try-once found none, or
+the receive failed) by the placement rules with this thread's CPU skipped as the caller's preferred
+CPU ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). A caller those
+rules still place on this thread's CPU, at this thread's level or above, runs before this thread
+returns to user mode.
+
+**Capability requirement:** `endpoint_cap` must have Receive rights; the reply needs the implicit
+reply capability, as for `SYS_IPC_REPLY`.
+
+**Errors:** those of part 1: `InvalidCapability`, `InsufficientRights`, `QuotaExceeded`,
+`OutOfMemory` (as for `SYS_IPC_RECV`); those of part 2: every error of `SYS_IPC_REPLY`,
+`InvalidCapability` included when no reply is pending; those of part 3: `NoReceiver`,
+`Interrupted`, `WouldBlock` (as for `SYS_IPC_RECV`). An error of part 3 is returned after the
+reply has been made.
+
+---
+
 ### `SYS_NOTIFICATION_SEND` (3)
 
 OR bits into a notification object. Non-blocking; if threads are waiting and pending bits
@@ -658,9 +721,9 @@ Dequeue the next entry from an event queue with optional bounded wait.
 | 0 | `queue_cap`  | Event queue capability with Recv rights                 |
 | 1 | `timeout_ms` | Wait policy: see sentinels below                        |
 
-`timeout_ms` sentinels, shared by `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, and
-`SYS_WAIT_SET_WAIT` (`u64::MAX` is `syscall_abi::WAIT_TRY_ONCE`; an elapsed
-`SYS_NOTIFICATION_WAIT` returns a zero bitmask rather than `WouldBlock`):
+`timeout_ms` sentinels, shared by `SYS_IPC_RECV`, the receive of `SYS_IPC_REPLY_RECV`,
+`SYS_NOTIFICATION_WAIT`, and `SYS_WAIT_SET_WAIT` (`u64::MAX` is `syscall_abi::WAIT_TRY_ONCE`; an
+elapsed `SYS_NOTIFICATION_WAIT` returns a zero bitmask rather than `WouldBlock`):
 
 | Value             | Behaviour                                                       |
 |-------------------|-----------------------------------------------------------------|
@@ -4035,22 +4098,24 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   § Lock Hierarchy).
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
-  `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
-  `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`,
-  or, `SYS_IPC_CALL` apart, is posted an upcall it does not mask (`SYS_THREAD_POST_UPCALL`),
-  unless its wake (a delivery, or the elapsed deadline of a sleep or a timed wait) was claimed
-  first. `SYS_IPC_CALL` is atomic with respect to upcalls: an upcall posted to a thread queued on
-  the endpoint or awaiting its reply, or pending when the call begins, ends neither wait, and is
-  delivered at the call's own return with the call's result in the registers
-  ([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
-  Upcalls, Blocking syscalls; [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md)
-  § Upcall Cancel-and-Wake Protocol). `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
-  `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
-  caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or
-  is destroyed before replying. `SYS_IPC_CALL` and `SYS_IPC_RECV` queued on an endpoint return
+  `SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`,
+  `SYS_WAIT_SET_WAIT`, `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped
+  via `SYS_THREAD_STOP`, or, `SYS_IPC_CALL` apart, is posted an upcall it does not mask
+  (`SYS_THREAD_POST_UPCALL`), unless its wake (a delivery, or the elapsed deadline of a sleep or a
+  timed wait) was claimed first. `SYS_IPC_CALL` is atomic with respect to upcalls: an upcall posted
+  to a thread queued on the endpoint or awaiting its reply, or pending when the call begins, ends
+  neither wait, and is delivered at the call's own return with the call's result in the registers
+  ([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous Upcalls,
+  Blocking syscalls; [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall
+  Cancel-and-Wake Protocol). `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and `SYS_WAIT_SET_WAIT` also
+  return `Interrupted` when the object waited on is destroyed under the caller, and `SYS_IPC_CALL`
+  returns it when the receiving thread receives again before replying or is destroyed before
+  replying. `SYS_IPC_CALL`, `SYS_IPC_RECV` and `SYS_IPC_REPLY_RECV` queued on an endpoint return
   `NoReceiver`, not `Interrupted`, when the last capability with the Receive right goes or the
-  endpoint is destroyed under them. `SYS_THREAD_START` returns `Interrupted` when its caller is
-  stopped while the start waits for the target to settle; nothing is started.
+  endpoint is destroyed under them. `SYS_IPC_REPLY_RECV` returns these errors, and `WouldBlock`,
+  from its receive, after its reply was delivered and its caller woken: a retry receives with
+  `SYS_IPC_RECV` and does not reply again. `SYS_THREAD_START` returns `Interrupted` when its caller
+  is stopped while the start waits for the target to settle; nothing is started.
 
 ---
 
@@ -4060,7 +4125,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 |---|---|---|
 | `MSG_DATA_WORDS_MAX` | 64 | Maximum data words per message |
 | `MSG_CAP_SLOTS_MAX` | 4 | Maximum capabilities per message |
-| `WAIT_TRY_ONCE` | `u64::MAX` | The `timeout_ms` that makes `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, or `SYS_WAIT_SET_WAIT` a non-blocking try-once |
+| `WAIT_TRY_ONCE` | `u64::MAX` | The `timeout_ms` that makes `SYS_IPC_RECV`, the receive of `SYS_IPC_REPLY_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, or `SYS_WAIT_SET_WAIT` a non-blocking try-once |
 | `IPC_CALL_TIMEOUT_SHIFT` | 32 | Bit position of `SYS_IPC_CALL`'s `timeout_ms` in its arg 2, above `data_count` |
 | `CSPACE_IPC_RECV_RESERVE` | 4 | Free slots every CSpace keeps back from general allocations for IPC capability transfer (§ Error Codes) |
 | `CSPACE_SLOTS_PER_PAGE` | 56 | Capability slots one donated CSpace slot page backs |

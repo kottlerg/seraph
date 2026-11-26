@@ -21,7 +21,7 @@
 //! pre-allocation peek (`magic`, `cspace_id`, `cspace_epoch`), so a dealloc
 //! that won the binding in between let the reply read a freed, possibly
 //! reused TCB (#513). The reply now claims first and reads the caller only
-//! under its claim (core/kernel/src/syscall/ipc.rs `sys_ipc_reply`;
+//! under its claim (core/kernel/src/syscall/ipc.rs `deposit_reply`;
 //! core/kernel/docs/ipc-internals.md § Reply Path).
 //!
 //! ## How this exercises it

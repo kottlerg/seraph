@@ -500,13 +500,23 @@ the server's next receive blocks. Two cases stay with the other rules: a call ma
 work is queued on the caller's CPU, whose threads the receiver would otherwise run ahead of while
 its own CPU idles, and a receiver that outranks its caller, such as an RT server called by a fair
 client, which, serving a backlog without parking, would hold off the caller's reply wake past any
-slice (§ Time Slice Policy). A reply-and-receive call (#1482), whose server parks in the same
-syscall as it replies, may lift the second condition. A receiver at its caller's level that, after
-its reply, serves other callers' queued calls without parking leaves the caller's reply wake queued
-behind it on that CPU until it parks or its slice expires: with several callers, the one whose CPU
-it moved to waits up to one slice per round trip. #1482 closes that wait, at the receive that binds
-a queued sender while the replied caller is queued on the server's CPU. Every other wake, the
-reply's included, passes `WakeHint::None`.
+slice (§ Time Slice Policy). The second condition stays though a server can reply with
+`SYS_IPC_REPLY_RECV`: at the call the kernel cannot tell how the receiver will reply, and a
+`SYS_IPC_REPLY`'s wake still goes by the caller's sticky preferred CPU.
+
+A reply's wake is placed by what its server does next. A `SYS_IPC_REPLY` passes
+`WakeHint::None`: the kernel cannot tell whether the server blocks next, so a receiver at its
+caller's level that, after its reply, serves other callers' queued calls without parking leaves
+the caller's reply wake queued behind it on that CPU until it parks or its slice expires. A
+`SYS_IPC_REPLY_RECV` wakes its caller after its receive. When the receive parks, the server blocks
+in the same syscall, and the caller is woken with `WakeHint::Sync` onto the server's CPU, under the
+guard above with the server as the waker. Otherwise the server runs on, and the caller is woken
+with `WakeHint::WakerRuns`, for which the sticky rule skips the server's CPU: the caller goes to
+its preferred CPU when that is another, and by least load otherwise. A caller still placed on the
+server's CPU, at the server's level or above, runs before the server returns to user mode, the
+server yielding to the tail of its level
+([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). Every other wake
+passes `WakeHint::None`.
 
 ### Load Balancing
 

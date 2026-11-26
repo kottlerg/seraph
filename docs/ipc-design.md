@@ -54,6 +54,13 @@ Synchronous IPC follows a strict call/reply pattern:
 The reply capability is valid for exactly one use; it cannot be stored, delegated,
 or reused.
 
+A server loop may join steps 3 and 2 of its next request: `reply_recv(endpoint_cap, message)`
+replies to the bound caller and then receives on the endpoint, in one syscall. The caller's wake
+waits for that receive, so the kernel places it knowing whether the server blocks (it parked) or
+runs on (it took a queued call)
+([syscalls.md § `SYS_IPC_REPLY_RECV`](../core/kernel/docs/syscalls.md#sys_ipc_reply_recv-77);
+[scheduler.md](../core/kernel/docs/scheduler.md) § Thread Assignment).
+
 A server that needs to delegate work may make a downstream call before replying: the pending reply
 stays bound to the receiving thread until that thread replies, and the downstream call does not
 touch that binding. A delegating server therefore replies before it next receives. A receive

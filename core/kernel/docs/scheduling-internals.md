@@ -175,8 +175,9 @@ skipping levels, risks deadlock.
    exclusive claim is the `reply_tcb` `compare_exchange(client, null)`, the caller's
    `wake_in_flight` was set when `endpoint_call` published the binding or the receive's send-queue
    dequeue (`bind_next_sender`) claimed the caller, and
-   `sys_ipc_reply` stamps the disposition and calls `enqueue_and_wake` once `endpoint_reply` has won
-   the CAS. Between a claim (a source-lock claim: waiter dequeued, payload deposited,
+   `deposit_reply` stamps the disposition once `endpoint_reply` has won the CAS, and
+   `sys_ipc_reply`, or `sys_ipc_reply_recv` after its receive, calls `enqueue_and_wake`. Between
+   a claim (a source-lock claim: waiter dequeued, payload deposited,
    `wake_in_flight = 1`; or a waking `reply_tcb` claim: the `endpoint_reply` or dying-server dealloc
    `compare_exchange` (the former also serving the `SYS_IPC_REPLY` failure path), the receive-entry
    swap that releases an unreplied caller or the try-once receive's release of a displaced one
@@ -552,7 +553,7 @@ write, and the canonical helper / locks held. Deviations from this table are bug
 | `Blocked` | `Ready` | IPC wake (`notification_send`, `event_queue_post`, `endpoint_reply`, `endpoint_call` server-wake, `waitset_notify`, and the release of an unreplied or displaced caller, `release_unreplied_caller` / `release_displaced_caller`, per [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model) | wake-issuing CPU | source IPC lock to snapshot wakeup payload, *released*, then `enqueue_and_wake(target_cpu)`; `endpoint_reply` takes no source lock: the `reply_tcb` CAS is the claim, then stamp and `enqueue_and_wake(target_cpu)`; `release_unreplied_caller` takes none either: the `reply_tcb` `swap(null)` is the claim (the try-once receive's rebind `swap` claims a displaced caller), then the INTERRUPTED stamp and `enqueue_and_wake(target_cpu)` |
 | `Blocked` | `Ready` | fault-handler binding change of the in-flight delivery's class while that delivery is in flight (`sys_thread_set_fault_handler` or `sys_thread_inherit_fault_handler` → `apply_bindings` → `ipc::fault::redeliver_in_flight`, per [fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and Kill) | calling CPU | `(*tcb).sched_lock` to read the delivery of that class (`delivery_in_flight`) and the park binding; then the claim `cancel_ipc_block` takes for the park: for a queued delivery the send-queue unlink under the endpoint's lock, try-locked under `sched_lock` (`ipc::lock_bound_source` gated on `park_seq`, Lock Hierarchy rule 7), for a received one the handler's `reply_tcb` CAS under `sched_lock` behind a `blocked_on_object` re-read; a won claim stamps `FAULT_OUTCOME_REDELIVER` and clears the binding inside the hold, then `enqueue_and_wake(target_cpu)` through the `wake_in_flight` pin (the reply binding's, or one the send-queue claim sets) |
 | `Blocked` | `Ready` | a posted upcall (`ipc::upcall::post`, per [fault-handling.md](../../../docs/fault-handling.md) § Asynchronous Upcalls) on a thread that masks no upcall, is in no fault or upcall delivery, and is blocked in no call | posting CPU | `cancel_for_upcall`: the claim `cancel_ipc_block` takes for the park, under the same locks, with `wake_in_flight = 1` set inside the claim's `sched_lock` hold; then `enqueue_and_wake(select_target_cpu(tcb))`, once ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall Cancel-and-Wake Protocol) |
-| `Blocked` | `Ready` | timeout from sleep list | timer-firing CPU | `SLEEP_LIST_LOCK` to pop expired entries (released first), then source IPC lock to arbitrate (the TCB still queued on the source in the popped park) and write the wake payload (a plain sleeper is claimed at the pop); a timed `SYS_IPC_CALL`, `SYS_IPC_RECV` or `SYS_WAIT_SET_WAIT` park instead expires through `cancel_for_timeout` (the claim `cancel_ipc_block` takes, gated on the popped park, stamping TIMED_OUT, `wake_in_flight = 1` set inside the claim's hold); then `enqueue_and_wake(target_cpu)` |
+| `Blocked` | `Ready` | timeout from sleep list | timer-firing CPU | `SLEEP_LIST_LOCK` to pop expired entries (released first), then source IPC lock to arbitrate (the TCB still queued on the source in the popped park) and write the wake payload (a plain sleeper is claimed at the pop); a timed `SYS_IPC_CALL`, `SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV` or `SYS_WAIT_SET_WAIT` park instead expires through `cancel_for_timeout` (the claim `cancel_ipc_block` takes, gated on the popped park, stamping TIMED_OUT, `wake_in_flight = 1` set inside the claim's hold); then `enqueue_and_wake(target_cpu)` |
 | `Blocked` | `Blocked` (binding cleared) | `cancel_ipc_block` (called from `sys_thread_stop` or the object-teardown stop on a blocked target) | calling CPU | `(*tcb).sched_lock` to snapshot `(state, ipc_state, blocked_on_object, park_seq)` and re-verify `Blocked` (cancelling a plain sleep through `sleep_list_remove` under it; released first), then, for a source park, `sched_lock` again with the source IPC lock matching `tcb.ipc_state` try-locked under it once the binding still matches the snapshot (`ipc::lock_bound_source`, Lock Hierarchy rule 7) to unlink the waiter and, if this cancel claimed the park, clear the binding inside the same hold (the reply and fault arms clear it inside the `sched_lock` hold of their `reply_tcb` CAS win; a lost claim's winner owns the episode and retires the binding, as Lock Hierarchy rule 7 lists; it may already have let the thread park again, on the same source or another of the same kind, and the caller's commit retries on the changed `park_seq`); the caller's commit then writes `Stopped` or `Exited` |
 | `Running` | `Blocked` (`BlockedOnFault`) | fault redirection — `ipc::fault::fault_dispatch`, or `ipc::fault::copy_fault_dispatch` for a restartable syscall's user-copy fault, delivering a kernel-unresolvable fault to the thread's bound handler endpoint | running CPU (arch fault handler, or the syscall dispatcher's `syscall::deliver_copy_fault` for a user-copy fault) | `endpoint_call(ep, tcb, BlockedOnFault)`, the fault message built in `tcb`'s `ipc_msg`: with a handler waiting it commits `commit_blocked_under_local_lock(tcb, BlockedOnFault, handler)`; otherwise it commits `BlockedOnSend` (`in_fault_delivery` set), and a later receive rebinds it to `BlockedOnFault` via `commit_reply_rebind_under_local_lock`; kernel-synthesized, the faulter takes the caller role in the endpoint call/reply machinery (see [fault-handling.md](../../../docs/fault-handling.md#mechanism-overview)) |
 | `Blocked` (`BlockedOnFault`) | `Ready` | fault reply (`sys_ipc_reply`), cancellation (handler-thread destruction in `dealloc_object(Thread)`, via `server_reply_wake`; the endpoint's drain (`release_waiters`) when no Receive-right capability is left, which records `NoReceiver`; the handler's next `SYS_IPC_RECV`, via `release_unreplied_caller`; each records `Kill`), or a fault-handler binding change (`ipc::fault::claim_fault_park`, which records `Redeliver`; the binding-change `Blocked` → `Ready` row above gives its locks) | wake-issuing CPU | the wake-claim winner records `fault_outcome` (`Resume`, `Declined` for a `FAULT_REPLY_KILL` reply, `Forwarded` for a `FAULT_REPLY_FORWARD` reply to a virtual-memory delivery, `Redirected` or `RedirectRefused` for a `FAULT_REPLY_REDIRECT` reply, `Kill`, `Redeliver`, or `NoReceiver` (`FAULT_OUTCOME_NO_RECEIVER` = 8, a handler endpoint with no Receive-right capability left)) then `enqueue_and_wake(target_cpu)` (`cancel_ipc_block` records `Kill` without a wake — the stop or teardown commit that follows leaves the faulter `Stopped` or `Exited` — and the `dealloc_object(Thread)` unlink of a dying faulter records nothing); the faulter resumes inside `fault_dispatch` or `copy_fault_dispatch` (re-executing its faulting instruction or syscall, delivering the fault again under the binding current then on `Redeliver`, delivering it to the endpoint `fault_redirect` holds on `Redirected`, delivering it through the exception class on `Forwarded` (`copy_fault_dispatch` takes `Forwarded` as a decline), or taking the unhandled outcome: the kill path, or a copy fault's `InvalidAddress`; `NoReceiver` is also the unhandled outcome, and `deliver_once` returns it at once, without parking, for a delivery to an endpoint with none left, or `Redeliver` when a binding change cancelled that delivery first (`fault_rebound`)) rather than returning a syscall value (see [fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill)) |
@@ -1283,7 +1284,8 @@ and `commit_blocked`'s `Running→Blocked` commit because all three contend for 
 `schedule()` spin against the source CPU's in-flight save), (3) for a
 `WakeHint::Sync` wake, the waker's CPU, under the guard below, (4) sticky
 `preferred_cpu` when its load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD`
-of the global `min_load`, and (5) the least-loaded CPU, a tie going to
+of the global `min_load`, except, for a `WakeHint::WakerRuns` wake, when
+`preferred_cpu` is the waker's CPU, and (5) the least-loaded CPU, a tie going to
 the CPU with the fewest busy SMT siblings, then the lowest index
 (`least_loaded_cpu`; [scheduler.md](scheduler.md) § SMT Awareness). Hard
 affinity overrides the pin, so an in-window wake of a thread whose affinity
@@ -1307,9 +1309,11 @@ that issue).
 thread running on this CPU, its park committed in the same syscall, and its `schedule()` follows
 before any return to user mode: the call rendezvous (`sys_ipc_call` after `endpoint_call`) and
 the fault delivery (`ipc::fault`'s `deliver_once`), each when `CallRendezvous::Bound` carries
-`hint: Sync`, which `endpoint_call` sets only on `ParkCommit::Committed`. A refused park passes
-`WakeHint::None`: its waker runs on, and a recipient left queued behind it would wait out its
-slice while another CPU idles. Every other wake passes `None`. Under `Sync`, the woken thread is
+`hint: Sync`, which `endpoint_call` sets only on `ParkCommit::Committed`, and the reply of a
+`SYS_IPC_REPLY_RECV` whose receive parked (`sys_ipc_reply_recv`'s deferred wake, when
+`receive_on` returns `Received::Parked`, which `endpoint_recv` reports only for a committed park).
+A refused park of a call passes `WakeHint::None`: its waker runs on, and a recipient left queued
+behind it would wait out its slice while another CPU idles. Under `Sync`, the woken thread is
 placed on the waker's CPU k when k is eligible and the guard holds:
 
 - **k queues no thread but its idle thread** (`PerCpuScheduler::has_queued_thread` is false), for
@@ -1322,8 +1326,21 @@ placed on the waker's CPU k when k is eligible and the guard holds:
   would hold it off past any slice, since slice expiry never hands the CPU to a lower RT level or
   from an RT thread to a fair one ([scheduler.md](scheduler.md) § Time Slice Policy). At or below
   the waker, the recipient is preempted by the reply wake or shares k with the waker within one
-  slice; at the waker's level, a recipient serving a backlog without parking holds the reply wake
-  that long, which #1482 closes (scheduler.md § Thread Assignment).
+  slice; at the waker's level, a recipient serving a backlog without parking holds a
+  `SYS_IPC_REPLY` wake that long, and a `SYS_IPC_REPLY_RECV` wake not at all (below).
+
+**The waker that runs on (rule 4's exception).** The reply of a `SYS_IPC_REPLY_RECV` whose receive
+did not park (it bound a queued caller, a try-once found none, its park was refused, or it failed)
+passes `WakeHint::WakerRuns`: the server runs on, so its CPU k is busy whatever its load reads.
+Rule 4 then skips k when it is the caller's `preferred_cpu`, and the caller goes to its preferred
+CPU when that is another and within the threshold, and by least load otherwise. Rules 1, 2 and 5
+may still place it on k. When one does, and the server does not outrank the caller,
+`wake_replied` reports it and the server yields to the caller (`schedule(Requeue::Always)`, at
+the tail of its level) before it returns to user mode, after
+delivering a bound message or before returning an error; a refused park yields through its own
+`schedule()` ([ipc-internals.md](ipc-internals.md) § Reply-and-Receive Path). A caller placed
+there would otherwise wait behind the server until the server parks or its slice ends. Every other
+wake passes `WakeHint::None`.
 
 When the guard holds, the woken thread is the thread k's `schedule()` dispatches when the waker
 blocks, and `enqueue_and_wake` to k sends no IPI (it skips self-wakes). Between the link and that

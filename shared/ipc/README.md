@@ -1,9 +1,9 @@
 # shared/ipc
 
 Shared IPC helpers for Seraph userspace: the stack-owned `IpcMessage` snapshot type, the `ipc_call`
-/ `ipc_recv` / `ipc_reply` wrappers, with the bounded and try-once forms `ipc_call_timeout`,
-`ipc_recv_timeout`, and `ipc_try_recv`, and `ipc_call_within`, a call bounded by the time left to a
-deadline (`call_timeout`; `WouldBlock` without a call once none is left;
+/ `ipc_recv` / `ipc_reply` / `ipc_reply_recv` wrappers, with the bounded and try-once forms
+`ipc_call_timeout`, `ipc_recv_timeout`, and `ipc_try_recv`, and `ipc_call_within`, a call bounded by
+the time left to a deadline (`call_timeout`; `WouldBlock` without a call once none is left;
 [runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Call deadline), that keep the
 kernel's per-thread IPC buffer as scratch at the syscall boundary, the generic bootstrap protocol,
 the `RecvGuard` receive-failure policy for blocking receive loops, the per-service IPC label and

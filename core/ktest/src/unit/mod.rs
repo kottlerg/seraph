@@ -723,6 +723,14 @@ pub fn run_all(ctx: &TestContext)
         ipc::regs_and_buffer_delivery(ctx)
     );
     run_test!(
+        "ipc::words_past_count_never_reach_recipient",
+        ipc::words_past_count_never_reach_recipient(ctx)
+    );
+    run_test!(
+        "ipc::reply_recv_without_pending_reply_refused",
+        ipc::reply_recv_without_pending_reply_refused(ctx)
+    );
+    run_test!(
         "ipc::fault_message_in_registers",
         ipc::fault_message_in_registers(ctx)
     );

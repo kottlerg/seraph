@@ -424,15 +424,16 @@ pub const PARK_DISPOSITION_INTERRUPTED: u8 = 2;
 
 /// The park's timeout expired: the sleep-list timer claimed it through
 /// `syscall::thread::cancel_for_timeout`. Stamped only for the endpoint and
-/// wait-set parks (`SYS_IPC_CALL`, `SYS_IPC_RECV`, `SYS_WAIT_SET_WAIT`); the
-/// resume returns `WouldBlock` and must not read the wake deposit.
+/// wait-set parks (`SYS_IPC_CALL`, `SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`,
+/// `SYS_WAIT_SET_WAIT`); the resume returns `WouldBlock` and must not read the
+/// wake deposit.
 pub const PARK_DISPOSITION_TIMED_OUT: u8 = 3;
 
 /// The park's endpoint has no receiver left: the last capability with the
 /// Receive right on it went while the thread was queued in `SYS_IPC_CALL` or
-/// parked in `SYS_IPC_RECV`, and the endpoint's drain claimed the park
-/// (`ipc::endpoint::release_waiters`). The resume returns `NoReceiver` and
-/// must not read the wake deposit.
+/// parked in `SYS_IPC_RECV` or `SYS_IPC_REPLY_RECV`, and the endpoint's drain
+/// claimed the park (`ipc::endpoint::release_waiters`). The resume returns
+/// `NoReceiver` and must not read the wake deposit.
 pub const PARK_DISPOSITION_NO_RECEIVER: u8 = 4;
 
 /// The call episode a `park_seq` value belongs to. A park commit
@@ -721,15 +722,15 @@ pub enum ParkCancel
     /// The timer claim stamped [`PARK_DISPOSITION_TIMED_OUT`].
     TimedOut,
     /// The endpoint's drain stamped [`PARK_DISPOSITION_NO_RECEIVER`]: only on
-    /// a `SYS_IPC_RECV` park.
+    /// a `SYS_IPC_RECV` or `SYS_IPC_REPLY_RECV` receive park.
     NoReceiver,
 }
 
 /// [`consume_park_interrupted`] for the non-call parks whose timeout the
-/// timer claims as a cancel (`SYS_IPC_RECV`, `SYS_WAIT_SET_WAIT`): it also
-/// reports a [`PARK_DISPOSITION_TIMED_OUT`] stamp, and, for a receive, a
-/// [`PARK_DISPOSITION_NO_RECEIVER`] one. The Acquire pairs with the
-/// stamp's Release.
+/// timer claims as a cancel (`SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`,
+/// `SYS_WAIT_SET_WAIT`): it also reports a [`PARK_DISPOSITION_TIMED_OUT`]
+/// stamp, and, for a receive, a [`PARK_DISPOSITION_NO_RECEIVER`] one. The
+/// Acquire pairs with the stamp's Release.
 ///
 /// # Safety
 /// `tcb` must be the current thread's valid TCB, resuming from a non-call

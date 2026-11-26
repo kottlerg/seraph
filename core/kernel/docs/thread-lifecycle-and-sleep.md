@@ -55,7 +55,8 @@ touches these):
 - `core/kernel/src/ipc/upcall.rs` — `post`, the post's cancel and wake (§ Upcall Cancel-and-Wake
   Protocol).
 - `core/kernel/src/syscall/ipc.rs` — `sys_ipc_call`, `sys_ipc_recv`, `sys_notification_wait`,
-  `sys_event_recv`, `sys_wait_set_wait`, `sys_ipc_reply`, `deposit_transfer_failed_reply`.
+  `sys_event_recv`, `sys_wait_set_wait`, `sys_ipc_reply`, `sys_ipc_reply_recv`, `deposit_reply`,
+  `deposit_transfer_failed_reply`.
 - `core/kernel/src/ipc/mod.rs` — `WaitQueue`, `arm_timed_park` (called by `notification_wait`,
   `event_queue_recv`, `waitset_wait`, `endpoint_recv`, and `endpoint_call`),
   `cancel_timed_entry` (invariant 7), and the waiter claims that drop a sleep-list entry:
@@ -615,8 +616,9 @@ domains:
    the next queued sender, leaving the server's binding as it was. See invariant 4 (#289).
 3. **Server in `endpoint_reply`** — loads `reply_tcb` (Acquire), then claims it by
    `compare_exchange(caller, null, AcqRel, Acquire)` with no lock held; on a lost race it returns
-   `None` and the winning claimant owns the wake. `sys_ipc_reply` makes this claim before it reads
-   the caller or validates the reply: the won claim keeps the caller's TCB live (its
+   `None` and the winning claimant owns the wake. `deposit_reply` (called by `sys_ipc_reply` and
+   `sys_ipc_reply_recv`) makes this claim before it reads the caller or validates the reply: the
+   won claim keeps the caller's TCB live (its
    `wake_in_flight` pin waits for this reply's wake, and the caller's `dealloc_object(Thread)` waits
    for that pin).
 4. **Client cancel via `cancel_ipc_block`** — `compare_exchange(this_client, null, AcqRel, Acquire)`
@@ -645,7 +647,7 @@ domains:
    faulter runs its kill path on resume. Without this, a client blocked on a dying server/handler
    would remain blocked indefinitely with a dangling `blocked_on_object` pointer to freed memory.
 7. **Server on the `SYS_IPC_REPLY` failure path** — makes no claim of its own: a payload,
-   capability, or destination failure is detected after actor 3's claim, so `sys_ipc_reply`
+   capability, or destination failure is detected after actor 3's claim, so `deposit_reply`
    deposits a synthetic `IPC_REPLY_TRANSFER_FAILED` reply under that claim
    (`deposit_transfer_failed_reply`) and wakes the caller. With no caller bound the claim returns
    `None` and nothing is woken.

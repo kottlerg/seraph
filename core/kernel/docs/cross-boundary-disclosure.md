@@ -65,7 +65,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `CAP_INFO_IRQ_REMAP_ENTRY` → the remapping entry a routed line or a message-signaled target needs with interrupt remapping on: its handle (derived from the target CPU's index and vector), the vector, and the target CPU's APIC id, all firmware-originated or fixed by the handle formula; x86-64 only | `cap::sys_cap_info`, `irq::remap_entry` | d |
 | `CAP_INFO_IRQ_REMAP_HANDLES` → the count of remapping handles the boot's CPUs use (`min(cpu_count, 302) * 217`); x86-64 only | `cap::sys_cap_info`, `arch::x86_64::interrupts::remap_handles` | d |
 | `CAP_INFO_THREAD_UPCALL` → a thread's upcall flags (`THREAD_UPCALL_PENDING`, `THREAD_UPCALL_MASKED`, `THREAD_UPCALL_IN_CALL`: blocked in a call's park), to any holder of the Thread cap, as thread-state is | `cap::sys_cap_info`, `ipc::upcall::info` | d |
-| `CAP_INFO_THREAD_PLACEMENT` → a thread's CPU index (`preferred_cpu`) or one of four 32-bit counts of how it was placed (wakes onto another CPU than the waker's, of those the wakes of an idle CPU, wakes off its preferred CPU, load-balancer pulls), to any holder of the Thread cap, as thread-state is | `cap::sys_cap_info`, `sched::placement_view` | d |
+| `CAP_INFO_THREAD_PLACEMENT` → a thread's CPU index (`preferred_cpu`) or one of six 32-bit counts of how it was placed (wakes onto another CPU than the waker's, of those the wakes of an idle CPU, wakes off its preferred CPU, load-balancer pulls, synchronous wakes that reached the synchronous wake rule, of those the ones it placed on the waker's CPU), to any holder of the Thread cap, as thread-state is | `cap::sys_cap_info`, `sched::placement_view` | d |
 | `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu, user-half top) | `sysinfo::sys_system_info` | c/d |
 | `SYS_SYSTEM_INFO(StackHighWater)` → the deepest use, in bytes, of the idle, thread, or handoff kernel stacks; readable by any process with no capability, and the thread class is a system-wide maximum over every freed thread, other processes' included | `sysinfo::sys_system_info`, `stack_depth::high_water` | d |
 | `SYS_SYSTEM_INFO(ThreadRetypeBytes)` → the bytes one Thread retype debits: the guard page, the kernel stack, the TCB page, the extended-state save area, and with shadow stacks on a shadow-stack page, whose page count the boot CPU's XSAVE size (CPUID leaf 0xD) or `vlenb` sets; a page-granular count that names no kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `sched::thread_slot::thread_slot_bytes` | d |
@@ -203,7 +203,10 @@ Notes on the non-obvious entries:
   already reads the thread's state (`CAP_INFO_THREAD_STATE`). What it discloses beyond that is how
   often the thread was woken from another CPU and moved between CPUs, a coarse signal of its traffic
   with other threads. ktest's round-trip benchmarks need exactly that signal, to tell whether their
-  two threads shared a CPU.
+  two threads shared a CPU. The two counts of the synchronous wake rule add how often the thread
+  was woken by a synchronous call or fault delivery, and how often it then ran on the caller's CPU:
+  a rate of the thread's own synchronous traffic, with no caller's identity and no address. ktest's
+  `sync_ipc_placement` reads them to judge each wake the rule decided.
 
 ## Physical-address surfaces
 

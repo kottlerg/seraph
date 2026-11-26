@@ -1,6 +1,6 @@
 # bench baseline, written by `cargo xtask bench-baseline`
 # Format: xtask/README.md (`cargo xtask bench-check`).
-path=fault pages=16 cpus=1 unit=cycles p50=58290
-path=fault pages=16 cpus=4 unit=cycles p50=62215
-path=grant pages=16 cpus=1 unit=cycles p50=60758
-path=grant pages=16 cpus=4 unit=cycles p50=64789
+path=fault pages=16 cpus=1 unit=cycles p50=58560
+path=fault pages=16 cpus=4 unit=cycles p50=62444
+path=grant pages=16 cpus=1 unit=cycles p50=60903
+path=grant pages=16 cpus=4 unit=cycles p50=64925

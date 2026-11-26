@@ -316,7 +316,8 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
     // stop (and any restart, which links the thread itself) may have
     // superseded it, and the start then took effect and was stopped.
     // SAFETY: target_tcb is a valid, initialized TCB, pinned by `thread_slot`.
-    let target_cpu = unsafe { crate::sched::select_target_cpu(target_tcb) };
+    let target_cpu =
+        unsafe { crate::sched::select_target_cpu(target_tcb, crate::sched::WakeHint::None) };
     // SAFETY: target_tcb is valid and pinned; Ready at `start_seq` it is
     // neither live nor linked on any CPU (the commit drained it); target_cpu comes from
     // select_target_cpu, so it is an initialised CPU; no run-queue lock is
@@ -2544,7 +2545,8 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
 ///   one time slice.
 /// - **Blocked / Stopped / Created**: the new affinity takes effect on
 ///   the next enqueue (`enqueue_and_wake` on wake, `sys_thread_start` on
-///   start or resume), both routed via `select_target_cpu`.
+///   start or resume), each of which re-reads the affinity under the
+///   thread's `sched_lock` at its link.
 ///
 /// The affinity write, the `preferred_cpu` / `state` reads, and the action run
 /// under the target's `sched_lock`, and the IPI is sent after it is released.
@@ -2699,7 +2701,9 @@ unsafe fn set_affinity_locked(
             // migrate_ready_thread re-checks location under both run-queue
             // locks and declines if the thread is no longer linked on old_cpu
             // (a dequeue for dispatch already took it; `schedule()`'s
-            // cross-affinity arm moves it at its next requeue).
+            // cross-affinity arm moves it at its next requeue), or not yet
+            // linked (`sys_thread_start`'s commit made it Ready; its link,
+            // `enqueue_ready_thread`, reads the new affinity under this lock).
             // SAFETY: tcb valid, its sched_lock held, no scheduler lock held;
             // both CPUs < CPU_COUNT.
             let moved = unsafe { crate::sched::migrate_ready_thread(tcb, old_cpu, new_cpu) };
@@ -2713,8 +2717,9 @@ unsafe fn set_affinity_locked(
             // comes at worst one time slice later.
             Some(old_cpu)
         }
-        // The next enqueue routes via select_target_cpu, which reads the new
-        // affinity under sched_lock.
+        // The next link routes by the new affinity: enqueue_and_wake and
+        // enqueue_ready_thread re-read it under sched_lock (sched::link_cpu)
+        // over the target their caller chose without it.
         ThreadState::Created
         | ThreadState::Blocked
         | ThreadState::Stopped

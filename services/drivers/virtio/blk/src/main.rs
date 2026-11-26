@@ -1107,7 +1107,7 @@ fn handle_register_partition(msg: &IpcMessage, rt: &mut BlkRuntime, out: &mut Re
     let reply = IpcMessage::builder(ipc::blk_errors::SUCCESS)
         .cap(partition_cap)
         .build();
-    out.set(reply);
+    out.set_or_delete_caps(reply);
 }
 
 /// Handle a `BLK_GET_GEOMETRY` request: reply the logical block size and

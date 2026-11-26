@@ -1148,7 +1148,7 @@ fn handle_get_system_root_cap(rt: &VfsdRuntime, reply: &mut Reply)
         std::os::seraph::log!(warn: "GET_SYSTEM_ROOT_CAP derive failed");
         IpcMessage::new(ipc::vfsd_errors::IO_ERROR)
     };
-    reply.set(answer);
+    reply.set_or_delete_caps(answer);
 }
 
 // ── Swap-partition hand-out ─────────────────────────────────────────────────

@@ -2390,7 +2390,7 @@ fn handle_write_memory(
         {
             builder = builder.cap(src_cap);
         }
-        reply.set(builder.build());
+        reply.set_or_delete_caps(builder.build());
     };
 
     if src_cap == 0
@@ -2545,7 +2545,7 @@ fn handle_write_memory(
         .word(0, byte_count as u64)
         .cap(src_cap)
         .build();
-    reply.set(answer);
+    reply.set_or_delete_caps(answer);
 }
 
 /// Lazy process-local VA reservation for `FS_WRITE_MEMORY` source-memory-cap
@@ -2871,7 +2871,7 @@ fn create_entry_common(
         .word(0, kind_for_node as u64)
         .cap(new_cap)
         .build();
-    reply.set(answer);
+    reply.set_or_delete_caps(answer);
 }
 
 /// `FS_CREATE` with `CREATE_OPEN` (services/fs/docs/fs-driver-protocol.md

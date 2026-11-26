@@ -370,7 +370,9 @@ pub fn dispatch_request<B: NamespaceBackend>(
     reply: &mut ipc::serve::Reply,
 )
 {
-    reply.set(request_reply(backend, received, namespace_endpoint));
+    // An `NS_LOOKUP` reply's cap is minted for the caller and kept by no
+    // one, so a reply that is not delivered deletes it.
+    reply.set_or_delete_caps(request_reply(backend, received, namespace_endpoint));
 }
 
 /// The reply [`dispatch_request`] leaves for `received`.

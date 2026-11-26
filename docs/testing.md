@@ -1604,10 +1604,13 @@ or body):
   `PerCpuScheduler`, or `Prng` inside `CpuRng`), and so is a change to a constant that sizes a
   per-CPU allocation (`KERNEL_STACK_PAGES` for the idle stacks, and `TAG_STATE_BYTES`, the tag-state
   slab's element size);
-- CPU enumeration and bringup: in the bootloader, the MADT walk (`madt_cpu_ids`), the device
-  tree's (`for_each_cpu`, `cpu_count` and `place_hart_ids`), the placement both feed
-  (`place_cpu_ids` and the per-CPU `record_cpu_id`), the sizing of the CPU-id array
-  (`cpu_id_capacity` and `allocate_cpu_ids`),
+- CPU enumeration and bringup: in the bootloader, the MADT walk (`madt_cpu_ids`, and `madt_cpu_id`,
+  which reads each structure's CPU id, with the structure types and lengths it tests,
+  `madt_type::LAPIC`, `madt_type::LOCAL_X2APIC`, `madt_type::RINTC`, `madt_len::LAPIC`,
+  `madt_len::LOCAL_X2APIC`, and `madt_len::RINTC_ID`), the device tree's (`for_each_cpu`,
+  `cpu_count` and `place_hart_ids`, and the CPU-node walk they run, `CpuWalk`, its node state
+  `CpuState`, and `record_cpu_prop`), the placement both feed (`place_cpu_ids` and the per-CPU
+  `record_cpu_id`), the sizing of the CPU-id array (`cpu_id_capacity` and `allocate_cpu_ids`),
   `step5_discover_cpu_topology`, `CpuTopology`, `discover_boot_hart_id` and `bsp_hardware_id`
   (the source of the BSP id that becomes `cpu_ids[0]`), and the handoff of the count and the CPU
   ids into `BootInfo` (`cpus.count` and `cpus.ids_phys`); in the kernel, the boot CPU count and
@@ -1679,7 +1682,9 @@ S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadContr
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|VectorRow|CpuTopology"
 S="$S|SlotEntry|DeliveryGate|SyscallScratch|CoreSlot"
 S="$S|madt_cpu_ids|for_each_cpu|cpu_count|record_cpu_id|place_cpu_ids|place_hart_ids"
-S="$S|cpu_id_capacity"
+S="$S|cpu_id_capacity|madt_cpu_id|CpuWalk|CpuState|record_cpu_prop"
+S="$S|madt_type::(LAPIC|LOCAL_X2APIC|RINTC)|madt_len::(LAPIC|LOCAL_X2APIC|RINTC_ID)"
+S="$S|const (LAPIC|LOCAL_X2APIC|RINTC): u8|const (LAPIC|LOCAL_X2APIC|RINTC_ID): usize"
 S="$S|allocate_cpu_ids|cpus\.count|cpus\.ids_phys|info\.cpu_count|boot_cpu_ids"
 S="$S|step5_discover_cpu_topology|start_ap|discover_boot_hart_id|bsp_hardware_id"
 S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"
@@ -1860,7 +1865,7 @@ the cells of every surface a non-inert line of its own diff is on.
 
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
-| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, `core/kernel/src/arch/riscv64/aia_encoding.rs`, `core/kernel/src/arch/x86_64/msi.rs`, and `core/kernel/src/arch/x86_64/remap.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, `sys_irq_split`, `sys_irq_msg_alloc`, `sys_irq_route`, and `sys_irq_remap`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, the message-signaled targets' slots (`alloc_message_target`, `free_message_target`, and the slot entry a delivery reads, `slot_entry`), and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, `select_ioapics`, and the allocation of the per-CPU device-vector rows the routes and targets take (`init_vector_storage`)); the interrupt-remapping switch and the entries it needs (`set_remap`, `remap_entry`, and `remap_handles`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes and targets take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules, as files (`shared/ipc/src/devmgr_labels.rs`, `shared/ipc/src/devmgr_errors.rs`, `shared/ipc/src/devmgr_dma_labels.rs`, `shared/ipc/src/devmgr_dma_errors.rs`, and `shared/ipc/src/device_info_kind.rs`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, `RISCV_IOMMU_DEVICE`, `X86_IOMMU_DEVICE`, and `X86_MACHINE_SPLIT_IRQCHIP`) | every device cell |
+| Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/` and the firmware-table formats it decodes with (`shared/firmware-tables/`), `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, `core/kernel/src/arch/riscv64/aia_encoding.rs`, `core/kernel/src/arch/x86_64/msi.rs`, and `core/kernel/src/arch/x86_64/remap.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, `sys_irq_split`, `sys_irq_msg_alloc`, `sys_irq_route`, and `sys_irq_remap`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, the message-signaled targets' slots (`alloc_message_target`, `free_message_target`, and the slot entry a delivery reads, `slot_entry`), and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, `select_ioapics`, and the allocation of the per-CPU device-vector rows the routes and targets take (`init_vector_storage`)); the interrupt-remapping switch and the entries it needs (`set_remap`, `remap_entry`, and `remap_handles`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes and targets take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules, as files (`shared/ipc/src/devmgr_labels.rs`, `shared/ipc/src/devmgr_errors.rs`, `shared/ipc/src/devmgr_dma_labels.rs`, `shared/ipc/src/devmgr_dma_errors.rs`, and `shared/ipc/src/device_info_kind.rs`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, `RISCV_IOMMU_DEVICE`, `X86_IOMMU_DEVICE`, and `X86_MACHINE_SPLIT_IRQCHIP`) | every device cell |
 | Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), the storage statement's crate `shared/storage-statement/`, `xtask/src/disk.rs`, its GPT writer `xtask/src/gpt.rs`, its FAT writer `xtask/src/fat.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers, as files (`shared/ipc/src/vfsd_labels.rs`, `shared/ipc/src/vfsd_errors.rs`, `shared/ipc/src/fs_labels.rs`, `shared/ipc/src/fs_errors.rs`, `shared/ipc/src/blk_labels.rs`, and `shared/ipc/src/blk_errors.rs`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_line`, `DiskLine`, `SecondSlot`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_FIRST_DISK_SLOT`, `MOVED_DISK_SLOT`, `first_disk_slot`, `SECOND_DISK_LOCATION`, `BlockSize`, and `split_data`) | every storage cell |
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
@@ -1895,8 +1900,8 @@ in that file's hunk, unless the line names a listed type only in an import, a re
 signature, or a type annotation, as the first paragraph of Device surfaces defines it.
 
 ```sh
-git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
-    core/kernel/src/irq.rs core/kernel/src/arch/x86_64/ioapic.rs \
+git diff --stat "$B" <head> -- services/devmgr/ shared/firmware-tables/ \
+    services/drivers/virtio/core/ core/kernel/src/irq.rs core/kernel/src/arch/x86_64/ioapic.rs \
     core/kernel/src/arch/riscv64/aia.rs core/kernel/src/arch/riscv64/aia_encoding.rs \
     core/kernel/src/arch/x86_64/msi.rs core/kernel/src/arch/x86_64/remap.rs services/vfsd/ \
     shared/storage-statement/ xtask/src/disk.rs xtask/src/gpt.rs xtask/src/fat.rs \

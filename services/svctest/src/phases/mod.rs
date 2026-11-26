@@ -127,6 +127,7 @@ pub mod acpi;
 pub mod budget;
 pub mod charge_node;
 pub mod checkpoint;
+pub mod console_whole_lines;
 pub mod crash;
 pub mod crashd;
 pub mod critical_creates;
@@ -312,6 +313,7 @@ fn ordered() -> Vec<Phase>
     out.extend_from_slice(crashd::oom_hold());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(logd_sinks::phases());
+    out.extend_from_slice(console_whole_lines::phases());
     out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());
     out.extend_from_slice(unmount::phases());

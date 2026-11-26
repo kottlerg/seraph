@@ -8,9 +8,10 @@
 # (docs/testing.md § Fuzzing). This workflow's cache carries each target's
 # working corpus only between runs made within the cache's lifetime, so a
 # run may start from the checked-in inputs alone; what lasts is in the
-# tree, each target's seeds and regressions. It gates no merge; the run the release host runs dispatch gates the tag. A
-# failing input it finds is uploaded, and its fix lands with the minimized
-# input under the target's regressions/.
+# tree, each target's seeds and regressions. It gates no merge; the run
+# the release host runs dispatch gates the tag. A failing input it finds is
+# uploaded, and its fix lands with the minimized input under the target's
+# regressions/.
 
 name: fuzz
 
@@ -18,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: Seconds each target runs
+        description: Seconds each target runs, at most 2700
         default: '1800'
 
 concurrency:
@@ -30,12 +31,26 @@ permissions:
 
 jobs:
   targets:
-    # The targets, one matrix entry each.
+    # The targets, one matrix entry each, once the dispatch's time is known
+    # to fit the campaign job's timeout.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
       targets: ${{ steps.list.outputs.targets }}
     steps:
+      - name: Check the dispatch's time
+        env:
+          SECONDS_INPUT: ${{ inputs.seconds || '1800' }}
+        run: |
+          case "$SECONDS_INPUT" in
+            ''|*[!0-9]*) ok=false ;;
+            *) [ "$SECONDS_INPUT" -ge 1 ] && [ "$SECONDS_INPUT" -le 2700 ] && ok=true || ok=false ;;
+          esac
+          if [ "$ok" != true ]; then
+            echo "::error::seconds is $SECONDS_INPUT; the campaign takes 1 to 2700 seconds per target, which the campaign job's 60-minute timeout holds with its build and minimization"
+            exit 1
+          fi
+
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
@@ -51,8 +66,8 @@ jobs:
 
   campaign:
     # One job per target, side by side, each for the dispatch's time: its
-    # timeout is that time's default with room for the build and the
-    # minimization, so a dispatch keeps its time under about 45 minutes.
+    # timeout holds the longest time the targets job admits, 2700 seconds,
+    # with room for the build and the minimization.
     needs: targets
     runs-on: ubuntu-latest
     timeout-minutes: 60

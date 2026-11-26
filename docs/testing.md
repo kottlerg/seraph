@@ -2341,7 +2341,9 @@ slowest target's run in the gating job (about 8 minutes, of a job of about 17); 
 cap is stopped and fails the job, named as over the cap, and is a defect of the target or of its
 property, made faster before it merges: a property whose checks grow faster than the input,
 over inputs of up to the target's longest, is the usual cause. The job's `timeout-minutes` is the
-backstop for the rest, and every fuzz job sets one.
+backstop for the rest, and every fuzz job sets one. A campaign job's, 60 minutes, holds a
+dispatch's time of up to 2700 seconds per target with the build and the minimization, and
+`fuzz.yml` fails a dispatch of a longer time before any target runs.
 
 The self-test runs the engine on planted defects in `xtask/fuzz/targets` (an eight-byte magic
 compared as one integer, a length field whose add overflows, and a state reached only through

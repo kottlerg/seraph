@@ -130,7 +130,7 @@ pub fn run(ctx: &BuildContext, args: &FuzzArgs) -> Result<()>
         command
             .args(engine_args(&ctx.root, &work_dir(ctx, name), args))
             .env("RUST_BACKTRACE", "1");
-        let Some(status) = run_capped(&mut command, cap)
+        let Some(status) = run_capped(&mut command, cap, &crate::term::signal::interrupted)
             .with_context(|| format!("running the fuzz target {name}"))?
         else
         {
@@ -186,8 +186,15 @@ fn cap(args: &FuzzArgs) -> Option<Duration>
 /// Run `command` to its end, or, with a `cap`, until the cap: its exit
 /// status, or `None` when the cap stopped it. The command runs in a process
 /// group of its own, which the cap kills whole, so the search the target
-/// binary supervises in a child of itself stops with it.
-fn run_capped(command: &mut Command, cap: Option<Duration>) -> Result<Option<ExitStatus>>
+/// binary supervises in a child of itself stops with it. Outside the
+/// terminal's foreground group, the run does not receive Ctrl+C, so the wait
+/// polls `interrupted` (`crate::term::signal::interrupted`) and, once it
+/// reports Ctrl+C, kills the group the same way and fails.
+fn run_capped(
+    command: &mut Command,
+    cap: Option<Duration>,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<Option<ExitStatus>>
 {
     let Some(cap) = cap
     else
@@ -202,7 +209,8 @@ fn run_capped(command: &mut Command, cap: Option<Duration>) -> Result<Option<Exi
         {
             return Ok(Some(status));
         }
-        if started.elapsed() >= cap
+        let over = started.elapsed() >= cap;
+        if over || interrupted()
         {
             // The group's id is the child's pid.
             let _ = Command::new("kill")
@@ -210,6 +218,10 @@ fn run_capped(command: &mut Command, cap: Option<Duration>) -> Result<Option<Exi
                 .status();
             let _ = child.kill();
             child.wait()?;
+            if !over
+            {
+                bail!("interrupted");
+            }
             return Ok(None);
         }
         std::thread::sleep(CAP_POLL);
@@ -620,7 +632,7 @@ mod tests
             "-c",
             &format!("sleep 600 & echo $! > {}; wait", pid_file.display()),
         ]);
-        let ended = run_capped(&mut command, Some(Duration::from_millis(500))).unwrap();
+        let ended = run_capped(&mut command, Some(Duration::from_millis(500)), &|| false).unwrap();
         assert!(ended.is_none());
         let pid = fs::read_to_string(&pid_file).unwrap();
         let stat = Path::new("/proc").join(pid.trim()).join("stat");
@@ -643,7 +655,57 @@ mod tests
         }
         assert!(!alive(), "the child of the capped run still runs");
         fs::remove_dir_all(&dir).unwrap();
-        let ended = run_capped(&mut Command::new("true"), Some(Duration::from_secs(60))).unwrap();
+        let ended = run_capped(
+            &mut Command::new("true"),
+            Some(Duration::from_secs(60)),
+            &|| false,
+        )
+        .unwrap();
         assert!(ended.is_some_and(|s| s.success()));
+    }
+
+    // Defect caught: Ctrl+C ignored by a capped run, whose process group the
+    // terminal's SIGINT does not reach, so the run holds until its cap and
+    // `--all` goes on to the next target; or the group left running after it.
+    #[test]
+    fn an_interrupted_capped_run_is_stopped_with_its_children_and_fails()
+    {
+        let dir = std::env::temp_dir().join(format!("xtask-fuzz-int-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!("sleep 600 & echo $! > {}; wait", pid_file.display()),
+        ]);
+        // Interrupted once the grandchild has written its pid.
+        let interrupted = || fs::read_to_string(&pid_file).is_ok_and(|s| s.ends_with('\n'));
+        let started = Instant::now();
+        let error = run_capped(&mut command, Some(Duration::from_secs(60)), &interrupted)
+            .expect_err("an interrupted run fails");
+        assert!(error.to_string().contains("interrupted"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the run held to its cap"
+        );
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        let stat = Path::new("/proc").join(pid.trim()).join("stat");
+        let alive = || {
+            fs::read_to_string(&stat).is_ok_and(|s| {
+                !s.rsplit(')')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start()
+                    .starts_with('Z')
+            })
+        };
+        let mut waited = 0;
+        while alive() && waited < 50
+        {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 1;
+        }
+        assert!(!alive(), "the child of the interrupted run still runs");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

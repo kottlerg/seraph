@@ -70,22 +70,38 @@ surfacing as an intermittent consumer fault.
 ## Free-Pool Data Structure
 
 Each free run (a Memory cap, its page count, and its physical base) is a node
-in the metadata arena (below), linked on one list sorted by physical base. The
-run count is therefore bounded by RAM, not by a constant: no run is turned
-away for want of a slot, short of the arena being unable to grow with its
-reserve spent. The pool keeps running totals of its free pages and runs.
-Selection walks the list:
+in the metadata arena (below), on two lists at once. One holds every run,
+doubly linked in order of physical base, so physical neighbours are list
+neighbours (see [Coalescing](#coalescing)). The other is the list of the run's
+size class, a two-level segregated fit: each power of two of pages splits into
+eight classes of equal width, every count below 16 pages is a class of its own,
+a bitmap marks the non-empty classes of each power, and a word marks the
+non-empty powers. The run count is therefore bounded by RAM, not by a
+constant: no run is turned away for want of a slot, short of the arena being
+unable to grow with its reserve spent. The pool keeps running totals of its
+free pages and runs. Selection reads the size classes, never the whole pool:
 
-- **Smallest fit.** The smallest run covering at least `N` pages serves a
-  `REQUIRE_CONTIGUOUS` request and the single-run case of best-effort
-  allocation.
+- **Size-class fit.** A run covering at least `N` pages from the smallest
+  size class that holds one serves a `REQUIRE_CONTIGUOUS` request and the
+  single-run case of best-effort allocation: the first run of `N`'s own
+  class when it covers `N`, else the first run of the lowest non-empty class
+  above it, which the bitmaps find and every run of which covers `N`. The
+  steps are the same however many runs the pool holds and in whatever order
+  they came back, so a grant's cost does not follow the history of the pool's
+  frees. Below 16 pages the fit is exact, and above it the run taken is
+  within one class width (an eighth of its power of two) of the smallest
+  covering run. Only when no class above `N`'s holds a run is `N`'s own
+  class walked for a covering run, so a request a run covers never fails.
 - **Largest run.** Best-effort allocation falls back to repeatedly taking the
   largest run when no single run is large enough, and a demand fault to
-  taking it once, whole (see [Demand faults](#demand-faults)).
+  taking it once, whole (see [Demand faults](#demand-faults)): the largest run
+  of the highest non-empty class, a walk of that one class.
 
-Taking a whole run frees its node; splitting one keeps the node for the
-remainder, whose sorted position does not change. Returning a run inserts it
-at its sorted position. A reclaimed frame's descriptor node is rewritten into
+Taking a whole run frees its node, unlinked from both lists without a walk;
+splitting one keeps the node for the remainder, whose physical position does
+not change and which moves to its own size class. Returning a run inserts it
+at its physical position, found by a walk of the list, and at the head of its
+size class. A reclaimed frame's descriptor node is rewritten into
 the run's node in place, so reclamation never allocates and cannot fail. When
 the arena has no free node outside its reserve (below) and the pool cannot
 fund an arena page, the returned run funds it itself: its first page (all of
@@ -112,16 +128,18 @@ reserve and, while chunks are swapped, the restore headroom; § Distribution pol
 node outside the reserve, or than none, fails with the out-of-memory code of its flags, before any
 run leaves the pool. An admitted request then selects:
 
-1. **`REQUIRE_CONTIGUOUS` set.** Select the smallest run that covers
-   `want_pages`. On hit: detach the run, split off exactly `want_pages` via
+1. **`REQUIRE_CONTIGUOUS` set.** Select a run that covers `want_pages`
+   from the smallest size class that holds one (§ Free-Pool Data
+   Structure). On hit: detach the run, split off exactly `want_pages` via
    `memory_split` if the run is larger than requested, return one Memory
    cap. On miss, or if the split fails: return `OUT_OF_MEMORY_CONTIGUOUS`.
    memmgr does not migrate live pages to produce a contiguous run;
    coalescing is the only mechanism that restores contiguity.
-2. **Best-effort.** First try a single best-fit run — the smallest run
-   that covers `want_pages` whole. One run is the fewest possible caps,
-   and best-fit reuses a freed run of the requested size instead of
-   re-splitting a larger one, so a workload that repeatedly frees and
+2. **Best-effort.** First try a single run that covers `want_pages`
+   whole, chosen as for `REQUIRE_CONTIGUOUS`. One run is the fewest possible
+   caps, and the size-class fit reuses a freed run of the requested size
+   instead of re-splitting a larger one (the latest freed run of a class is
+   its first), so a workload that repeatedly frees and
    re-requests a fixed size (e.g. ruststd's per-thread Thread-retype slab)
    cycles the same run — and the same tracking anchor — rather than minting
    a fresh anchor each request. Only when no single run is large enough,
@@ -709,9 +727,10 @@ cap. Eligibility:
 Coalescing runs explicitly after every reclamation — `PROCESS_DIED`,
 `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` alike — so a freed run rejoins
 its physical neighbours immediately rather than staying discrete. Together
-with best-fit best-effort selection (above), this bounds the pool's run count
+with size-class selection (above), this bounds the pool's run count
 under long spawn/free/die churn, and with it the per-run tracking anchor
-memmgr holds in its own CSpace: best-fit keeps a fixed-size churn cycling one
+memmgr holds in its own CSpace: the size-class fit keeps a fixed-size churn cycling
+one
 run, and the explicit merge keeps residual fragmentation from drifting the run
 (and anchor) count up over time. Left un-coalesced, reclaimed runs stay
 discrete and their anchors persist, slowly consuming memmgr's CSpace and arena
@@ -721,10 +740,10 @@ kernel requires a virgin tail; see
 [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_merge-50)
 §"`SYS_MEMORY_MERGE`"), but such a run waits on the deferred list, not in the
 pool (see [Reclamation](#reclamation)), so every pooled run is virgin.
-Coalescing cost scales with the live run count, which best-fit and this pass
+Coalescing cost scales with the live run count, which the size-class fit and this pass
 jointly keep small, so the per-reclamation merge is negligible.
 
-The free-run list is sorted by physical base, so mergeable runs are list
+The physical-order list holds the runs sorted by base, so mergeable runs are list
 neighbours: memmgr attempts `memory_merge` on each pair of physically adjacent
 neighbours (`base_a + size_a == base_b`) and skips every other pair without a
 syscall; the kernel declines any attempted pair that fails the remaining
@@ -1099,18 +1118,18 @@ read-only into its own address space, at a span of its object zone that holds th
 their order, and records each page's address there in the frame's descriptor. The object zone is 64
 GiB of memmgr's address space just below the lowest bootstrap window `shared/process-layout` draws,
 so it exists under every paging mode, Sv39 included ([Metadata Arena](#metadata-arena)). Its spans
-come from a free pool of their own, which takes the smallest free span that holds an object's pages
-and merges a span given back with its free neighbours. A seal that finds no span is refused with
-`QUOTA`, and one whose map fails with `OUT_OF_MEMORY_BEST_EFFORT`, the part already mapped unmapped
-and its span given back. The view serves two ends. memmgr copies an object page for a private write,
-or for `MAKE_PRIVATE`, from it (Faults). And it is a leaf of each object frame that no process
-holds, so every object frame a process maps has at least two leaves: the kernel refuses a text write
-of `SYS_THREAD_WRITE_MEM` with `InvalidState` on a read-only page whose frame is mapped more than
-once ([docs/fault-handling.md](../../../docs/fault-handling.md) § Debugging), which keeps a holder
-of a process's thread from patching, through an executable attachment, a frame other processes map
-(Attach, Make private). The view's page tables are memmgr's own, taken as an arena page's are
-([Metadata Arena](#metadata-arena)), about one page per 512 pages sealed at once, and kept for reuse
-when a view is unmapped.
+come from a free pool of their own, which takes a span from the smallest size class that holds an
+object's pages and merges a span given back with its free neighbours. A seal that finds no span is
+refused with `QUOTA`, and one whose map fails with `OUT_OF_MEMORY_BEST_EFFORT`, the part already
+mapped unmapped and its span given back. The view serves two ends. memmgr copies an object page for
+a private write, or for `MAKE_PRIVATE`, from it (Faults). And it is a leaf of each object frame that
+no process holds, so every object frame a process maps has at least two leaves: the kernel refuses a
+text write of `SYS_THREAD_WRITE_MEM` with `InvalidState` on a read-only page whose frame is mapped
+more than once ([docs/fault-handling.md](../../../docs/fault-handling.md) § Debugging), which keeps
+a holder of a process's thread from patching, through an executable attachment, a frame other
+processes map (Attach, Make private). The view's page tables are memmgr's own, taken as an arena
+page's are ([Metadata Arena](#metadata-arena)), about one page per 512 pages sealed at once, and
+kept for reuse when a view is unmapped.
 
 **Release.** `OBJECT_RELEASE`, or the sealer's `PROCESS_DIED`, drops the object's handle state:
 its key leaves the index, so every handle is refused from then on. Each attachment holds a

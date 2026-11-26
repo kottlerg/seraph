@@ -1309,7 +1309,7 @@ mod tests
         pool.push(&mut a, run(1, 3, 0x1000)).unwrap();
         pool.push(&mut a, run(2, 20, 0x10000)).unwrap();
         pool.push(&mut a, run(3, 40, 0x100_000)).unwrap();
-        // 16 pages: the smallest covering run (20) is split, as Contiguous does.
+        // 16 pages: the covering run of the smallest class (20) is split, as Contiguous does.
         let g = pool.select(&mut a, 16, Fit::UpTo, |_, _| Some(9)).unwrap();
         assert_eq!(g.entries(), [(2, 16, 0x10000)]);
         assert_eq!((pool.free_pages(), pool.run_count()), (47, 3));

@@ -1379,7 +1379,8 @@ affinity mask, less the excluded CPU), the rule returns:
   the fewest busy SMT siblings, then to the lowest index (`least_loaded_cpu` over the key of rank
   and load).
 
-It returns nothing only when no CPU is eligible, and rules 4 and 5 then decide as for a fair wake.
+It returns nothing only when no CPU is eligible, or when the only eligible CPU is the waker's CPU k
+that a `Sync` wake leaves out of the scan, and rules 4 and 5 then decide as for a fair wake.
 A thread placed behind a thread of its own level shares the CPU within a slice; one placed behind a
 higher level waits for it to block, which the rule chooses only when every eligible CPU runs or
 queues its level or above.

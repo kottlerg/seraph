@@ -1159,7 +1159,7 @@ its own state as it did before the word existed. A bit says only that a check ma
 | `RECLAIM` | `cap::object::push_deferred_reclaim` | its own |
 | `SOLE_REF` | a decrement that marks the sole-reference table or fires its observers (`KernelObjectHeader::dec_ref`), a drain pass that leaves work, and the timer tick while the table has work (`sched::timer_tick`) | its own |
 | `UPCALL_SYSCALL`, `UPCALL_ANY` | `ipc::upcall::post` for a `Running`, unmasked target; `schedule()`'s dispatch of a thread with an unmasked upcall pending; the unmask (`upcall::set_mask`) | the target's `preferred_cpu`; the dispatching CPU; its own |
-| `RUN_LIMIT` | the timer tick that brings its current thread's run-limit count to the limit, or finds a run-limit fault pending on it (`sched::run_limit::tick`; [scheduler.md](scheduler.md#run-limit) § Run Limit) | its own |
+| `RUN_LIMIT` | the timer tick that brings its current thread's run-limit count to the limit (`sched::run_limit::tick`); `schedule()`'s dispatch of a thread with a run-limit fault pending (`sched::mark_dispatched`, `sched::run_limit::return_work_of`; [scheduler.md](scheduler.md#run-limit) § Run Limit) | its own; the dispatching CPU |
 | `PREEMPT` | a run-queue link, or a priority change's move (`relink`), that leaves a queued thread outranking the running one; `mark_level_stale`; the wake IPI's handler; a preemption the boot transient or a preemption-disabled window declined | the linked CPU; the CPU running the thread; the IPI's target; its own |
 
 The return points and the bits they handle:

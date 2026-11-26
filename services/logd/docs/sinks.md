@@ -242,10 +242,11 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
   the line as dropped. The cursor passes the entry
   only once the barrier is answered without `STALLED` by the driver that accepted every chunk of
   it, so it never passes an entry unsent.
-- **`LOG_FLUSH`** (#928) waits for serial's cursor, which passes an entry only once it is sent, and
-  needs no barrier of its own. It reports the log flushed once serial's cursor has passed the
-  newest entry at the call, or serial is stalled or unserved, as the kernel reader's
-  acknowledgement does.
+- **`LOG_FLUSH`** (#928) waits for the cursor of every `hold` sink, serial's by default, which
+  passes an entry only once it is sent, and needs no barrier of its own. It reports the log flushed
+  once each `hold` sink's cursor has passed the newest entry at the call, or that sink is stalled,
+  unserved or `off`, as the kernel reader's acknowledgement does; with no `hold` sink it reports
+  flushed at once.
 - **framebuffer.** For the person at the screen. Its level is critical, so a healthy boot shows no
   log line on it. When an emergency entry reaches it, the sink first writes the last `backlog`
   entries at info or more severe that precede the emergency entry in the history and that it has
@@ -256,7 +257,12 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
 - **pstore.** A RAM ring that survives a warm reset (§ pstore).
 
 The panic sink stays outside this contract: logd's own panic and allocation-failure output goes to
-the serial driver directly, outside the history and with no lock taken.
+the serial driver directly, when one is resolved, outside the history and with no lock taken.
+
+No device sink is required. Each one writes only while devmgr serves its driver's class and its
+`level` is not `off` (§ Settings), and nothing in logd waits on a sink that is neither: a boot
+without a UART or a screen, or one whose recipe turns serial or the framebuffer off, logs to the
+sinks it has, and with no `hold` sink no sender is ever held.
 
 ### External sinks
 
@@ -301,7 +307,7 @@ LOGD_SINK_<NAME>=<key>=<value>,<key>=<value>,...
 
 | Key | Values | Meaning |
 |---|---|---|
-| `level` | one of the eight keywords | least severe level shown |
+| `level` | one of the eight keywords, or `off` | least severe level shown; `off` shows none |
 | `format` | `console`, `rfc5424` | the output format |
 | `fields` | a `:`-separated list of `time`, `host`, `level`, `name`, `procid`, `msg` | the console format's fields, in the order given |
 | `time` | `uptime`, `wall` | what the console format's `time` field shows |
@@ -316,7 +322,8 @@ LOGD_SINK_<NAME>=<key>=<value>,<key>=<value>,...
   it does not know, keeps the defaults for that sink and is self-logged at warning.
 - `LOGD_HOSTNAME=<name>` sets the host name the `host` field and the rfc5424 HOSTNAME show; absent,
   they show the nil value `-`.
-- Quiet mode is a sink's level.
+- Quiet mode is a sink's level, and `level=off` turns a sink off: it writes nothing, holds no
+  sender and stalls nothing, and `SINK_SET` can turn it on again.
 - The sender-side level ([ipc-interface.md](ipc-interface.md) § Levels, Filter) is still the only
   thing that stops a line from being sent. A sink's level only selects among the lines logd
   retains, and the history keeps every retained line whatever the sinks show.
@@ -445,16 +452,17 @@ message longer than the transport carries is cut at a character boundary of MSG.
 
 ## The kernel's lines
 
-*Built: the reader and its acknowledgement. Design intent: the acknowledgement by serial's cursor
-(#928).*
+*Built: the reader and its acknowledgement. Design intent: the acknowledgement by the `hold` sinks'
+cursors (#928).*
 
 logd's kernel log reader retains each kernel record as an entry of the kernel's slot
 (`LOG_BADGE_KERNEL`), and the sinks write it as any entry
 ([handover-protocol.md](handover-protocol.md) § Kernel log). It acknowledges a record on its next
-read only once serial's cursor has passed the record's entry, or serial is stalled or unserved, so
-a record the kernel's flush before a failure report writes is one no sink took
-([docs/console-model.md](../../../docs/console-model.md) item 4). The reader is a thread of its own
-and waits on serial's progress for no sender.
+read only once every `hold` sink's cursor (serial's by default) has passed the record's entry, or
+that sink is stalled, unserved or `off`, so a record the kernel's flush before a failure report
+writes is one no sink took ([docs/console-model.md](../../../docs/console-model.md) item 4); with
+no `hold` sink it acknowledges each record on its next read. The reader is a thread of its own and
+waits on no sink's progress for a sender.
 
 ---
 
@@ -479,8 +487,8 @@ and waits on serial's progress for no sender.
 [    1.204630] NOTICE [logd] previous boot: end
 ```
 
-- The pstore sink closes the loss #928 accepts: the entries retained but not yet written to serial
-  when the kernel panics are on the next boot's console.
+- The pstore sink closes the loss #928 accepts: the entries retained but not yet written to serial,
+  or to any sink, when the kernel panics are on the next boot's console.
 
 ---
 
@@ -591,7 +599,7 @@ Each later sink is built against the interface above and changes none of it.
 | Disk (#1496) | every entry in `seq` order from its start, `relayed` and `previous` included; the gaps it could not read; each entry's sender name after the sender died; to learn of a logd restart; wall time for its timestamps | the ascending unfiltered walk from `seq` 0, the oldest, the dense `seq`, the slot serial and `QUERY_SLOTS`, the token and the epoch, its own `timed` seed |
 | Network syslog (#1499, #1500) | the RFC 5424 fields of each entry; the facility, severity and host name; APP-NAME and PROCID per instance; TLS | the record and § The rfc5424 format; its own recipe's settings; the TLS stack in its own process (#1500), none in logd |
 | pstore (#1498) | each entry as a record at memory speed; a way to bring the previous boot's entries back | a device sink inside logd; the `previous` origin |
-| Serial transmit (#1497, built) | nothing from logd's interface; for the serial sink, a write answered once its bytes have left the UART (§ Device sinks), while a plain write is answered once its bytes are in the transmit ring | the serial driver's `SERIAL_WRITE_SENT` flag (label bit 32) on `SERIAL_WRITE_BYTES`, which logd's serial sink ends each line with as a zero-length barrier (#1703, built), so `LOG_FLUSH` waits for serial's cursor alone |
+| Serial transmit (#1497, built) | nothing from logd's interface; for the serial sink, a write answered once its bytes have left the UART (§ Device sinks), while a plain write is answered once its bytes are in the transmit ring | the serial driver's `SERIAL_WRITE_SENT` flag (label bit 32) on `SERIAL_WRITE_BYTES`, which logd's serial sink ends each line with as a zero-length barrier (#1703, built), so `LOG_FLUSH` waits for the `hold` sinks' cursors alone |
 
 ---
 

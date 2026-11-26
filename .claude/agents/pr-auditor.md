@@ -255,6 +255,15 @@ claims.
    body, bounds or `kani::any` sizes differ between that head and the PR
    head (a change to its comments alone does not count).
 
+   Kani run: run `cargo xtask kani --since <merge base> --list` at the PR
+   head, the merge base being `git merge-base <head> origin/master`. When it
+   lists a crate, `docs/testing.md` § Bounded verification owes a local
+   `cargo xtask kani --since <merge base>` run and `docs/conventions.md`
+   § PR-body checklist discipline owns its report: FAIL when `## Validation`
+   does not give the command, a head that covers the PR head, the crates
+   verified and a passing outcome. When it lists none, FAIL a body that does
+   not say that no Kani run is owed.
+
    CPU-count width: a non-inert line the PR's own diff adds that introduces
    a structure with one entry or one bit per CPU is on the Boundary surface
    whatever file it is in, so it owes the boundary set; FAIL a "none owed"

@@ -480,16 +480,18 @@ waits on no sink's progress for a sender.
   devmgr serves it as a `pstore` class device to logd.
 - logd's pstore sink writes each entry into a ring there, at memory speed, as a record: a header
   with a magic, a format version and the boot it belongs to, and per entry `seq`, `us`, `level`,
-  `kind`, the slot's name with its instance number, the bytes, and a checksum. It stores records,
-  not rendered lines, so each sink renders them in its own format on the next boot.
+  `kind`, the slot's badge, its name with its instance number, the bytes, and a checksum. It stores
+  records, not rendered lines, so each sink renders them in its own format on the next boot.
 - On the next boot logd reads a ring whose header and checksums are valid, installs its entries as
   `previous` entries ahead of its own, and clears the ring. For each distinct name with its instance
-  number among them it creates one previous slot: a slot with a new slot serial, that name and
-  instance number, no badge (0) and name generation 0, and each `previous` entry carries the serial
-  of its name's slot, so every sink, external ones through `QUERY_SLOTS`, names it as it names any
-  entry. Previous slots are kept beside the retired slots, outside their `RETIRED_SLOTS` FIFO and
-  their one-slot-per-badge rule ([ipc-interface.md](ipc-interface.md) § Retired slots), at most one
-  per entry installed, and each is dropped with its last entry.
+  number and badge among them it creates one previous slot: a slot with a new slot serial, that
+  name, instance number and badge, the state `SLOT_PREVIOUS` and name generation 0, and each
+  `previous` entry carries the serial of its slot, so every sink, external ones through
+  `QUERY_SLOTS` (§ Queries, follow and control), names it as it names any entry, and the rfc5424
+  PROCID, the previous boot's badge, tells that boot's instances of one name apart. Previous slots
+  are kept beside the retired slots, outside their `RETIRED_SLOTS` FIFO and their one-slot-per-badge
+  rule ([ipc-interface.md](ipc-interface.md) § Retired slots), at most one per entry installed, and
+  each is dropped with its last entry.
 - Serial shows `previous` entries, which no console of this boot has shown, between two notice lines
   of logd's:
 
@@ -532,6 +534,10 @@ capability space.
   in bits 32-63 of word 3.
 - `QUERY_SLOTS` rows carry the instance number in bits 32-63 of word 1, the slot serial in a tenth
   word and the name generation in an eleventh, so `SLOTS_PAGE` is 5.
+- `QUERY_SLOTS` lists the previous slots (§ pstore), state `SLOT_PREVIOUS` (3), after every live
+  and retired slot, in ascending slot serial, since several can share a badge. A resume whose
+  `data[3]` is `SLOT_PREVIOUS` takes `data[2]` as the slot serial of the last previous slot read,
+  not its badge, and goes on from the next serial.
 - The severity filter serves interactive reads, which count no gap; a reader that counts gaps walks
   unfiltered (§ External sinks).
 

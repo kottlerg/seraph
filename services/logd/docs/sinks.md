@@ -221,10 +221,10 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
   once its bytes are on the wire.
 - **A `STALLED` answer.** The driver answers a write that waited on a transmitter making no
   progress `STALLED` after its `TX_STALL_MS` (1000 ms), the same answer whichever wait stalled.
-  Today logd's writer takes it as it takes any answer. In this design (#928) the writer writes an
-  entry in two steps whose `STALLED` answers each mean one thing, and a `STALLED` answer does not
-  move serial's cursor: the sink is stalled (§ Pace) and the writer repeats the step that stalled
-  until it is answered without `STALLED`, each attempt bounded by the driver's stall bound.
+  Today logd's writer takes it as it takes any answer (#1703). In this design (#928) the writer
+  writes an entry in two steps whose `STALLED` answers each mean one thing, and a `STALLED` answer
+  does not move serial's cursor: the sink is stalled (§ Pace) and the writer repeats the step that
+  stalled until it is answered without `STALLED`, each attempt bounded by the driver's stall bound.
   1. Each chunk of the entry as a plain write. `STALLED` here means the chunk was not appended to
      the ring, so the writer writes that chunk again and goes on from it, not from the entry's
      first chunk. Without the transmit interrupt the driver writes a chunk byte by byte and stops
@@ -232,8 +232,12 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
   2. A zero-length write with the flag. `STALLED` here means the entry's bytes are in the ring
      and not yet sent, so the writer writes the barrier again.
 
-  The cursor passes the entry only once the barrier is answered without `STALLED`, so it never
-  passes an entry unsent.
+  A call that fails, the driver's endpoint withdrawn
+  ([serial driver](../../drivers/serial/README.md) § Endpoint), is not a `STALLED` answer: the
+  bytes the dead driver accepted died with its ring, so the sink is unserved and the writer writes
+  the entry again from its first chunk on the next driver it resolves. The cursor passes the entry
+  only once the barrier is answered without `STALLED` by the driver that accepted every chunk of
+  it, so it never passes an entry unsent.
 - **`LOG_FLUSH`** (#928) waits for serial's cursor, which passes an entry only once it is sent, and
   needs no barrier of its own. It reports the log flushed once serial's cursor has passed the
   newest entry at the call, or serial is stalled or unserved, as the kernel reader's

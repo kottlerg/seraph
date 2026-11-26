@@ -66,7 +66,10 @@ zeroes no whole `Message` on either side: its largest functions are the entries
 loops (`memcpy` 1448, `memset` 667). Each switch-in makes the incoming thread's floating-point
 and vector state live (`fpu::switch_in_restore`, 18 / 30): on riscv64 it loads the F/D and V
 files (`restore_fp_from` 68, `restore_v_from` 34) and each switch-out saves the dirty V file
-(`save_v_to` 36); x86_64's `XSAVE` and `XRSTOR` fall in the closing row.
+(`save_v_to` 36); x86_64's `XSAVE` and `XRSTOR` fall in the closing row. The kernel's search of
+the CPU's parked-receiver table compares all four slots, so its cost does not follow the slot the
+endpoint holds, which the order of earlier parks sets
+([hot-path-account.md](hot-path-account.md) § Context Switch and IPC).
 
 ### Page Faults
 
@@ -98,7 +101,10 @@ and the kernel's copy to and from user memory. A read through granted frames (`p
 `SYS_GETRANDOM`, fresh output with its own squeeze and ratchet
 ([entropy.md](entropy.md) § Draw API and consumers). `fsbench.open depth=3` is 70412 / 97652, one
 such draw (12628 / 12530, the release badge `File::open` allocates) and
-fatfs's long-name parsing (`LfnAccum`, 7670 / 6478) among it.
+fatfs's long-name parsing (`LfnAccum`, 7670 / 6478) among it. fatfs finds each cached page through
+its page index, a binary search whose steps the slot ceiling alone sets, rather than a scan of
+the slots in the order they were filled, which follows the requests served before the benchmark
+([services/fs/fat/docs/storage-layout.md](../../../services/fs/fat/docs/storage-layout.md)).
 
 ## Account
 

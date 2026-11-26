@@ -101,6 +101,13 @@ the registers zeroed at its switch-in when they hold another thread's state (`fp
 has used them, so each round trip zeroes the registers for the one and loads the other's area
 (`restore_fp_from` 34, `restore_v_from` 17): the pair's `fpu` rows are 184 instructions.
 
+A call finds the receiver its CPU parked on the endpoint by comparing the queue words of all four
+slots of the CPU's parked-receiver table, and a receiver's park finds the slot naming its endpoint
+the same way ([ipc-internals.md](ipc-internals.md) § Wait Queues), so the search costs the same
+whichever slot names the endpoint. The slot follows the order of the CPU's earlier parks on other
+endpoints, which the machine's timing decides, and a search that stopped at the match gave one
+image's round trip a different count from one boot to the next.
+
 An IPC message is built in place in each thread's `ipc_msg`, and a rendezvous, a reply or a
 fault delivery copies only its counted data words and capability slots, so no row zeroes or
 moves a whole 576-byte `Message`. A server that replies and receives in one

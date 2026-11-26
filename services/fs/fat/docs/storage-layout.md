@@ -125,4 +125,5 @@ each mutation in [crash-safety.md](crash-safety.md).
 
 ## Summarized By
 
+[Userspace Hot-Path Instruction Account](../../../../core/kernel/docs/hot-path-account-userspace.md),
 [services/fs/fat/README.md](../README.md)

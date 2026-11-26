@@ -1224,7 +1224,7 @@ the "Lock primitive" and "Bare spin locks" paragraphs of
 ## Summarized By
 
 [core/kernel/README.md](../README.md), [Capability Subsystem Internals](capability-internals.md),
-[Scheduler Internals](scheduler.md),
+[Kernel Hot-Path Instruction Account](hot-path-account.md), [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
 [Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),

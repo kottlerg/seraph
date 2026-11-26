@@ -56,8 +56,21 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 /// longest-waiting. `lock` serialises every non-atomic field that changes after
 /// construction (the bare-field exception of docs/coding-standards.md
 /// § Concurrency).
+///
+/// The state fills the rest of the endpoint's 128-byte retype slot after the
+/// 24-byte `EndpointObject` wrapper, and `repr(C)` fixes its order across the
+/// slot's two 64-byte cache lines (asserted below): the fields a call or a
+/// receive touches (`lock`, `send`, `send_nonempty`, `receivers`, and the
+/// receive queue's list) take bytes 24 to 55, and the receive queue's slot
+/// hints follow, CPUs 0 to 31 in bytes 56 to 63 of the first line and CPUs 32
+/// to 223 in the second. The wait-set back-pointer and its index, which a call
+/// reads only when it queues, end the second line.
+#[repr(C)]
 pub struct EndpointState
 {
+    /// Serialises the send/recv queues and the call/recv rendezvous; reply is
+    /// serialised by the `reply_tcb` claim, not this lock.
+    pub lock: crate::sync::Spinlock,
     /// The blocked senders (callers waiting for a receiver).
     pub send: WaitQueue,
     /// `1` iff `send` is not empty: the lockless readiness signal that
@@ -65,17 +78,6 @@ pub struct EndpointState
     /// [`EndpointState::refresh_send_ready`] at every `send` mutation
     /// (core/kernel/docs/ipc-internals.md § Wait Path).
     pub send_nonempty: core::sync::atomic::AtomicU32,
-    /// The blocked receivers (servers waiting for a caller).
-    pub recv: RecvQueue,
-    /// Opaque pointer to the `WaitSetState` this endpoint is registered with,
-    /// or null if not in any wait set. Type-erased to avoid a circular import.
-    /// Cast to `*mut WaitSetState` only inside `wait_set.rs`.
-    pub wait_set: *mut u8,
-    /// Index of this endpoint's entry in `WaitSetState::members`.
-    pub wait_set_member_idx: u16,
-    /// Serialises the send/recv queues and the call/recv rendezvous; reply is
-    /// serialised by the `reply_tcb` claim, not this lock.
-    pub lock: crate::sync::Spinlock,
     /// Number of capability slots, in every `CSpace`, that name this endpoint
     /// with the Receive right: raised when such a slot is filled and lowered
     /// when it is freed or its dying `CSpace` releases it
@@ -86,6 +88,15 @@ pub struct EndpointState
     /// reads it under `lock` and fails with `NoReceiver` at zero; the release
     /// that made it zero then drains the queues ([`release_if_unreceivable`]).
     pub receivers: core::sync::atomic::AtomicU32,
+    /// The blocked receivers (servers waiting for a caller), with the slot
+    /// hints of the CPUs' parked-receiver tables.
+    pub recv: RecvQueue,
+    /// Opaque pointer to the `WaitSetState` this endpoint is registered with,
+    /// or null if not in any wait set. Type-erased to avoid a circular import.
+    /// Cast to `*mut WaitSetState` only inside `wait_set.rs`.
+    pub wait_set: *mut u8,
+    /// Index of this endpoint's entry in `WaitSetState::members`.
+    pub wait_set_member_idx: u16,
 }
 
 #[expect(
@@ -104,10 +115,16 @@ unsafe impl Send for EndpointState {}
 unsafe impl Sync for EndpointState {}
 
 // Pins the retype-slot budget assumed by `cap::retype::dispatch_for(Endpoint)`:
-// the 24 B `EndpointObject` wrapper plus this state must fit BIN_128 (128 B).
-// Catches a future field addition that would overflow the bin.
+// the 24 B `EndpointObject` wrapper plus this state must fit BIN_128 (128 B),
+// which the receive queue's hints fill. Catches a field added that would
+// overflow the bin, and pins the layout above: the receive queue's hints start
+// at byte 56 of the slot, after every field a call or a receive touches, so
+// that hints of CPUs 0 to 31 share the first cache line with those fields.
 const _: () = {
-    assert!(24 + core::mem::size_of::<EndpointState>() <= 128);
+    use core::mem::offset_of;
+    assert!(24 + core::mem::size_of::<EndpointState>() == 128);
+    assert!(24 + offset_of!(EndpointState, recv) + offset_of!(RecvQueue, hints) == 56);
+    assert!(offset_of!(EndpointState, wait_set) > offset_of!(EndpointState, recv));
 };
 
 impl EndpointState

@@ -152,8 +152,8 @@ fn slot_field<T>(block_virt: u64, offset: u64) -> *mut T
 ///
 /// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The Memory cap
 /// MUST carry `MemRights::RETYPE` and have at least the size class of
-/// `dispatch_for(Endpoint, 0).raw_bytes` (72 B = 24 wrapper + 48
-/// `EndpointState`, debited as the 128 B `BIN_128` class) of `available_bytes`.
+/// `dispatch_for(Endpoint, 0).raw_bytes` (128 B = 24 wrapper + 104
+/// `EndpointState`, the whole `BIN_128` class) of `available_bytes`.
 ///
 /// On success, the wrapper + `EndpointState` are constructed in place inside
 /// the source Memory cap's region; a cap with `SEND | RECEIVE | GRANT |
@@ -206,7 +206,7 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout: EndpointObject at offset 0; EndpointState at offset
-    // size_of::<EndpointObject>() (24). Total 24 + 48 = 72 B, rounds to 128 B.
+    // size_of::<EndpointObject>() (24). Total 24 + 104 = 128 B, the BIN_128 class.
     let ep_obj_ptr = block_virt as *mut EndpointObject;
     let state_offset = core::mem::size_of::<EndpointObject>() as u64;
     let ep_state_ptr = slot_field::<EndpointState>(block_virt, state_offset);

@@ -578,6 +578,8 @@ pub unsafe fn init_bsp()
     let ptr = per_cpu_ptr(0);
     // SAFETY: single-threaded boot phase; no concurrent access to `per_cpu_ptr(0)`'s entry.
     unsafe { (*ptr).cpu_id = 0 };
+    // SAFETY: as for `cpu_id`.
+    unsafe { (*ptr).recv_parked.bind(0) };
     // Store BSP TSS pointer so set_rsp0() can find the TSS via GS-relative
     // access on x86-64 (on RISC-V tss_ptr remains 0 — not used by the arch).
     // SAFETY: as for `cpu_id`: single-threaded boot, no concurrent access to
@@ -608,6 +610,8 @@ pub unsafe fn init_ap(cpu_id: u32)
     unsafe {
         (*ptr).cpu_id = cpu_id;
     }
+    // SAFETY: as for `cpu_id`.
+    unsafe { (*ptr).recv_parked.bind(cpu_id) };
     // SAFETY: ptr is valid; arch init sets GS-base / tp to this address.
     unsafe {
         crate::arch::current::cpu::install_percpu(ptr as u64);
@@ -1022,6 +1026,6 @@ mod tests
             PERCPU_PREEMPT_COUNT_OFFSET
         );
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 232);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 248);
     }
 }

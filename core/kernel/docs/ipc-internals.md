@@ -19,8 +19,14 @@ The IPC subsystem comprises four kernel object types:
 ### Object Structure
 
 ```rust
+#[repr(C)]
 pub struct EndpointState
 {
+    /// Serialises every non-atomic field that changes after construction:
+    /// the two queues, the call/recv rendezvous, and the wait-set
+    /// back-pointer pair.
+    lock: Spinlock,
+
     /// Threads waiting to send (callers blocked in SYS_IPC_CALL), FIFO.
     send: WaitQueue,
 
@@ -28,27 +34,31 @@ pub struct EndpointState
     /// check reads without the lock.
     send_nonempty: AtomicU32,
 
+    /// Number of capability slots, in every CSpace, that name this endpoint
+    /// with the Receive right. A call or receive reads it under `lock` and
+    /// fails with NoReceiver at zero.
+    receivers: AtomicU32,
+
     /// Threads waiting to receive (servers blocked in SYS_IPC_RECV): a
     /// WaitQueue in arrival order whose parks are recorded in the parking
-    /// CPU's parked-receiver table (§ Wait Queues).
+    /// CPU's parked-receiver table, and the slot hints of the CPUs' tables
+    /// (§ Wait Queues).
     recv: RecvQueue,
 
     /// Wait-set back-pointer (null if not in any wait set) and this
     /// endpoint's member index in that set.
     wait_set: *mut u8,
     wait_set_member_idx: u16,
-
-    /// Serialises every non-atomic field that changes after construction:
-    /// the two queues, the call/recv rendezvous, and the wait-set
-    /// back-pointer pair.
-    lock: Spinlock,
-
-    /// Number of capability slots, in every CSpace, that name this endpoint
-    /// with the Receive right. A call or receive reads it under `lock` and
-    /// fails with NoReceiver at zero.
-    receivers: AtomicU32,
 }
 ```
+
+The state fills the endpoint's 128-byte retype slot after the 24-byte `EndpointObject` wrapper
+(`ENDPOINT_RETYPE_BYTES`, 128), and `repr(C)` fixes its order across the slot's two 64-byte cache
+lines, which `ipc/endpoint.rs` asserts: the fields a call or a receive touches (`lock`, `send`,
+`send_nonempty`, `receivers`, and the receive queue's list) take bytes 24 to 55 of the first line,
+and the receive queue's 56 bytes of slot hints follow, those of CPUs 0 to 31 in bytes 56 to 63 of
+the first line and those of CPUs 32 to 223 in the second. The wait-set pair, which a call reads
+only when it queues, ends the second line.
 
 `receivers` is raised when a slot with the Receive right on the endpoint is filled and lowered
 when one is freed or its dying CSpace releases it (`note_receiver_filled` and
@@ -99,22 +109,36 @@ receiver stays queued unrecorded. The TCB keeps the address of its slot's receiv
 the Thread dealloc unlink) clears that word by a compare-and-swap from the removed TCB to null,
 which leaves alone a slot a later park has since taken. `RecvQueue` is the only way to the inner
 queue, so no removal skips the clear, and a slot's receiver, read under the endpoint's lock, is a
-thread still parked on that queue. A lookup compares all four queue words, whichever slot names
-the endpoint, loads one receiver word, and reads no TCB; a park's search for the slot naming its
-queue compares all four the same way. The slot an endpoint takes follows the order of the CPU's
-earlier parks on other endpoints, which the machine's timing decides, so a search that stopped
-at the match would make one call cost more or fewer instructions from one boot to the next. A
-table with no record for the endpoint, full or not, leaves the call to the longest-waiting
-receiver: no call is refused for want of a slot.
+thread still parked on that queue.
+
+**Slot hints.** A receive queue keeps, for each CPU below `RECV_PARK_HINT_CPUS` (224), two bits
+naming the slot that CPU's table last took for it (`RecvQueue::hints`, the 56 bytes of the
+endpoint's retype slot that its other state leaves; § Object Structure). A park that finds no slot
+naming its queue writes the hint of the slot it takes, so the slot of that CPU's table that names
+the queue and holds a receiver is always the one the hint names. A lookup, or a park's search, on
+such a CPU loads its two bits and the queue word of the slot they name, and takes that slot only
+when the word names the queue: a hint whose slot was given to another endpoint since fails the
+check, as a table with no slot for the queue does, and a slot naming the queue that the hint does
+not name (one left by an endpoint freed at the same address) holds no receiver. A zero hint is a
+slot index like any other, so a new queue needs no state for none. A CPU at or above 224 keeps no
+hint, which its per-CPU init chooses (`RecvParkTable::bind`), and compares all four queue words,
+whichever slot names the endpoint, with no branch on which one matched. Either search loads one
+receiver word and reads no TCB, and costs the same whichever slot holds the endpoint. That slot
+follows the order of the CPU's earlier parks on other endpoints, which the machine's timing
+decides, so a search whose cost followed it would make one call cost more or fewer instructions
+from one boot to the next; the cost follows only the CPU's index and whether its table holds the
+endpoint. A table with no record for the endpoint, full or not, leaves the call to the
+longest-waiting receiver: no call is refused for want of a slot.
 
 The table has no lock of its own. Its words are atomics accessed `Relaxed`, but for the owning
-CPU's plain (non-atomic) reads of its queue words in `RecvParkTable::named`, sound only because
-no other CPU reads or writes a queue word; a cross-CPU access of one needs `named` back on an
-atomic load. A CPU records and looks up in its own table only, under the lock of the endpoint it
-parks on or calls, with interrupts off; a remover on any CPU clears a slot only under the lock of
-the endpoint it removes the receiver from, and only from that receiver to null. An access that
-decides an outcome therefore holds the lock of the endpoint the slot names, which orders it
-(scheduling-internals.md
+CPU's plain (non-atomic) reads of its queue words in `RecvParkTable::names` and
+`RecvParkTable::scan`, sound only because no other CPU reads or writes a queue word; a cross-CPU
+access of one needs both back on atomic loads. A receive queue's hints are plain bytes, read and
+written only under its endpoint's lock. A CPU records and looks up in its own table only, under
+the lock of the endpoint it parks on or calls, with interrupts off; a remover on any CPU clears a
+slot only under the lock of the endpoint it removes the receiver from, and only from that receiver
+to null. An access that decides an outcome therefore holds the lock of the endpoint the slot
+names, which orders it (scheduling-internals.md
 [§ Atomic Ordering Invariants](scheduling-internals.md#atomic-ordering-invariants)).
 
 **Release when no receiver is left.** `release_if_unreceivable` runs where a slot's reference is
@@ -1173,8 +1197,8 @@ The capability-revocation deferred-cleanup pattern remains specified in
 [capability-internals.md](capability-internals.md).
 
 The per-CPU parked-receiver table (§ Wait Queues) adds no lock: its slots are atomics, read by
-the owning CPU plainly in their queue words alone, accessed under the endpoint lock that already
-serialises the receive queue.
+the owning CPU plainly in their queue words alone, and the receive queue's slot hints plain bytes,
+all accessed under the endpoint lock that already serialises the receive queue.
 
 ### Cross-CPU Wakeup
 

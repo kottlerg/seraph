@@ -140,7 +140,7 @@ pub const fn cap_handle_gen(handle: u64) -> u32
 // an ABI-visible change by design.
 
 /// Raw retype debit of one `Endpoint`, in bytes.
-pub const ENDPOINT_RETYPE_BYTES: u64 = 72;
+pub const ENDPOINT_RETYPE_BYTES: u64 = 128;
 
 /// Raw retype debit of one `Notification`, in bytes.
 pub const NOTIFICATION_RETYPE_BYTES: u64 = 64;

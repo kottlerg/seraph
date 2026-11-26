@@ -23,8 +23,8 @@
 //!   `STREAM_BYTES` message carries a badge (delivered by the kernel
 //!   from the badged SEND cap they hold) and a length-prefixed payload.
 //!   The thread maintains a per-badge line buffer; on `\n` it emits
-//!   `[name] <line>\r\n` (with the line's level tag after `[name]` for any
-//!   level but info) to the serial port AND records the line in a bounded
+//!   `[sec.usfrac] LEVEL  [name] <line>\r\n` (`logd_codec::prefix`) to the
+//!   serial port AND records the line in a bounded
 //!   history ring for handover to real-logd. A `STREAM_RECORD` message is
 //!   one complete record: the thread renders it as one line
 //!   (`logd_codec::record`) and records it in the same ring, leaving the

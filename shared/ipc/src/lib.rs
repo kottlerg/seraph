@@ -323,7 +323,7 @@ pub mod keysym;
 
 /// Wire-protocol version of [`stream_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const STREAM_LABELS_VERSION: u32 = 4;
+pub const STREAM_LABELS_VERSION: u32 = 5;
 pub mod stream_labels;
 
 /// Badge bits that endpoints gating a label on a verb-bit use for it: each
@@ -358,7 +358,7 @@ pub mod log_badges;
 
 /// Wire-protocol version of [`log_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const LOG_LABELS_VERSION: u32 = 5;
+pub const LOG_LABELS_VERSION: u32 = 6;
 pub mod log_labels;
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────

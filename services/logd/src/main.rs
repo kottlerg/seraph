@@ -1792,11 +1792,9 @@ fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u3
     unsafe { ipc::ipc_call_timeout(cap, &msg, ipc_buf, timeout_ms) }.is_ok()
 }
 
-/// Longest prefix [`LineBuf::push_prefix`] writes, CRLF included: the
-/// `[sec.usfrac] ` timestamp (at most 20 + 1 + 6 digits and 3 more bytes), a
-/// `[name] ` of at most [`MAX_NAME_LEN`] bytes, the longest level tag and its
-/// space (`ERROR `), and the line's `\r\n`.
-const LINE_FRAME_MAX: usize = 30 + (MAX_NAME_LEN + 3) + 6 + 2;
+/// Longest frame of a line: the prefix [`LineBuf::push_prefix`] writes
+/// (`logd_codec::prefix::PREFIX_MAX`) and the line's `\r\n`.
+const LINE_FRAME_MAX: usize = logd_codec::prefix::PREFIX_MAX + 2;
 
 /// Bytes of a [`LineBuf`]: the frame of any logd line with its longest body,
 /// a rendered record ([`RENDERED_MAX_BYTES`]), which is longer than any text
@@ -1845,74 +1843,7 @@ impl LineBuf
         self.push(b);
     }
 
-    fn push_decimal(&mut self, value: u64)
-    {
-        let mut digits = [0u8; 20];
-        let mut n = value;
-        let mut idx = digits.len();
-        if n == 0
-        {
-            idx = idx.saturating_sub(1);
-            if let Some(d) = digits.get_mut(idx)
-            {
-                *d = b'0';
-            }
-        }
-        else
-        {
-            while n > 0
-            {
-                // A `u64` has at most 20 digits, so `idx` stays in bounds.
-                idx = idx.saturating_sub(1);
-                if let Some(d) = digits.get_mut(idx)
-                {
-                    *d = b'0'.saturating_add((n % 10) as u8);
-                }
-                n /= 10;
-            }
-        }
-        for &d in digits.get(idx..).unwrap_or_default()
-        {
-            self.push(d);
-        }
-    }
-
-    fn push_decimal_padded(&mut self, value: u64, width: usize)
-    {
-        let mut digits = [b'0'; 20];
-        let mut n = value;
-        let mut idx = digits.len();
-        while n > 0 && idx > 0
-        {
-            // The loop condition keeps `idx` above zero.
-            idx = idx.saturating_sub(1);
-            if let Some(d) = digits.get_mut(idx)
-            {
-                *d = b'0'.saturating_add((n % 10) as u8);
-            }
-            n /= 10;
-        }
-        let start = digits.len().saturating_sub(width);
-        for &d in digits.get(start..).unwrap_or_default()
-        {
-            self.push(d);
-        }
-    }
-
-    /// Push `[sec.usfrac] ` for `us` microseconds of the monotonic clock.
-    fn push_timestamp(&mut self, us: u64)
-    {
-        self.push(b'[');
-        self.push_decimal(us / 1_000_000);
-        self.push(b'.');
-        self.push_decimal_padded(us % 1_000_000, 6);
-        self.push(b']');
-        self.push(b' ');
-    }
-
-    /// Push a line's `[sec.usfrac] [name] ` prefix stamped now, `[?]` for an
-    /// empty `name`, then the level's tag and a space for any level but info
-    /// (`logd_codec::level::tag`).
+    /// Push a line's prefix (`logd_codec::prefix::write`) stamped now.
     fn push_prefix(&mut self, name: &[u8], level: u64)
     {
         self.push_prefix_at(name, level, elapsed_us());
@@ -1922,30 +1853,7 @@ impl LineBuf
     /// clock.
     fn push_prefix_at(&mut self, name: &[u8], level: u64, us: u64)
     {
-        self.push_timestamp(us);
-        self.push(b'[');
-        let name = if name.is_empty()
-        {
-            logd_codec::reclaim::UNNAMED.as_bytes()
-        }
-        else
-        {
-            name
-        };
-        for &b in name
-        {
-            self.push(b);
-        }
-        self.push(b']');
-        self.push(b' ');
-        if let Some(tag) = logd_codec::level::tag(level)
-        {
-            for &b in tag.as_bytes()
-            {
-                self.push(b);
-            }
-            self.push(b' ');
-        }
+        logd_codec::prefix::write(us, level, name, |b| self.push(b));
     }
 
     /// Push a text line: the prefix stamped `us`, the line's bytes with each
@@ -2009,7 +1917,7 @@ fn panic_to_serial(bytes: &[u8])
     }
 }
 
-/// Emit `[sec.usfrac] [logd] <payload>\r\n` to the serial driver, stamped
+/// Emit `[sec.usfrac] INFO   [logd] <payload>\r\n` to the serial driver, stamped
 /// when called. Used for logd's own diagnostics in place of `seraph::log!`
 /// (which would self-IPC into the endpoint logd serves). Until
 /// [`open_self_log`], the line is held in [`SELF_LOG_HOLD`] instead; a payload

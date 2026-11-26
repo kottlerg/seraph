@@ -725,6 +725,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Process(r) => Some(r),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -751,6 +752,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Region(r) => Some(r),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Frame(_)
@@ -778,6 +780,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Commit(c) => Some(c),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -829,6 +832,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Caps(c) => Some(c),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -1039,6 +1043,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Handle(s) => Some(s),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -1067,6 +1072,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Limit(l) => Some(l),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -1753,6 +1759,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Object(o) => Some(o),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -6198,6 +6205,7 @@ mod tests
                 // Free runs count in `free_pages`, store runs on their chunk.
                 Node::Free
                 | Node::Run(_)
+                | Node::Pooled(_)
                 | Node::Budget(_)
                 | Node::Process(_)
                 | Node::Caps(_)

@@ -70,6 +70,7 @@ pub const fn key_of(node: &Node) -> Option<u64>
         | Node::Reclaim(_)
         | Node::Holder(_)
         | Node::Run(_)
+        | Node::Pooled(_)
         | Node::Deferred(_)
         | Node::Budget(_)
         | Node::Region(_)
@@ -189,18 +190,16 @@ impl<W: WordStore> ProcessIndex<W>
         }
     }
 
+    /// The live bucket of `badge`: its bucket at this round's level, or at
+    /// the next level once that bucket is split. Chosen by mask, so the steps
+    /// do not follow whether the badge's bucket has split.
     fn bucket_of(&self, badge: u64) -> u64
     {
         let h = hash(badge);
         let b = h & self.level.saturating_sub(1);
-        if b < self.split
-        {
-            h & self.level.saturating_mul(2).saturating_sub(1)
-        }
-        else
-        {
-            b
-        }
+        let wide = h & self.level.saturating_mul(2).saturating_sub(1);
+        let split = u64::from(b < self.split).wrapping_neg();
+        (wide & split) | (b & !split)
     }
 
     /// The slot keyed by `badge`: a record or a handle state ([`key_of`]).

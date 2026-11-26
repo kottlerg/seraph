@@ -175,10 +175,12 @@ under its sender's name, the first after the restart included
   ([services/crashd/docs/operation.md](../crashd/docs/operation.md)
   § Core Dump).
 
-## Out of scope (follow-up issues)
+## Out of scope
 
-* Log rotation, durable-disk persistence.
-* Network-syslog sink.
+Disk persistence with rotation and a network syslog sink are external sinks, processes that follow
+logd's history; logd itself holds no file system and no network stack. Their interface, with
+the per-sink settings and the record's RFC 5424 mapping, is designed in
+[`docs/sinks.md`](docs/sinks.md) (design intent; not yet implemented).
 
 ## Source Layout
 
@@ -196,7 +198,8 @@ logd/
 │                               # (see codec/README.md)
 ├── docs/
 │   ├── handover-protocol.md    # init-logd → logd wire format
-│   └── ipc-interface.md        # IPC labels logd handles
+│   ├── ipc-interface.md        # IPC labels logd handles
+│   └── sinks.md                # sink contract, record, formats, settings
 ├── slot-table/                 # logd-slot-table: SlotTable, the sender
 │                               # slots, their history under
 │                               # HISTORY_BYTES, and the retired slots
@@ -246,6 +249,7 @@ the two class SENDs for its lifetime (see
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler and the per-teardown death forward, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
+| [services/logd/docs/sinks.md](docs/sinks.md) | The sink contract (device and external sinks), the record and its RFC 5424 mapping, the per-sink settings, the console format, and the query, follow and control interface (design intent) |
 | [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts, the query API (`QUERY_SLOTS`, `QUERY_HISTORY`) and its `LOG_QUERY_AUTHORITY`, the history's stored form and the retired slots, and the `reclaim:` line logd logs when it evicts a slot |
 | [services/crashd/docs/operation.md](../crashd/docs/operation.md) | The core dump, whose outcome line waits on logd, and so writes no core of logd, which declares itself on the core path |
 | [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with, the `reclaim:` line, log record rendering, and the `BoundedStr` diagnostic formatter |

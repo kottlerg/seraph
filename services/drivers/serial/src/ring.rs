@@ -201,6 +201,19 @@ impl<const N: usize> Consumer<'_, N>
     }
 }
 
+/// Whether the consumer holds its next take for a write that waits for its
+/// bytes to leave the transmitter: such a write waits (`wanted`, the highest
+/// waiting write's mark, is past `drained`) and every byte up to its mark is
+/// taken (`sent` has reached it). The consumer then waits for the UART's
+/// transmitter to empty and settles ([`Consumer::settle`]) before it takes
+/// more, so the write waits for the bytes ahead of its mark and the last take
+/// past it, however many bytes later writes append behind it.
+#[must_use]
+pub const fn hold_for_drain(sent: u64, drained: u64, wanted: u64) -> bool
+{
+    wanted > drained && sent >= wanted
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -211,6 +224,45 @@ mod tests
         let mut out = Vec::new();
         consumer.take(max, |b| out.push(b));
         out
+    }
+
+    // Defect caught: a waiting write's mark settled only once the ring is
+    // empty, which another writer that keeps appending postpones without
+    // bound.
+    #[test]
+    fn the_take_holds_once_a_waited_mark_is_taken_whatever_follows_it()
+    {
+        let ring = Ring::<64>::new();
+        let (mut producer, mut consumer) = ring.split().unwrap();
+        let mark = producer.push(b"logd line\r\n").unwrap();
+        assert!(producer.push(&[b'x'; 20]).is_some());
+        // The bytes ahead of the mark are not all taken: keep taking.
+        assert_eq!(taken(&mut consumer, 4).len(), 4);
+        assert!(!hold_for_drain(ring.sent(), ring.drained(), mark));
+        // A take reaches past the mark while later bytes wait: hold, though
+        // the ring is not empty.
+        assert_eq!(taken(&mut consumer, 16).len(), 16);
+        assert!(!consumer.is_empty());
+        assert!(hold_for_drain(ring.sent(), ring.drained(), mark));
+        // More bytes behind it change nothing.
+        assert!(producer.push(&[b'y'; 8]).is_some());
+        assert!(hold_for_drain(ring.sent(), ring.drained(), mark));
+        // The transmitter emptied: settled, the mark is drained, takes resume.
+        consumer.settle();
+        assert!(ring.drained() >= mark);
+        assert!(!hold_for_drain(ring.sent(), ring.drained(), mark));
+    }
+
+    #[test]
+    fn no_hold_without_a_waiting_write()
+    {
+        assert!(!hold_for_drain(0, 0, 0));
+        assert!(!hold_for_drain(30, 10, 10));
+        assert!(!hold_for_drain(9, 0, 10));
+        assert!(hold_for_drain(10, 0, 10));
+        // A mark of zero bytes past the drained count: a zero-length write
+        // behind bytes already taken waits for them.
+        assert!(hold_for_drain(12, 4, 12));
     }
 
     // Defect caught: a split that hands out a second producer or consumer,

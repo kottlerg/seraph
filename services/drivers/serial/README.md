@@ -228,11 +228,14 @@ without an interrupt and looks at the line status register, so a transmit interr
 not raise, or that was lost, delays the output by that bound at most.
 
 A `SERIAL_WRITE_SENT` write marks the ring position of its last byte and waits until the
-transmitter has seen every byte up to the mark leave the UART. Once the ring and the transmit
-holding register are both empty, the transmitter spins on the line status register for up to
-`DRAIN_SPIN` (2 ms) until it reports the transmitter empty (`TEMT`): only the shift register's
-last character is left, 87 µs at 115200 baud. A UART not empty by then is looked at again at the
-next watchdog wake.
+transmitter has seen every byte up to the mark leave the UART. Once it has loaded every byte up
+to the mark, the transmitter loads nothing more until the UART is empty, whatever other writes
+have appended behind the mark (`ring::hold_for_drain`): when the transmit holding register is
+empty it spins on the line status register for up to `DRAIN_SPIN` (2 ms) until it reports the
+transmitter empty (`TEMT`), with only the shift register's last character left, 87 µs at 115200
+baud. It then settles the write and loads again. A UART not empty by then is looked at again at
+the next watchdog wake. So a waiting write waits for the bytes ahead of its mark and one FIFO load
+past it, and each such write pauses the output for about one character time.
 
 ### Receive
 

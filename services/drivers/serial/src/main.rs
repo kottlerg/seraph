@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use arch::current::{Uart, serial_init};
 use driver_binding::resources::{self, PlatformDelivery};
 use ipc::{IpcMessage, serial_errors, serial_labels};
-use serial::ring::{Consumer, Producer, RX_RING_BYTES, Ring, TX_RING_BYTES};
+use serial::ring::{self, Consumer, Producer, RX_RING_BYTES, Ring, TX_RING_BYTES};
 use serial::uart::{self, Cause};
 use serial::wait::{StallWatch, TX_STALL_MS};
 use std::os::seraph::startup_info;
@@ -432,10 +432,12 @@ impl Transmitter
         }
     }
 
-    /// Load the transmit FIFO from the ring when LSR reports it empty. With
-    /// the ring empty and a write waiting for its bytes to leave the UART,
-    /// wait the shift register's last character out ([`DRAIN_SPIN`]) and
-    /// settle the drained count once the transmitter is empty.
+    /// Load the transmit FIFO from the ring when LSR reports it empty. Once
+    /// every byte up to a waiting write's mark is loaded
+    /// ([`ring::hold_for_drain`]), load nothing more: wait the shift
+    /// register's last character out ([`DRAIN_SPIN`]), settle the drained
+    /// count once the transmitter is empty, and load again. A transmitter not
+    /// empty within the spin is looked at again at the next wake.
     fn transmit(&mut self)
     {
         let mut lsr = self.uart.read(uart::LSR);
@@ -443,14 +445,10 @@ impl Transmitter
         {
             return;
         }
-        if !self.tx.is_empty()
+        let wanted = self.shared.drain_wanted.load(Ordering::Acquire);
+        if !ring::hold_for_drain(TX_RING.sent(), TX_RING.drained(), wanted)
         {
-            let uart = self.uart;
-            self.tx.take(self.load, |byte| uart.write(uart::DATA, byte));
-            return;
-        }
-        if !self.draining()
-        {
+            self.load_fifo();
             return;
         }
         let start = Instant::now();
@@ -463,9 +461,19 @@ impl Transmitter
             core::hint::spin_loop();
             lsr = self.uart.read(uart::LSR);
         }
-        // Nothing was loaded since the ring emptied, so every byte taken is
-        // off the transmitter.
+        // Nothing was loaded since the hold began, so every byte taken is
+        // off the transmitter. The FIFO is empty too: load the bytes behind
+        // the mark now, not at the next wake.
         self.tx.settle();
+        self.load_fifo();
+    }
+
+    /// Write up to one FIFO load ([`uart::transmit_load`]) from the ring to
+    /// THR, which the caller saw empty.
+    fn load_fifo(&mut self)
+    {
+        let uart = self.uart;
+        self.tx.take(self.load, |byte| uart.write(uart::DATA, byte));
     }
 
     /// Whether a write waits for bytes to leave the UART that have not been

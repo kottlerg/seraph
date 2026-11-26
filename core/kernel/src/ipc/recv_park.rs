@@ -63,9 +63,10 @@ pub const RECV_PARK_HINT_CPUS: usize = RECV_PARK_HINT_BYTES * 4;
 /// byte `c / 4`.
 type Hints = [u8; RECV_PARK_HINT_BYTES];
 
-/// The [`RecvParkTable::hint_byte`] of a table with no hint: no byte of a
-/// queue's hints has this index.
-const NO_HINT: usize = usize::MAX;
+/// The [`RecvParkTable::hint_byte_end`] of a table with no hint, zero so that
+/// an all-zero table, which the zero-filled per-CPU slab holds until
+/// [`RecvParkTable::bind`] runs, is one.
+const NO_HINT: usize = 0;
 
 /// One slot of a [`RecvParkTable`]: a receive queue, the receiver last parked
 /// on it from the owning CPU, and when that park was recorded.
@@ -108,10 +109,11 @@ pub struct RecvParkTable
     /// The stamp of this CPU's last record. A `u64` counting records does not
     /// wrap in the system's life.
     last_stamp: AtomicU64,
-    /// The byte of a receive queue's hints that holds this CPU's hint, or
-    /// [`NO_HINT`] for a CPU at or above [`RECV_PARK_HINT_CPUS`]. Written once,
-    /// by [`Self::bind`] before the CPU runs, and read only by this CPU.
-    hint_byte: usize,
+    /// One past the index of the byte of a receive queue's hints that holds
+    /// this CPU's hint, or [`NO_HINT`] for a CPU at or above
+    /// [`RECV_PARK_HINT_CPUS`]. Written once, by [`Self::bind`] before the CPU
+    /// runs, and read only by this CPU.
+    hint_byte_end: usize,
     /// The shift of this CPU's two bits in that byte.
     hint_shift: u32,
 }
@@ -124,7 +126,7 @@ impl RecvParkTable
         Self {
             slots: [const { RecvParkSlot::new() }; RECV_PARK_SLOTS],
             last_stamp: AtomicU64::new(0),
-            hint_byte: NO_HINT,
+            hint_byte_end: NO_HINT,
             hint_shift: 0,
         }
     }
@@ -138,7 +140,7 @@ impl RecvParkTable
         let cpu = cpu as usize;
         if cpu < RECV_PARK_HINT_CPUS
         {
-            self.hint_byte = cpu / 4;
+            self.hint_byte_end = (cpu / 4).wrapping_add(1);
             #[expect(clippy::cast_possible_truncation, reason = "(cpu & 3) * 2 is below 8")]
             {
                 self.hint_shift = (cpu & 3).wrapping_mul(2) as u32;
@@ -146,9 +148,16 @@ impl RecvParkTable
         }
         else
         {
-            self.hint_byte = NO_HINT;
+            self.hint_byte_end = NO_HINT;
             self.hint_shift = 0;
         }
+    }
+
+    /// The index of this CPU's byte of a receive queue's hints, past the last
+    /// byte when the CPU has no hint.
+    fn hint_byte(&self) -> usize
+    {
+        self.hint_byte_end.wrapping_sub(1)
     }
 
     /// Slot `index`, which is below [`RECV_PARK_SLOTS`]: a hint's two bits or
@@ -186,7 +195,7 @@ impl RecvParkTable
     /// owns `queue` and `hints`, with interrupts off.
     fn find(&self, queue: *const RecvQueue, hints: &Hints) -> Option<usize>
     {
-        match hints.get(self.hint_byte)
+        match hints.get(self.hint_byte())
         {
             Some(&byte) =>
             {
@@ -253,7 +262,7 @@ impl RecvParkTable
         let found = self.find(queue, hints);
         let index = found.unwrap_or_else(|| self.free_or_oldest());
         if found.is_none()
-            && let Some(byte) = hints.get_mut(self.hint_byte)
+            && let Some(byte) = hints.get_mut(self.hint_byte())
         {
             #[expect(clippy::cast_possible_truncation, reason = "a slot index is below 4")]
             let bits = (index as u8) << self.hint_shift;
@@ -956,5 +965,30 @@ mod tests
             }
             assert_eq!(f.take(3, Some(0)), Some(3));
         }
+    }
+
+    #[test]
+    fn an_all_zero_table_scans_and_writes_no_hint_until_bound()
+    {
+        // The per-CPU slab is zero-filled before `bind` runs: an all-zero
+        // table is `RecvParkTable::new()`, and keeps no hint.
+        // SAFETY: every field of a table (atomics, a pointer, integers) is
+        // valid at zero.
+        let zeroed: RecvParkTable = unsafe { core::mem::zeroed() };
+        let new = RecvParkTable::new();
+        assert_eq!(zeroed.hint_byte_end, new.hint_byte_end);
+        assert_eq!(zeroed.hint_shift, new.hint_shift);
+        let mut f = Fixture::new(4, 4, 1, 0);
+        f.tables[0] = zeroed;
+        for q in 0..4
+        {
+            f.park(q, q, 0);
+        }
+        for q in 0..4
+        {
+            assert_eq!(f.named_slot(0, q), Some(q));
+            assert_eq!(f.queues[q].hints, [0; super::RECV_PARK_HINT_BYTES]);
+        }
+        assert_eq!(f.take(2, Some(0)), Some(2));
     }
 }

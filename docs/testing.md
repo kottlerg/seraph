@@ -625,12 +625,14 @@ the region between two reads, the benchmark's measured operation, as follows:
   read with those it wrote.
 - **Under icount.** QEMU retires a vCPU's instructions one at a time in program order, and the
   counter advances one per instruction. A sample is therefore exactly the instructions retired
-  between the two reads: the region as compiled, and the reads' own instructions (on x86-64 the two
-  `lfence`s on the region's side of each read).
-- **On hardware, x86-64.** The read is `lfence; rdtsc; lfence`. The first `lfence` holds `rdtsc`
-  until every earlier instruction has completed locally. The second holds every later instruction
-  until `rdtsc` has read the counter. A window therefore covers all of its region's execution and
-  none of what precedes or follows it, plus the cost of the fences, as the Intel SDM's `RDTSC`
+  between the two reads: the region as compiled, and the reads' own instructions on the region's
+  side (on x86-64 the `lfence` after the opening `rdtsc`, and the `mfence; lfence` before the
+  closing one).
+- **On hardware, x86-64.** The read is `mfence; lfence; rdtsc; lfence`. `mfence; lfence` holds
+  `rdtsc` until every earlier instruction has completed and every earlier load and store is
+  globally visible. The last `lfence` holds every later instruction until `rdtsc` has read the
+  counter. A window therefore covers all of its region's execution, its stores' drain included,
+  and none of what precedes or follows it, plus the cost of the fences, as the Intel SDM's `RDTSC`
   entry gives. AMD's processors give it where `lfence` is dispatch-serializing, which AMD's
   guidance on `lfence` documents per processor family, with the `DE_CFG` bit that makes it so
   where it is not by default.

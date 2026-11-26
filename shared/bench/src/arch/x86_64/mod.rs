@@ -8,7 +8,8 @@
 /// The architecture's name in the result line's `arch=` column.
 pub const ARCH: &str = "x86_64";
 
-/// Read the timestamp counter with `rdtsc`, between two `lfence`s.
+/// Read the timestamp counter with `rdtsc`, after `mfence; lfence` and
+/// before `lfence`.
 ///
 /// Ring 3 may execute `rdtsc` while `CR4.TSD` is clear, which the Seraph
 /// kernel keeps on every CPU and a hosted OS keeps for its processes. The
@@ -17,10 +18,11 @@ pub const ARCH: &str = "x86_64";
 ///
 /// The read bounds the code around it on both levels. The compiler sees it
 /// read and write memory, so it keeps every load and store on the side of
-/// the read the program puts it. The `lfence` before `rdtsc` holds the
-/// read until every earlier instruction has completed, and the one after
-/// holds every later instruction until the read has, as the Intel SDM's
-/// `RDTSC` entry gives, and AMD's processors on which `lfence` is
+/// the read the program puts it. `mfence; lfence` before `rdtsc` holds the
+/// read until every earlier instruction has completed and every earlier
+/// load and store is globally visible, and the `lfence` after it holds
+/// every later instruction until the read has, as the Intel SDM's `RDTSC`
+/// entry gives; AMD's processors give the same where `lfence` is
 /// dispatch-serializing.
 #[expect(
     clippy::inline_always,
@@ -31,13 +33,14 @@ pub fn cycles() -> u64
 {
     let lo: u32;
     let hi: u32;
-    // SAFETY: `lfence` and `rdtsc` are user-mode instructions, the latter
-    // while `CR4.TSD` is clear (above); they write only EAX and EDX, and
-    // access no memory. preserves_flags: neither modifies RFLAGS. The block
+    // SAFETY: `mfence`, `lfence` and `rdtsc` are user-mode instructions,
+    // `rdtsc` while `CR4.TSD` is clear (above); they write only EAX and EDX,
+    // and access no memory. preserves_flags: none modifies RFLAGS. The block
     // omits `nomem` on purpose: the compiler then keeps memory accesses on
     // their side of the read (above).
     unsafe {
         core::arch::asm!(
+            "mfence",
             "lfence",
             "rdtsc",
             "lfence",

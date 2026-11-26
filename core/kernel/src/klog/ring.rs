@@ -396,13 +396,22 @@ pub struct Cursor
     pub last_read_seq: u64,
     /// The kernel's time the stall bound runs from, in microseconds: the
     /// later of the last read that attached the reader or returned a record
-    /// past `last_read_seq`, and the append of the oldest record no read has
-    /// returned.
+    /// past `last_read_seq`, and the append of the oldest unread record
+    /// ([`Self::seen`]).
     pub since_us: u64,
 }
 
 impl Cursor
 {
+    /// The highest sequence number no longer unread: the later of the last
+    /// record a read returned and the committed mark, which a flush raises
+    /// past records it printed that no read returned. The records past it are
+    /// the unread ones the stall bound is about.
+    pub fn seen(&self) -> u64
+    {
+        self.last_read_seq.max(self.committed)
+    }
+
     /// The sequence number a read with `from_seq` starts at: the record after
     /// the committed one for 0, else `from_seq`.
     pub fn start_seq(&self, from_seq: u64) -> u64
@@ -445,20 +454,19 @@ impl Cursor
     /// before it, the stall bound starts at its append.
     pub fn on_append(&mut self, seq: u64, us: u64)
     {
-        if seq == self.last_read_seq.saturating_add(1)
+        if seq == self.seen().saturating_add(1)
         {
             self.since_us = self.since_us.max(us);
         }
     }
 
-    /// Whether the attached reader has stalled at `now_us`: records it has not
-    /// read exist, and more than `stall_us` has passed since the oldest of them
-    /// was appended and since the reader last attached or read a new record.
+    /// Whether the attached reader has stalled at `now_us`: unread records
+    /// exist ([`Self::seen`]), and more than `stall_us` has passed since the
+    /// oldest of them was appended and since the reader last attached or read
+    /// a new record.
     pub fn stalled(&self, newest: u64, now_us: u64, stall_us: u64) -> bool
     {
-        self.attached
-            && newest > self.last_read_seq
-            && now_us.saturating_sub(self.since_us) > stall_us
+        self.attached && newest > self.seen() && now_us.saturating_sub(self.since_us) > stall_us
     }
 }
 
@@ -796,5 +804,28 @@ mod tests
             "within the bound of the attach"
         );
         assert!(c.stalled(6, 10_000_001, 1_000_000));
+    }
+
+    // Defect guarded: records a flush printed (a non-fatal watchdog dump)
+    // counted as unread, so a reader whose read after the flush returns
+    // nothing is detached a bound later and, its lines going direct, never
+    // signalled again.
+    #[test]
+    fn records_a_flush_printed_are_not_unread()
+    {
+        let mut c = Cursor::default();
+        c.on_read(0, 5, 5, 1_000_000);
+        c.on_append(6, 2_000_000);
+        c.on_append(7, 2_100_000);
+        // The flush raises the committed mark past them; the reader's read
+        // from 0 then starts after it and returns nothing.
+        c.acknowledge(7, 7);
+        c.on_read(0, 0, 7, 2_200_000);
+        assert!(!c.stalled(7, 9_000_000, 1_000_000), "nothing unread");
+        // The next record starts the bound at its append, as after a quiet
+        // period.
+        c.on_append(8, 20_000_000);
+        assert!(!c.stalled(8, 21_000_000, 1_000_000), "at the bound");
+        assert!(c.stalled(8, 21_000_001, 1_000_000));
     }
 }

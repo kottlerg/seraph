@@ -320,7 +320,7 @@ fn stall_check()
     {
         crate::kprintln!(
             "klog: reader stalled at record {} for {} ms",
-            c.last_read_seq.saturating_add(1),
+            c.seen().saturating_add(1),
             now.saturating_sub(c.since_us) / 1000
         );
     }

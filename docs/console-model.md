@@ -32,8 +32,9 @@ direct console paths remain as fallbacks for the life of the system.
    kernel's address-free lines (`kprintln!`) and userspace-fault diagnostics
    (`kprintln_fault!`) are records that reader writes on its console instead, so a kernel line
    does not land inside one of the reader's; with no reader attached, or after one leaves a record
-   unread for `KLOG_STALL_MS`, measured from the record's append, the kernel writes them directly
-   again, and before a failure report it writes the records no reader has written
+   unread (neither read nor printed by a flush) for `KLOG_STALL_MS`, measured from the record's
+   append, the kernel writes them directly again, and before a failure report it writes the
+   records no reader has written
    ([core/kernel/docs/kernel-log.md](../core/kernel/docs/kernel-log.md)). In a normally-composed
    boot the reader is init-logd and then real-logd (items 3 and 4), which write each record as a
    `[kernel]` line between whole userspace lines; in a ktest boot it is ktest. The kernel

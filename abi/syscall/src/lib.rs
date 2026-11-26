@@ -773,8 +773,8 @@ pub const KLOG_READ_MAX: usize = 16 * 1024;
 
 /// How long an attached reader may leave a record unread before the kernel
 /// writes its lines directly again, in milliseconds, measured from the oldest
-/// unread record's append, or from the reader's last read that returned a new
-/// record when that came later. A reader that reads again is attached again;
+/// unread record's append (a record a flush printed is not unread), or from
+/// the reader's last read that returned a new record when that came later. A reader that reads again is attached again;
 /// the lines of the gap stay records.
 pub const KLOG_STALL_MS: u64 = 1000;
 

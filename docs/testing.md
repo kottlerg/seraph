@@ -642,6 +642,13 @@ the region between two reads, the benchmark's measured operation, as follows:
   order. An out-of-order hart may overlap a small window's edges with the work around it, so a
   window shorter than its pipeline's depth measures the region only to within that overlap.
 
+Every sample therefore includes the cost of the reads themselves: their instructions on the
+region's side under icount, and on hardware the cycles of those instructions and of the fences.
+The `empty_window` benchmark of each suite, `ktest.empty_window` and `ubench.empty_window`,
+measures that offset as two reads with nothing between them, in both modes. A line's p50 includes
+the offset its suite's `empty_window` line reports in the same mode. No tool subtracts it: a
+reader who wants the region's cost alone subtracts it.
+
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
 (`--mode host`, x86_64 under KVM, on the release build the cell measures, per-measurement bands

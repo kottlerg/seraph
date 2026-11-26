@@ -47,7 +47,8 @@ services/ubench/
     ├── fault.rs           # fault_fill and fault_scaling: demand faults and grants
     ├── shmem_ring.rs      # shmem_ring: the stdio pipe's byte ring
     ├── console.rs         # console_write: FB_WRITE_BYTES to the framebuffer driver
-    └── fsbench.rs         # fsbench: /tests/fixtures/programs/fsbench at its full counts
+    ├── fsbench.rs         # fsbench: /tests/fixtures/programs/fsbench at its full counts
+    └── empty_window.rs    # empty_window: two counter reads with nothing between them
 ```
 
 ---
@@ -69,6 +70,7 @@ its timed ones.
 | `shmem_ring` | `bytes=64\|512\|4096\|65536 wrap=no\|yes` | `bytes` moved through a byte ring of the stdio pipe's capacity, 2048 bytes ([shared/shmem](../../shared/shmem/README.md), `runtime/ruststd/src/sys/pipe/seraph.rs`): `SpscWriter::write` of what fits, `SpscReader::read` of it, until every byte passed, as a pipe's writer and reader take turns. One thread does both, so a sample is the copies and the index updates, with no notification or IPC. The ring copies a write or a read as two segments where it passes the body's end, so every sample starts at a stated ring index, reached by an untimed transfer before it. `wrap=no` starts at index 0, where no copy splits. `wrap=yes` starts half the transfer, or half the ring when the transfer is larger, before the body's end: the first write and read split into halves, as does every ring-full of a larger transfer | 256 per size and `wrap`, after 16 |
 | `console_write` | `bytes=64\|4096` | `bytes` of text, lines of 63 letters and a newline, sent to the framebuffer driver as `FB_WRITE_BYTES` calls of at most 512 bytes each, as the terminal sends its child's output (`programs/terminal/src/output.rs`). Before each size's warm-up, untimed writes of 4096 bytes fill the screen, so every timed write of either size scrolls it, whatever the screen held before | 64 per size, after 16 |
 | `fsbench` | — | [`/tests/fixtures/programs/fsbench`](../fixtures/fsbench/README.md) spawned with no iteration count, its full benchmark, which logs its own `fsbench.read`, `fsbench.write` and `fsbench.open` lines | as fsbench's |
+| `empty_window` | — | Two counter reads with nothing between them: the offset every other line includes ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)) | 1024, after 64 |
 
 The `fault` line of `fault_fill` carries two extras, read outside the timed window from ubench's
 own charge, `QUERY_MEMORY_USAGE` before and after each store: `faults=`, the timed stores memmgr

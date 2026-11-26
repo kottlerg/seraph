@@ -49,10 +49,9 @@ devmgr's responsibilities are:
   [docs/driver-binding.md](../../../docs/driver-binding.md#binding) § Binding
   step 1 says, each `IoPort` from its
   port capability, and the wired line carved exclusive, shared with no other
-  device (the serial driver acknowledges a delivery only when its client reads
-  ([services/drivers/serial/README.md](../../drivers/serial/README.md#interrupts)
-  § Interrupts), so no other device may share its line; every PCI device's
-  line is instead held and shared,
+  device (only a PCI function's line is shared,
+  [docs/driver-binding.md](../../../docs/driver-binding.md) § Declaration Bounds:
+  every PCI device's line is held and shared,
   [docs/pci-enumeration.md](pci-enumeration.md) step 4), then the service
   endpoint and the driver's devmgr query cap (below). The serial driver
   matches an SPCR interface type 0x00 or 0x12 or `_HID` `PNP0501`, the

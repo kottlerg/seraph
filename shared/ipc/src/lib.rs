@@ -300,7 +300,7 @@ pub mod blk_labels;
 
 /// Wire-protocol version of [`serial_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SERIAL_LABELS_VERSION: u32 = 2;
+pub const SERIAL_LABELS_VERSION: u32 = 3;
 pub mod serial_labels;
 
 pub mod serial_errors;

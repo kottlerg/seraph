@@ -182,7 +182,7 @@ fn run_waves(
     let checks = Arc::new(PassChecks::new(
         &args.require,
         args.crash_reports,
-        args.whole_lines.clone(),
+        &args.whole_lines,
     )?);
 
     // Resolve qemu binary once, up front: missing-tool errors should
@@ -653,8 +653,8 @@ struct PassChecks
     /// Each `--require` pattern, as given and compiled.
     require: Vec<(String, Regex)>,
     crash_reports: Option<CrashReportExpect>,
-    /// The `--whole-lines` tag.
-    whole_lines: Option<String>,
+    /// The `--whole-lines` tags.
+    whole_lines: Vec<String>,
 }
 
 impl PassChecks
@@ -662,7 +662,7 @@ impl PassChecks
     fn new(
         require: &[String],
         crash_reports: Option<CrashReportExpect>,
-        whole_lines: Option<String>,
+        whole_lines: &[String],
     ) -> Result<Self>
     {
         let require = require
@@ -676,7 +676,7 @@ impl PassChecks
         Ok(Self {
             require,
             crash_reports,
-            whole_lines,
+            whole_lines: whole_lines.to_vec(),
         })
     }
 
@@ -706,10 +706,12 @@ impl PassChecks
         {
             return (Status::Fail, Some(format!("--crash-reports: {err:#}")));
         }
-        if let Some(tag) = &self.whole_lines
-            && let Err(err) = crate::whole_lines::check_log(log, tag)
+        for tag in &self.whole_lines
         {
-            return (Status::Fail, Some(format!("--whole-lines: {err:#}")));
+            if let Err(err) = crate::whole_lines::check_log(log, tag)
+            {
+                return (Status::Fail, Some(format!("--whole-lines {tag}: {err:#}")));
+            }
         }
         (status, matched)
     }
@@ -2041,7 +2043,7 @@ mod tests
     #[test]
     fn a_pass_without_a_required_line_is_a_fail_naming_the_pattern()
     {
-        let checks = PassChecks::new(&["mapredo knob present".to_owned()], None, None).unwrap();
+        let checks = PassChecks::new(&["mapredo knob present".to_owned()], None, &[]).unwrap();
         let log =
             "[0.1] boot: memory map: mapredo knob present\n[2.0] INFO   [ktest] ALL TESTS PASSED\n";
         assert!(matches!(
@@ -2066,7 +2068,7 @@ mod tests
                 "DEBUG  \\[fatfs\\] ".to_owned(),
             ],
             None,
-            None,
+            &[],
         )
         .unwrap();
         let one = "[1.0] DEBUG  [vfsd] mounted\n[2.0] INFO   [usertest] ALL TESTS PASSED\n";
@@ -2083,7 +2085,7 @@ mod tests
     #[test]
     fn the_crash_report_check_fails_a_pass_and_leaves_other_verdicts()
     {
-        let checks = PassChecks::new(&[], Some(CrashReportExpect::Reports), None).unwrap();
+        let checks = PassChecks::new(&[], Some(CrashReportExpect::Reports), &[]).unwrap();
         let no_reports = "[2.0] INFO   [usertest] ALL TESTS PASSED\n";
         let (status, reason) = checks.judge(Status::Pass, None, no_reports);
         assert!(matches!(status, Status::Fail));
@@ -2099,9 +2101,32 @@ mod tests
             checks.judge(Status::Hang, None, no_reports).0,
             Status::Hang
         ));
-        let none = PassChecks::new(&[], Some(CrashReportExpect::None), None).unwrap();
+        let none = PassChecks::new(&[], Some(CrashReportExpect::None), &[]).unwrap();
         assert!(matches!(
             none.judge(Status::Pass, None, no_reports).0,
+            Status::Pass
+        ));
+    }
+
+    // Defect caught: a second --whole-lines tag left unchecked, so a torn
+    // window of the later tag gates as PASS.
+    #[test]
+    fn every_whole_lines_tag_is_checked()
+    {
+        let checks =
+            PassChecks::new(&[], None, &["first".to_owned(), "second".to_owned()]).unwrap();
+        let first = "[1.000000] INFO   [svctest] first begin\n\
+                     [1.000100] INFO   [svctest] first t=0 n=0 len=3 abc\n\
+                     [1.000200] INFO   [svctest] first end senders=1 lines=1\n";
+        let (status, reason) = checks.judge(Status::Pass, None, first);
+        assert!(matches!(status, Status::Fail));
+        assert!(reason.unwrap().starts_with("--whole-lines second: "));
+        let both = format!(
+            "{first}[2.000000] INFO   [svctest] second begin\n\
+             [2.000200] INFO   [svctest] second end senders=0 lines=0\n"
+        );
+        assert!(matches!(
+            checks.judge(Status::Pass, None, &both).0,
             Status::Pass
         ));
     }
@@ -2109,9 +2134,7 @@ mod tests
     #[test]
     fn an_invalid_require_regex_is_refused()
     {
-        let err = PassChecks::new(&["(".to_owned()], None, None)
-            .err()
-            .unwrap();
+        let err = PassChecks::new(&["(".to_owned()], None, &[]).err().unwrap();
         assert!(err.to_string().contains("--require"), "{err}");
     }
 

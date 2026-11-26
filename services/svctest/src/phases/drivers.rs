@@ -207,10 +207,10 @@ const UNKNOWN_LABEL: u64 = 0x7FFF;
 
 /// The serial driver's cases. A granted label keeps no cap but the
 /// notification of an accepted `SERIAL_REGISTER_RX_NOTIFY`, which replaces
-/// (and deletes) the one bound before. The rejected registration carries a
-/// stray SEND as its notification, which `SYS_IRQ_REGISTER` refuses, so the
-/// line's binding stays as it was; the accepted one rebinds the line to a
-/// fresh notification on each call.
+/// (and deletes) the one kept before. The rejected registration carries a
+/// stray SEND as its notification, which is not a notification the driver
+/// may signal, so the driver deletes it and keeps the one registered before;
+/// the accepted one replaces that with a fresh notification on each call.
 const SERIAL_CASES: [StrayCapCase; 5] = [
     StrayCapCase {
         label: UNKNOWN_LABEL,

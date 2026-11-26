@@ -76,7 +76,7 @@ direct console paths remain as fallbacks for the life of the system.
 
    init-logd is also the kernel log's first reader. It binds a notification the kernel signals
    when it appends a line, waits on it and the master log endpoint together, writes each record
-   to the UART as a `[<t>] [kernel] <text>` line between the senders' lines, stamped with the
+   to the UART as a `[<t>] LEVEL  [kernel] <text>` line between the senders' lines, stamped with the
    record's own time, and keeps it in its history under the kernel's slot (`LOG_BADGE_KERNEL`).
    It stops reading at real-logd's first `HANDOVER_PULL`, once it has written and acknowledged
    what the kernel holds, so the history that pull drains holds every kernel line it wrote; the

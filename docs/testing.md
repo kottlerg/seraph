@@ -700,8 +700,8 @@ usertest staging of [Gating](#gating):
 ```sh
 cargo xtask mkdisk --arch <arch> --repack-only \
     --log-levels services/init/log-levels-vfsd-debug.conf
-cargo xtask run --arch <arch> --runs 1 --require '\[vfsd\] DEBUG ' \
-    --require '\[fatfs\] DEBUG ' --fail-also '\[(devmgr|procmgr)\] DEBUG '
+cargo xtask run --arch <arch> --runs 1 --require 'DEBUG  \[vfsd\] ' \
+    --require 'DEBUG  \[fatfs\] ' --fail-also 'DEBUG  \[(devmgr|procmgr)\] '
 ```
 
 ### Reboot (`shutdown` case)

@@ -194,7 +194,7 @@ const VFSD_REMOVED_MARKER: &str = "removed; tearing down its mounts";
 
 /// vfsd's line once its root filesystem is lost. Kept in sync with
 /// `services/vfsd/src/watch.rs`.
-const ROOT_LOST_MARKER: &str = "[vfsd] ERROR FATAL: root filesystem lost";
+const ROOT_LOST_MARKER: &str = "ERROR  [vfsd] FATAL: root filesystem lost";
 
 /// svcmgr's line once a critical service, here vfsd, died. Kept in sync
 /// with `services/svcmgr/src/restart.rs`.
@@ -958,15 +958,15 @@ mod tests
     fn only_a_sighting_off_the_named_location_passes_the_copy_step()
     {
         elsewhere_seen(
-            "[vfsd] WARN /data: no partition named by the storage statement: not on PCI \
+            "WARN   [vfsd] /data: no partition named by the storage statement: not on PCI \
              0000:01:00.0; seen on disk 2 at PCI 0000:02:00.0; not taken",
             PORT,
         )
         .unwrap();
         for line in [
-            "[vfsd] WARN /data: no partition named by the storage statement: not on PCI \
+            "WARN   [vfsd] /data: no partition named by the storage statement: not on PCI \
              0000:01:00.0; seen on disk 2 at PCI 0000:01:00.0; not taken",
-            "[vfsd] WARN /data: no partition named by the storage statement: not on PCI \
+            "WARN   [vfsd] /data: no partition named by the storage statement: not on PCI \
              0000:02:00.0; seen on disk 2 at PCI 0000:03:00.0; not taken",
             "[hotplug-check] MOUNTED /data on the re-added disk beside the copy of it",
             "[hotplug-check] FAIL: MOUNT at /data answered 0x7",

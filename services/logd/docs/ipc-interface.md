@@ -63,13 +63,13 @@ lifetime and reads the kernel log through it.
 
 Per-line byte stream. Sender packs the chunk byte length into bits
 16-31 of the label (`label | (len << 16)`), the chunk's log level into
-bits 32-34 (§ Levels), and, once it has registered a display name, bit 35
+bits 32-35 (§ Levels), and, once it has registered a display name, bit 36
 (`SENDER_NAMED`, § `stream_labels::STREAM_REGISTER_NAME`). Inline bytes
 arrive in the IPC message's data words, packed at word 0. logd
 appends the bytes to the slot keyed by the kernel-delivered
 `msg.badge`; every `\n` flushes the slot's partial buffer as one
 line: under the state lock the line is rendered as
-`[sec.usfrac] [name] <line>\r\n` and retained in logd's history as
+`[sec.usfrac] LEVEL  [name] <line>\r\n` (§ Levels) and retained in logd's history as
 the slot's entry with its level, and once the lock is released the rendered line
 is written to the serial driver
 (`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
@@ -91,17 +91,20 @@ unblocks.
 
 #### Levels
 
-A log line carries one of five levels, from least to most verbose: error,
-warn, info, debug, trace. The level code rides bits 32-34 of every
-`STREAM_BYTES` and `STREAM_RECORD` label (`ipc::stream_labels::LEVEL_SHIFT`, `LEVEL_MASK`, and the
-`LEVEL_*` codes 1 to 5). Code 0 means no level was given and, like the
-unassigned codes 6 and 7, reads as info (`ipc::stream_labels::level_of`), so
-a sender that sets no level logs at info.
+A log line carries one of the eight RFC 5424 severities, from least to most
+verbose: emergency, alert, critical, error, warn (RFC 5424's warning), notice,
+info (informational), debug. The `ipc::stream_labels::LEVEL_*` codes are the
+severities, 0 (`LEVEL_EMERGENCY`) to 7 (`LEVEL_DEBUG`). The level rides bits
+32-35 of every `STREAM_BYTES` and `STREAM_RECORD` label
+(`ipc::stream_labels::LEVEL_SHIFT`, `LEVEL_MASK`) as the severity plus one
+(`level_bits`). A field of 0 means no level was given and, like the unassigned
+fields 9 to 15, reads as info (`ipc::stream_labels::level_of`), so a sender
+that sets no level logs at info.
 
-- **Sender.** `seraph::log!("fmt", args…)` logs at info; a leading `error:`,
-  `warn:`, `info:`, `debug:`, or `trace:` sets the level
-  (`seraph::log!(warn: "fmt", args…)`). Each call site states the level
-  the rule below gives its line, in a message worded as
+- **Sender.** `seraph::log!("fmt", args…)` logs at info; a leading
+  `emergency:`, `alert:`, `critical:`, `error:`, `warn:`, `notice:`,
+  `info:`, or `debug:` sets the level (`seraph::log!(warn: "fmt", args…)`).
+  Each call site states the level the rule below gives its line, in a message worded as
   [coding-standards.md](../../../docs/coding-standards.md#log-messages)
   § Log Messages requires. std's panic, allocation-error,
   and precondition output, sent through the same cap, is at error. Bytes a
@@ -110,38 +113,45 @@ a sender that sets no level logs at info.
 - **Choosing a level.** A call site states the level its line deserves, so
   a default boot shows lifecycle and failures and `SERAPH_LOG=debug` adds
   the detail a developer needs:
+  - emergency: the system cannot go on;
+  - alert: an operator must act now (the memory reserve reached, a critical
+    service out of its restart budget);
+  - critical: a component lost, with the system degrading around it;
   - error: a failure the component does not recover from, or a request it
     fails that an operator must see (a service that cannot start, a driver
     that cannot bring its device up, a lost invariant before a panic);
   - warn: an anomaly the component recovers from or degrades around (a
     retry, a fallback, a dropped or malformed request it rejects, a
     resource limit reached);
+  - notice: a significant normal event, shown once (a service restarted, an
+    oomd kill, a crash report written);
   - info: lifecycle a default boot shows once per event (start, ready, a
     device or mount found, shutdown), and every line of a test harness
     (svctest, usertest, and the programs and fixtures they run: phase
     results and the terminal `ALL TESTS PASSED` / `SOME TESTS FAILED`
     markers);
-  - debug: per-request, per-device-probe, or per-step detail useful while
-    developing the component;
-  - trace: per-message or hot-path lines (per IPC, per block, per packet).
+  - debug: per-request, per-device-probe, per-step, or per-message detail
+    useful while developing the component.
 
   A line that an xtask check or a CI `run --runs` pattern matches stays
   at info, whatever the list above gives it, unless the check changes with
-  it: a line below info is not sent in a default boot, and a tag after
-  `[name] ` breaks a match anchored there. A line a document says a
+  it: a line below info is not sent in a default boot, and the tag of
+  another level, ahead of `[name] `, breaks a match anchored before the
+  name. A line a document says a
   component logs, or tells its reader to read, stays at info too unless
   the document changes with it: procmgr's `spawn image bias=0x… (<argv0>)` line,
   from which `run --gdb` and `symbolize --bias` take a process's load bias
   ([xtask/README.md](../../../xtask/README.md#cargo-xtask-symbolize)), is
   one. A line whose text contains
   `FATAL:`, which CI's fail pattern matches, keeps its text at any level.
-  A line given error or warn drops a leading `error:`, `warning:`, or
-  `FAILED` from its text, since the tag replaces it, unless a check
-  matches the word.
+  A line given a level from emergency to warn drops a leading `error:`,
+  `warning:`, or `FAILED` from its text, since the tag replaces it, unless a
+  check matches the word.
 - **Filter.** A std process sends only lines at or less verbose than its
   level, which std's `_start` reads once from the process's `SERAPH_LOG`
-  environment entry (`error`, `warn`, `info`, `debug`, or `trace`; absent
-  or any other value: info). A line above that level is neither formatted
+  environment entry (one of the eight keywords `emergency`, `alert`,
+  `critical`, `error`, `warn`, `notice`, `info`, or `debug`; absent or any
+  other value: info). A line above that level is neither formatted
   nor sent, so it costs no IPC; a record is filtered as a line is. A
   service svcmgr launches sets the entry with the `.svc`
   `env` key ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)
@@ -159,12 +169,15 @@ a sender that sets no level logs at info.
   of the same line do not change it. A line split at `LINE_BUF_SIZE` keeps
   that level for each part. Two threads of one process share the process's
   badge and slot, so lines they interleave mix as their bytes do.
-- **Rendering.** Both init-logd and logd render an info line as
-  `[sec.usfrac] [name] <line>`, as every line rendered before levels
-  existed, so each line a harness matches (`[svctest] ALL TESTS PASSED`,
-  the `reclaim:` line below) is unchanged. A line of any other level carries
-  its tag and a space after `[name] `: `ERROR`, `WARN`, `DEBUG`, or `TRACE`
-  (`logd_codec::level::tag`): `[sec.usfrac] [name] WARN <line>`.
+- **Rendering.** Both init-logd and logd render every line as
+  `[sec.usfrac] LEVEL  [name] <line>`, writing the prefix with one function
+  (`logd_codec::prefix::write`): the stamp, the level's tag padded with
+  spaces to six columns and a space, then `[name] `. The tags are `EMERG`,
+  `ALERT`, `CRIT`, `ERROR`, `WARN`, `NOTICE`, `INFO`, and `DEBUG`
+  (`logd_codec::level::tag`), so the names of lines at different levels line
+  up: `[6.000457] WARN   [svcmgr] <line>`. A line's name and text stay
+  together, so a pattern that starts at `[name] ` (`[svctest] ALL TESTS
+  PASSED`, the `reclaim:` line below) matches at every level.
 - **History.** Each history entry keeps its level, init-logd's across the
   handover ([`handover-protocol.md`](handover-protocol.md) § `LINE`,
   § `RECORD`).
@@ -174,7 +187,7 @@ a sender that sets no level logs at info.
 One log record per message: a message text and a list of fields, each a key
 and a value, delimited by lengths rather than by text, so no value or
 message byte can read as a key. Bits 16-31 of the label carry the record's
-byte length and bits 32-34 its level (§ Levels); the record's bytes are
+byte length and bits 32-35 its level (§ Levels); the record's bytes are
 packed into the data words from word 0. `ipc::log_record` defines the
 layout and its encoder and decoder:
 
@@ -204,15 +217,15 @@ exactly. A key may repeat; a reader sees each occurrence, in order.
   complete in its message: the receiver renders it as one line at once and
   leaves the slot's partial text line (§ `stream_labels::STREAM_BYTES`)
   pending, then retains it in the history (§ History).
-- **Rendering.** `[sec.usfrac] [name] [TAG ]<message> key=value …`, the
+- **Rendering.** `[sec.usfrac] LEVEL  [name] <message> key=value …`, the
   prefix and tag as for a text line (§ Levels). The message is written as a
   text line's bytes are, except that a newline is written `\n`, so a record
   stays on one line. A value is written bare when it is a non-empty run of
   UTF-8 characters, none of them whitespace, a control character, `=`, or
   `"`; any other value is written in double quotes, with `\"`, `\\`, `\n`,
   `\r`, and `\t` escaped, and `\xNN` for each byte of any other control
-  character and each byte of an invalid UTF-8 sequence. An info record with
-  no fields renders as the text line of its message does. A rendered body is
+  character and each byte of an invalid UTF-8 sequence. A record with no
+  fields renders as a text line of its message at its level does. A rendered body is
   at most `RENDERED_MAX_BYTES` (1920) bytes. `logd_codec::record` renders a
   record, and its `fields` reads the text after the message back to the same
   keys and value bytes. The message is the sender's own text, as a text line
@@ -224,7 +237,7 @@ exactly. A key may repeat; a reader sees each occurrence, in order.
   that overruns the payload, a key outside the alphabet, bytes left over):
   such a payload is neither rendered nor retained. logd answers
   `NAME_UNKNOWN` (2) to a record that decodes and carries `SENDER_NAMED`
-  (bit 35) from a sender whose name it does not hold, and neither renders nor
+  (bit 36) from a sender whose name it does not hold, and neither renders nor
   retains it (§ `stream_labels::STREAM_REGISTER_NAME`). The payload is empty.
   Sender unblocks.
 
@@ -255,7 +268,7 @@ therefore keeps its name and states that it has one, and logd asks for it again:
 
 - **Sender.** `shared/log` keeps the first `SLOT_NAME_MAX` (48) bytes of the name
   a process registers on its own log cap (`std::os::seraph::log::register_name`)
-  and sets `SENDER_NAMED` (bit 35 of the label) on every `STREAM_BYTES` and
+  and sets `SENDER_NAMED` (bit 36 of the label) on every `STREAM_BYTES` and
   `STREAM_RECORD` it sends on that cap from then on.
 - **logd.** A `STREAM_BYTES` or `STREAM_RECORD` that carries `SENDER_NAMED`, from a
   badge whose live slot holds no name, or that has no live slot and is not among the

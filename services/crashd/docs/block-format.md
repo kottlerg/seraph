@@ -8,9 +8,9 @@ symbolizer and `cargo xtask run --crash-reports` read.
 ## Lines
 
 A crash report is one block of lines in the system log. logd prefixes each with crashd's log name,
-so on the serial console a line reads `[<seconds>] [crashd] <line>`; a reader finds a line by its
-tag wherever it starts on a log line. Three kinds of line make a block, each carrying the block's
-`id`, sixteen lowercase hexadecimal digits:
+so on the serial console a line reads `[<seconds>] LEVEL  [crashd] <line>`; a reader finds a line
+by its tag wherever it starts on a log line. Three kinds of line make a block, each carrying the
+block's `id`, sixteen lowercase hexadecimal digits:
 
 ```
 CRASH-BEGIN id=<id> version=<version>

@@ -112,7 +112,7 @@ end, and its serial writes can then interleave with init-logd's.
 
 Bits 16-31 of the reply label (`(byte_len << 16)`) carry the
 inline byte length on `SLOT`, `LINE`, and `RECORD` chunk kinds, and bits
-32-34 the entry's level on `LINE` and `RECORD`, matching the stream-protocol
+32-35 the entry's level on `LINE` and `RECORD`, matching the stream-protocol
 convention
 ([`ipc-interface.md`](ipc-interface.md) § Levels). Real-logd masks the
 bottom 16 bits to extract the status code.
@@ -177,8 +177,8 @@ including by a further drain after a deferred release.
 
 No trailing `\n`. The line is the buffered content between two
 `\n`-terminated `STREAM_BYTES` flushes, unmodified. The line's level
-rides the reply label's level field (bits 32-34, a
-`ipc::stream_labels::LEVEL_*` code; a label without one reads as info).
+rides the reply label's level field (bits 32-35, a
+`ipc::stream_labels::LEVEL_*` code plus one; a label without one reads as info).
 As for `SLOT`, real-logd takes at most the bytes the message carries,
 whatever length word 3 declares. Real-logd stores it, with its level, via
 [`SlotTable::install_history_line`](../slot-table/src/lib.rs); the slot is

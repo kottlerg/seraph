@@ -20,12 +20,17 @@
 //! the slot names, which orders it. The owning CPU records and looks up under
 //! the lock of the endpoint it parks on or calls, with interrupts off, so no
 //! other access of its own interleaves with either. A remover on any CPU clears
-//! a slot by a compare-and-swap of its receiver word, under the lock of the
-//! endpoint it removes the receiver from. A slot naming that endpoint has no
-//! other writer meanwhile, since its owner records into it only under the same
-//! lock. A slot the owner has since given to another endpoint no longer names
-//! the removed receiver, and the swap then races only the owner's store of the
-//! new receiver: whichever lands first, the slot ends up naming the new
+//! a slot by a compare-and-swap of its receiver word from the removed receiver
+//! to null, never a plain store, under the lock of the endpoint it removes the
+//! receiver from. A slot naming that endpoint has no other writer meanwhile,
+//! since its owner records into it only under the same lock.
+//!
+//! A slot the owner has since given to another endpoint, under that
+//! endpoint's lock, is the one place accesses under different locks meet: the
+//! swap races the owner's store of the new receiver, on that single word,
+//! whose coherence settles the race. A swap that lands first clears the old
+//! receiver and the store then names the new one; a swap that lands after the
+//! store fails and changes nothing. Either way the slot names the new
 //! receiver.
 
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering::Relaxed};
@@ -300,6 +305,8 @@ unsafe fn forget_park(tcb: *mut ThreadControlBlock)
 #[cfg(test)]
 mod tests
 {
+    use core::sync::atomic::Ordering::Relaxed;
+
     use super::{RecvParkTable, RecvQueue};
     use crate::sched::thread::ThreadControlBlock;
 
@@ -518,5 +525,86 @@ mod tests
             assert_eq!(f.recorded(t, t), None);
             assert!(f.slotless(t));
         }
+    }
+
+    #[test]
+    fn a_clear_before_its_slot_is_recorded_again_leaves_the_new_record()
+    {
+        // CPU 0's table is full (queues 0 to 3, TCBs 0 to 3, TCB 0 oldest);
+        // TCB 0 leaves queue 0, clearing its slot, before a park on queue 4,
+        // another endpoint, records into that slot.
+        let mut f = Fixture::new(6, 5, 2);
+        f.park(4, 5, 1);
+        for q in 0..4
+        {
+            f.park(q, q, 0);
+        }
+        assert!(f.remove(0, 0));
+        assert!(f.slotless(0));
+        f.park(4, 4, 0);
+        assert_eq!(f.recorded(0, 4), Some(4));
+        for q in 1..4
+        {
+            assert_eq!(f.recorded(0, q), Some(q));
+        }
+        // The head of queue 4 is TCB 5; the call from CPU 0 takes the record.
+        assert_eq!(f.take(4, Some(0)), Some(4));
+    }
+
+    #[test]
+    fn a_stale_clear_after_its_slot_is_recorded_again_changes_nothing()
+    {
+        // As above, but the park on queue 4 evicts TCB 0's slot while TCB 0
+        // is still parked on queue 0, and TCB 0 leaves afterwards: its clear,
+        // under queue 0's lock, finds the slot naming queue 4 and TCB 4.
+        let mut f = Fixture::new(6, 5, 2);
+        f.park(4, 5, 1);
+        for q in 0..4
+        {
+            f.park(q, q, 0);
+        }
+        f.park(4, 4, 0);
+        assert_eq!(f.recorded(0, 0), None);
+        assert!(f.remove(0, 0));
+        assert!(f.slotless(0));
+        assert_eq!(f.recorded(0, 4), Some(4));
+        assert_eq!(f.take(4, Some(0)), Some(4));
+        assert_eq!(f.take(4, Some(0)), Some(5));
+    }
+
+    #[test]
+    fn a_clear_between_a_records_queue_and_receiver_stores_leaves_the_new_record()
+    {
+        // The owner's record of TCB 4 on queue 4 into the slot of TCB 0
+        // (queue 0) is interrupted, between its queue store and its receiver
+        // store, by TCB 0's removal on another CPU under queue 0's lock: the
+        // clear succeeds on the slot's old receiver, and the receiver store
+        // that follows leaves the slot naming queue 4 and TCB 4.
+        let mut f = Fixture::new(5, 5, 1);
+        for q in 0..4
+        {
+            f.park(q, q, 0);
+        }
+        let queue4 = core::ptr::from_ref(&f.queues[4]);
+        let slot_ptr = core::ptr::from_ref(f.tables[0].slot_for(queue4));
+        // SAFETY: the slot lives in the heap buffer of the tables vector, which
+        // is never resized and outlives this test's uses; the fixture's methods
+        // touch only the queues and TCBs.
+        let slot = unsafe { &*slot_ptr };
+        assert_eq!(f.index_of(slot.receiver.load(Relaxed)), Some(0));
+        slot.queue.store(queue4.cast_mut(), Relaxed);
+        assert!(f.remove(0, 0));
+        assert!(f.slotless(0));
+        assert!(slot.receiver.load(Relaxed).is_null());
+        let tcb = f.tcbs[4];
+        // SAFETY: TCB 4 is a live TCB of the fixture on no queue; as under
+        // queue 4's lock, on the table's CPU.
+        unsafe { f.queues[4].waiting.push(tcb) };
+        // SAFETY: as above; the field is owned by queue 4's lock.
+        unsafe { (*tcb).recv_park_slot = core::ptr::from_ref(&slot.receiver) };
+        slot.receiver.store(tcb, Relaxed);
+        assert_eq!(f.recorded(0, 4), Some(4));
+        assert_eq!(f.take(4, Some(0)), Some(4));
+        assert!(f.slotless(4));
     }
 }

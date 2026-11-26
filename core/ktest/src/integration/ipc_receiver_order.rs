@@ -1002,7 +1002,8 @@ extern "C" fn caller_entry(arg: u64) -> !
 }
 
 /// Each step: pin to its CPU, wait for the parks it names, give the receivers'
-/// switch-outs [`SETTLE_MS`], call, and record the reply. `false` on any failure.
+/// switch-outs [`SETTLE_MS`], call, and record the reply; stop after a reply
+/// from a receiver the step does not expect. `false` on any failure.
 fn run_script(args: &ChildArgs) -> bool
 {
     let Some(buf) = ipc_buffer(args.slot)
@@ -1041,6 +1042,13 @@ fn run_script(args: &ChildArgs) -> bool
             at,
             u32::try_from(reply.word(1)).unwrap_or(u32::MAX),
         );
+        if reply.word(0) != u64::from(next.expect_id)
+        {
+            // The wrong receiver served: its own next park, which a later
+            // step may wait for, may never come. The harness reports the
+            // mismatch from the recorded results.
+            return true;
+        }
         i = i.saturating_add(1);
     }
     true

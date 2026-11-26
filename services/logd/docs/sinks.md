@@ -78,11 +78,15 @@ logd's history entry is the record. Every sink renders from it, and the query in
   after its first lines, or update it.
   A retired slot that is dropped takes its entries with it, so every entry in the history has its
   slot, and its name, at the moment it is read.
-- **Name.** An entry carries no name. A sink renders the name of the entry's slot, with the
-  instance number of § Display names, at the moment it renders.
+- **Name.** An entry carries no name. A device sink renders the name of the entry's slot, with the
+  instance number of § Display names, at the moment it renders. An external sink renders a name
+  at least as new as the one the slot had when the entry was retained (§ External sinks).
 - **Name generation.** logd counts each slot's name registrations, a 32-bit count from 0 that only
   rises, and an entry carries its slot's count at the moment the entry was retained, so a reader
-  that keeps a slot's name knows when the name it keeps is older than the entry it renders.
+  that keeps a slot's name knows when the name it keeps is older than the entry it renders. The
+  count never wraps: logd answers a registration from a slot whose count is at `u32::MAX` as it
+  answers any other, but leaves the slot's name and count as they are, so the slot keeps its last
+  name for the rest of its life.
 - **Time.** `us` is monotonic. Wall time is `us` plus the boot wall offset (§ Wall time), applied
   when a sink renders, so a record needs no wall clock to be kept.
 - **Origin.** A `relayed` entry was written to the console by init-logd before the handover; a

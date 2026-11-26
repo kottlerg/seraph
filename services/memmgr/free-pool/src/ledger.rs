@@ -716,6 +716,17 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             .filter(|&rec| self.record(rec).is_some())
     }
 
+    /// The record slot keyed by `badge`, as [`Ledger::find`], moved to the
+    /// head of its index chain ([`ProcessIndex::find_front`]): for a fault's
+    /// and a grant's lookup of their caller, so the lookup's cost does not
+    /// follow which badges share its bucket.
+    pub fn find_front(&mut self, badge: u64) -> Option<NodeIdx>
+    {
+        self.index
+            .find_front(&mut self.arena, badge)
+            .filter(|&rec| self.record(rec).is_some())
+    }
+
     /// The record in slot `rec`.
     #[must_use]
     pub fn record(&self, rec: NodeIdx) -> Option<ProcessRecord>

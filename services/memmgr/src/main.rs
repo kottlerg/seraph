@@ -1487,13 +1487,13 @@ fn charge_node_of(l: &MemLedger, badge: u64) -> Option<NodeIdx>
 /// badge `charge_badge` is ([`charge_node_of`]). `None` for an unknown
 /// requester, or a charge node that is missing or gone.
 fn request_target(
-    l: &MemLedger,
+    l: &mut MemLedger,
     badge: u64,
     flags: u32,
     charge_badge: Option<u64>,
 ) -> Option<(NodeIdx, NodeIdx)>
 {
-    let rec = l.find(badge)?;
+    let rec = l.find_front(badge)?;
     if flags & memmgr_labels::REQUEST_CHARGE_NODE == 0
     {
         return Some((rec, NODE_NULL));
@@ -3084,7 +3084,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     let page_base = va & !(PAGE_SIZE - 1);
 
     let l = ledger_mut();
-    let Some(rec) = l.find(req.badge)
+    let Some(rec) = l.find_front(req.badge)
     else
     {
         decline_fault(ipc_buf, FaultDecline::UnknownProcess, 0);

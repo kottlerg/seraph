@@ -8,10 +8,10 @@ a program reads, follows and steers the log.
 
 ## Implementation status
 
-Built: the eight severities and their console tags, the console prefix `[sec.usfrac] LEVEL [name] `
-that both receivers write, the kernel's records read and written as `[kernel]` lines, and the serial
-and framebuffer outputs as two sinks with a bounded queue and a writer thread each
-([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks).
+Built: the eight severities and their console tags, the console prefix
+`[sec.usfrac] LEVEL  [name] ` that both receivers write, the kernel's records read and written as
+`[kernel]` lines, and the serial and framebuffer outputs as two sinks with a bounded queue and a
+writer thread each ([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks).
 
 Everything else this document states is design intent, not yet implemented, unless a sentence names
 it as built. Each section names the Issue that builds it. Until an Issue lands,
@@ -69,12 +69,13 @@ logd's history entry is the record. Every sink renders from it, and the query in
 | `bytes` | the line's bytes or the record's payload |
 | `origin` | `live` (retained by this logd instance), `relayed` (installed from init-logd's handover), or `previous` (installed from the previous boot's pstore ring, § pstore) |
 
-- **Slot serial.** logd gives every slot it creates a 32-bit serial, counting up over the life of
-  the logd instance. An entry names its sender by it, not by its badge alone: a live and a retired
-  slot can share a badge ([ipc-interface.md](ipc-interface.md) § Retired slots), and a reader that
-  lags behind the history must name an entry whose slot has since been retired. The serial wraps,
-  and on a wrap logd skips every serial a live or retired slot still holds, so no two slots in the
-  table share one.
+- **Slot serial.** logd gives every slot it creates a 64-bit serial, counting up from 1 over the
+  life of the logd instance and never reused within it. An entry names its sender by it, not by its
+  badge alone: a live and a retired slot can share a badge
+  ([ipc-interface.md](ipc-interface.md) § Retired slots), and a reader that lags behind the history
+  must name an entry whose slot has since been retired. A serial names one slot for the life of the
+  instance, so a reader may keep the name it read for a serial for as long as it follows that
+  instance.
   A retired slot that is dropped takes its entries with it, so every entry in the history has its
   slot, and its name, at the moment it is read.
 - **Name.** An entry carries no name. A sink renders the name of the entry's slot, with the
@@ -205,7 +206,8 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
   entries at info or more severe that precede the emergency entry in the history and that it has
   not written, then the emergency entry, so the screen of a dead machine carries its context. The
   backlog is a walk back through the history, not a buffer of the sink's own. On a (re)attach, its
-  cursor starts `backlog` entries before the newest, `relayed` ones included.
+  cursor starts `backlog` entries before the newest, `relayed` ones included, when it is further
+  behind than that.
 - **pstore.** A RAM ring that survives a warm reset (§ pstore).
 
 The panic sink stays outside this contract: logd's own panic and allocation-failure output goes to
@@ -225,8 +227,8 @@ An external sink:
 2. reads the history ascending from the `seq` after its cursor, unfiltered, page by page, and
    applies its own level itself: the walk is unfiltered so that every missing `seq` between two
    entries it reads is an evicted entry, which it counts as dropped;
-3. names each entry from its slot serial, reading `QUERY_SLOTS` for a serial it has not seen; a
-   serial no longer in the table is rendered as the unnamed sender `?`;
+3. names each entry, and learns its badge, from its slot serial, reading `QUERY_SLOTS` for a serial
+   it has not seen; a serial no longer in the table is rendered as the unnamed sender `?`;
 4. renders each entry in its format and writes it;
 5. waits on its Notification and its event queue together (§ Subscriptions), and on a signal goes
    back to 2.
@@ -456,10 +458,11 @@ capability space.
   the last one it read; bit 3, a severity filter, `data[4]` the least severe level
   returned. With bit 2, `data[5]` carries the instance epoch the caller follows; logd answers
   `QUERY_STALE` (4) when it is not its own, and 0 asks no check.
-- An entry in the reply carries the slot serial in bits 32-63 of its word 3 and the origin in bits
-  12-15 of its kind field (bits 8-11 the kind).
-- `QUERY_SLOTS` rows carry the slot serial and the instance number in a tenth word, the serial in
-  bits 32-63 and the number in bits 0-31, so `SLOTS_PAGE` is 6.
+- An entry in the reply carries its slot serial in word 2, in place of the badge, which the slot's
+  `QUERY_SLOTS` row carries, so an entry keeps its four header words and the longest still fits one
+  reply; the origin is in bits 12-15 of its kind field (bits 8-11 the kind).
+- `QUERY_SLOTS` rows carry the instance number in bits 32-63 of word 1 and the slot serial in a
+  tenth word, so `SLOTS_PAGE` is 6.
 - The severity filter serves interactive reads, which count no gap; a reader that counts gaps walks
   unfiltered (§ External sinks).
 

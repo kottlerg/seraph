@@ -215,8 +215,8 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
   with the flag, so serial's cursor passes an entry only once its bytes are sent. The `hold` pace,
   the `SINK_STALL_MS` bound on a write, the kernel reader's acknowledgement (§ The kernel's lines)
   and the pass marker and crash reports being on serial before power-off all rest on that. #928's
-  `LOG_FLUSH` barrier is a zero-length write with the flag, answered once every byte written before
-  it is sent.
+  `LOG_FLUSH` waits for serial's cursor, which passes an entry only once it is sent, and needs no
+  barrier of its own.
 - **framebuffer.** For the person at the screen. Its level is critical, so a healthy boot shows no
   log line on it. When an emergency entry reaches it, the sink first writes the last `backlog`
   entries at info or more severe that precede the emergency entry in the history and that it has
@@ -562,7 +562,7 @@ Each later sink is built against the interface above and changes none of it.
 | Disk (#1496) | every entry in `seq` order from its start, `relayed` and `previous` included; the gaps it could not read; each entry's sender name after the sender died; to learn of a logd restart; wall time for its timestamps | the ascending unfiltered walk from `seq` 0, the oldest, the dense `seq`, the slot serial and `QUERY_SLOTS`, the token and the epoch, its own `timed` seed |
 | Network syslog (#1499, #1500) | the RFC 5424 fields of each entry; the facility, severity and host name; APP-NAME and PROCID per instance; TLS | the record and § The rfc5424 format; its own recipe's settings; the TLS stack in its own process (#1500), none in logd |
 | pstore (#1498) | each entry as a record at memory speed; a way to bring the previous boot's entries back | a device sink inside logd; the `previous` origin |
-| Serial transmit (#1497) | nothing from logd's interface; for the serial sink, a write answered once its bytes have left for the UART (§ Device sinks), while a plain write is answered once its bytes are in the transmit ring | the serial driver's `SERIAL_WRITE_SENT` flag (label bit 32) on `SERIAL_WRITE_BYTES`, which logd's serial sink and the zero-length `LOG_FLUSH` barrier write with |
+| Serial transmit (#1497) | nothing from logd's interface; for the serial sink, a write answered once its bytes have left for the UART (§ Device sinks), while a plain write is answered once its bytes are in the transmit ring | the serial driver's `SERIAL_WRITE_SENT` flag (label bit 32) on `SERIAL_WRITE_BYTES`, which logd's serial sink writes with, so `LOG_FLUSH` waits for serial's cursor alone |
 
 ---
 

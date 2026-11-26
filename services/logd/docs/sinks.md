@@ -487,8 +487,8 @@ capability space.
   observed because the subscriber's wait on the Notification, and its wait-set membership, are
   references the kernel counts, so the Notification does not fall to one while the subscriber waits
   on it. Every holder of a name shares that name's one badge (`log_labels::LOG_QUERY_AUTHORITY`,
-  `LOG_FOLLOW_AUTHORITY`), so a subscriber cannot be told apart by its badge, and the death cascade cannot end it.
-  `LOG_UNSUBSCRIBE` ends a subscription at once.
+  `LOG_FOLLOW_AUTHORITY`), so a subscriber cannot be told apart by its badge, and the death cascade
+  cannot end it. `LOG_UNSUBSCRIBE` ends a subscription at once.
 - **logd's end.** The subscriber binds a sole-reference observer on the same token, posting to its
   own event queue. When logd dies, or ends the subscription, the token falls to the subscriber's
   reference and the post tells the subscriber to subscribe again (§ External sinks). The epoch then

@@ -98,7 +98,9 @@ subcommands! {
         /// affect, with the pinned Kani release, and fail on any failed,
         /// undetermined or unwinding-incomplete check, on a Kani release other
         /// than the pinned one, and on a harness that lies in no package; with
-        /// `--pin`, print the pinned release (see xtask/README.md).
+        /// `--shard`, one part of a crate's harnesses; with `--plan`, print the
+        /// jobs CI's matrix runs; with `--pin`, print the pinned release (see
+        /// xtask/README.md).
         Kani(KaniArgs),
 
         /// Print the CI cells a change owes: each file the change from a base
@@ -1101,10 +1103,13 @@ args! {
         #[arg(long, value_name = "CRATE")]
         pub component: Option<String>,
 
-        /// Verify only the crates the change from COMMIT to the working tree
-        /// can affect: each crate whose package, a package in its dependency
-        /// closure, or a file one of them reads, the change touches; every
-        /// crate when it touches an input of every build.
+        /// Verify only the crates the change from the merge base of COMMIT and
+        /// HEAD to the working tree can affect: each crate whose package, a
+        /// package in its dependency closure, or a file one of them reads, the
+        /// change touches; every crate when it touches an input of every
+        /// build; and, when it selects no crate otherwise but touches
+        /// `.github/workflows/kani.yml` or `build-test.yml`, the crate with the
+        /// fewest harnesses.
         #[arg(long, value_name = "COMMIT", conflicts_with_all = ["component", "harness"])]
         pub since: Option<String>,
 
@@ -1118,8 +1123,25 @@ args! {
         #[arg(long, value_name = "NAME", requires = "component")]
         pub harness: Option<String>,
 
+        /// Verify the K-th of N parts of the crate's harnesses: of Kani's list
+        /// of them, sorted by path, every N-th from the K-th, so the N parts
+        /// take each harness once.
+        #[arg(long, value_name = "K/N", requires = "component", conflicts_with = "harness")]
+        pub shard: Option<String>,
+
+        /// Print the jobs CI's matrix runs, one per crate the run would verify
+        /// or per shard of a crate split into shards, and exit, verifying
+        /// nothing.
+        #[arg(long, conflicts_with_all = ["component", "harness", "shard", "list"])]
+        pub plan: bool,
+
+        /// With --plan, append the workflow's outputs to FILE
+        /// (`$GITHUB_OUTPUT`): the matrix and whether it holds a job.
+        #[arg(long, value_name = "FILE", requires = "plan")]
+        pub github_output: Option<PathBuf>,
+
         /// Print the pinned Kani release and exit, verifying nothing.
-        #[arg(long, conflicts_with_all = ["component", "harness", "since", "list"])]
+        #[arg(long, conflicts_with_all = ["component", "harness", "since", "list", "shard", "plan"])]
         pub pin: bool,
 
         /// The shared host's launch rules (see xtask/README.md "Host launch

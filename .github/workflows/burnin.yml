@@ -4,7 +4,8 @@
 # .github/workflows/burnin.yml
 
 # The burn-in tier: each canonical boot repeated, on a tag push or a manual
-# dispatch (docs/testing.md § Coverage tiers).
+# dispatch, and every bounded proof (docs/testing.md § Coverage tiers,
+# § Bounded verification).
 
 name: burn-in
 
@@ -195,3 +196,9 @@ jobs:
             target/xtask/run/**/*.log
             target/xtask/run/**/*.crash.txt
           if-no-files-found: ignore
+
+  kani:
+    # Every bounded proof, one job per crate or shard, as build-test.yml
+    # runs the crates a change can affect (.github/workflows/kani.yml;
+    # docs/testing.md § Bounded verification).
+    uses: ./.github/workflows/kani.yml

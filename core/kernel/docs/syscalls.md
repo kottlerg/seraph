@@ -610,7 +610,10 @@ of a synchronous wake, and otherwise (the receive bound a queued caller, a try-o
 the receive failed) by the placement rules with this thread's CPU skipped as the caller's preferred
 CPU ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). A caller those
 rules still place on this thread's CPU, at this thread's level or above, runs before this thread
-returns to user mode.
+returns to user mode. A call that finds this thread parked in the receive runs it on the caller's
+CPU when that CPU queues nothing else, even when this thread outranks the caller, since a reply sent
+this way never leaves the caller queued behind this thread ([scheduler.md](scheduler.md) § Thread
+Assignment); a thread that answers such a call with `SYS_IPC_REPLY` instead can.
 
 **Capability requirement:** `endpoint_cap` must have Receive rights; the reply needs the implicit
 reply capability, as for `SYS_IPC_REPLY`.

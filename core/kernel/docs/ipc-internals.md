@@ -490,7 +490,8 @@ every reply wakes the recipient through `enqueue_and_wake` on the CPU
 decides when it runs. A call rendezvous whose caller's park committed
 (`CallRendezvous::Bound` with `hint: WakeHint::Sync`) asks for the caller's
 CPU, which the placement grants when that CPU queues no thread but its idle
-thread and the receiver does not outrank the caller
+thread and the receiver does not outrank the caller, or outranks it but last
+received through `SYS_IPC_REPLY_RECV`
 ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection); a
 refused park and a `SYS_IPC_REPLY` pass `WakeHint::None`. A `SYS_IPC_REPLY_RECV` wakes its replied
 caller after its receive, with `WakeHint::Sync` when the receive parked and

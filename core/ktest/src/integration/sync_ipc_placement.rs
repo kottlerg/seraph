@@ -4,8 +4,9 @@
 // core/ktest/src/integration/sync_ipc_placement.rs
 
 //! Integration: a call runs its receiver on the caller's CPU when that CPU
-//! queues no other thread and the receiver does not outrank the caller, and
-//! leaves it to the other placement rules otherwise
+//! queues no other thread and the receiver does not outrank the caller, or
+//! outranks it but last received through `SYS_IPC_REPLY_RECV`, and leaves it
+//! to the other placement rules otherwise
 //! (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
 //! "Target CPU selection").
 //!
@@ -15,8 +16,11 @@
 //! that CPU by every call from another, so a pair that starts apart stays
 //! apart and each round trip pays a wake IPI to a halted CPU. With the rule
 //! too wide, the server runs ahead of a thread queued on the caller's CPU
-//! while its own CPU idles, or ahead of a caller it outranks, whose reply wake
-//! then waits behind it.
+//! while its own CPU idles, or ahead of a caller it outranks and answers with
+//! a plain reply, whose reply wake then waits behind it. With the rule too
+//! narrow, an RT server that answers its fair callers with
+//! `SYS_IPC_REPLY_RECV` (whose reply wake cannot wait behind it) stays apart
+//! from them.
 //!
 //! ## How this exercises it
 //!
@@ -29,7 +33,10 @@
 //! counts (`CAP_INFO_THREAD_PLACEMENT`): the wakes that reached the rule, those
 //! the rule placed on the waker's CPU, and the load balancer's pulls. It
 //! records them with the CPU the receive returned on. [`ROUNDS`] rounds per
-//! case.
+//! case. A server that replies with `SYS_IPC_REPLY_RECV` takes its first call
+//! with a plain receive (no reply is owed yet), and holds each later reply
+//! while it returns to P, then replies and parks in one
+//! `SYS_IPC_REPLY_RECV`; its first round is judged as a plain receive's.
 //!
 //! ## Pass criterion
 //!
@@ -46,7 +53,7 @@
 //! - A case that allows the rule fails when no round is counted.
 //! - A round whose counts moved by more than its one wake fails.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use ipc::IpcMessage;
 use syscall::{
@@ -90,7 +97,9 @@ const DONE_POLLS: u32 = 4_000;
 const SETTLE_MS: u64 = 2;
 
 /// One case: the levels of the server and the caller, whether a fair spinner
-/// is queued on K, and whether the rule runs the server on K.
+/// is queued on K, whether the server replies with `SYS_IPC_REPLY_RECV`, and
+/// whether the rule runs the server on K (in a `SYS_IPC_REPLY_RECV` case,
+/// from its second round, the first receive being a plain one).
 #[derive(Clone, Copy)]
 struct Case
 {
@@ -98,15 +107,17 @@ struct Case
     server: u8,
     caller: u8,
     spinner: bool,
+    reply_recv: bool,
     on_k: bool,
 }
 
-const CASES: [Case; 5] = [
+const CASES: [Case; 6] = [
     Case {
         name: "fair",
         server: FAIR,
         caller: FAIR,
         spinner: false,
+        reply_recv: false,
         on_k: true,
     },
     Case {
@@ -114,6 +125,7 @@ const CASES: [Case; 5] = [
         server: FAIR,
         caller: FAIR,
         spinner: true,
+        reply_recv: false,
         on_k: false,
     },
     Case {
@@ -121,6 +133,7 @@ const CASES: [Case; 5] = [
         server: RT,
         caller: RT,
         spinner: false,
+        reply_recv: false,
         on_k: true,
     },
     Case {
@@ -128,6 +141,7 @@ const CASES: [Case; 5] = [
         server: RT,
         caller: RT,
         spinner: true,
+        reply_recv: false,
         on_k: false,
     },
     Case {
@@ -135,9 +149,21 @@ const CASES: [Case; 5] = [
         server: RT,
         caller: FAIR,
         spinner: false,
+        reply_recv: false,
         on_k: false,
     },
+    Case {
+        name: "RT server replying with reply_recv, fair caller",
+        server: RT,
+        caller: FAIR,
+        spinner: false,
+        reply_recv: true,
+        on_k: true,
+    },
 ];
+
+/// Whether the current case's server replies with `SYS_IPC_REPLY_RECV`.
+static REPLY_RECV: AtomicBool = AtomicBool::new(false);
 
 /// The round the server is about to park for (1-based; 0 before the first).
 static PARKING: AtomicU32 = AtomicU32::new(0);
@@ -295,6 +321,7 @@ fn rounds(
 ) -> TestResult
 {
     PARKING.store(0, Ordering::Release);
+    REPLY_RECV.store(case.reply_recv, Ordering::Release);
     CHILD_ERRORS.store(0, Ordering::Release);
     for ran_on in &RAN_ON
     {
@@ -378,8 +405,15 @@ fn check(case: Case) -> TestResult
 {
     let mut on_k = 0u32;
     let mut counted = 0u32;
-    for (((ran_on, reached), local), pulled) in RAN_ON.iter().zip(&REACHED).zip(&LOCAL).zip(&PULLED)
+    for (index, (((ran_on, reached), local), pulled)) in RAN_ON
+        .iter()
+        .zip(&REACHED)
+        .zip(&LOCAL)
+        .zip(&PULLED)
+        .enumerate()
     {
+        // A reply_recv server's first receive is a plain one.
+        let allowed = case.on_k && !(case.reply_recv && index == 0);
         let cpu = ran_on.load(Ordering::Acquire);
         let reached = reached.load(Ordering::Acquire);
         let local = local.load(Ordering::Acquire);
@@ -394,7 +428,7 @@ fn check(case: Case) -> TestResult
                 "sync_ipc_placement: the rule's counts moved by more than a round's one wake",
             );
         }
-        if !case.on_k && cpu == K && pulled == 0
+        if !allowed && cpu == K && pulled == 0
         {
             return Err(
                 "sync_ipc_placement: a call ran its server on the caller's CPU past the guard",
@@ -405,17 +439,17 @@ fn check(case: Case) -> TestResult
             continue;
         }
         counted = counted.saturating_add(1);
-        if case.on_k && local == 0
+        if allowed && local == 0
         {
             return Err(
                 "sync_ipc_placement: a call the rule allows was not placed on the caller's CPU",
             );
         }
-        if !case.on_k && local != 0
+        if !allowed && local != 0
         {
             return Err("sync_ipc_placement: the rule placed a guarded call on the caller's CPU");
         }
-        if case.on_k && cpu != K && pulled == 0
+        if allowed && cpu != K && pulled == 0
         {
             crate::log_args(format_args!(
                 "ktest: sync_ipc_placement {}: a server placed on the caller's CPU ran on CPU {cpu}",
@@ -468,8 +502,9 @@ fn ipc_buffer(slot: usize) -> Option<*mut u64>
 /// Each round: pin to P and run there, clear the affinity (the server stays on
 /// P until it parks), read its placement counts, publish the round, receive,
 /// record the counts' differences across the receive, and reply with the CPU
-/// the receive returned on. Runs until a receive fails; its case deletes it,
-/// parked.
+/// the receive returned on: at once with `SYS_IPC_REPLY`, or, in a
+/// `SYS_IPC_REPLY_RECV` case, in the next round's receive. Runs until a
+/// receive fails; its case deletes it, parked.
 extern "C" fn server_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `rounds` published for the server.
@@ -483,6 +518,9 @@ extern "C" fn server_entry(arg: u64) -> !
         fail();
         thread_exit()
     };
+    let reply_recv = REPLY_RECV.load(Ordering::Acquire);
+    // The label of the reply the next receive owes, in a SYS_IPC_REPLY_RECV case.
+    let mut owed: Option<u64> = None;
     let mut round = 0u32;
     loop
     {
@@ -497,8 +535,13 @@ extern "C" fn server_entry(arg: u64) -> !
         }
         let before = counts(me);
         PARKING.store(round, Ordering::Release);
-        // SAFETY: buf is this thread's registered IPC buffer.
-        if unsafe { ipc::ipc_recv(ep, buf) }.is_err()
+        let received = match owed.take()
+        {
+            Some(label) => reply_and_receive(ep, label, buf),
+            // SAFETY: buf is this thread's registered IPC buffer.
+            None => unsafe { ipc::ipc_recv(ep, buf) }.is_ok(),
+        };
+        if !received
         {
             break;
         }
@@ -511,6 +554,11 @@ extern "C" fn server_entry(arg: u64) -> !
             }
             _ => fail(),
         }
+        if reply_recv
+        {
+            owed = Some(u64::from(cpu));
+            continue;
+        }
         let reply = IpcMessage::new(u64::from(cpu));
         // SAFETY: as for the receive.
         if unsafe { ipc::ipc_reply(&reply, buf) }.is_err()
@@ -519,6 +567,18 @@ extern "C" fn server_entry(arg: u64) -> !
         }
     }
     thread_exit()
+}
+
+/// Reply `label` to the pending caller and receive the next call on `ep` in
+/// one `SYS_IPC_REPLY_RECV`, through the IPC buffer `buf`; whether it
+/// succeeded. Out of line, so the server's frame holds neither message.
+#[inline(never)]
+fn reply_and_receive(ep: u64, label: u64, buf: *mut u64) -> bool
+{
+    let reply = IpcMessage::new(label);
+    // SAFETY: buf is the calling thread's registered IPC buffer (the server's
+    // `ipc_buffer`).
+    unsafe { ipc::ipc_reply_recv(ep, &reply, buf, 0) }.is_ok()
 }
 
 /// Record round `round`'s count differences, `before` and `after` its

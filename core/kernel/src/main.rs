@@ -1686,6 +1686,7 @@ unsafe fn kernel_entry_post_rebase(
                         cpu_affinity: sched::AFFINITY_ANY,
                         preferred_cpu: 0,
                         placement: crate::sched::thread::PlacementCounts::new(),
+                        serves_reply_recv: core::sync::atomic::AtomicBool::new(false),
                         run_queue_next: None,
                         queued_on: core::sync::atomic::AtomicI16::new(-1),
                         #[cfg(debug_assertions)]

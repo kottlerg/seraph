@@ -182,8 +182,9 @@ each in its format, and writes it to its output.
 - A sink whose level is `off` takes part in none of the above, whatever its pace: it counts toward
   no window, keeps no entry from eviction, is never stalled, and neither `LOG_FLUSH` nor the kernel
   reader waits on it. Its cursor follows the newest entry and it counts no drops, so when `SINK_SET`
-  turns it on it starts after the entry newest then, as a `skip` sink with no backlog does, and
-  shows nothing of the time it was off.
+  turns it on its cursor starts after the entry newest then, as a `skip` sink with no backlog does,
+  and passes nothing of the time it was off. The framebuffer's emergency walk (§ Device sinks) still
+  reaches entries from that time, since it looks back from the emergency entry for context.
 
 ### Drops
 
@@ -482,7 +483,13 @@ waits on no sink's progress for a sender.
   `kind`, the slot's name with its instance number, the bytes, and a checksum. It stores records,
   not rendered lines, so each sink renders them in its own format on the next boot.
 - On the next boot logd reads a ring whose header and checksums are valid, installs its entries as
-  `previous` entries ahead of its own, and clears the ring.
+  `previous` entries ahead of its own, and clears the ring. For each distinct name with its instance
+  number among them it creates one previous slot: a slot with a new slot serial, that name and
+  instance number, no badge (0) and name generation 0, and each `previous` entry carries the serial
+  of its name's slot, so every sink, external ones through `QUERY_SLOTS`, names it as it names any
+  entry. Previous slots are kept beside the retired slots, outside their `RETIRED_SLOTS` FIFO and
+  their one-slot-per-badge rule ([ipc-interface.md](ipc-interface.md) § Retired slots), at most one
+  per entry installed, and each is dropped with its last entry.
 - Serial shows `previous` entries, which no console of this boot has shown, between two notice lines
   of logd's:
 

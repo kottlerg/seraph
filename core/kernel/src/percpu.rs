@@ -317,9 +317,11 @@ pub mod return_work
 
 /// Per-CPU private state for one logical CPU.
 ///
-/// All fields are accessed exclusively by the owning CPU after init, so
-/// no locks are required. The struct is `#[repr(C)]` to guarantee the
-/// byte layout expected by GS-relative assembly.
+/// After init each field is written only by the owning CPU, so no locks are
+/// required, except the atomics whose own documentation names other writers
+/// (`return_work`, and the receiver words of `recv_parked`). The struct is
+/// `#[repr(C)]` to guarantee the byte layout expected by GS-relative
+/// assembly.
 #[repr(C)]
 pub struct PerCpuData
 {
@@ -412,6 +414,14 @@ pub struct PerCpuData
     /// run the checks, so a bit set after the clear stays for the next return.
     pub return_work: AtomicU32,
     _pad2: u32,
+    /// This CPU's parked-receiver table: for a few endpoints, the receiver
+    /// that last parked on the endpoint's receive queue from this CPU and is
+    /// still parked, which a call from this CPU prefers
+    /// (core/kernel/docs/ipc-internals.md § Wait Queues). Recorded and looked
+    /// up only by this CPU ([`this_cpu_recv_parked`]); a receiver's removal
+    /// from its queue, on any CPU, clears its slot by an atomic
+    /// compare-and-swap, under that endpoint's lock.
+    pub recv_parked: crate::ipc::recv_park::RecvParkTable,
 }
 
 impl PerCpuData
@@ -438,6 +448,7 @@ impl PerCpuData
             diag: core::ptr::null(),
             return_work: AtomicU32::new(0),
             _pad2: 0,
+            recv_parked: crate::ipc::recv_park::RecvParkTable::new(),
         }
     }
 }
@@ -885,6 +896,21 @@ pub unsafe fn return_work_of(cpu: usize) -> &'static AtomicU32
     unsafe { &(*entry).return_work }
 }
 
+/// This CPU's parked-receiver table ([`PerCpuData::recv_parked`]).
+///
+/// # Safety
+/// As [`this_cpu`]; the table stays this CPU's only while the caller cannot
+/// migrate, as an endpoint's lock held with interrupts off ensures.
+#[cfg(not(test))]
+pub unsafe fn this_cpu_recv_parked() -> &'static crate::ipc::recv_park::RecvParkTable
+{
+    // SAFETY: the per-CPU pointer is installed (caller contract).
+    let this = unsafe { this_cpu() };
+    // SAFETY: an entry of the slab, live for the kernel's lifetime; the table
+    // is reached through shared references only.
+    unsafe { &(*this).recv_parked }
+}
+
 /// Returns `true` if preemption is disabled on the current CPU.
 #[cfg(not(test))]
 #[inline]
@@ -996,6 +1022,6 @@ mod tests
             PERCPU_PREEMPT_COUNT_OFFSET
         );
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 128);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 232);
     }
 }

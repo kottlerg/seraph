@@ -536,17 +536,167 @@ fn boot_disk_behind_port(spec: &QemuLaunchSpec) -> bool
 /// could confine it by; at 00:01.0 every other function lies above it.
 const RISCV_IOMMU_DEVICE: &str = "riscv-iommu-pci,off=off,addr=0x01";
 
-/// The VT-d IOMMU of an x86-64 launch that attaches one: DMA remapping, and
-/// interrupt remapping (`intremap=on`) with 32-bit destinations offered
-/// (`eim=on`), so devmgr turns interrupt remapping on and every message and
-/// wired line reaches a CPU through a remapping entry.
+/// The VT-d IOMMU of an x86-64 launch that attaches one and offers interrupt
+/// remapping ([`InterruptRemapping::Offered`]): DMA remapping, and interrupt
+/// remapping (`intremap=on`) with 32-bit destinations offered (`eim=on`), so
+/// devmgr turns interrupt remapping on and every message and wired line reaches
+/// a CPU through a remapping entry.
 const X86_IOMMU_DEVICE: &str = "intel-iommu,intremap=on,eim=on";
 
-/// The q35 machine of a KVM launch with the IOMMU attached: interrupt
-/// remapping needs the I/O APIC emulated by QEMU (`kernel-irqchip=split`),
-/// which QEMU refuses `intremap=on` without. Under TCG and the other
-/// accelerators QEMU emulates it in any case.
+/// The VT-d IOMMU of an x86-64 launch that attaches one and withholds
+/// interrupt remapping ([`InterruptRemapping::Withheld`]): DMA remapping alone.
+const X86_IOMMU_DEVICE_DMA_ONLY: &str = "intel-iommu,intremap=off";
+
+/// The q35 machine of a KVM launch whose IOMMU offers interrupt remapping
+/// ([`X86Irqchip::Split`]): interrupt remapping needs the I/O APIC emulated
+/// by QEMU (`kernel-irqchip=split`), which QEMU refuses `intremap=on`
+/// without.
 const X86_MACHINE_SPLIT_IRQCHIP: &str = "q35,kernel-irqchip=split";
+
+/// The q35 machine of every other KVM launch ([`X86Irqchip::Kvm`]): the I/O
+/// APIC, the PIC and the PIT emulated in KVM. It is KVM's default, named so
+/// the launch's command line shows it.
+const X86_MACHINE_KVM_IRQCHIP: &str = "q35,kernel-irqchip=on";
+
+/// Whether an x86-64 launch's IOMMU, when attached, offers interrupt
+/// remapping, which decides where a KVM launch emulates the I/O APIC
+/// ([`X86Irqchip::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptRemapping
+{
+    /// Offered (`intremap=on,eim=on`): devmgr turns it on, and a KVM launch
+    /// emulates the I/O APIC in QEMU's process, which remapping needs there.
+    Offered,
+    /// Withheld (`intremap=off`): the IOMMU remaps DMA alone, and a KVM launch
+    /// keeps KVM's I/O APIC.
+    Withheld,
+}
+
+impl InterruptRemapping
+{
+    /// The remapping a launch of an image that boots `harnesses` offers:
+    /// withheld for an image that boots ktest alone, offered for every other.
+    ///
+    /// ktest never turns interrupt remapping on (its `unit::hw` tests check
+    /// the refusals with it off), so offering it to ktest covers nothing,
+    /// while under KVM it costs the split irqchip: every access to an I/O
+    /// APIC redirection entry then exits to QEMU's process and takes its
+    /// lock. A delivery on a wired line masks its entry and the
+    /// acknowledgement unmasks it, so a case that raises a line in a loop
+    /// pays that exit on every delivery (`stress::irq_route_delete_race`
+    /// runs several times as long), a cost hardware, which reaches the
+    /// I/O APIC through uncached MMIO and remaps in the IOMMU, never pays. The
+    /// system's harnesses (svctest, usertest, ubench) boot devmgr, which
+    /// turns remapping on, so they keep it, and remapped delivery stays under
+    /// test there. An image whose harnesses are unknown (none recorded) or
+    /// mixed takes the system's launch.
+    #[must_use]
+    pub fn for_image(harnesses: &[crate::sysroot::ImageHarness]) -> Self
+    {
+        match harnesses
+        {
+            [crate::sysroot::ImageHarness::Ktest] => Self::Withheld,
+            _ => Self::Offered,
+        }
+    }
+
+    /// [`Self::for_image`] for the image the sysroot's last complete pack
+    /// wrote, as `sysroot::recorded_image_harnesses` reads it; offered when
+    /// no record can be read.
+    #[must_use]
+    pub fn for_sysroot(ctx: &Context) -> Self
+    {
+        sysroot::recorded_image_harnesses(ctx)
+            .map_or(Self::Offered, |harnesses| Self::for_image(&harnesses))
+    }
+
+    /// The VT-d device of an x86-64 launch that attaches the IOMMU.
+    const fn x86_iommu_device(self) -> &'static str
+    {
+        match self
+        {
+            Self::Offered => X86_IOMMU_DEVICE,
+            Self::Withheld => X86_IOMMU_DEVICE_DMA_ONLY,
+        }
+    }
+}
+
+/// Where an x86-64 launch emulates the I/O APIC, the PIC and the PIT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X86Irqchip
+{
+    /// In KVM (`kernel-irqchip=on`).
+    Kvm,
+    /// In QEMU's process, beside KVM's local APICs (`kernel-irqchip=split`).
+    Split,
+    /// In QEMU's process with the rest of the machine: every accelerator
+    /// other than KVM.
+    Qemu,
+}
+
+impl X86Irqchip
+{
+    /// The irqchip of an x86-64 launch on `accel`: split under KVM when the
+    /// IOMMU is attached and offers interrupt remapping, which QEMU accepts
+    /// only on a split irqchip; KVM's under KVM otherwise.
+    #[must_use]
+    pub fn of(iommu: Iommu, remapping: InterruptRemapping, accel: Accel) -> Self
+    {
+        match accel
+        {
+            Accel::Kvm if iommu == Iommu::Attached && remapping == InterruptRemapping::Offered =>
+            {
+                Self::Split
+            }
+            Accel::Kvm => Self::Kvm,
+            Accel::Hvf | Accel::Whpx | Accel::Nvmm | Accel::Tcg => Self::Qemu,
+        }
+    }
+
+    /// The irqchip's name in a run's launch line.
+    #[must_use]
+    pub const fn name(self) -> &'static str
+    {
+        match self
+        {
+            Self::Kvm => "kvm",
+            Self::Split => "split",
+            Self::Qemu => "qemu",
+        }
+    }
+
+    /// The field a run's launch line names the irqchip of an `arch` launch
+    /// with: ` irqchip=<name>` on x86-64, empty on riscv64, whose machine has
+    /// no such choice.
+    #[must_use]
+    pub fn launch_field(
+        arch: Arch,
+        iommu: Iommu,
+        remapping: InterruptRemapping,
+        execution: Execution,
+    ) -> String
+    {
+        match arch
+        {
+            Arch::X86_64 => format!(
+                " irqchip={}",
+                Self::of(iommu, remapping, execution.accel(arch)).name()
+            ),
+            Arch::Riscv64 => String::new(),
+        }
+    }
+
+    /// The `-machine` value that selects it.
+    const fn machine(self) -> &'static str
+    {
+        match self
+        {
+            Self::Kvm => X86_MACHINE_KVM_IRQCHIP,
+            Self::Split => X86_MACHINE_SPLIT_IRQCHIP,
+            Self::Qemu => "q35",
+        }
+    }
+}
 
 crate::argparse::value_enum! {
     /// Whether a QEMU launch attaches the machine's IOMMU (`--iommu`).
@@ -796,6 +946,10 @@ pub struct QemuLaunchSpec<'a>
     /// Whether the machine's IOMMU is attached; every launch site attaches it
     /// unless the run asks for the no-IOMMU variant (`--iommu absent`).
     pub iommu: Iommu,
+    /// Whether an attached x86-64 IOMMU offers interrupt remapping, which the
+    /// launch site takes from the image it boots
+    /// ([`InterruptRemapping::for_image`]); ignored on riscv64.
+    pub interrupt_remapping: InterruptRemapping,
     /// When set, attach the debug port (`--debug-port`): a `virtio-console`
     /// device whose port QEMU exposes as a TCP server on `127.0.0.1` at this
     /// port ([`debug_port_args`]).
@@ -1236,28 +1390,21 @@ fn extend_x86(
         spec.x86_paging.cpu_la57_prop(),
         spec.x86_shadow_stack.cpu_cet_ss_prop(host)?
     );
-    let iommu = spec.iommu == Iommu::Attached;
-    // VT-d interrupt remapping needs the I/O APIC emulated outside KVM,
-    // which QEMU otherwise refuses.
-    let machine = if iommu && accel == Accel::Kvm
-    {
-        X86_MACHINE_SPLIT_IRQCHIP
-    }
-    else
-    {
-        "q35"
-    };
-    args.extend(["-machine".into(), machine.into()]);
+    let irqchip = X86Irqchip::of(spec.iommu, spec.interrupt_remapping, accel);
+    args.extend(["-machine".into(), irqchip.machine().into()]);
     if spec.smm
     {
         args.extend(smm_args());
     }
 
-    // VT-d DMA and interrupt remapping, with 32-bit (x2APIC) destinations
-    // offered.
-    if iommu
+    // VT-d DMA remapping, and interrupt remapping with 32-bit (x2APIC)
+    // destinations when the launch offers it.
+    if spec.iommu == Iommu::Attached
     {
-        args.extend(["-device".into(), X86_IOMMU_DEVICE.into()]);
+        args.extend([
+            "-device".into(),
+            spec.interrupt_remapping.x86_iommu_device().into(),
+        ]);
     }
     // The test devices: QEMU's `edu` device, whose DMA engine svctest's DMA
     // confinement phase drives through the test-only `test-dma` driver,
@@ -1800,6 +1947,7 @@ mod tests
             x86_paging: X86Paging::Four,
             x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
+            interrupt_remapping: InterruptRemapping::Offered,
             debug_port: None,
             test_devices: false,
             hotplug_port: None,
@@ -1968,6 +2116,7 @@ mod tests
             x86_paging: X86Paging::Four,
             x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
+            interrupt_remapping: InterruptRemapping::Offered,
             debug_port: None,
             test_devices: false,
             hotplug_port: None,
@@ -2007,6 +2156,7 @@ mod tests
             x86_paging,
             x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
+            interrupt_remapping: InterruptRemapping::Offered,
             debug_port: None,
             test_devices: false,
             hotplug_port: None,
@@ -2179,37 +2329,133 @@ mod tests
         assert!(!dev.contains("iommu_platform"));
     }
 
-    #[test]
-    fn a_kvm_launch_with_the_iommu_splits_the_irqchip_and_no_other_does()
+    /// The `-machine` value of `argv`.
+    fn machine(argv: &[String]) -> &str
     {
-        let machine = |argv: &[String]| -> String {
-            let at = argv.iter().position(|a| a == "-machine").unwrap();
-            argv[at + 1].clone()
-        };
+        let at = argv.iter().position(|a| a == "-machine").unwrap();
+        &argv[at + 1]
+    }
+
+    /// The x86-64 KVM argv of a launch of an image that boots `harnesses`,
+    /// the IOMMU attached.
+    fn kvm_argv_for_image(harnesses: &[sysroot::ImageHarness]) -> Vec<String>
+    {
+        let mut spec = x86_spec(X86Paging::Four);
+        spec.interrupt_remapping = InterruptRemapping::for_image(harnesses);
+        let mut argv = Vec::new();
+        extend_x86(&mut argv, &spec, Accel::Kvm, Execution::Standard, HOST).unwrap();
+        argv
+    }
+
+    #[test]
+    fn only_a_kvm_launch_that_offers_interrupt_remapping_splits_the_irqchip()
+    {
+        // The defect caught: a KVM launch offering `intremap=on` on KVM's own
+        // I/O APIC, which QEMU refuses, or one splitting the irqchip where no
+        // remapping needs it, which moves every I/O APIC access into QEMU's
+        // process; and a VT-d device that does not follow the offer.
         for accel in [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm, Accel::Tcg]
         {
             for iommu in [Iommu::Attached, Iommu::Absent]
             {
-                let mut spec = x86_spec(X86Paging::Four);
-                spec.iommu = iommu;
-                let mut argv = Vec::new();
-                extend_x86(&mut argv, &spec, accel, Execution::Standard, HOST).unwrap();
-                let split = accel == Accel::Kvm && iommu == Iommu::Attached;
-                let expected = if split
+                for remapping in [InterruptRemapping::Offered, InterruptRemapping::Withheld]
                 {
-                    X86_MACHINE_SPLIT_IRQCHIP
+                    let mut spec = x86_spec(X86Paging::Four);
+                    spec.iommu = iommu;
+                    spec.interrupt_remapping = remapping;
+                    let mut argv = Vec::new();
+                    extend_x86(&mut argv, &spec, accel, Execution::Standard, HOST).unwrap();
+                    let offered =
+                        iommu == Iommu::Attached && remapping == InterruptRemapping::Offered;
+                    let expected = match accel
+                    {
+                        Accel::Kvm if offered => X86_MACHINE_SPLIT_IRQCHIP,
+                        Accel::Kvm => X86_MACHINE_KVM_IRQCHIP,
+                        Accel::Hvf | Accel::Whpx | Accel::Nvmm | Accel::Tcg => "q35",
+                    };
+                    assert_eq!(
+                        machine(&argv),
+                        expected,
+                        "{accel:?} {iommu:?} {remapping:?}"
+                    );
+                    let vtd: Vec<&str> = devices(&argv)
+                        .into_iter()
+                        .filter(|d| d.starts_with("intel-iommu"))
+                        .collect();
+                    let expected_vtd = match (iommu, remapping)
+                    {
+                        (Iommu::Absent, _) => vec![],
+                        (Iommu::Attached, InterruptRemapping::Offered) => vec![X86_IOMMU_DEVICE],
+                        (Iommu::Attached, InterruptRemapping::Withheld) =>
+                        {
+                            vec![X86_IOMMU_DEVICE_DMA_ONLY]
+                        }
+                    };
+                    assert_eq!(vtd, expected_vtd, "{accel:?} {iommu:?} {remapping:?}");
                 }
-                else
-                {
-                    "q35"
-                };
-                assert_eq!(machine(&argv), expected, "{accel:?} {iommu:?}");
-                assert_eq!(
-                    devices(&argv).contains(&X86_IOMMU_DEVICE),
-                    iommu == Iommu::Attached
-                );
             }
         }
+    }
+
+    #[test]
+    fn a_ktest_image_keeps_kvms_io_apic_with_interrupt_remapping_withheld()
+    {
+        // The defect caught: a ktest launch offering interrupt remapping,
+        // which ktest never turns on, on the split irqchip it then needs, whose
+        // exit to QEMU on every I/O APIC access ktest pays on every delivery.
+        let argv = kvm_argv_for_image(&[sysroot::ImageHarness::Ktest]);
+        assert_eq!(machine(&argv), X86_MACHINE_KVM_IRQCHIP);
+        assert!(devices(&argv).contains(&X86_IOMMU_DEVICE_DMA_ONLY));
+    }
+
+    #[test]
+    fn every_system_harness_image_offers_interrupt_remapping_on_a_split_irqchip()
+    {
+        // The defect caught: an svctest, usertest or ubench launch
+        // withholding interrupt remapping, so devmgr never turns it on and
+        // remapped delivery goes untested.
+        for harness in sysroot::ImageHarness::SUPERVISED
+        {
+            let argv = kvm_argv_for_image(&[harness]);
+            assert_eq!(machine(&argv), X86_MACHINE_SPLIT_IRQCHIP, "{harness:?}");
+            assert!(devices(&argv).contains(&X86_IOMMU_DEVICE), "{harness:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_mixed_image_takes_the_system_launch()
+    {
+        // The defect caught: an image whose harnesses are not recorded, or
+        // one that boots ktest beside a system harness, losing the interrupt
+        // remapping the system's harnesses need.
+        for harnesses in [
+            &[][..],
+            &[sysroot::ImageHarness::Ktest, sysroot::ImageHarness::Svctest][..],
+        ]
+        {
+            assert_eq!(
+                InterruptRemapping::for_image(harnesses),
+                InterruptRemapping::Offered,
+                "{harnesses:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_launch_line_names_the_irqchip_on_x86_64_alone()
+    {
+        // The defect caught: a run whose launch line does not say where its
+        // I/O APIC runs, which its timings depend on; riscv64 has no choice.
+        let field = |arch| {
+            X86Irqchip::launch_field(
+                arch,
+                Iommu::Attached,
+                InterruptRemapping::Withheld,
+                Execution::Icount,
+            )
+        };
+        assert_eq!(field(Arch::X86_64), " irqchip=qemu");
+        assert_eq!(field(Arch::Riscv64), "");
     }
 
     #[test]

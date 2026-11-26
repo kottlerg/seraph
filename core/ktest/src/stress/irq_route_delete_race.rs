@@ -59,6 +59,17 @@
 //! delete did not wait out, or from a removed binding that still named the
 //! victim.
 //!
+//! ## Its cost on x86-64
+//!
+//! On x86-64 each delivery masks the line at the I/O APIC and each
+//! acknowledgement unmasks it, a read-modify-write of the line's redirection
+//! entry each, and each round routes and releases the line, so the case's
+//! time follows the cost of an I/O APIC access. ktest's launch keeps the I/O
+//! APIC in KVM. A KVM launch that offers interrupt remapping emulates it in
+//! QEMU's process (`kernel-irqchip=split`), where every such access exits to
+//! QEMU and the case runs several times as long, a cost of the emulator that
+//! hardware does not have (xtask/README.md § Attached devices).
+//!
 //! ## Two schedules
 //!
 //! Every kind of round (direct, rebound, binding) runs in two schedules,

@@ -31,9 +31,9 @@ direct console paths remain as fallbacks for the life of the system.
    must not depend on userspace IPC. While a userspace reader is attached to the kernel log, the
    kernel's address-free lines (`kprintln!`) and userspace-fault diagnostics
    (`kprintln_fault!`) are records that reader writes on its console instead, so a kernel line
-   does not land inside one of the reader's; with no reader attached, or after one leaves records
-   unread for `KLOG_STALL_MS`, the kernel writes them directly again, and before a failure
-   report it writes the records no reader has written
+   does not land inside one of the reader's; with no reader attached, or after one leaves a record
+   unread for `KLOG_STALL_MS`, measured from the record's append, the kernel writes them directly
+   again, and before a failure report it writes the records no reader has written
    ([core/kernel/docs/kernel-log.md](../core/kernel/docs/kernel-log.md)). The kernel framebuffer
    renderer is similarly **retained**: it carries the console lines the kernel writes directly
    (`kprintln!` with no reader attached, and `kprintln_direct!`), including the address-free

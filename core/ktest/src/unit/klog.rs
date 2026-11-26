@@ -363,10 +363,10 @@ pub fn stalled_reader_falls_back(ctx: &TestContext) -> TestResult
     let cap = klog_cap(ctx)?;
     let from = next_seq();
     // No read from here: the first fault's lines are records ktest leaves
-    // unread past the bound, so a tick detaches it before the second fault.
-    let _ = syscall::thread_sleep(KLOG_STALL_MS + 300);
+    // unread past the bound, measured from their append, so a tick detaches
+    // it before the second fault.
     fault_at(ctx, FAULT_BASE + 0x4000)?;
-    let _ = syscall::thread_sleep(TICKS_MS);
+    let _ = syscall::thread_sleep(KLOG_STALL_MS + 300);
     let direct = FAULT_BASE + 0x5000;
     fault_at(ctx, direct)?;
     if recorded(cap, from, address_text(direct).as_str())?

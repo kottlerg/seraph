@@ -51,7 +51,7 @@ static KLOG_LOCK: Spinlock = Spinlock::new();
 static ATTACHED: AtomicBool = AtomicBool::new(false);
 static COMMITTED: AtomicU64 = AtomicU64::new(0);
 static LAST_READ_SEQ: AtomicU64 = AtomicU64::new(0);
-static LAST_READ_US: AtomicU64 = AtomicU64::new(0);
+static SINCE_US: AtomicU64 = AtomicU64::new(0);
 
 /// A record was appended since the last timer tick signalled the reader.
 static PENDING: AtomicBool = AtomicBool::new(false);
@@ -79,7 +79,7 @@ fn load_cursor() -> Cursor
         attached: ATTACHED.load(Ordering::Relaxed),
         committed: COMMITTED.load(Ordering::Acquire),
         last_read_seq: LAST_READ_SEQ.load(Ordering::Relaxed),
-        last_read_us: LAST_READ_US.load(Ordering::Relaxed),
+        since_us: SINCE_US.load(Ordering::Relaxed),
     }
 }
 
@@ -99,7 +99,11 @@ pub fn print(sink: Sink, args: core::fmt::Arguments)
     {
         let mut w = RING.begin();
         let _ = core::fmt::Write::write_fmt(&mut w, args);
-        RING.commit(w, us.unwrap_or(0), LEVEL_INFO);
+        let us = us.unwrap_or(0);
+        let seq = RING.commit(w, us, LEVEL_INFO);
+        let mut c = load_cursor();
+        c.on_append(seq, us);
+        SINCE_US.store(c.since_us, Ordering::Relaxed);
         PENDING.store(true, Ordering::Release);
     }
     else
@@ -243,8 +247,9 @@ pub fn copy_out(from: u64, out: &mut [u8]) -> (usize, u64)
 }
 
 /// Record a completed read (`ring::Cursor::on_read`): attach the reader,
-/// raise the committed mark to `ack_seq`, and note the read's time and the
-/// last record it returned.
+/// raise the committed mark to `ack_seq`, and note the last record it
+/// returned and, when it attached the reader or returned a new record, its
+/// time.
 pub fn complete_read(ack_seq: u64, returned_last: u64)
 {
     // SAFETY: released below; nothing here takes a lock.
@@ -258,7 +263,7 @@ pub fn complete_read(ack_seq: u64, returned_last: u64)
     );
     COMMITTED.fetch_max(c.committed, Ordering::AcqRel);
     LAST_READ_SEQ.store(c.last_read_seq, Ordering::Relaxed);
-    LAST_READ_US.store(c.last_read_us, Ordering::Relaxed);
+    SINCE_US.store(c.since_us, Ordering::Relaxed);
     ATTACHED.store(true, Ordering::Release);
     // SAFETY: paired with lock_raw above.
     unsafe { KLOG_LOCK.unlock_raw(saved) };
@@ -316,7 +321,7 @@ fn stall_check()
         crate::kprintln!(
             "klog: reader stalled at record {} for {} ms",
             c.last_read_seq.saturating_add(1),
-            now.saturating_sub(c.last_read_us) / 1000
+            now.saturating_sub(c.since_us) / 1000
         );
     }
 }

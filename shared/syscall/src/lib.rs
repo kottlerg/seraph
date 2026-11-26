@@ -3079,10 +3079,10 @@ pub fn thread_inherit_fault_handler(
 /// or, with `flags` = `UPCALL_ANY_INSTRUCTION`, at any return to user mode.
 ///
 /// Unless the thread masks upcalls, a block of it in one of the blocking
-/// syscalls (`SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`,
-/// `SYS_WAIT_SET_WAIT`, `SYS_THREAD_SLEEP`) returns `Interrupted`, unless
-/// its wake (a delivery, or the elapsed deadline of a sleep or a timed wait)
-/// was claimed first, and the upcall is delivered at that return; such a
+/// syscalls (`SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`, `SYS_NOTIFICATION_WAIT`,
+/// `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`, `SYS_THREAD_SLEEP`) returns
+/// `Interrupted`, unless its wake (a delivery, or the elapsed deadline of a
+/// sleep or a timed wait) was claimed first, and the upcall is delivered at that return; such a
 /// syscall it enters with the upcall pending returns `Interrupted` at once
 /// instead of blocking, while a try-once (`WAIT_TRY_ONCE`), or a syscall
 /// whose result is already available, returns its own result. A call

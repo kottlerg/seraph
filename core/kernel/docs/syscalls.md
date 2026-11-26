@@ -721,9 +721,9 @@ Dequeue the next entry from an event queue with optional bounded wait.
 | 0 | `queue_cap`  | Event queue capability with Recv rights                 |
 | 1 | `timeout_ms` | Wait policy: see sentinels below                        |
 
-`timeout_ms` sentinels, shared by `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, and
-`SYS_WAIT_SET_WAIT` (`u64::MAX` is `syscall_abi::WAIT_TRY_ONCE`; an elapsed
-`SYS_NOTIFICATION_WAIT` returns a zero bitmask rather than `WouldBlock`):
+`timeout_ms` sentinels, shared by `SYS_IPC_RECV`, the receive of `SYS_IPC_REPLY_RECV`,
+`SYS_NOTIFICATION_WAIT`, and `SYS_WAIT_SET_WAIT` (`u64::MAX` is `syscall_abi::WAIT_TRY_ONCE`; an
+elapsed `SYS_NOTIFICATION_WAIT` returns a zero bitmask rather than `WouldBlock`):
 
 | Value             | Behaviour                                                       |
 |-------------------|-----------------------------------------------------------------|
@@ -4098,22 +4098,24 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   § Lock Hierarchy).
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
-  `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
-  `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`,
-  or, `SYS_IPC_CALL` apart, is posted an upcall it does not mask (`SYS_THREAD_POST_UPCALL`),
-  unless its wake (a delivery, or the elapsed deadline of a sleep or a timed wait) was claimed
-  first. `SYS_IPC_CALL` is atomic with respect to upcalls: an upcall posted to a thread queued on
-  the endpoint or awaiting its reply, or pending when the call begins, ends neither wait, and is
-  delivered at the call's own return with the call's result in the registers
-  ([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
-  Upcalls, Blocking syscalls; [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md)
-  § Upcall Cancel-and-Wake Protocol). `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
-  `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
-  caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or
-  is destroyed before replying. `SYS_IPC_CALL` and `SYS_IPC_RECV` queued on an endpoint return
+  `SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`,
+  `SYS_WAIT_SET_WAIT`, `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped
+  via `SYS_THREAD_STOP`, or, `SYS_IPC_CALL` apart, is posted an upcall it does not mask
+  (`SYS_THREAD_POST_UPCALL`), unless its wake (a delivery, or the elapsed deadline of a sleep or a
+  timed wait) was claimed first. `SYS_IPC_CALL` is atomic with respect to upcalls: an upcall posted
+  to a thread queued on the endpoint or awaiting its reply, or pending when the call begins, ends
+  neither wait, and is delivered at the call's own return with the call's result in the registers
+  ([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous Upcalls,
+  Blocking syscalls; [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall
+  Cancel-and-Wake Protocol). `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and `SYS_WAIT_SET_WAIT` also
+  return `Interrupted` when the object waited on is destroyed under the caller, and `SYS_IPC_CALL`
+  returns it when the receiving thread receives again before replying or is destroyed before
+  replying. `SYS_IPC_CALL`, `SYS_IPC_RECV` and `SYS_IPC_REPLY_RECV` queued on an endpoint return
   `NoReceiver`, not `Interrupted`, when the last capability with the Receive right goes or the
-  endpoint is destroyed under them. `SYS_THREAD_START` returns `Interrupted` when its caller is
-  stopped while the start waits for the target to settle; nothing is started.
+  endpoint is destroyed under them. `SYS_IPC_REPLY_RECV` returns these errors, and `WouldBlock`,
+  from its receive, after its reply was delivered and its caller woken: a retry receives with
+  `SYS_IPC_RECV` and does not reply again. `SYS_THREAD_START` returns `Interrupted` when its caller
+  is stopped while the start waits for the target to settle; nothing is started.
 
 ---
 
@@ -4123,7 +4125,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 |---|---|---|
 | `MSG_DATA_WORDS_MAX` | 64 | Maximum data words per message |
 | `MSG_CAP_SLOTS_MAX` | 4 | Maximum capabilities per message |
-| `WAIT_TRY_ONCE` | `u64::MAX` | The `timeout_ms` that makes `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, or `SYS_WAIT_SET_WAIT` a non-blocking try-once |
+| `WAIT_TRY_ONCE` | `u64::MAX` | The `timeout_ms` that makes `SYS_IPC_RECV`, the receive of `SYS_IPC_REPLY_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, or `SYS_WAIT_SET_WAIT` a non-blocking try-once |
 | `IPC_CALL_TIMEOUT_SHIFT` | 32 | Bit position of `SYS_IPC_CALL`'s `timeout_ms` in its arg 2, above `data_count` |
 | `CSPACE_IPC_RECV_RESERVE` | 4 | Free slots every CSpace keeps back from general allocations for IPC capability transfer (§ Error Codes) |
 | `CSPACE_SLOTS_PER_PAGE` | 56 | Capability slots one donated CSpace slot page backs |

@@ -1072,9 +1072,10 @@ pub const fn ipc_delivered_cap_count(counts: u64) -> u64
 
 /// The `timeout_ms` sentinel that makes a wait a non-blocking try-once: the
 /// wait takes what is ready, or returns `WouldBlock` at once without parking.
-/// `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
-/// `SYS_WAIT_SET_WAIT` accept it; `0` blocks indefinitely, and any other value
-/// bounds the wait in milliseconds (`core/kernel/docs/syscalls.md`).
+/// `SYS_IPC_RECV`, the receive of `SYS_IPC_REPLY_RECV`,
+/// `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and `SYS_WAIT_SET_WAIT` accept
+/// it; `0` blocks indefinitely, and any other value bounds the wait in
+/// milliseconds (`core/kernel/docs/syscalls.md`).
 pub const WAIT_TRY_ONCE: u64 = u64::MAX;
 
 /// Bit position of `SYS_IPC_CALL`'s `timeout_ms` in its `arg2`: the low 32

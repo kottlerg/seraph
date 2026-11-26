@@ -137,7 +137,9 @@ skipping levels, risks deadlock.
    under it only try-locks each walked thread's `sched_lock` and,
    under that, the lock of the source the thread is bound to; the one lock it
    waits for under the registry lock is the console's `CONSOLE_LOCK`
-   (`kprintln!`), a leaf no holder keeps across another acquisition, so that
+   (`kprintln_direct!`, which under it first writes the unread kernel log
+   records, reading the ring without its lock), a leaf no holder keeps across
+   another acquisition, so that
    wait is on no CPU that needs the registry (§ Softlockup Watchdog). See
    § Thread Registry.
 
@@ -1883,7 +1885,7 @@ storm when many CPUs observe the same stall, and the first dump is the uncontami
 dump is callable from any CPU in interrupt context. Every field it prints is read under the lock
 that owns it or is atomic, and every such lock is only try-locked, so a wedged holder cannot
 deadlock the dump (a contended lock prints as held and its fields are skipped), though every line it
-prints still takes the console lock (`kprintln!`): each CPU's `current` under that CPU's
+prints still takes the console lock (`kprintln_direct!`): each CPU's `current` under that CPU's
 `scheduler.lock` (which keeps the thread allocated, § Cross-CPU TCB Ownership step 8) and the
 thread's own `sched_lock`; the sleep-list entries' ids and deadlines under `SLEEP_LIST_LOCK` (a
 leaf, so nothing is taken under it; the threads' states are printed by the registry walk), copied
@@ -1893,7 +1895,7 @@ under the registry lock); and a `Blocked` thread's blocking source under that `s
 observed binding keeps the source allocated, the argument of `ipc::lock_bound_source`) and the
 source's own lock. The owed-wake detector (2 below) reads the walked threads' `sched_lock`-owned
 fields under each thread's try-locked `sched_lock`, skipping a thread whose lock is held for that
-scan. The dump names threads by id and prints no kernel pointer through `kprintln!`, as
+scan. The dump names threads by id and prints no kernel pointer through `kprintln_direct!`, as
 [cross-boundary-disclosure.md § Kernel console
 diagnostics](cross-boundary-disclosure.md#kernel-console-diagnostics) requires.
 

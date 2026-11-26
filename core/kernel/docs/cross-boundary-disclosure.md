@@ -90,9 +90,10 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | IPC `Message` label / badge / data[] / cap_slots[] | `ipc::message::Message`, `ipc::{read_ipc_buf, write_ipc_buf, read_data_words, deliver_data_words, write_cap_results}` | b/c |
 | Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge, and, on a forwarded fault, data word 4 (the forwarding handler's reason word) | `ipc::fault::FaultInfo`, `ipc::fault::deliver_once`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for`, `syscall::deliver_copy_fault` | b/d |
 | Upcall message (`FAULT_KIND_UPCALL`) → the poster's cookie, the delivery point, and the thread's user instruction pointer, to the receiver of the thread's upcall binding; no kernel address, and nothing identifying the poster | `ipc::upcall::deliver`, `ipc::fault::FaultInfo` | b/d |
+| `SYS_KERNEL_LOG_READ` → kernel log records: sequence numbers, times, levels and the text of the address-free (R) and userspace-fault (U) lines, to the holder of a `KernelLog` cap with `Read` | `klog::ring::Ring::copy_out`, `syscall::klog::sys_kernel_log_read` | b/d |
 | Exit / death reason encoding + death entry `(reason, correlator)` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
-| `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
+| `CSpaceId` (registry index, returned to userspace only as the text of kernel log records); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
 | Boot-time `InitInfo` handover — kernel writes a read-only struct into init's mapped region | `init_protocol::InitInfo`, `init_protocol::CapDescriptor` | b/c/d/e |
 | x86-64 descriptor-table registers read at CPL 3 (`SGDT`, `SIDT`, `SLDT`, `SMSW`, `STR`): `#GP` where `CR4.UMIP` is set; the IDTR and GDTR bases on a CPU without UMIP | `cpu::enable_smep_smap`, `idt::IDT`, `gdt::GDT`, `gdt::AP_GDT_PTR` | d / **a** without UMIP |
 
@@ -158,7 +159,8 @@ Notes on the non-obvious entries:
   fixed value 1 (class **d**) (issue #248;
   [scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership) — a
   monotonic id would leak thread creation counts/rates wherever logged. They are diagnostic
-  correlators only and never cross the boundary as syscall data.
+  correlators only, and cross the boundary as data only as the text of kernel log records
+  (§ Kernel console diagnostics), never as a syscall's value.
 - **`SYS_SBI_CALL`** forwards caller-supplied arguments to M-mode firmware and
   returns the firmware result; neither the arguments the kernel forwards nor the
   value it returns is kernel-derived.
@@ -237,6 +239,9 @@ the two a process can reach answer only a holder of the Memory `Phys` right
   `CapDescriptor::aux0` (Memory / Mmio physical base) and
   `InitFramebufferInfo::physical_base`. Each describes a resource init receives a
   capability to, and init alone reads the handover.
+
+No kernel console line that reaches the framebuffer or the kernel log carries a physical
+address: the lines that print one are serial-only (§ Kernel console diagnostics).
 
 Who holds `Phys`, and why:
 
@@ -378,50 +383,64 @@ contents), so it does not reach the next owner.
 
 ## Kernel console diagnostics
 
-The kernel's `kprint!` / `kprintln!` macros (`core/kernel/src/console.rs`) and the
-register-dump, watchdog, and `KERNEL EXCEPTION` paths do format kernel pointers (`{:p}`,
-`{:#x}`). No IPC channel delivers kernel log output to a userspace process as data, but
-`kprintln!` mirrors to the framebuffer, whose memory userspace can read back; only the
-serial-only class ([docs/console-model.md](../../../docs/console-model.md) § Ownership
-across the boot lifecycle) is not userspace-readable. The
-always-on `USERSPACE FAULT` serial dumps print the faulting thread's *own* user
-registers, not kernel addresses, and the `fault unhandled` line ahead of one prints only the
-thread id and the fault handler's own decline-reason word, or the kernel's own cause. Every
-kernel VA outside the low-VA identity mappings (the boot-stack mapping and, until Phase 8, the AP
-trampoline page, whose VAs equal their physical addresses) lies in one of the two regions KASLR
-randomizes (the image or the direct map; see [docs/memory-model.md](../../../docs/memory-model.md) §
-Virtual Address Space Layout), so kernel-pointer console output is governed by the serial-only rule
-below; it must not be routed to any userspace-reachable IPC or log channel.
+The kernel's print macros (`core/kernel/src/console.rs`) and the register-dump, watchdog, and
+`KERNEL EXCEPTION` paths format values that can be kernel pointers or physical addresses
+(`{:p}`, `{:#x}`). Two of the outputs these lines reach are userspace-readable: the framebuffer,
+which a `kprintln!` or `kprintln_direct!` line written to the console mirrors to and whose memory
+userspace can read back, and the kernel log, whose records a holder of a `KernelLog` capability
+reads as data with `SYS_KERNEL_LOG_READ` ([kernel-log.md](kernel-log.md)). Only the serial-only
+class ([docs/console-model.md](../../../docs/console-model.md) § Ownership across the boot
+lifecycle) is not userspace-readable. A line becomes a record only through `kprintln!` and
+`kprintln_fault!` ([kernel-log.md](kernel-log.md) § Print classes); the serial-only sinks never
+make one. The `USERSPACE FAULT` dumps (`kprintln_fault!`), which reach the kernel log's reader
+while one is attached and otherwise the serial port only, print the faulting thread's *own* user
+registers, not kernel addresses, and on x86-64 an error code whose present bit is cleared for a
+page fault at or above the user half's top, as the fault message's is (§ Surface inventory, the
+fault message); the raw error code of such a fault is on no line they print. The
+`fault unhandled` line ahead of one prints only the thread id and the fault handler's own
+decline-reason word, or the kernel's own cause. Every kernel VA outside the low-VA identity
+mappings (the boot-stack mapping and, until Phase 8, the AP trampoline page, whose VAs equal their
+physical addresses) lies in one of the two regions KASLR randomizes (the image or the direct map;
+see [docs/memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout), so
+kernel-pointer console output is governed by the serial-only rule below; it must not be routed to
+any userspace-reachable IPC or log channel.
 
-**KASLR values are serial-only.** The randomized kernel image base, direct-map base, and slide, and
-any kernel virtual address derived from them (an image VA or a direct-map VA), are secrets whose
-disclosure defeats KASLR. `kprintln!` mirrors to the framebuffer, and although the kernel writes
-that framebuffer directly (not as a driver client), the framebuffer *memory* is later handed to the
-userspace framebuffer driver ([docs/console-model.md](../../../docs/console-model.md) § The
-framebuffer driver as sole userspace framebuffer owner), which can read the pixels back — so a KASLR
-value printed via `kprintln!` becomes userspace-recoverable. These values must be emitted **only**
-via the serial-only sinks (`kprintln_serial!` / `console::serial_write_fmt`; on the panic and NMI
-paths the lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` / `console::nmi_write_fmt`),
-never `kprintln!`, and never through any IPC or log channel. The panic handler's backtrace and the
-x86-64 NMI backtrace print their kernel addresses through those two sinks, and so does the panic
-handler's message line: a panic or assertion message that formats a kernel pointer (the run-queue
-link and use-after-free checks print a TCB address, the sleep list's binding check a source
-address, and the reference-count checks an object address) reaches only `console::panic_write_fmt`,
-and each such format carries the `clippy::pointer_format` expectation that
+**KASLR values and physical addresses are serial-only.** The randomized kernel image base,
+direct-map base, and slide, and any kernel virtual address derived from them (an image VA or a
+direct-map VA), are secrets whose disclosure defeats KASLR. The framebuffer the console mirrors
+to is written by the kernel directly (not as a driver client), but its *memory* is later handed to
+the userspace framebuffer driver ([docs/console-model.md](../../../docs/console-model.md) § The
+framebuffer driver as sole userspace framebuffer owner), which can read the pixels back, and a
+`kprintln!` or `kprintln_fault!` line is a record the kernel log's reader receives — so a KASLR
+value printed through either becomes userspace-recoverable. These values, and every physical
+address a line carries, must be emitted **only** via the serial-only sinks (`kprintln_serial!` /
+`console::print_serial`; on the panic and NMI paths the lock-bypassing
+`console::panic_write_fmt` and `kprintln_nmi!` / `console::nmi_write_fmt`), never
+`kprintln!`, `kprintln_fault!` or `kprintln_direct!`, and never through any IPC channel or the
+kernel log. The physical addresses the kernel prints (the Phase 2 memory map, the device-tree
+refusals, the MMIO aperture refusals, the retype free-list corruption reports, the frame map's
+underflow report, the I/O APIC report and the VM generation ID's address) are printed this way.
+The panic handler's backtrace and the x86-64 NMI backtrace print their kernel addresses through
+those two sinks, and so does the panic handler's message line: a panic or assertion message that
+formats a kernel pointer (the run-queue link and use-after-free checks print a TCB address, the
+sleep list's binding check a source address, and the reference-count checks an object address)
+reaches only `console::panic_write_fmt`, and each such format carries the
+`clippy::pointer_format` expectation that
 [docs/coding-standards.md](../../../docs/coding-standards.md) § Cross-Boundary Data Hygiene
 requires.
 The Phase-1 KASLR report
 prints address-free status lines (one for the image, one for the direct map) via `kprintln!` and the
 slide/bases only via `kprintln_serial!`; the Phase-9 init-thread report prints the thread id and
 priority on one `kprintln!` line and init's kernel stack top (a direct-map VA) on a separate
-`kprintln_serial!` line; the watchdog dump's lock-wait line prints the lock kind via `kprintln!` and
-the lock word's address (an image VA for a static lock, revealing the slide, or a direct-map VA for
-a slab-resident one) only via `kprintln_serial!`, and the rest of the watchdog dump (the per-CPU
-snapshot, the sleep list, the registry walk and its blocking-object decode) names threads by id and
-objects by kind, printing no pointer; the bootloader's console (which also mirrors to the
-framebuffer) prints only the opaque `kaslr_flags`. Paths that end in `fatal`, which halts only the
-faulting CPU (so on SMP the rest of the system, userspace included, keeps running), print an
-address-free header via `kprintln!` and every value that can be a kernel VA via `kprintln_serial!`:
+`kprintln_serial!` line; the watchdog dump's lock-wait line prints the lock kind via
+`kprintln_direct!` and the lock word's address (an image VA for a static lock, revealing the
+slide, or a direct-map VA for a slab-resident one) only via `kprintln_serial!`, and the rest of the
+watchdog dump (the per-CPU snapshot, the sleep list, the registry walk and its blocking-object
+decode) names threads by id and objects by kind, printing no pointer; the bootloader's console
+(which also mirrors to the framebuffer) prints only the opaque `kaslr_flags`. Paths that end in
+`fatal`, which halts only the faulting CPU (so on SMP the rest of the system, userspace included,
+keeps running), print an address-free header via `kprintln_direct!` and every value that can be a
+kernel VA via `kprintln_serial!`:
 the x86-64 `KERNEL EXCEPTION` dump (`rip`, `cr2`, the register file, and, with `CR4.CET` set,
 the CET registers serial-only; the vector, error code, `cs`, and `rflags` on the console), the
 riscv64 `KERNEL STACK OVERFLOW` dump (`sepc`, `stval`, `sp`, and `floor` serial-only; the CPU on
@@ -489,7 +508,7 @@ identifier observed across the boundary is drawn from the entropy root
 ## Summarized By
 
 [core/kernel/README.md](../README.md), [Capability Subsystem Internals](capability-internals.md),
-[Kernel Initialization Sequence](initialization.md),
+[Kernel Initialization Sequence](initialization.md), [Kernel Log](kernel-log.md),
 [Return-Address Integrity](return-address-integrity.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [core/ktest/README.md](../../ktest/README.md),

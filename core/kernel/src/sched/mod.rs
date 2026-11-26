@@ -1299,7 +1299,7 @@ fn owed_wake_scan()
             OWED_RULE_WAKE_IN_FLIGHT => "wake claimed (wake_in_flight) but never linked",
             _ => "wake_pending persisting while Blocked",
         };
-        crate::kprintln!("watchdog: owed wake lost on tid{}: {}", tid, rule_name);
+        crate::kprintln_direct!("watchdog: owed wake lost on tid{}: {}", tid, rule_name);
         watchdog_dump("Blocked thread whose owed wake never arrived");
     }
 }
@@ -1340,7 +1340,7 @@ fn ap_silence_check(cpu_count: usize)
         {
             // The silent CPU's own frame first, before this CPU prints.
             let frame = crate::arch::current::interrupts::dump_remote_frame(cpu);
-            crate::kprintln!(
+            crate::kprintln_direct!(
                 "watchdog: cpu{} timer heartbeat stalled (last={} now={} own_frame={})",
                 cpu,
                 hb,
@@ -1388,7 +1388,7 @@ fn bsp_stall_check(own_heartbeat: u64)
         // The BSP's own frame first, before this CPU prints.
         let frame = crate::arch::current::interrupts::dump_remote_frame(0);
         let cpu = crate::arch::current::cpu::current_cpu();
-        crate::kprintln!(
+        crate::kprintln_direct!(
             "watchdog: cpu{} observes BSP heartbeat stalled (bsp={} now={} own_frame={})",
             cpu,
             hb0,
@@ -1418,8 +1418,8 @@ fn watchdog_dump(reason: &str)
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     let now = WATCHDOG_TICK_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
-    crate::kprintln!("=== WATCHDOG: {} ===", reason);
-    crate::kprintln!(
+    crate::kprintln_direct!("=== WATCHDOG: {} ===", reason);
+    crate::kprintln_direct!(
         "  bsp_tick={} timer_tick={} last_idle_tick={}",
         now,
         crate::arch::current::timer::current_tick(),
@@ -1439,7 +1439,7 @@ fn watchdog_dump(reason: &str)
     let (site_file, site_line) = deriv
         .site
         .map_or(("none", 0), |loc| (loc.file(), loc.line()));
-    crate::kprintln!(
+    crate::kprintln_direct!(
         "  DERIVATION_LOCK state=0x{:x} holder_cpu={} last_tid={} last_syscall={} \
          last_site={}:{}",
         deriv.state,
@@ -1451,7 +1451,7 @@ fn watchdog_dump(reason: &str)
     );
     watchdog_dump_sleep_list();
     watchdog_dump_registry();
-    crate::kprintln!("=== END WATCHDOG ===");
+    crate::kprintln_direct!("=== END WATCHDOG ===");
 }
 
 /// One CPU's `current`, as the watchdog reads it under the locks that own it.
@@ -1567,7 +1567,7 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
     {
         CpuSnapshot::SchedulerLocked =>
         {
-            crate::kprintln!(
+            crate::kprintln_direct!(
                 "  cpu{} (scheduler lock held) idle_age={} heartbeat={} mask=0x{:x}",
                 cpu,
                 idle_age,
@@ -1577,7 +1577,7 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
         }
         CpuSnapshot::NoCurrent =>
         {
-            crate::kprintln!(
+            crate::kprintln_direct!(
                 "  cpu{} current=NULL last_tick={} now={}",
                 cpu,
                 last_tick,
@@ -1587,7 +1587,7 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
         }
         CpuSnapshot::ThreadLocked { tid } =>
         {
-            crate::kprintln!(
+            crate::kprintln_direct!(
                 "  cpu{} tid{} (sched_lock held) idle_age={} heartbeat={} mask=0x{:x}",
                 cpu,
                 tid,
@@ -1605,7 +1605,7 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
             pref,
         } =>
         {
-            crate::kprintln!(
+            crate::kprintln_direct!(
                 "  cpu{} tid{} state={:?} ipc={:?} bound={} prio={} pref={} \
                  idle_age={} heartbeat={} mask=0x{:x}",
                 cpu,
@@ -1629,7 +1629,7 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
     });
     if spin != SPIN_SITE_NONE
     {
-        crate::kprintln!("    spinning in {}", spin_site_name(spin));
+        crate::kprintln_direct!("    spinning in {}", spin_site_name(spin));
     }
     // Name the bare spin lock this CPU is waiting for, if any: these waits
     // spin with interrupts masked, inside a preempt-disabled window, or on
@@ -1654,7 +1654,7 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
         // The lock word's address is a kernel VA: serial only
         // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
         // diagnostics).
-        crate::kprintln!("    waiting on {} lock", lock_kind.name());
+        crate::kprintln_direct!("    waiting on {} lock", lock_kind.name());
         crate::kprintln_serial!("    lock word @0x{:x}", word);
     }
     // The last syscall entered on this CPU, from the dispatcher's per-CPU
@@ -1664,7 +1664,7 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
     });
     if syscall_nr != u64::MAX
     {
-        crate::kprintln!("    last syscall on this cpu: nr={}", syscall_nr);
+        crate::kprintln_direct!("    last syscall on this cpu: nr={}", syscall_nr);
     }
 }
 
@@ -1731,16 +1731,16 @@ fn watchdog_dump_sleep_list()
     let Some(count) = count
     else
     {
-        crate::kprintln!("  SLEEP_LIST (lock contended; skipped)");
+        crate::kprintln_direct!("  SLEEP_LIST (lock contended; skipped)");
         return;
     };
-    crate::kprintln!("  SLEEP_LIST count={}", count);
+    crate::kprintln_direct!("  SLEEP_LIST count={}", count);
     for (i, entry) in entries
         .iter()
         .enumerate()
         .take(count.min(WATCHDOG_SLEEP_ENTRIES))
     {
-        crate::kprintln!("    sleep[{}] tid={} dl={}", i, entry.tid, entry.deadline);
+        crate::kprintln_direct!("    sleep[{}] tid={} dl={}", i, entry.tid, entry.deadline);
     }
 }
 
@@ -1760,7 +1760,7 @@ fn watchdog_dump_sleep_list()
 #[cfg(not(test))]
 fn watchdog_dump_registry()
 {
-    crate::kprintln!("  NON-RUNNING REGISTERED THREADS:");
+    crate::kprintln_direct!("  NON-RUNNING REGISTERED THREADS:");
     let dump = |t: *mut ThreadControlBlock| {
         // SAFETY: the walk holds the registry lock, which keeps each walked
         // TCB allocated.
@@ -1769,12 +1769,12 @@ fn watchdog_dump_registry()
     // SAFETY: the closure registers and unregisters no thread, the locks it
     // takes (each TCB's `sched_lock` and its bound source's lock) are only
     // try-locked and released before it prints, and the one lock it waits for
-    // is the console's leaf `CONSOLE_LOCK` in `kprintln!`, as `try_for_each`'s
+    // is the console's leaf `CONSOLE_LOCK` in `kprintln_direct!`, as `try_for_each`'s
     // contract allows.
     let walked = unsafe { thread_registry::try_for_each(dump) };
     if !walked
     {
-        crate::kprintln!("    (registry walk contended; skipped or cut short)");
+        crate::kprintln_direct!("    (registry walk contended; skipped or cut short)");
     }
 }
 
@@ -1818,7 +1818,7 @@ unsafe fn watchdog_dump_thread(t: *mut ThreadControlBlock)
     let Some(saved) = (unsafe { t_lock.try_lock_raw() })
     else
     {
-        crate::kprintln!("    tid{} (sched_lock held)", tid);
+        crate::kprintln_direct!("    tid{} (sched_lock held)", tid);
         return;
     };
     #[expect(
@@ -1868,7 +1868,7 @@ fn watchdog_print_thread(tid: u32, snap: &ThreadSnapshot, decoded: &BlockedOnSna
     {
         thread::ThreadState::Blocked =>
         {
-            crate::kprintln!(
+            crate::kprintln_direct!(
                 "    tid{} Blocked ipc={:?} bound={} prio={} pref={} wake_pending={} \
                  wake_in_flight={} dl={} parked_at={}",
                 tid,
@@ -1887,7 +1887,7 @@ fn watchdog_print_thread(tid: u32, snap: &ThreadSnapshot, decoded: &BlockedOnSna
         | thread::ThreadState::Stopped
         | thread::ThreadState::Created =>
         {
-            crate::kprintln!(
+            crate::kprintln_direct!(
                 "    tid{} {:?} prio={} pref={} affinity=0x{:x} queued_on={} \
                  context_saved={} wake_in_flight={} wake_pending={}",
                 tid,
@@ -2006,14 +2006,14 @@ fn watchdog_print_blocked_on(decoded: &BlockedOnSnapshot)
         {}
         BlockedOnSnapshot::Server { tid, reply_is_self } =>
         {
-            crate::kprintln!("      server tid{} reply_is_self={}", tid, reply_is_self);
+            crate::kprintln_direct!("      server tid{} reply_is_self={}", tid, reply_is_self);
         }
-        BlockedOnSnapshot::SourceLocked => crate::kprintln!("      source lock held"),
+        BlockedOnSnapshot::SourceLocked => crate::kprintln_direct!("      source lock held"),
         BlockedOnSnapshot::Source(SourceSnapshot::EventQueue {
             queued,
             count,
             capacity,
-        }) => crate::kprintln!(
+        }) => crate::kprintln_direct!(
             "      eq: queued={} count={} capacity={}",
             queued,
             count,
@@ -2021,19 +2021,19 @@ fn watchdog_print_blocked_on(decoded: &BlockedOnSnapshot)
         ),
         BlockedOnSnapshot::Source(SourceSnapshot::Notification { queued, bits }) =>
         {
-            crate::kprintln!("      notif: queued={} bits=0x{:x}", queued, bits);
+            crate::kprintln_direct!("      notif: queued={} bits=0x{:x}", queued, bits);
         }
         BlockedOnSnapshot::Source(SourceSnapshot::Endpoint {
             send_head,
             recv_head,
-        }) => crate::kprintln!(
+        }) => crate::kprintln_direct!(
             "      ep: send_head={} recv_head={}",
             TidOrNone(*send_head),
             TidOrNone(*recv_head)
         ),
         BlockedOnSnapshot::Source(SourceSnapshot::WaitSet { queued }) =>
         {
-            crate::kprintln!("      waitset: queued={}", queued);
+            crate::kprintln_direct!("      waitset: queued={}", queued);
         }
     }
 }
@@ -8833,6 +8833,12 @@ pub unsafe fn timer_tick()
     {
         crate::entropy::vmgenid::poll_log();
     }
+
+    // Kernel log: signal the reader once records were appended since the
+    // last tick, and on the BSP end a stalled reader's attach
+    // (core/kernel/docs/kernel-log.md § Reader notification).
+    // SAFETY: interrupt context, interrupts disabled, no lock held.
+    unsafe { crate::klog::tick(cpu) };
 
     // SAFETY: an interrupt on a CPU whose per-CPU pointer is installed;
     // percpu::init_storage named its scheduler, initialised by init().

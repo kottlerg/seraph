@@ -125,7 +125,12 @@ pub mod property;
 ///     descriptor and its controller's PCI location), which the kernel checks
 ///     and copies from `BootInfo`. `framebuffer` moves 48 bytes on, and the
 ///     boot-module name table and the descriptor array after it.
-pub const INIT_PROTOCOL_VERSION: u32 = 20;
+/// v21: Added [`CapType::KernelLog`]: the root `CSpace` carries one
+///     `KernelLog` capability, on both architectures, named by its
+///     [`CapDescriptor`] alone (no [`InitInfo`] field). Field layout
+///     unchanged; an init built against v20 would read the new descriptor's
+///     type byte as no [`CapType`] at all.
+pub const INIT_PROTOCOL_VERSION: u32 = 21;
 
 /// Length of [`InitModuleName::name`], matching
 /// `boot_protocol::BOOT_MODULE_NAME_LEN` (256, `objsig::NAME_MAX`) so the
@@ -553,6 +558,9 @@ pub enum CapType
     /// Authority to mix bytes into the kernel entropy pool. Matches
     /// `CapTag::EntropyControl = 14`. `aux0 = aux1 = 0`.
     EntropyControl = 14,
+    /// Authority to read the kernel log. Matches `CapTag::KernelLog = 15`.
+    /// `aux0 = aux1 = 0`.
+    KernelLog = 15,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

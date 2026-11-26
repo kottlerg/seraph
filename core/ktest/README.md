@@ -10,6 +10,10 @@ On completion ktest emits the cross-harness marker
 [docs/testing.md](../../docs/testing.md). `cargo xtask run --runs`, which CI boots it with,
 passes the boot on that pass marker and on no other line.
 
+ktest holds the root `KernelLog` capability and is the kernel log's reader: it attaches at its start
+and writes the kernel's records, in the kernel's own line form, before each line of its own and in
+its waits ([core/kernel/docs/kernel-log.md](../kernel/docs/kernel-log.md) § Readers).
+
 ---
 
 ## Activating ktest
@@ -50,6 +54,7 @@ core/ktest/
     ├── tally.rs            # Failure tallies and receive-guard diagnostics for stress cells
     ├── latency.rs          # Interrupt-latency rig: a call probed by TLB shootdowns from
     │                       # another CPU
+    ├── klog.rs             # The kernel log reader: attach, drain and write the records
     ├── arch/               # Arch-dispatch surface (see Test structure)
     │   ├── mod.rs          # Selects the active arch module by target_arch
     │   ├── x86_64/         # x86-64 entry points, constants, I/O ports, COM1 serial,
@@ -134,6 +139,7 @@ respectively. Files are grouped by kernel subsystem, mirroring the kernel's own 
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, sole reference, type-specific fields); the `InitInfo` RAM Memory descriptors against their caps; the `Phys` gate on the physical base and on an address space's `Read` right |
 | `retype.rs` | Retype primitive: augmentation and donation spill, `CSpace` growth into the indirect and double-indirect directory regions by explicit placement, PT walk budget, kernel PT pool, and the page-pool latency cases: a TLB shootdown of a CPU deleting a pool of ten thousand donations, or seeding one large donation, is acknowledged within a bound while the call runs; and the machine-code stubs the address-space stop cases run, each written through a data mapping and then mapped executable, with `SYS_SYSTEM_INFO(InstructionCacheSyncs)` rising across that map (the instruction-fetch synchronisation of [docs/memory-model.md § Instruction-Fetch Coherence](../../docs/memory-model.md#instruction-fetch-coherence), which QEMU does not need to pass) |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, `SYS_ASPACE_QUERY`; `SYS_ASPACE_HARVEST`: the bitmap of a range reports exactly the pages touched since the last harvest (an unmapped page reads 0), a cap without `Map`, an unaligned or kernel-half range, and a count of 0 or past `MAX_HARVEST_PAGES` are refused, a bitmap the copy-out cannot write clears no accessed bit, and a kernel copy (`SYS_GETRANDOM`) into a page whose accessed bit a harvest cleared succeeds and sets it again |
+| `klog.rs` | `SYS_KERNEL_LOG_READ` / `SYS_KERNEL_LOG_BIND` refusals, fault lines as records, the bound notification's signal, binding replacement and clearing, the stall fallback |
 | `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` and an over-maximum length refused with `InvalidArgument`; `SYS_ENTROPY_CONTRIBUTE` (`entropy_contribute_then_draw`, `entropy_contribute_cap_refusals`, `entropy_contribute_arg_refusals`) |
 | `notification.rs` | `SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT` (blocking and `notification_wait_timeout`) |
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
@@ -668,6 +674,7 @@ before recompiling is how a narrower-scope run is produced.
 | [core/kernel/docs/thread-lifecycle-and-sleep.md](../kernel/docs/thread-lifecycle-and-sleep.md) | The stop protocol and park semantics the stop and sleep stress cells race |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics and the receive-failure policy the cells' `RecvGuard`s follow |
 | [docs/fault-handling.md](../../docs/fault-handling.md) | The pager protocol the fault integration tests and `stop_fault_sender` drive |
+| [core/kernel/docs/kernel-log.md](../kernel/docs/kernel-log.md) | The kernel log ring and the reader protocol ktest follows (§ Readers) |
 | [docs/console-model.md](../../docs/console-model.md) | ktest's direct serial and framebuffer output across boot |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety, and testing rules |
 

@@ -596,12 +596,15 @@ Phase 7.
    g. One EntropyControl capability carrying Contribute, authorising the holder to
       contribute bytes to the entropy pool through SYS_ENTROPY_CONTRIBUTE; init finds it by
       its `CapDescriptor` (`CapType::EntropyControl`, `aux0 = aux1 = 0`)
-   h. Memory capabilities for the boot module images, via
+   h. One KernelLog capability carrying Read, authorising the holder to read the kernel log
+      through SYS_KERNEL_LOG_READ and to bind a notification to it through SYS_KERNEL_LOG_BIND;
+      init finds it by its `CapDescriptor` (`CapType::KernelLog`, `aux0 = aux1 = 0`)
+   i. Memory capabilities for the boot module images, via
       `cap::mint_module_memory_caps` (one per `BootInfo.modules` entry), which
       also writes each module's name entry into the `InitInfo` module-name
       table, which follows the header at `MODULE_NAMES_OFFSET`, in place in
       the region step 1 reserved, and the entry count into the header
-   i. (Init's AddressSpace, Thread, and CSpace capabilities and the Memory capabilities
+   j. (Init's AddressSpace, Thread, and CSpace capabilities and the Memory capabilities
       for its segments, InitInfo pages, and stack pages are added in Phase 9)
 
    Because step 1 reserves Phase 9's backing before the drain takes the
@@ -929,7 +932,7 @@ At any phase, if the kernel cannot continue:
 ```rust
 pub(crate) fn fatal(msg: &str) -> !
 {
-    kprintln!("FATAL: {}", msg);
+    kprintln_direct!("FATAL: {}", msg);
     arch::current::cpu::halt_loop();
 }
 ```

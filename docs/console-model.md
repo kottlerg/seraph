@@ -25,24 +25,31 @@ direct console paths remain as fallbacks for the life of the system.
    geometry forward.
 
 2. **Kernel early console** — `core/kernel/src/console.rs` (plus
-   `core/kernel/src/framebuffer.rs`) owns `kprint!`/`kprintln!` and the panic
+   `core/kernel/src/framebuffer.rs`) owns the kernel's print macros and the panic
    path. It writes the UART directly and **retains** that direct access for the
-   life of the system: panics and pre-userspace diagnostics must not depend on
-   userspace IPC. The kernel framebuffer renderer is similarly **retained**: it carries the
-   mirrored `kprintln!` console, including the address-free header line of a fatal
-   `KERNEL EXCEPTION` dump, while the panic path itself is serial-only
+   life of the system: panics, the softlockup watchdog's reports and pre-userspace diagnostics
+   must not depend on userspace IPC. While a userspace reader is attached to the kernel log, the
+   kernel's address-free lines (`kprintln!`) and userspace-fault diagnostics
+   (`kprintln_fault!`) are records that reader writes on its console instead, so a kernel line
+   does not land inside one of the reader's; with no reader attached, or after one leaves records
+   unread for `KLOG_STALL_MS`, the kernel writes them directly again, and before a failure
+   report it writes the records no reader has written
+   ([core/kernel/docs/kernel-log.md](../core/kernel/docs/kernel-log.md)). The kernel framebuffer
+   renderer is similarly **retained**: it carries the console lines the kernel writes directly
+   (`kprintln!` with no reader attached, and `kprintln_direct!`), including the address-free
+   header line of a fatal `KERNEL EXCEPTION` dump, while the panic path itself is serial-only
    (`console::panic_write_fmt`). The dump's kernel-address lines are serial-only.
    The kernel never becomes a client of the userspace serial or framebuffer driver.
 
    A **serial-only class** of kernel output writes the UART but skips the
-   framebuffer: the spin-locking `kprintln_serial!` / `console::serial_write_fmt`
-   and the lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` /
-   `console::nmi_write_fmt` for the panic and NMI paths. It
+   framebuffer and is never a kernel log record: the spin-locking `kprintln_serial!` /
+   `console::print_serial` and the lock-bypassing `console::panic_write_fmt` and
+   `kprintln_nmi!` / `console::nmi_write_fmt` for the panic and NMI paths. It
    exists because `kprintln!` *mirrors* to the framebuffer, and although the
    kernel writes that framebuffer directly rather than as a driver client, the
    framebuffer memory is later handed to the userspace framebuffer driver — so
-   anything `kprintln!` draws can be read back by userspace. Which kernel output must use the
-   serial-only class is specified in
+   anything `kprintln!` draws can be read back by userspace, as can anything that is a kernel
+   log record. Which kernel output must use the serial-only class is specified in
    [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
    § Kernel console diagnostics.
 
@@ -266,6 +273,7 @@ surface prints the identical glyph set.
 ## Summarized By
 
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
+[Kernel Log](../core/kernel/docs/kernel-log.md),
 [Coding Standards](coding-standards.md),
 [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md),
 [services/drivers/serial/README.md](../services/drivers/serial/README.md),

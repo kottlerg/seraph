@@ -231,35 +231,35 @@ pub fn report_user_kill(tid: u32, cause: KillCause)
     {
         KillCause::BindingCleared =>
         {
-            crate::kprintln_serial!(
+            crate::kprintln_fault!(
                 "fault unhandled: tid={tid} class binding cleared before delivery"
             );
         }
         KillCause::Cancelled =>
         {
-            crate::kprintln_serial!("fault unhandled: tid={tid} delivery cancelled before a reply");
+            crate::kprintln_fault!("fault unhandled: tid={tid} delivery cancelled before a reply");
         }
         KillCause::Declined(None) =>
         {
-            crate::kprintln_serial!("fault unhandled: tid={tid} handler declined");
+            crate::kprintln_fault!("fault unhandled: tid={tid} handler declined");
         }
         KillCause::Declined(Some(reason)) =>
         {
-            crate::kprintln_serial!(
+            crate::kprintln_fault!(
                 "fault unhandled: tid={tid} handler declined, reason={reason:#x}"
             );
         }
         KillCause::NoHandler =>
         {
-            crate::kprintln_serial!("fault unhandled: tid={tid} no handler bound");
+            crate::kprintln_fault!("fault unhandled: tid={tid} no handler bound");
         }
         KillCause::RedirectRefused =>
         {
-            crate::kprintln_serial!("fault unhandled: tid={tid} handler redirect refused");
+            crate::kprintln_fault!("fault unhandled: tid={tid} handler redirect refused");
         }
         KillCause::NoReceiver =>
         {
-            crate::kprintln_serial!("fault unhandled: tid={tid} handler endpoint has no receiver");
+            crate::kprintln_fault!("fault unhandled: tid={tid} handler endpoint has no receiver");
         }
     }
 }

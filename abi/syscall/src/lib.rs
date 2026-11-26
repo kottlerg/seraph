@@ -736,11 +736,115 @@ pub const SYS_ENDPOINT_IDENTIFY: u64 = 73;
 /// bind, or at the object's death. See `core/kernel/docs/syscalls.md`
 /// § `SYS_CAP_BIND_SOLE_REFERENCE` (74).
 pub const SYS_CAP_BIND_SOLE_REFERENCE: u64 = 74;
+/// `KernelLog`: copy the kernel's log records into the caller's buffer and
+/// acknowledge the ones written, through a `KernelLog` capability carrying
+/// [`RIGHTS_KLOG_READ`]. See `core/kernel/docs/syscalls.md`
+/// § `SYS_KERNEL_LOG_READ` (75).
+pub const SYS_KERNEL_LOG_READ: u64 = 75;
+/// `KernelLog`: name the notification the kernel signals when it appends log
+/// records, through a `KernelLog` capability carrying [`RIGHTS_KLOG_READ`].
+/// See `core/kernel/docs/syscalls.md` § `SYS_KERNEL_LOG_BIND` (76).
+pub const SYS_KERNEL_LOG_BIND: u64 = 76;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_CAP_BIND_SOLE_REFERENCE + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_KERNEL_LOG_BIND + 1;
+
+// ── Kernel log records ──────────────────────────────────────────────────────
+
+/// Bytes of a kernel log record's header, as [`SYS_KERNEL_LOG_READ`] writes
+/// it: the sequence number, the kernel's time in microseconds, and a word
+/// holding the level (bits 0..8), the flags (bits 8..16) and the text length
+/// (bits 16..32), each little-endian. The text follows, padded with zeros to
+/// a multiple of 8 bytes.
+pub const KLOG_HEADER_BYTES: usize = 24;
+
+/// The longest text of one kernel log record, in bytes. A longer line is cut
+/// at a character boundary and carries [`KLOG_FLAG_TRUNCATED`].
+pub const KLOG_LINE_MAX: usize = 512;
+
+/// The bytes of the longest record: a [`SYS_KERNEL_LOG_READ`] buffer shorter
+/// than this is refused.
+pub const KLOG_RECORD_MAX: usize = KLOG_HEADER_BYTES + KLOG_LINE_MAX;
+
+/// The longest buffer [`SYS_KERNEL_LOG_READ`] accepts, in bytes.
+pub const KLOG_READ_MAX: usize = 16 * 1024;
+
+/// How long an attached reader may leave records unread before the kernel
+/// writes its lines directly again, in milliseconds. A reader that reads
+/// again is attached again; the lines of the gap stay records.
+pub const KLOG_STALL_MS: u64 = 1000;
+
+/// Kernel log record flag: the line was cut at [`KLOG_LINE_MAX`] bytes.
+pub const KLOG_FLAG_TRUNCATED: u8 = 1 << 0;
+
+/// One kernel log record of a [`SYS_KERNEL_LOG_READ`] buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelLogRecord<'a>
+{
+    /// The record's sequence number: 1 for the kernel's first record, one
+    /// more for each record after it.
+    pub seq: u64,
+    /// The kernel's time when the line was formed, in microseconds.
+    pub us: u64,
+    /// The line's RFC 5424 severity (0 emergency to 7 debug).
+    pub level: u8,
+    /// `KLOG_FLAG_*` bits.
+    pub flags: u8,
+    /// The line's text, UTF-8, without a newline.
+    pub text: &'a [u8],
+}
+
+/// The records of the first `len` bytes a [`SYS_KERNEL_LOG_READ`] wrote,
+/// oldest first. A malformed record ends the walk.
+#[must_use]
+pub fn kernel_log_records(buf: &[u8]) -> KernelLogRecords<'_>
+{
+    KernelLogRecords { buf }
+}
+
+/// Iterator over a [`SYS_KERNEL_LOG_READ`] buffer; see [`kernel_log_records`].
+#[derive(Clone, Debug)]
+pub struct KernelLogRecords<'a>
+{
+    buf: &'a [u8],
+}
+
+impl<'a> Iterator for KernelLogRecords<'a>
+{
+    type Item = KernelLogRecord<'a>;
+
+    fn next(&mut self) -> Option<KernelLogRecord<'a>>
+    {
+        let word = |i: usize| -> Option<u64> {
+            let b = self.buf.get(i..i.checked_add(8)?)?;
+            Some(u64::from_le_bytes(b.try_into().ok()?))
+        };
+        let seq = word(0)?;
+        let us = word(8)?;
+        let meta = word(16)?;
+        let [level, flags, ..] = meta.to_le_bytes();
+        let len = usize::try_from((meta >> 16) & 0xFFFF).ok()?;
+        if len > KLOG_LINE_MAX
+        {
+            self.buf = &[];
+            return None;
+        }
+        let text = self
+            .buf
+            .get(KLOG_HEADER_BYTES..KLOG_HEADER_BYTES.checked_add(len)?)?;
+        let next = KLOG_HEADER_BYTES.checked_add(len.next_multiple_of(8))?;
+        self.buf = self.buf.get(next..).unwrap_or_default();
+        Some(KernelLogRecord {
+            seq,
+            us,
+            level,
+            flags,
+            text,
+        })
+    }
+}
 
 /// [`SYS_IRQ_REMAP`] setting (arg1): compatibility formats, a message or an
 /// I/O APIC entry naming its CPU and vector.
@@ -1372,6 +1476,13 @@ pub const RIGHTS_SBI_PMU: u64 = 1 << 5;
 /// `EntropyControl`: may mix bytes into the kernel entropy pool with
 /// [`SYS_ENTROPY_CONTRIBUTE`].
 pub const RIGHTS_ENTROPY_CONTRIBUTE: u64 = 1 << 0;
+
+// KernelLog ──
+
+/// `KernelLog`: may read and acknowledge the kernel's log records with
+/// [`SYS_KERNEL_LOG_READ`] and bind their notification with
+/// [`SYS_KERNEL_LOG_BIND`].
+pub const RIGHTS_KLOG_READ: u64 = 1 << 0;
 
 // ABI promise: the MAP_WRITABLE / MAP_EXECUTABLE rustdoc above states that
 // prot bits coincide with the Memory rights bit positions. Nothing decodes
@@ -2332,6 +2443,8 @@ mod tests
             ],
             // EntropyControl
             &[RIGHTS_ENTROPY_CONTRIBUTE],
+            // KernelLog
+            &[RIGHTS_KLOG_READ],
         ];
 
         for bits in spaces
@@ -2355,5 +2468,38 @@ mod tests
                 seen |= bit;
             }
         }
+    }
+
+    // Defect guarded: a record walk that reads past the buffer, misses the
+    // padding to whole words, or takes a length past the limit for text.
+    #[test]
+    fn kernel_log_records_walk_whole_records_and_stop_at_a_bad_one()
+    {
+        let mut buf = [0u8; 64];
+        let mut off = 0;
+        for (seq, text) in [(4u64, &b"abc"[..]), (5, &b"eight by"[..])]
+        {
+            buf[off..off + 8].copy_from_slice(&seq.to_le_bytes());
+            buf[off + 8..off + 16].copy_from_slice(&99u64.to_le_bytes());
+            let meta = 6u64 | ((text.len() as u64) << 16);
+            buf[off + 16..off + 24].copy_from_slice(&meta.to_le_bytes());
+            buf[off + 24..off + 24 + text.len()].copy_from_slice(text);
+            off += 24 + text.len().next_multiple_of(8);
+        }
+        let mut recs = kernel_log_records(&buf[..off]);
+        let a = recs.next().unwrap();
+        assert_eq!(
+            (a.seq, a.us, a.level, a.flags, a.text),
+            (4, 99, 6, 0, &b"abc"[..])
+        );
+        let b = recs.next().unwrap();
+        assert_eq!((b.seq, b.text), (5, &b"eight by"[..]));
+        assert!(recs.next().is_none());
+        // A cut buffer ends the walk at the last whole record.
+        assert_eq!(kernel_log_records(&buf[..off - 1]).count(), 1);
+        // A length past the limit ends it.
+        let mut bad = buf;
+        bad[16..24].copy_from_slice(&(((KLOG_LINE_MAX as u64) + 1) << 16).to_le_bytes());
+        assert_eq!(kernel_log_records(&bad[..off]).count(), 0);
     }
 }

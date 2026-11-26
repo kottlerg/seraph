@@ -13,7 +13,7 @@
 
 use syscall::raw_syscall3;
 use syscall_abi::{
-    KERNEL_VERSION, SYS_CAP_BIND_SOLE_REFERENCE, SYS_IPC_CALL, SYS_SYSTEM_INFO, SYS_THREAD_YIELD,
+    KERNEL_VERSION, SYS_IPC_CALL, SYS_KERNEL_LOG_BIND, SYS_SYSTEM_INFO, SYS_THREAD_YIELD,
     SYSCALL_NR_BOUND, SyscallError, SystemInfoType,
 };
 
@@ -42,14 +42,14 @@ pub fn table_edges_reach_their_handlers(_ctx: &TestContext) -> TestResult
     {
         return Err("SYS_IPC_CALL on a slot no CSpace holds did not return InvalidCapability");
     }
-    if SYS_CAP_BIND_SOLE_REFERENCE + 1 != SYSCALL_NR_BOUND
+    if SYS_KERNEL_LOG_BIND + 1 != SYSCALL_NR_BOUND
     {
-        return Err("SYS_CAP_BIND_SOLE_REFERENCE is no longer the last syscall: update this test");
+        return Err("SYS_KERNEL_LOG_BIND is no longer the last syscall: update this test");
     }
-    if call(SYS_CAP_BIND_SOLE_REFERENCE, NO_SLOT, NO_SLOT, 0) != invalid
+    if call(SYS_KERNEL_LOG_BIND, NO_SLOT, NO_SLOT, 0) != invalid
     {
         return Err(
-            "SYS_CAP_BIND_SOLE_REFERENCE on a slot no CSpace holds did not return InvalidCapability",
+            "SYS_KERNEL_LOG_BIND on a slot no CSpace holds did not return InvalidCapability",
         );
     }
     if call(SYS_THREAD_YIELD, 0, 0, 0) != 0

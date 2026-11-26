@@ -567,7 +567,7 @@ pub unsafe fn init()
             pin_count,
         };
 
-        crate::kprintln!(
+        crate::kprintln_serial!(
             "ioapic[{}]: base={:#x} id={:#x} gsi_base={} pins={}",
             i,
             entry.phys_base,

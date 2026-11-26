@@ -20,7 +20,8 @@
 //! (spawned behind its gate, `services/logd/docs/ipc-interface.md`
 //! § Receive pool), the output sinks' writer threads ([`Sink`]), the handover
 //! pull, the release of the self-log lines held until init-logd stops writing
-//! the UART ([`SELF_LOG_HOLD`]), then the gate's opening and the control loop.
+//! the UART ([`SELF_LOG_HOLD`]), the kernel log reader's thread
+//! ([`read_kernel_log`]), then the gate's opening and the control loop.
 
 mod handover;
 
@@ -39,6 +40,7 @@ use ipc::stream_labels::{
 };
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use logd_codec::hold::HeldLines;
+use logd_codec::kernel::{Accept, Cursor, KERNEL_NAME, KernelLine};
 use logd_codec::reclaim::{Cause, ReclaimLine};
 use logd_codec::record::RENDERED_MAX_BYTES;
 use logd_codec::sink::{HEADER_BYTES, Offer, Popped, SINK_QUEUE_BYTES, SINK_STALL_MS, SinkQueue};
@@ -92,6 +94,10 @@ struct BootCaps
     /// publication), through which logd resolves the framebuffer driver
     /// the same way. Zero disables the framebuffer mirror.
     fb_class: u64,
+    /// A `KernelLog` cap carrying `Read`, through which logd reads the
+    /// kernel's console lines ([`read_kernel_log`]). Zero leaves the kernel
+    /// writing its lines itself.
+    kernel_log: u64,
 }
 
 fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
@@ -110,7 +116,8 @@ fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
         procmgr_death_auth_send,
         serial_class,
         fb_class,
-    ] = unsafe { ipc::bootstrap::request_slots::<5>(creator_endpoint, ipc_buf) }.ok()?;
+        kernel_log,
+    ] = unsafe { ipc::bootstrap::request_slots::<6>(creator_endpoint, ipc_buf) }.ok()?;
     if log_ep_recv == 0
     {
         return None;
@@ -121,6 +128,7 @@ fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
         procmgr_death_auth_send,
         serial_class,
         fb_class,
+        kernel_log,
     })
 }
 
@@ -293,6 +301,7 @@ fn main() -> !
     }
 
     logd.lock().table = table;
+    start_kernel_reader(caps.kernel_log, logd);
     pool.open();
     let mut resync = Resync::new(caps.procmgr_death_auth_send, resync_note);
     control_loop(ws_cap, logd, &mut resync, watches, ipc_buf);
@@ -1011,6 +1020,139 @@ fn flush_partial(slot: &mut Slot, history: &mut History, badge: u64, out: &mut L
     history.push_text(slot, badge, us, level, &line);
 }
 
+/// Bytes of one kernel log read: several records of the longest line, within
+/// `KLOG_READ_MAX`.
+const KERNEL_READ_BYTES: usize = 4096;
+
+/// The bit the kernel signals the kernel log reader's notification with.
+const KERNEL_LOG_BIT: u64 = 1;
+
+/// Name the kernel's slot `kernel`: it holds the kernel's lines init-logd
+/// kept and those read from here on. Then start the kernel log reader's
+/// thread ([`read_kernel_log`]) through `cap`, a `KernelLog` cap carrying
+/// `Read`, with a notification bound as the kernel log's. With no cap, or
+/// when the notification, the binding or the thread cannot be had, say so;
+/// the kernel then writes its lines itself once the records init-logd left
+/// unread stall (`KLOG_STALL_MS`).
+fn start_kernel_reader(cap: u64, logd: &'static Logd)
+{
+    logd.lock()
+        .table
+        .install_from_handover(ipc::log_badges::LOG_BADGE_KERNEL, KERNEL_NAME);
+    if cap == 0
+    {
+        self_log("no KernelLog capability; the kernel writes its own lines");
+        return;
+    }
+    let Some(ntf) =
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        })
+    else
+    {
+        self_log("kernel log notification not created; the kernel writes its own lines");
+        return;
+    };
+    if syscall::kernel_log_bind(cap, ntf, KERNEL_LOG_BIT).is_err()
+    {
+        let _ = syscall::cap_delete(ntf);
+        self_log("kernel log not bound; the kernel writes its own lines");
+        return;
+    }
+    let spawned = std::thread::Builder::new().spawn(move || read_kernel_log(cap, ntf, logd));
+    if spawned.is_err()
+    {
+        // The notification's deletion clears the binding.
+        let _ = syscall::cap_delete(ntf);
+        self_log("kernel log reader spawn failed; the kernel writes its own lines");
+    }
+}
+
+/// The kernel log reader (`docs/console-model.md` item 3): read the records
+/// the kernel appended, write each as a `[kernel]` line through the sinks
+/// as a sender's line is written, and keep it in the kernel's slot
+/// (`LOG_BADGE_KERNEL`); then wait for the kernel's signal. Each read
+/// acknowledges the records written before it, so a record is acknowledged
+/// once its line is written or its sink stalled. A failed read ends the
+/// thread, and the kernel writes its lines itself once the records stall.
+fn read_kernel_log(cap: u64, ntf: u64, logd: &Logd)
+{
+    let mut buf = std::vec![0u8; KERNEL_READ_BYTES];
+    let mut cursor = Cursor::new();
+    loop
+    {
+        match syscall::kernel_log_read(cap, 0, cursor.ack(), &mut buf)
+        {
+            Ok(0) =>
+            {
+                // An append after this read signals the notification at the
+                // next tick, so a wait begun after it still wakes.
+                let _ = syscall::notification_wait(ntf);
+            }
+            Ok(n) =>
+            {
+                for record in syscall_abi::kernel_log_records(buf.get(..n).unwrap_or_default())
+                {
+                    write_kernel_record(&record, &mut cursor, logd);
+                }
+            }
+            Err(e) =>
+            {
+                let mut text = SerialFmt::new();
+                let _ = write!(
+                    text,
+                    "kernel log read failed ({e}); the kernel writes its own lines"
+                );
+                self_log(text.as_str());
+                let _ = syscall::cap_delete(ntf);
+                return;
+            }
+        }
+    }
+}
+
+/// Write `record` as the kernel's line, stamped with its own time, in parts
+/// of at most `LINE_BUF_SIZE` bytes, each kept in the kernel's slot and
+/// written whole; a gap before it is named in a warning line of logd's.
+fn write_kernel_record(record: &syscall_abi::KernelLogRecord<'_>, cursor: &mut Cursor, logd: &Logd)
+{
+    match cursor.accept(record.seq)
+    {
+        Accept::Stale => return,
+        Accept::InOrder =>
+        {}
+        Accept::AfterGap { first, last } =>
+        {
+            let text = logd_codec::kernel::gap_text(first, last);
+            let mut out = LineBuf::new();
+            out.push_text_line(b"logd", LEVEL_WARN, elapsed_us(), text.as_str().as_bytes());
+            out.flush();
+        }
+    }
+    let level = logd_codec::kernel::level(record.level);
+    let line = KernelLine::new(record);
+    for part in line.parts()
+    {
+        let mut out = LineBuf::new();
+        out.push_text_line(KERNEL_NAME, level, record.us, part);
+        keep_kernel_line(logd, record.us, level, part);
+        out.flush();
+    }
+}
+
+/// Keep one kernel line in the kernel's slot.
+fn keep_kernel_line(logd: &Logd, us: u64, level: u64, part: &[u8])
+{
+    let badge = ipc::log_badges::LOG_BADGE_KERNEL;
+    let mut state = logd.lock();
+    // The kernel's badge is no process's, so no eviction takes it and the
+    // slot is always there (`SlotTable::sender_slot`).
+    if let Some((slot, history)) = state.table.sender_slot(badge)
+    {
+        history.push_text(slot, badge, us, level, part);
+    }
+}
+
 /// Record / update the display name for `badge`. History entries carry
 /// no name, only the badge (`QUERY_HISTORY`), so a rename changes the
 /// slot's one current name (`QUERY_SLOTS`), which every line of the
@@ -1027,6 +1169,7 @@ fn register_name(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
 {
     let bytes = msg.data_bytes();
     let n = byte_len.min(bytes.len()).min(MAX_NAME_LEN);
+    let name = logd_codec::kernel::stored_name(bytes.get(..n).unwrap_or_default());
     let mut state = logd.lock();
     let Some((slot, _)) = state.table.sender_slot(badge)
     else
@@ -1035,8 +1178,7 @@ fn register_name(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
         return;
     };
     slot.name.clear();
-    slot.name
-        .extend_from_slice(bytes.get(..n).unwrap_or_default());
+    slot.name.extend_from_slice(name);
 }
 
 // ── Serial output (driver-mediated) ────────────────────────────────────────

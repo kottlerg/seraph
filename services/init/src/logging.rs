@@ -30,6 +30,14 @@
 //!   (`logd_codec::record`) and records it in the same ring, leaving the
 //!   sender's partial text line as it was.
 //!
+//! * **Kernel log (`KernelReader`):** the log thread is the kernel log's
+//!   first reader. It waits on a wait set holding the master log endpoint
+//!   and a notification the kernel signals when it appends a line, writes
+//!   each kernel line to the serial port as a `[kernel]` line among the
+//!   senders' lines, and records it in the history ring under
+//!   `LOG_BADGE_KERNEL` (`docs/console-model.md` item 3). It stops reading
+//!   at the handover's first pull, after one last read.
+//!
 //! * **Handover (`HANDOVER_PULL` + `HANDOVER_RELEASE`):** the receiver
 //!   serves real-logd's drain of the badge table and history ring, and
 //!   exits on the release, as `services/logd/docs/handover-protocol.md`
@@ -48,6 +56,7 @@ use ipc::stream_labels::{RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES, STREAM_
 use logd_codec::LINE_BUF_SIZE;
 use logd_codec::handover::{self, NameResend};
 use logd_codec::history::{ENTRY_MAX_BYTES, EntryKind, HistoryCursor, HistoryRing};
+use logd_codec::kernel::{Accept, Cursor, KERNEL_NAME, KernelLine};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 //
@@ -253,6 +262,9 @@ fn ipc_log(cap: u64, ipc_buf: *mut u64, bytes: &[u8])
 /// TCB Exited but does not reclaim it until `cap_delete` drops the cap's
 /// last reference.
 ///
+/// `kernel_log_cap` is init's root `KernelLog` capability, 0 when init holds
+/// none; the thread reads the kernel log through it (`KernelReader`).
+///
 /// # Safety
 /// Called at most once, on init's main thread: it maps the log thread's stack
 /// and IPC page at the fixed `LOG_THREAD_STACK_VA` and `LOG_THREAD_IPC_BUF_VA`
@@ -263,8 +275,11 @@ pub unsafe fn spawn_log_thread(
     arena: &mut BootArena,
     log_ep: u64,
     ioport_cap: u64,
+    kernel_log_cap: u64,
 ) -> u64
 {
+    KERNEL_LOG_CAP.store(kernel_log_cap, core::sync::atomic::Ordering::Relaxed);
+
     // Offset-map the log thread's stack pages from init's arena into init's
     // address space, writable (W^X: not executable). `place_page` maps the
     // full-rights arena cap directly with explicit protection, so no per-page
@@ -458,18 +473,48 @@ fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
     // SAFETY: as for SENDERS: nothing else names HISTORY.
     let history = unsafe { &mut *core::ptr::addr_of_mut!(HISTORY) };
     let mut drain = HandoverDrain::new();
+    let mut kernel = KernelReader::start(log_ep);
+    kernel.drain(history);
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         if HANDOVER_COMPLETE.load(core::sync::atomic::Ordering::Acquire)
         {
+            kernel.close(log_ep);
             arch::current::serial_release();
             syscall::thread_exit();
         }
 
-        // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
-        let recv = match unsafe { ipc::ipc_recv(log_ep, ipc_buf_raw) }
+        let received = if kernel.ws == 0
+        {
+            // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
+            unsafe { ipc::ipc_recv(log_ep, ipc_buf_raw) }
+        }
+        else
+        {
+            match syscall::wait_set_wait(kernel.ws)
+            {
+                Ok(WS_KERNEL_LOG) =>
+                {
+                    guard.on_success();
+                    kernel.wake(history);
+                    continue;
+                }
+                // The endpoint is ready: a sender waits, so this takes its
+                // message at once. Nothing else receives on the endpoint
+                // while init-logd runs, so a sender gone meanwhile is the
+                // only `WouldBlock`.
+                // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
+                Ok(_) => match unsafe { ipc::ipc_try_recv(log_ep, ipc_buf_raw) }
+                {
+                    Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => continue,
+                    other => other,
+                },
+                Err(e) => Err(e),
+            }
+        };
+        let recv = match received
         {
             Ok(recv) => recv,
             Err(e) =>
@@ -505,6 +550,10 @@ fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
         }
         else if label_id == HANDOVER_PULL && handover::drives_handover(recv.badge)
         {
+            // The first pull ends the kernel log reading: the kernel's lines
+            // so far are written and in the history this drain sends, and
+            // real-logd reads the rest after the release.
+            kernel.stop(history);
             let reply = drain.next_chunk(senders.slots(), history);
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf_raw) };
@@ -523,6 +572,9 @@ fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
             let status = drain.name_resend.release_status();
             if status == handover::RELEASE_ACK
             {
+                // A release with no pull before it (a pull the kernel
+                // dropped) still ends the kernel log reading first.
+                kernel.stop(history);
                 flush_synthetic_logd_line(b"handover complete; init-logd thread exiting");
             }
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
@@ -539,6 +591,229 @@ fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
             // unblocks, the drain and the release untouched.
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
+        }
+    }
+}
+
+// ── Kernel log reader ────────────────────────────────────────────────────────
+
+/// init's root `KernelLog` capability, stored by [`spawn_log_thread`] before
+/// the log thread starts; 0 when init holds none.
+static KERNEL_LOG_CAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Wait-set badge of the master log endpoint.
+const WS_LOG_EP: u64 = 1;
+
+/// Wait-set badge of the kernel log's notification.
+const WS_KERNEL_LOG: u64 = 2;
+
+/// The bit the kernel signals the kernel log's notification with.
+const KERNEL_LOG_BIT: u64 = 1;
+
+/// Bytes of one kernel log read: several records of the longest line, within
+/// `KLOG_READ_MAX`.
+const KERNEL_READ_BYTES: usize = 4096;
+
+/// Reads one wake makes at most. A kernel that prints as fast as init-logd
+/// writes cannot hold it in the drain: past the bound it signals its own
+/// notification, and the wait set gives the endpoint its turn first.
+const KERNEL_WAKE_READS: u32 = 8;
+
+/// Reads the last drain makes at most: the ring's bytes over a read's, many
+/// times over, so the drain ends with the ring read.
+const KERNEL_STOP_READS: u32 = 64;
+
+/// The kernel log reads' buffer. Too large for the log thread's 16 KiB stack
+/// beside the receive loop's messages, so it sits in BSS; the log thread is
+/// its only user, through [`KernelReader`].
+static mut KERNEL_READ_BUF: [u8; KERNEL_READ_BYTES] = [0; KERNEL_READ_BYTES];
+
+/// init-logd as the kernel log's first reader (`docs/console-model.md`
+/// item 3): it writes each kernel line to the serial port between the
+/// senders' lines, so no kernel line lands inside one, and records it in the
+/// history ring for real-logd.
+struct KernelReader
+{
+    /// The `KernelLog` capability; 0 when there is none.
+    cap: u64,
+    /// The notification the kernel signals when it appends.
+    ntf: u64,
+    /// The wait set of the log endpoint and [`Self::ntf`]; 0 when the
+    /// reader could not be set up, and the loop receives on the endpoint
+    /// alone.
+    ws: u64,
+    /// The records written so far.
+    cursor: Cursor,
+    /// Whether the reader reads: from a successful start to [`Self::stop`].
+    reading: bool,
+}
+
+impl KernelReader
+{
+    /// Set up the reader: the notification, bound as the kernel log's, and
+    /// the wait set of the log endpoint and that notification, retyped from
+    /// init's arena (`bootstrap::init_retype_reserve_pages`). A step that
+    /// fails leaves no reader, says so in one line, and the kernel goes on
+    /// writing its lines itself.
+    fn start(log_ep: u64) -> Self
+    {
+        let mut reader = Self {
+            cap: KERNEL_LOG_CAP.load(core::sync::atomic::Ordering::Relaxed),
+            ntf: 0,
+            ws: 0,
+            cursor: Cursor::new(),
+            reading: false,
+        };
+        if reader.cap == 0
+        {
+            flush_synthetic_logd_line(b"no KernelLog capability; the kernel writes its own lines");
+            return reader;
+        }
+        let Ok(ntf) = syscall::cap_create_notification(crate::endpoint_slab())
+        else
+        {
+            flush_synthetic_logd_line(b"kernel log notification not created; not reading it");
+            return reader;
+        };
+        let Ok(ws) = syscall::wait_set_create(crate::endpoint_slab(), 2)
+        else
+        {
+            let _ = syscall::cap_delete(ntf);
+            flush_synthetic_logd_line(b"log wait set not created; not reading the kernel log");
+            return reader;
+        };
+        let ready = syscall::wait_set_add(ws, log_ep, WS_LOG_EP).is_ok()
+            && syscall::wait_set_add(ws, ntf, WS_KERNEL_LOG).is_ok()
+            && syscall::kernel_log_bind(reader.cap, ntf, KERNEL_LOG_BIT).is_ok();
+        if !ready
+        {
+            let _ = syscall::cap_delete(ws);
+            let _ = syscall::cap_delete(ntf);
+            flush_synthetic_logd_line(b"kernel log not bound; not reading it");
+            return reader;
+        }
+        reader.ntf = ntf;
+        reader.ws = ws;
+        reader.reading = true;
+        reader
+    }
+
+    /// The kernel signalled: take its bits and write what it appended.
+    fn wake(&mut self, history: &mut HistoryRing<HISTORY_RING_BYTES>)
+    {
+        let _ = syscall::notification_try_wait(self.ntf);
+        if !self.drain_reads(history, KERNEL_WAKE_READS)
+        {
+            // Records remain: come back to them after the endpoint's turn.
+            let _ = syscall::notification_send(self.ntf, KERNEL_LOG_BIT);
+        }
+    }
+
+    /// Write every record the kernel holds after the last one written.
+    fn drain(&mut self, history: &mut HistoryRing<HISTORY_RING_BYTES>)
+    {
+        let _ = self.drain_reads(history, KERNEL_STOP_READS);
+    }
+
+    /// Read and write the kernel's records, at most `reads` reads, each
+    /// acknowledging the records written before it. Returns whether a read
+    /// found nothing more (or the reader does not read).
+    fn drain_reads(&mut self, history: &mut HistoryRing<HISTORY_RING_BYTES>, reads: u32) -> bool
+    {
+        if !self.reading
+        {
+            return true;
+        }
+        // SAFETY: the log thread is KERNEL_READ_BUF's only user, and this is
+        // its only reference while the drain runs.
+        let buf = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_READ_BUF) };
+        for _ in 0..reads
+        {
+            // `from_seq` 0: the records after the acknowledged one, less any a
+            // kernel flush has written.
+            let Ok(n) = syscall::kernel_log_read(self.cap, 0, self.cursor.ack(), buf)
+            else
+            {
+                return true;
+            };
+            if n == 0
+            {
+                return true;
+            }
+            for record in syscall_abi::kernel_log_records(buf.get(..n).unwrap_or_default())
+            {
+                self.write(&record, history);
+            }
+        }
+        false
+    }
+
+    /// Write `record` to the serial port as the kernel's line, stamped with
+    /// its own time, in parts of at most `LINE_BUF_SIZE` bytes, and record each
+    /// part in `history`. A gap before it is named in a line of init-logd's.
+    fn write(
+        &mut self,
+        record: &syscall_abi::KernelLogRecord<'_>,
+        history: &mut HistoryRing<HISTORY_RING_BYTES>,
+    )
+    {
+        match self.cursor.accept(record.seq)
+        {
+            Accept::Stale => return,
+            Accept::InOrder =>
+            {}
+            Accept::AfterGap { first, last } =>
+            {
+                flush_synthetic_logd_line(
+                    logd_codec::kernel::gap_text(first, last)
+                        .as_str()
+                        .as_bytes(),
+                );
+            }
+        }
+        let level = logd_codec::kernel::level(record.level);
+        let line = KernelLine::new(record);
+        for part in line.parts()
+        {
+            history.push(ipc::log_badges::LOG_BADGE_KERNEL, record.us, level, part);
+            write_line_prefix_at(KERNEL_NAME, level, record.us);
+            for &b in part
+            {
+                arch::current::serial_write_byte(b);
+            }
+            arch::current::serial_write_byte(b'\r');
+            arch::current::serial_write_byte(b'\n');
+        }
+    }
+
+    /// Stop reading at the handover (`services/logd/docs/handover-protocol.md`
+    /// § Kernel log): write what the kernel holds, acknowledge it, and unbind,
+    /// so real-logd reads on from the record after the last one written.
+    /// A second call does nothing.
+    fn stop(&mut self, history: &mut HistoryRing<HISTORY_RING_BYTES>)
+    {
+        if !self.reading
+        {
+            return;
+        }
+        self.drain(history);
+        let _ = syscall::kernel_log_read(self.cap, 0, self.cursor.ack(), &mut []);
+        let _ = syscall::kernel_log_bind(self.cap, 0, 0);
+        let _ = syscall::wait_set_remove(self.ws, self.ntf);
+        let _ = syscall::cap_delete(self.ntf);
+        self.ntf = 0;
+        self.reading = false;
+    }
+
+    /// Release the wait set as the thread exits, so the log endpoint, which
+    /// real-logd receives on, is no member of it.
+    fn close(&mut self, log_ep: u64)
+    {
+        if self.ws != 0
+        {
+            let _ = syscall::wait_set_remove(self.ws, log_ep);
+            let _ = syscall::cap_delete(self.ws);
+            self.ws = 0;
         }
     }
 }
@@ -667,7 +942,7 @@ fn register_sender_name(
     let bytes = msg.data_bytes();
     // The bound is at most `bytes.len()`, so the range is in bounds.
     let requested = bytes.get(..byte_len.min(bytes.len())).unwrap_or_default();
-    let slot_idx = senders.register_name(badge, requested)?;
+    let slot_idx = senders.register_name(badge, logd_codec::kernel::stored_name(requested))?;
     if let Some(slot) = senders.slots().get(slot_idx)
     {
         emit_registration_event(badge, slot.name());
@@ -907,17 +1182,24 @@ fn flush_line(slot: &SenderSlot)
     arch::current::serial_write_byte(b'\n');
 }
 
-/// Emit a line's `[sec.usfrac] [name] ` prefix, and the level's tag and a
-/// space for any level but info, to the serial port: `[?]` for a sender with
-/// no registered `name`.
+/// Emit a line's `[sec.usfrac] [name] ` prefix, stamped now, and the level's
+/// tag and a space for any level but info, to the serial port: `[?]` for a
+/// sender with no registered `name`.
 fn write_line_prefix(name: &[u8], level: u64)
+{
+    // Source: `SYS_SYSTEM_INFO(ElapsedUs)` — kernel handler returns
+    // `unwrap_or(0)` and never errors.
+    let us = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
+    write_line_prefix_at(name, level, us);
+}
+
+/// [`write_line_prefix`], stamped `us` microseconds since boot.
+fn write_line_prefix_at(name: &[u8], level: u64, us: u64)
 {
     // ── Timestamp: [sec.usfrac:06] ─────────────────────────────────────
     //
-    // Source: `SYS_SYSTEM_INFO(ElapsedUs)` — kernel handler returns
-    // `unwrap_or(0)` and never errors. Format matches the kernel's
-    // `[sec.usfrac:06] ` prefix in `kernel/src/console.rs`.
-    let us = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
+    // Format matches the kernel's `[sec.usfrac:06] ` prefix in
+    // `kernel/src/console.rs`.
     let sec = us / 1_000_000;
     let usfrac = (us % 1_000_000) as u32;
 

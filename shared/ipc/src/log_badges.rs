@@ -24,6 +24,11 @@ pub const LOG_BADGE_INIT: u64 = 1;
 /// `ProcessInfo.log_send_cap` so procmgr's std `_start` can
 /// install it. Procmgr's `seraph::log!` writes ride this cap.
 pub const LOG_BADGE_PROCMGR: u64 = 2;
+/// The kernel's slot in a log receiver: the records it reads from the
+/// kernel log (`SYS_KERNEL_LOG_READ`) are kept under this key, named
+/// `kernel` (`logd_codec::kernel`). No SEND cap on the log endpoint carries
+/// it, so no message arrives under it.
+pub const LOG_BADGE_KERNEL: u64 = 3;
 /// Floor of every per-child badge: procmgr draws child badges at
 /// random and redraws any below it. Lower values are reserved for the
 /// system specials above; raising this leaves room to reserve more.

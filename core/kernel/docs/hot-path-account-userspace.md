@@ -59,7 +59,7 @@ under #1531; the kernel account's ranked list ([hot-path-account.md](hot-path-ac
 
 ### IPC Round Trip
 
-`ubench.ipc_rt words=0` is 2804 / 5112, 2150 / 2761 of it in the kernel. The kernel copies and
+`ubench.ipc_rt words=0` is 2825 / 5137, 2171 / 2786 of it in the kernel. The kernel copies and
 zeroes no whole `Message` on either side: its largest functions are the entries
 (`syscall_entry` 186 on x86_64; `trap_entry` and `trap_dispatch`, 279 and 114, on riscv64) and
 `schedule` (172 / 228). On riscv64 ubench moves the message through `compiler_builtins`' word
@@ -73,12 +73,12 @@ endpoint holds, which the order of earlier parks sets
 
 ### Page Faults
 
-`ubench.fault_fill path=fault pages=16` is 34111 / 57685: memmgr 14174 / 31787, of which its
+`ubench.fault_fill path=fault pages=16` is 34125 / 57711: memmgr 14167 / 31788, of which its
 `memset` zeroing the 16 frames is 8298 / 24812 (x86_64's `rep stos` is about one iteration per 8
-bytes, riscv64's loop about one instruction per 2.6 bytes), and the kernel 19926 / 25890, spread
+bytes, riscv64's loop about one instruction per 2.6 bytes), and the kernel 19947 / 25915, spread
 over the page-table walk and install (`level_shift`, `table_index`, `names_table`, `read_entry`,
 `install_user_leaf`), the frame map's counters, and `sys_mem_map`. `fault_scaling threads=1` runs
-the same path. `path=grant` adds the grant's capability operations, 33931 / 60080.
+the same path. `path=grant` adds the grant's capability operations, 33945 / 60105.
 
 ### Shared-Memory Ring
 
@@ -89,7 +89,7 @@ The 64- and 512-byte rows are a few hundred instructions each, mostly the copies
 
 ### Console Writes
 
-`ubench.console_write bytes=4096` is 33418215 / 149877181, all but 0.2 % in the framebuffer
+`ubench.console_write bytes=4096` is 33418383 / 149877405, all but 0.2 % in the framebuffer
 driver. Its scroll moves the whole framebuffer up a text row at each line it fills, one
 `memmove` of whole pixel words (28673472 / 143361728), and fills the freed row with `memset`
 (820544 / 2460720 with the other fills); drawing the glyphs with plain word stores is
@@ -100,9 +100,9 @@ driver. Its scroll moves the whole framebuffer up a text row at each line it fil
 A read through the inline path (`fsbench.read path=inline`) is fatfs's copy and zeroing of the reply
 and the kernel's copy to and from user memory. A read through granted frames (`path=frame`) spends
 12628 / 12530 in the kernel's Keccak permutation (`keccak_f1600`) per 4 KiB frame the grant names,
-202048 / 200480 of 677072 / 1030325 at 64 KiB: std draws each request's 8-byte cookie through
+202048 / 200480 of 677762 / 1031125 at 64 KiB: std draws each request's 8-byte cookie through
 `SYS_GETRANDOM`, fresh output with its own squeeze and ratchet
-([entropy.md](entropy.md) § Draw API and consumers). `fsbench.open depth=3` is 64947 / 95459, one
+([entropy.md](entropy.md) § Draw API and consumers). `fsbench.open depth=3` is 65010 / 95540, one
 such draw (12628 / 12530, the release badge `File::open` allocates) and
 fatfs's long-name parsing (`LfnAccum`, 7670 / 6478) among it. fatfs finds each cached page through
 its page index, a binary search whose steps the slot ceiling alone sets, rather than a scan of
@@ -115,37 +115,37 @@ the slots in the order they were filled, which follows the requests served befor
 
 | Configuration | Head | Taken | QEMU | Checked against |
 |---|---|---|---|---|
-| x86_64 release | `c5bd5f39361a` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
-| riscv64 release | `c5bd5f39361a` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| x86_64 release | `cd7761f897e1` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
+| riscv64 release | `cd7761f897e1` | 2026-11-26 | QEMU emulator version 11.1.3 | 1 icount boot(s) of the image without debuginfo |
 
 #### Totals
 
 | Path | Image | x86_64 release | riscv64 release |
 |---|---|---:|---:|
-| `ubench.ipc_rt words=0 cpus=1` | all | 2804 | 5112 |
+| `ubench.ipc_rt words=0 cpus=1` | all | 2825 | 5137 |
 | `ubench.ipc_rt words=0 cpus=1` | ubench | 654 | 2351 |
-| `ubench.ipc_rt words=0 cpus=1` | kernel | 2150 | 2761 |
-| `ubench.ipc_rt words=6 cpus=1` | all | 3050 | 5575 |
+| `ubench.ipc_rt words=0 cpus=1` | kernel | 2171 | 2786 |
+| `ubench.ipc_rt words=6 cpus=1` | all | 3071 | 5600 |
 | `ubench.ipc_rt words=6 cpus=1` | ubench | 755 | 2572 |
-| `ubench.ipc_rt words=6 cpus=1` | kernel | 2295 | 3003 |
-| `ubench.ipc_rt words=7 cpus=1` | all | 3297 | 5635 |
+| `ubench.ipc_rt words=6 cpus=1` | kernel | 2316 | 3028 |
+| `ubench.ipc_rt words=7 cpus=1` | all | 3318 | 5660 |
 | `ubench.ipc_rt words=7 cpus=1` | ubench | 840 | 2559 |
-| `ubench.ipc_rt words=7 cpus=1` | kernel | 2457 | 3076 |
-| `ubench.ipc_rt words=64 cpus=1` | all | 6275 | 7929 |
+| `ubench.ipc_rt words=7 cpus=1` | kernel | 2478 | 3101 |
+| `ubench.ipc_rt words=64 cpus=1` | all | 6296 | 7954 |
 | `ubench.ipc_rt words=64 cpus=1` | ubench | 1937 | 4098 |
-| `ubench.ipc_rt words=64 cpus=1` | kernel | 4338 | 3831 |
-| `ubench.fault_fill path=fault pages=16 cpus=1` | all | 34111 | 57685 |
+| `ubench.ipc_rt words=64 cpus=1` | kernel | 4359 | 3856 |
+| `ubench.fault_fill path=fault pages=16 cpus=1` | all | 34125 | 57711 |
 | `ubench.fault_fill path=fault pages=16 cpus=1` | ubench | 11 | 8 |
-| `ubench.fault_fill path=fault pages=16 cpus=1` | memmgr | 14174 | 31787 |
-| `ubench.fault_fill path=fault pages=16 cpus=1` | kernel | 19926 | 25890 |
-| `ubench.fault_fill path=grant pages=16 cpus=1` | all | 33931 | 60080 |
+| `ubench.fault_fill path=fault pages=16 cpus=1` | memmgr | 14167 | 31788 |
+| `ubench.fault_fill path=fault pages=16 cpus=1` | kernel | 19947 | 25915 |
+| `ubench.fault_fill path=grant pages=16 cpus=1` | all | 33945 | 60105 |
 | `ubench.fault_fill path=grant pages=16 cpus=1` | ubench | 114 | 352 |
-| `ubench.fault_fill path=grant pages=16 cpus=1` | memmgr | 11175 | 30225 |
-| `ubench.fault_fill path=grant pages=16 cpus=1` | kernel | 22642 | 29503 |
-| `ubench.fault_scaling threads=1 pages=16 cpus=1` | all | 34004 | 57630 |
+| `ubench.fault_fill path=grant pages=16 cpus=1` | memmgr | 11168 | 30225 |
+| `ubench.fault_fill path=grant pages=16 cpus=1` | kernel | 22663 | 29528 |
+| `ubench.fault_scaling threads=1 pages=16 cpus=1` | all | 34018 | 57655 |
 | `ubench.fault_scaling threads=1 pages=16 cpus=1` | ubench | 11 | 8 |
-| `ubench.fault_scaling threads=1 pages=16 cpus=1` | memmgr | 14067 | 31723 |
-| `ubench.fault_scaling threads=1 pages=16 cpus=1` | kernel | 19926 | 25899 |
+| `ubench.fault_scaling threads=1 pages=16 cpus=1` | memmgr | 14060 | 31723 |
+| `ubench.fault_scaling threads=1 pages=16 cpus=1` | kernel | 19947 | 25924 |
 | `ubench.shmem_ring bytes=64 cpus=1` | all | 185 | 225 |
 | `ubench.shmem_ring bytes=64 cpus=1` | ubench | 185 | 225 |
 | `ubench.shmem_ring bytes=512 cpus=1` | all | 297 | 785 |
@@ -154,71 +154,71 @@ the slots in the order they were filled, which follows the requests served befor
 | `ubench.shmem_ring bytes=4096 cpus=1` | ubench | 1347 | 5447 |
 | `ubench.shmem_ring bytes=65536 cpus=1` | all | 21327 | 86987 |
 | `ubench.shmem_ring bytes=65536 cpus=1` | ubench | 21327 | 86987 |
-| `ubench.console_write bytes=64 cpus=1` | all | 525332 | 2347433 |
+| `ubench.console_write bytes=64 cpus=1` | all | 525353 | 2347461 |
 | `ubench.console_write bytes=64 cpus=1` | ubench | 988 | 3097 |
 | `ubench.console_write bytes=64 cpus=1` | /services/drivers/framebuffer | 521319 | 2340097 |
-| `ubench.console_write bytes=64 cpus=1` | kernel | 3025 | 4239 |
-| `ubench.console_write bytes=4096 cpus=1` | all | 33418215 | 149877181 |
+| `ubench.console_write bytes=64 cpus=1` | kernel | 3046 | 4267 |
+| `ubench.console_write bytes=4096 cpus=1` | all | 33418383 | 149877405 |
 | `ubench.console_write bytes=4096 cpus=1` | ubench | 25243 | 60070 |
 | `ubench.console_write bytes=4096 cpus=1` | /services/drivers/framebuffer | 33348680 | 149708432 |
 | `ubench.console_write bytes=4096 cpus=1` | /services/drivers/iommu-riscv | 0 | 226 |
-| `ubench.console_write bytes=4096 cpus=1` | kernel | 44292 | 108453 |
-| `fsbench.read size=16 path=inline cpus=1` | all | 5898 | 11481 |
+| `ubench.console_write bytes=4096 cpus=1` | kernel | 44460 | 108677 |
+| `fsbench.read size=16 path=inline cpus=1` | all | 5919 | 11506 |
 | `fsbench.read size=16 path=inline cpus=1` | /tests/fixtures/programs/fsbench | 582 | 1547 |
 | `fsbench.read size=16 path=inline cpus=1` | fatfs:/ | 2232 | 5855 |
 | `fsbench.read size=16 path=inline cpus=1` | fatfs:/data | 223 | 227 |
-| `fsbench.read size=16 path=inline cpus=1` | kernel | 2861 | 3852 |
-| `fsbench.read size=16 path=frame cpus=1` | all | 42091 | 64148 |
+| `fsbench.read size=16 path=inline cpus=1` | kernel | 2882 | 3877 |
+| `fsbench.read size=16 path=frame cpus=1` | all | 42133 | 64198 |
 | `fsbench.read size=16 path=frame cpus=1` | /tests/fixtures/programs/fsbench | 11332 | 27048 |
 | `fsbench.read size=16 path=frame cpus=1` | fatfs:/ | 4330 | 6063 |
 | `fsbench.read size=16 path=frame cpus=1` | fatfs:/data | 0 | 29 |
-| `fsbench.read size=16 path=frame cpus=1` | kernel | 26429 | 31008 |
-| `fsbench.read size=1024 path=inline cpus=1` | all | 30857 | 57563 |
+| `fsbench.read size=16 path=frame cpus=1` | kernel | 26471 | 31058 |
+| `fsbench.read size=1024 path=inline cpus=1` | all | 30941 | 57663 |
 | `fsbench.read size=1024 path=inline cpus=1` | /tests/fixtures/programs/fsbench | 2663 | 7271 |
 | `fsbench.read size=1024 path=inline cpus=1` | fatfs:/ | 11048 | 30954 |
 | `fsbench.read size=1024 path=inline cpus=1` | fatfs:/data | 3696 | 3358 |
-| `fsbench.read size=1024 path=inline cpus=1` | kernel | 13450 | 15980 |
-| `fsbench.read size=1024 path=frame cpus=1` | all | 42091 | 64148 |
+| `fsbench.read size=1024 path=inline cpus=1` | kernel | 13534 | 16080 |
+| `fsbench.read size=1024 path=frame cpus=1` | all | 42133 | 64198 |
 | `fsbench.read size=1024 path=frame cpus=1` | /tests/fixtures/programs/fsbench | 11332 | 27048 |
 | `fsbench.read size=1024 path=frame cpus=1` | fatfs:/ | 4330 | 6063 |
 | `fsbench.read size=1024 path=frame cpus=1` | fatfs:/data | 0 | 29 |
-| `fsbench.read size=1024 path=frame cpus=1` | kernel | 26429 | 31008 |
-| `fsbench.read size=4096 path=inline cpus=1` | all | 123293 | 230111 |
+| `fsbench.read size=1024 path=frame cpus=1` | kernel | 26471 | 31058 |
+| `fsbench.read size=4096 path=inline cpus=1` | all | 123629 | 230511 |
 | `fsbench.read size=4096 path=inline cpus=1` | /tests/fixtures/programs/fsbench | 10517 | 28943 |
 | `fsbench.read size=4096 path=inline cpus=1` | fatfs:/ | 44192 | 123816 |
 | `fsbench.read size=4096 path=inline cpus=1` | fatfs:/data | 14784 | 13432 |
-| `fsbench.read size=4096 path=inline cpus=1` | kernel | 53800 | 63920 |
-| `fsbench.read size=4096 path=frame cpus=1` | all | 42091 | 64148 |
+| `fsbench.read size=4096 path=inline cpus=1` | kernel | 54136 | 64320 |
+| `fsbench.read size=4096 path=frame cpus=1` | all | 42133 | 64198 |
 | `fsbench.read size=4096 path=frame cpus=1` | /tests/fixtures/programs/fsbench | 11332 | 27048 |
 | `fsbench.read size=4096 path=frame cpus=1` | fatfs:/ | 4330 | 6063 |
 | `fsbench.read size=4096 path=frame cpus=1` | fatfs:/data | 0 | 29 |
-| `fsbench.read size=4096 path=frame cpus=1` | kernel | 26429 | 31008 |
-| `fsbench.read size=16384 path=inline cpus=1` | all | 504877 | 933916 |
+| `fsbench.read size=4096 path=frame cpus=1` | kernel | 26471 | 31058 |
+| `fsbench.read size=16384 path=inline cpus=1` | all | 506239 | 935516 |
 | `fsbench.read size=16384 path=inline cpus=1` | /tests/fixtures/programs/fsbench | 41933 | 115631 |
-| `fsbench.read size=16384 path=inline cpus=1` | fatfs:/ | 186367 | 506592 |
-| `fsbench.read size=16384 path=inline cpus=1` | fatfs:/data | 60865 | 55552 |
-| `fsbench.read size=16384 path=inline cpus=1` | kernel | 215712 | 256141 |
-| `fsbench.read size=16384 path=frame cpus=1` | all | 169000 | 257292 |
+| `fsbench.read size=16384 path=inline cpus=1` | fatfs:/ | 186365 | 506592 |
+| `fsbench.read size=16384 path=inline cpus=1` | fatfs:/data | 60867 | 55552 |
+| `fsbench.read size=16384 path=inline cpus=1` | kernel | 217074 | 257741 |
+| `fsbench.read size=16384 path=frame cpus=1` | all | 169168 | 257492 |
 | `fsbench.read size=16384 path=frame cpus=1` | /tests/fixtures/programs/fsbench | 45193 | 108051 |
 | `fsbench.read size=16384 path=frame cpus=1` | fatfs:/ | 18079 | 25081 |
 | `fsbench.read size=16384 path=frame cpus=1` | fatfs:/data | 0 | 128 |
-| `fsbench.read size=16384 path=frame cpus=1` | kernel | 105728 | 124032 |
-| `fsbench.read size=65536 path=inline cpus=1` | all | 2193965 | 3940195 |
+| `fsbench.read size=16384 path=frame cpus=1` | kernel | 105896 | 124232 |
+| `fsbench.read size=65536 path=inline cpus=1` | all | 2199377 | 3946595 |
 | `fsbench.read size=65536 path=inline cpus=1` | /tests/fixtures/programs/fsbench | 167597 | 462383 |
-| `fsbench.read size=65536 path=inline cpus=1` | fatfs:/ | 898991 | 2207613 |
-| `fsbench.read size=65536 path=inline cpus=1` | fatfs:/data | 265425 | 245635 |
-| `fsbench.read size=65536 path=inline cpus=1` | kernel | 861952 | 1024564 |
-| `fsbench.read size=65536 path=frame cpus=1` | all | 677072 | 1030325 |
+| `fsbench.read size=65536 path=inline cpus=1` | fatfs:/ | 899015 | 2207611 |
+| `fsbench.read size=65536 path=inline cpus=1` | fatfs:/data | 265401 | 245637 |
+| `fsbench.read size=65536 path=inline cpus=1` | kernel | 867364 | 1030964 |
+| `fsbench.read size=65536 path=frame cpus=1` | all | 677762 | 1031125 |
 | `fsbench.read size=65536 path=frame cpus=1` | /tests/fixtures/programs/fsbench | 180637 | 432063 |
-| `fsbench.read size=65536 path=frame cpus=1` | fatfs:/ | 73075 | 101190 |
-| `fsbench.read size=65536 path=frame cpus=1` | fatfs:/data | 0 | 483 |
-| `fsbench.read size=65536 path=frame cpus=1` | kernel | 423360 | 496589 |
-| `fsbench.open depth=3 cpus=1` | all | 64947 | 95459 |
+| `fsbench.read size=65536 path=frame cpus=1` | fatfs:/ | 73070 | 101197 |
+| `fsbench.read size=65536 path=frame cpus=1` | fatfs:/data | 5 | 476 |
+| `fsbench.read size=65536 path=frame cpus=1` | kernel | 424050 | 497389 |
+| `fsbench.open depth=3 cpus=1` | all | 65010 | 95540 |
 | `fsbench.open depth=3 cpus=1` | /tests/fixtures/programs/fsbench | 3416 | 7171 |
 | `fsbench.open depth=3 cpus=1` | fatfs:/ | 22644 | 38914 |
 | `fsbench.open depth=3 cpus=1` | fatfs:/data | 15 | 83 |
 | `fsbench.open depth=3 cpus=1` | vfsd | 1180 | 3578 |
-| `fsbench.open depth=3 cpus=1` | kernel | 37692 | 45713 |
+| `fsbench.open depth=3 cpus=1` | kernel | 37755 | 45794 |
 
 #### `ubench.ipc_rt words=0 cpus=1`
 
@@ -243,8 +243,9 @@ the slots in the order they were filled, which follows the requests served befor
 | `kernel::arch::current::interrupts::handle_trap` | kernel | | 57 |
 | `kernel::syscall::dispatch_in_range` | kernel | 57 | 45 |
 | `ubench::ipc_rt::serve` | ubench | 57 | 52 |
+| `kernel::ipc::endpoint::endpoint_call` | kernel | 40 | 55 |
 | `kernel::arch::current::cpu::restore_interrupts` | kernel | 34 | 54 |
-| `kernel::ipc::endpoint::endpoint_call` | kernel | 40 | 54 |
+| `<kernel::ipc::recv_park::RecvParkTable>::named` | kernel | 44 | 52 |
 | `kernel::arch::current::cpu::save_and_disable_interrupts` | kernel | 51 | 26 |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 24 | 50 |
 | `ipc::ipc_recv_timeout` | ubench | 36 | 50 |
@@ -261,11 +262,10 @@ the slots in the order they were filled, which follows the requests served befor
 | `kernel::syscall::ipc::deliver_message` | kernel | 32 | 34 |
 | `kernel::syscall::pin_checked::{closure#0}` | kernel | 24 | 34 |
 | `memcpy` | kernel | 32 | 4 |
-| `<kernel::ipc::recv_park::RecvParkTable>::named` | kernel | 25 | 31 |
 | `<kernel::arch::current::trap_frame::TrapFrame>::arg` | kernel | 30 | 7 |
 | `kernel::arch::current::fpu::switch_in_restore` | kernel | 18 | 30 |
 | `<kernel::ipc::message::Message>::caps` | kernel | 28 | 26 |
-| 140 functions below 25 each |  | 830 | 824 |
+| 140 functions below 25 each |  | 832 | 827 |
 
 #### `ubench.ipc_rt words=6 cpus=1`
 
@@ -293,8 +293,9 @@ the slots in the order they were filled, which follows the requests served befor
 | `ubench::ipc_rt::serve` | ubench | 58 | 53 |
 | `kernel::arch::current::interrupts::handle_trap` | kernel | | 57 |
 | `kernel::syscall::dispatch_in_range` | kernel | 57 | 45 |
+| `kernel::ipc::endpoint::endpoint_call` | kernel | 40 | 55 |
 | `kernel::arch::current::cpu::restore_interrupts` | kernel | 34 | 54 |
-| `kernel::ipc::endpoint::endpoint_call` | kernel | 40 | 54 |
+| `<kernel::ipc::recv_park::RecvParkTable>::named` | kernel | 44 | 52 |
 | `kernel::arch::current::cpu::save_and_disable_interrupts` | kernel | 51 | 26 |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 24 | 50 |
 | `<kernel::arch::current::trap_frame::TrapFrame>::set_msg_regs` | kernel | 46 | 46 |
@@ -311,11 +312,10 @@ the slots in the order they were filled, which follows the requests served befor
 | `kernel::syscall::ipc::deliver_message` | kernel | 32 | 34 |
 | `kernel::syscall::pin_checked::{closure#0}` | kernel | 24 | 34 |
 | `ipc::ipc_reply` | ubench | 32 | 31 |
-| `<kernel::ipc::recv_park::RecvParkTable>::named` | kernel | 25 | 31 |
 | `<kernel::arch::current::trap_frame::TrapFrame>::arg` | kernel | 30 | 7 |
 | `kernel::arch::current::fpu::switch_in_restore` | kernel | 18 | 30 |
 | `<kernel::ipc::message::Message>::caps` | kernel | 28 | 26 |
-| 143 functions below 27 each |  | 854 | 831 |
+| 143 functions below 28 each |  | 856 | 834 |
 
 #### `ubench.ipc_rt words=7 cpus=1`
 
@@ -345,8 +345,9 @@ the slots in the order they were filled, which follows the requests served befor
 | `ubench::ipc_rt::serve` | ubench | 58 | 53 |
 | `kernel::arch::current::interrupts::handle_trap` | kernel | | 57 |
 | `kernel::syscall::dispatch_in_range` | kernel | 57 | 45 |
+| `kernel::ipc::endpoint::endpoint_call` | kernel | 40 | 55 |
 | `kernel::arch::current::cpu::restore_interrupts` | kernel | 34 | 54 |
-| `kernel::ipc::endpoint::endpoint_call` | kernel | 40 | 54 |
+| `<kernel::ipc::recv_park::RecvParkTable>::named` | kernel | 44 | 52 |
 | `kernel::arch::current::cpu::save_and_disable_interrupts` | kernel | 51 | 26 |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 24 | 50 |
 | `<kernel::sched::run_queue::PerCpuScheduler>::link` | kernel | 44 | 42 |
@@ -363,11 +364,10 @@ the slots in the order they were filled, which follows the requests served befor
 | `kernel::syscall::ipc::deliver_message` | kernel | 32 | 34 |
 | `kernel::syscall::pin_checked::{closure#0}` | kernel | 24 | 34 |
 | `__copy_user` | kernel | 12 | 32 |
-| `<kernel::ipc::recv_park::RecvParkTable>::named` | kernel | 25 | 31 |
 | `<kernel::arch::current::trap_frame::TrapFrame>::arg` | kernel | 30 | 7 |
 | `kernel::arch::current::fpu::switch_in_restore` | kernel | 18 | 30 |
 | `<kernel::ipc::message::Message>::caps` | kernel | 28 | 26 |
-| 147 functions below 28 each |  | 865 | 839 |
+| 147 functions below 28 each |  | 867 | 842 |
 
 #### `ubench.ipc_rt words=64 cpus=1`
 
@@ -398,15 +398,16 @@ the slots in the order they were filled, which follows the requests served befor
 | `ubench::ipc_rt::serve` | ubench | 58 | 53 |
 | `kernel::arch::current::interrupts::handle_trap` | kernel | | 57 |
 | `kernel::syscall::dispatch_in_range` | kernel | 57 | 45 |
+| `kernel::ipc::endpoint::endpoint_call` | kernel | 40 | 55 |
 | `kernel::arch::current::cpu::restore_interrupts` | kernel | 34 | 54 |
-| `kernel::ipc::endpoint::endpoint_call` | kernel | 40 | 54 |
+| `<kernel::ipc::recv_park::RecvParkTable>::named` | kernel | 44 | 52 |
 | `kernel::arch::current::cpu::save_and_disable_interrupts` | kernel | 51 | 26 |
 | `<kernel::cap::cspace::CSpace>::slot` | kernel | 24 | 50 |
 | `<kernel::sched::run_queue::PerCpuScheduler>::link` | kernel | 44 | 42 |
 | `kernel::sched::commit_blocked_under_local_lock` | kernel | 35 | 40 |
 | `<kernel::sync::Spinlock>::unlock_raw` | kernel | 13 | 39 |
 | `kernel::syscall::ipc::sys_ipc_recv` | kernel | 25 | 39 |
-| 161 functions below 39 each |  | 1072 | 1250 |
+| 160 functions below 39 each |  | 1049 | 1222 |
 
 #### `ubench.fault_fill path=fault pages=16 cpus=1`
 
@@ -451,7 +452,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `kernel::mm::paging::phys_to_virt` | kernel | 292 | 292 |
 | `kernel::arch::current::paging::new_user_leaf` | kernel | 288 | |
 | `kernel::arch::current::paging::user_walk_or_alloc_pooled` | kernel | 288 | |
-| 463 functions below 288 each |  | 11330 | 12643 |
+| 463 functions below 288 each |  | 11344 | 12669 |
 
 #### `ubench.fault_fill path=grant pages=16 cpus=1`
 
@@ -491,7 +492,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `<kernel::cap::cspace::CSpace>::slot_mut` | kernel | 252 | 414 |
 | `<kernel::arch::current::paging::PageTableEntry>::new_page` | kernel | 352 | 384 |
 | `<kernel::cap::cspace::CSpace>::leaf_ptr` | kernel | 150 | 300 |
-| 481 functions below 300 each |  | 13197 | 14258 |
+| 481 functions below 300 each |  | 13211 | 14283 |
 
 #### `ubench.fault_scaling threads=1 pages=16 cpus=1`
 
@@ -536,7 +537,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `kernel::mm::paging::phys_to_virt` | kernel | 292 | 292 |
 | `kernel::arch::current::paging::new_user_leaf` | kernel | 288 | |
 | `kernel::arch::current::paging::user_walk_or_alloc_pooled` | kernel | 288 | |
-| 465 functions below 288 each |  | 11295 | 12642 |
+| 465 functions below 288 each |  | 11309 | 12667 |
 
 #### `ubench.shmem_ring bytes=64 cpus=1`
 
@@ -584,7 +585,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `memmove` | /services/drivers/framebuffer | 448023 | 2 |
 | `<framebuffer::render::FramebufferWriter>::draw_glyph_bitmap` | /services/drivers/framebuffer | 54054 | 54987 |
 | `memset` | /services/drivers/framebuffer | 12821 | 38636 |
-| 286 functions below 11737 each |  | 10434 | 13783 |
+| 286 functions below 11737 each |  | 10455 | 13811 |
 
 #### `ubench.console_write bytes=4096 cpus=1`
 
@@ -594,7 +595,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `memmove` | /services/drivers/framebuffer | 28673472 | 128 |
 | `<framebuffer::render::FramebufferWriter>::draw_glyph_bitmap` | /services/drivers/framebuffer | 3459456 | 3518344 |
 | `memset` | /services/drivers/framebuffer | 820544 | 2460720 |
-| 325 functions below 749385 each |  | 464743 | 536389 |
+| 325 functions below 749387 each |  | 464911 | 536613 |
 
 #### `fsbench.read size=16 path=inline cpus=1`
 
@@ -630,7 +631,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `kernel::sched::enqueue_and_wake` | kernel | 46 | 70 |
 | `kernel::arch::current::fpu::restore_fp_from` | kernel | | 68 |
 | `ipc::ipc_recv_timeout` | fatfs:/ | 43 | 64 |
-| 254 functions below 57 each |  | 2273 | 2535 |
+| 254 functions below 57 each |  | 2294 | 2560 |
 
 #### `fsbench.read size=16 path=frame cpus=1`
 
@@ -659,7 +660,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 341 | 275 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 332 | 340 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 272 | 340 |
-| 490 functions below 320 each |  | 13179 | 14671 |
+| 490 functions below 320 each |  | 13221 | 14721 |
 
 #### `fsbench.read size=1024 path=inline cpus=1`
 
@@ -693,7 +694,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `<kernel::mm::address_space::AddressSpace>::activate` | kernel | 16 | 352 |
 | `compiler_builtins::mem::memcpy` | kernel | | 346 |
 | `kernel::syscall::ipc::sys_ipc_call` | kernel | 256 | 296 |
-| 265 functions below 287 each |  | 9415 | 10977 |
+| 265 functions below 288 each |  | 9499 | 11077 |
 
 #### `fsbench.read size=1024 path=frame cpus=1`
 
@@ -722,7 +723,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 341 | 275 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 332 | 340 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 272 | 340 |
-| 490 functions below 320 each |  | 13179 | 14671 |
+| 490 functions below 320 each |  | 13221 | 14721 |
 
 #### `fsbench.read size=4096 path=inline cpus=1`
 
@@ -756,7 +757,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `<kernel::mm::address_space::AddressSpace>::activate` | kernel | 64 | 1408 |
 | `compiler_builtins::mem::memcpy` | kernel | | 1384 |
 | `kernel::syscall::ipc::sys_ipc_call` | kernel | 1024 | 1184 |
-| 265 functions below 1150 each |  | 37525 | 43767 |
+| 265 functions below 1152 each |  | 37861 | 44167 |
 
 #### `fsbench.read size=4096 path=frame cpus=1`
 
@@ -785,7 +786,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 341 | 275 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 332 | 340 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 272 | 340 |
-| 490 functions below 320 each |  | 13179 | 14671 |
+| 490 functions below 320 each |  | 13221 | 14721 |
 
 #### `fsbench.read size=16384 path=inline cpus=1`
 
@@ -793,7 +794,7 @@ the slots in the order they were filled, which follows the requests served befor
 |---|---|---:|---:|
 | `memset` | fatfs:/ | 73856 | 227392 |
 | `compiler_builtins::mem::memcpy` | fatfs:/ | | 219040 |
-| `memcpy` | fatfs:/ | 59391 | 4800 |
+| `memcpy` | fatfs:/ | 59389 | 4800 |
 | `compiler_builtins::mem::memcpy` | /tests/fixtures/programs/fsbench | | 59136 |
 | `fatfs::handle_read` | fatfs:/data | 36864 | 31808 |
 | `__copy_user_fault_start` | kernel | 32832 | |
@@ -821,7 +822,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `fatfs::fat::chain_next` | fatfs:/ | 5184 | 4992 |
 | `fatfs::fat::read_file_data` | fatfs:/data | 4848 | 4896 |
 | `kernel::syscall::ipc::sys_ipc_call` | kernel | 4096 | 4736 |
-| 311 functions below 4669 each |  | 151755 | 178487 |
+| 311 functions below 4677 each |  | 153119 | 180087 |
 
 #### `fsbench.read size=16384 path=frame cpus=1`
 
@@ -850,21 +851,21 @@ the slots in the order they were filled, which follows the requests served befor
 | `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 1364 | 1100 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 1328 | 1360 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 1088 | 1360 |
-| 498 functions below 1286 each |  | 53352 | 59384 |
+| 498 functions below 1287 each |  | 53520 | 59584 |
 
 #### `fsbench.read size=65536 path=inline cpus=1`
 
 | Function | Image | x86_64 release | riscv64 release |
 |---|---|---:|---:|
-| `memset` | fatfs:/ | 295424 | 909565 |
-| `compiler_builtins::mem::memcpy` | fatfs:/ | | 876160 |
+| `memset` | fatfs:/ | 295424 | 909568 |
+| `compiler_builtins::mem::memcpy` | fatfs:/ | | 876155 |
 | `memcpy` | fatfs:/ | 237568 | 19200 |
 | `compiler_builtins::mem::memcpy` | /tests/fixtures/programs/fsbench | | 236544 |
 | `fatfs::handle_read` | fatfs:/data | 147456 | 127232 |
 | `__copy_user_fault_start` | kernel | 131328 | |
 | `kernel::arch::current::interrupts::entry::trap_entry` | kernel | | 119412 |
 | `memset` | /tests/fixtures/programs/fsbench | 22272 | 111104 |
-| `fatfs::fat::chain_next` | fatfs:/ | 103671 | 99840 |
+| `fatfs::fat::chain_next` | fatfs:/ | 103680 | 99840 |
 | `kernel::arch::current::syscall::syscall_entry` | kernel | 79360 | |
 | `fatfs::alloc::read_fat_entry` | fatfs:/ | 36480 | 76800 |
 | `std::os::seraph::deadline_call` | /tests/fixtures/programs/fsbench | 55936 | 76288 |
@@ -887,7 +888,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `kernel::syscall::pin_checked` | kernel | 21504 | 23040 |
 | `<kernel::mm::address_space::AddressSpace>::activate` | kernel | 1024 | 22528 |
 | `compiler_builtins::mem::memcpy` | kernel | | 22144 |
-| 320 functions below 19700 each |  | 626208 | 723154 |
+| 313 functions below 19732 each |  | 631611 | 729556 |
 
 #### `fsbench.read size=65536 path=frame cpus=1`
 
@@ -913,10 +914,10 @@ the slots in the order they were filled, which follows the requests served befor
 | `<kernel::cap::cspace::CSpace>::leaf_ptr` | kernel | 3264 | 6528 |
 | `kernel::arch::current::interrupts::handle_trap` | kernel | | 6399 |
 | `compiler_builtins::mem::memcpy` | kernel | | 6336 |
-| `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 5456 | 4395 |
+| `<fatfs_parse::session_pool::SessionPool<fatfs::session::SessionPages>>::find` | fatfs:/ | 5456 | 4400 |
 | `kernel::arch::current::speculation::index_mask` | kernel | 5312 | 5440 |
 | `kernel::arch::nospec::select_ptr::<kernel::cap::cspace::CSpacePage>` | kernel | 4352 | 5440 |
-| 541 functions below 5151 each |  | 214480 | 238550 |
+| 539 functions below 5155 each |  | 215170 | 239345 |
 
 #### `fsbench.open depth=3 cpus=1`
 
@@ -960,7 +961,7 @@ the slots in the order they were filled, which follows the requests served befor
 | `kernel::cap::derivation::resolve_slot_mut` | kernel | 522 | 143 |
 | `kernel::syscall::ipc::transfer_caps` | kernel | 443 | 501 |
 | `core::str::converts::from_utf8` | /tests/fixtures/programs/fsbench | 370 | 483 |
-| 469 functions below 477 each |  | 19746 | 22375 |
+| 469 functions below 477 each |  | 19809 | 22456 |
 
 <!-- path-account: end -->
 

@@ -27,6 +27,19 @@
 //! through the move, and the existing AS mapping at the slot's VA
 //! continues to point at the same physical pages.
 //!
+//! ## Lookup
+//!
+//! A page is found through the page index ([`fat_parse::page_index`]), each
+//! cached page's LBA-base sorted with its slot, whose lookup is a binary search
+//! of a fixed number of steps, set by the slot ceiling. A slot's index is the
+//! order its page was filled in, which follows the order of the requests the
+//! filesystem served before, and so the machine's timing; a lookup that
+//! scanned the slots for the page would cost each request more or less in
+//! different boots, by where its pages sit, and a lookup through the index
+//! costs the same in every one. The count of slots holding a page
+//! ([`PageCache::fund_run_time_headroom`]'s input) is kept as slots take and
+//! give back pages for the same reason, rather than counted over the slots.
+//!
 //! ## Run fills
 //!
 //! A miss whose caller names a run of pages ([`PageCache::acquire_page_run`],
@@ -120,6 +133,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use syscall_abi::{MAP_WRITABLE, MSG_DATA_WORDS_MAX, PAGE_SIZE, SyscallError};
 
+use fat_parse::page_index::PageIndex;
 pub use fat_parse::{QUARANTINE_MAX, SLOT_COUNT, slot_ceiling};
 use fat_parse::{RELEASE_KEEP, RUN_PAGES, VictimView};
 
@@ -235,7 +249,8 @@ const DEFAULT_SECTOR_BYTES: NonZeroU64 = NonZeroU64::new(DEFAULT_SECTOR_SIZE as 
 
 /// Sentinel for an unfilled slot. Page-base LBAs are always multiples of
 /// the sectors per page; `u64::MAX` cannot collide with any valid page base.
-const PAGE_BASE_EMPTY: u64 = u64::MAX;
+/// The page index's mark of an unused entry is the same value.
+const PAGE_BASE_EMPTY: u64 = PageIndex::EMPTY;
 
 /// One cache slot. Holds one page of consecutive sectors starting at
 /// `page_lba_base`, packed contiguously from offset 0 of the slot's memory
@@ -299,6 +314,16 @@ pub struct PageCache
     /// in index order. Written only by the dispatch thread, the one that fills
     /// slots.
     provisioned: AtomicUsize,
+    /// The slots that hold a page (`region_id` not 0), counted as a slot
+    /// takes or gives back its page. Written only by the dispatch thread.
+    pages: AtomicUsize,
+    /// Each cached page's LBA-base and its slot: the slots whose
+    /// `page_lba_base` names a page, kept with it by [`Self::set_page_base`],
+    /// through which a lookup finds a page in the same instructions wherever
+    /// its slot is (module docs § Lookup). Only the dispatch thread, which
+    /// fills and empties slots, touches it; the lock makes the sharing
+    /// explicit.
+    index: Mutex<PageIndex>,
     /// Bytes per sector: the device's logical block size, set at mount.
     sector_size: AtomicU32,
     next_seq: AtomicU64,
@@ -401,10 +426,13 @@ impl PageCache
             .try_reserve_exact(slot_count)
             .map_err(|_| InitError::Heap)?;
         skips.resize(slot_count, false);
+        let index = PageIndex::with_capacity(slot_count).ok_or(InitError::Heap)?;
 
         let cache: &'static mut Self = Box::leak(Box::new(Self {
             slots: slots.into_boxed_slice(),
             provisioned: AtomicUsize::new(0),
+            pages: AtomicUsize::new(0),
+            index: Mutex::new(index),
             sector_size: AtomicU32::new(DEFAULT_SECTOR_SIZE),
             next_seq: AtomicU64::new(1),
             memmgr_ep,
@@ -541,13 +569,36 @@ impl PageCache
     }
 
     /// Slots that hold a page, counting one whose cap a failed fill lost,
-    /// whose VA still maps its page.
+    /// whose VA still maps its page: the count kept as slots take and give
+    /// back pages, so reading it costs the same however many slots there are.
     fn pages_held(&self) -> usize
     {
-        self.live_slots()
-            .iter()
-            .filter(|s| s.region_id.load(Ordering::Acquire) != 0)
-            .count()
+        self.pages.load(Ordering::Acquire)
+    }
+
+    /// Set slot `idx`'s page base to `base` (`PAGE_BASE_EMPTY` for none),
+    /// and the page index with it: the entry of the page the slot held goes,
+    /// and `base`, when a page, names the slot. Called only by the dispatch
+    /// thread. The index holds as many entries as there are slots, and a page
+    /// is in one slot at a time, so an insert never meets a full index; were
+    /// it to, the slot is left with no page base, a miss for its page.
+    fn set_page_base(&self, idx: usize, base: u64)
+    {
+        let Some(slot) = self.slots.get(idx)
+        else
+        {
+            return;
+        };
+        let mut index = self.index.lock().unwrap_or_else(PoisonError::into_inner);
+        let old = slot.page_lba_base.swap(base, Ordering::AcqRel);
+        if old != PAGE_BASE_EMPTY && index.lookup(old) == Some(idx)
+        {
+            let _ = index.remove(old);
+        }
+        if base != PAGE_BASE_EMPTY && !index.insert(base, idx)
+        {
+            slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+        }
     }
 
     /// Give a slot with no page its page, returning its index, or `None`
@@ -581,10 +632,12 @@ impl PageCache
             }
             return None;
         }
-        slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+        self.set_page_base(idx, PAGE_BASE_EMPTY);
         slot.exposed.store(false, Ordering::Release);
         slot.memory_cap.store(page.cap, Ordering::Release);
         slot.region_id.store(page.region_id, Ordering::Release);
+        // The slot held no page (above); at most the slot count hold one.
+        self.pages.fetch_add(1, Ordering::AcqRel);
         if idx == mark
         {
             // `idx` indexes `slots`, so this never saturates.
@@ -638,7 +691,7 @@ impl PageCache
             {
                 continue;
             }
-            if let Some(region_id) = self.take_idle_page(slot)
+            if let Some(region_id) = self.take_idle_page(i, slot)
             {
                 batch.push(region_id, ipc_buf);
             }
@@ -666,7 +719,7 @@ impl PageCache
     /// cap a failed fill lost gives its page back too: its VA still maps the
     /// page, which no pick or miss reuses. A failed unmap leaves the slot its
     /// page with no sector run, which the next miss fills.
-    fn take_idle_page(&self, slot: &CacheSlot) -> Option<u64>
+    fn take_idle_page(&self, idx: usize, slot: &CacheSlot) -> Option<u64>
     {
         let cap = slot.memory_cap.load(Ordering::Acquire);
         let region_id = slot.region_id.load(Ordering::Acquire);
@@ -677,7 +730,7 @@ impl PageCache
             return None;
         }
         // No lookup hits the page from here.
-        slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+        self.set_page_base(idx, PAGE_BASE_EMPTY);
         // SAFETY: slot.va is this slot's page of the cache's reserved window,
         // which only the cache maps; the slot is unreferenced, so no read or
         // write of the page is in progress and no Rust reference into it lives.
@@ -691,6 +744,8 @@ impl PageCache
             slot.memory_cap.store(0, Ordering::Release);
         }
         slot.region_id.store(0, Ordering::Release);
+        // The slot held a page (above), counted when it took it.
+        self.pages.fetch_sub(1, Ordering::AcqRel);
         Some(region_id)
     }
 
@@ -1014,9 +1069,11 @@ impl PageCache
     /// until that thread next acquires a page.
     pub fn contains_page(&self, page_lba_base: u64) -> bool
     {
-        self.live_slots()
-            .iter()
-            .any(|slot| slot.page_lba_base.load(Ordering::Acquire) == page_lba_base)
+        self.index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .lookup(page_lba_base)
+            .is_some()
     }
 
     /// Snapshot the Memory cap currently backing slot `idx`.
@@ -1075,7 +1132,7 @@ impl PageCache
         // Invalidate the page base up front: a fill failure leaves the
         // slot without correct contents, so it must not satisfy a hit
         // lookup even by stale page-base match.
-        slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+        self.set_page_base(victim, PAGE_BASE_EMPTY);
         let run = self.uncached_run(page_lba_base, pages);
         let filled = (run > 1 && self.fill_run(victim, page_lba_base, run, block_dev, ipc_buf))
             || fill_via_block_dev(
@@ -1090,7 +1147,7 @@ impl PageCache
             slot.refcount.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        slot.page_lba_base.store(page_lba_base, Ordering::Release);
+        self.set_page_base(victim, page_lba_base);
         slot.lru_seq.store(self.bump_seq(), Ordering::Release);
         Some(victim)
     }
@@ -1190,9 +1247,9 @@ impl PageCache
             *entry = idx;
             // At most `RUN_SLOTS`: `held` had room for this one.
             held_count = held_count.saturating_add(1);
-            slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+            self.set_page_base(idx, PAGE_BASE_EMPTY);
             self.copy_from_transfer(transfer, page, idx);
-            slot.page_lba_base.store(base, Ordering::Release);
+            self.set_page_base(idx, base);
             slot.lru_seq.store(self.bump_seq(), Ordering::Release);
         }
         for &idx in held.get(..held_count).unwrap_or_default()
@@ -1244,28 +1301,28 @@ impl PageCache
     }
 
     /// The slot holding the page at `page_lba_base`, with a reference taken
-    /// on it, or `None` when the page is not cached.
+    /// on it, or `None` when the page is not cached. Finds the slot through
+    /// the page index, in the same instructions wherever the slot is (module
+    /// docs § Lookup).
     fn lookup_cached(&self, page_lba_base: u64) -> Option<usize>
     {
-        for (i, slot) in self.live_slots().iter().enumerate()
+        let i = self
+            .index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .lookup(page_lba_base)?;
+        let slot = self.slots.get(i)?;
+        slot.refcount.fetch_add(1, Ordering::AcqRel);
+        // Re-check after the bump: a concurrent eviction could have just
+        // refilled the slot with another page. The single-threaded fs of
+        // today never hits this, but the pattern is forward-compatible.
+        if slot.page_lba_base.load(Ordering::Acquire) != page_lba_base
         {
-            if slot.page_lba_base.load(Ordering::Acquire) == page_lba_base
-            {
-                slot.refcount.fetch_add(1, Ordering::AcqRel);
-                // Re-check after the bump: a concurrent eviction could
-                // have just refilled the slot with another page. The
-                // single-threaded fs of today never hits this, but the
-                // pattern is forward-compatible.
-                if slot.page_lba_base.load(Ordering::Acquire) != page_lba_base
-                {
-                    slot.refcount.fetch_sub(1, Ordering::AcqRel);
-                    continue;
-                }
-                slot.lru_seq.store(self.bump_seq(), Ordering::Release);
-                return Some(i);
-            }
+            slot.refcount.fetch_sub(1, Ordering::AcqRel);
+            return None;
         }
-        None
+        slot.lru_seq.store(self.bump_seq(), Ordering::Release);
+        Some(i)
     }
 
     /// The least recently used unreferenced slot that is safe to refill:
@@ -1348,7 +1405,7 @@ impl PageCache
             return false;
         };
         let old = Page { cap, region_id };
-        match self.swap_page(slot, old, fresh)
+        match self.swap_page(idx, slot, old, fresh)
         {
             Swap::Done =>
             {
@@ -1377,7 +1434,7 @@ impl PageCache
     /// failure `old` is mapped back; when that fails too, the slot is left
     /// with no page ([`Swap::Lost`]). The slot is unreferenced, so no reader is
     /// inside its page.
-    fn swap_page(&self, slot: &CacheSlot, old: Page, fresh: Page) -> Swap
+    fn swap_page(&self, idx: usize, slot: &CacheSlot, old: Page, fresh: Page) -> Swap
     {
         // SAFETY: slot.va is this slot's page of the cache's reserved window,
         // which only the cache maps; the slot is unreferenced, so no read or
@@ -1399,9 +1456,11 @@ impl PageCache
         {
             return Swap::Restored;
         }
-        slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+        self.set_page_base(idx, PAGE_BASE_EMPTY);
         slot.memory_cap.store(0, Ordering::Release);
         slot.region_id.store(0, Ordering::Release);
+        // The slot held a page, `old`, counted when it took it.
+        self.pages.fetch_sub(1, Ordering::AcqRel);
         slot.exposed.store(false, Ordering::Release);
         Swap::Lost
     }

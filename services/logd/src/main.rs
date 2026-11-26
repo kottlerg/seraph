@@ -1345,7 +1345,8 @@ struct Sink
 {
     /// The driver, as resolved through devmgr.
     driver: OutputDriver,
-    /// The driver's write opcode (`SERIAL_WRITE_BYTES`, `FB_WRITE_BYTES`).
+    /// The driver's write label without its length: the opcode
+    /// (`SERIAL_WRITE_BYTES`, `FB_WRITE_BYTES`) and its flags.
     op: u64,
     /// The sink's name in logd's lines about it.
     what: &'static str,
@@ -1672,8 +1673,15 @@ impl Sink
     }
 }
 
-/// The serial driver logd writes every line to.
-static SERIAL: Sink = Sink::new(ipc::serial_labels::SERIAL_WRITE_BYTES, "serial");
+/// The serial driver logd writes every line to. Each write waits until its
+/// bytes have left the UART (`SERIAL_WRITE_SENT`), so a line is on the line
+/// when it counts as written: before its caller goes on, which may be to
+/// power the machine off (`services/logd/docs/ipc-interface.md` § Output
+/// sinks).
+static SERIAL: Sink = Sink::new(
+    ipc::serial_labels::SERIAL_WRITE_BYTES | ipc::serial_labels::SERIAL_WRITE_SENT,
+    "serial",
+);
 /// The framebuffer driver logd mirrors every line to. A headless boot runs
 /// none, so the sink stays unserved: it queues lines up to its queue and
 /// counts the rest, and nothing is written to a screen ([`Sink::offer`]).

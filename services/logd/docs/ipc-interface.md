@@ -541,6 +541,12 @@ logd's waits on it for longer than `SINK_STALL_MS` (1000 ms,
   ([devmgr responsibilities](../../devmgr/docs/responsibilities.md)); until then the writer waits
   in it and the sink stalls as for a stopped driver. The writers are spawned beside the receive
   workers, before the handover pull.
+- **Serial writes.** The serial sink writes with `serial_labels::SERIAL_WRITE_SENT`, so the driver
+  answers a call once its bytes have left the UART, not once they are in its transmit ring, and a
+  line counts as written when it is on the wire
+  ([serial driver](../../drivers/serial/README.md#label-1-serial_write_bytes)
+  § Label 1). The driver answers a call that waited on a transmitter making no progress for its
+  `TX_STALL_MS` (1000 ms) with `STALLED`, which the writer takes as it takes any answer.
 - **Inline.** Until a sink's writer runs, or when it cannot be spawned, a line's producer writes
   the line itself, one producer at a time so a line stays whole. Its wait for its turn and its
   calls end `SINK_STALL_MS` after it took the line, so no producer waits on the sink for longer;

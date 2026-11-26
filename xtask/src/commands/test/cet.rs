@@ -60,8 +60,8 @@ use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::guest::Guest;
 use crate::qemu::{
-    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging,
-    X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
+    Firmware, GdbMode, InterruptRemapping, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr,
+    X86Paging, X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::{Span, Stub, field_hex, function_path, stop_thread};
 use crate::socket_dir::SocketDir;
@@ -311,6 +311,7 @@ fn launch(ctx: &Context, args: &CaseArgs, gdb: GdbMode<'_>, name: &str) -> Resul
         vars.path(),
         args,
         gdb,
+        InterruptRemapping::for_sysroot(ctx),
     ))?;
     let qemu_binary = require_tool(Arch::X86_64.qemu_binary())?;
     let stderr_file =
@@ -337,6 +338,7 @@ fn cet_spec<'a>(
     firmware_vars: &'a Path,
     args: &CaseArgs,
     gdb: GdbMode<'a>,
+    interrupt_remapping: InterruptRemapping,
 ) -> QemuLaunchSpec<'a>
 {
     QemuLaunchSpec {
@@ -360,6 +362,7 @@ fn cet_spec<'a>(
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::On,
         iommu: Iommu::Attached,
+        interrupt_remapping,
         debug_port: None,
         test_devices: false,
         hotplug_port: None,
@@ -628,6 +631,7 @@ mod tests
             Path::new("vars.fd"),
             &args,
             GdbMode::Off,
+            InterruptRemapping::Withheld,
         );
         assert_eq!(spec.x86_shadow_stack, X86ShadowStack::On);
         assert_eq!(spec.arch, Arch::X86_64);

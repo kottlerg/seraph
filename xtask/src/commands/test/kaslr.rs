@@ -35,7 +35,7 @@ use crate::esp::{Knob, remove_knob, stage_knob};
 use crate::guest::Guest;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    Firmware, GdbMode, Iommu, QemuLaunchSpec, SecondDisk, build_qemu_argv,
+    Firmware, GdbMode, InterruptRemapping, Iommu, QemuLaunchSpec, SecondDisk, build_qemu_argv,
     validate_sysroot_for_launch,
 };
 use crate::util::{require_tool, step};
@@ -103,6 +103,7 @@ fn launch(
         x86_paging: args.x86_paging,
         x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
         iommu: Iommu::Attached,
+        interrupt_remapping: InterruptRemapping::for_sysroot(ctx),
         debug_port: None,
         test_devices: false,
         hotplug_port: None,

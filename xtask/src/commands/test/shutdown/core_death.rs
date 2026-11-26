@@ -60,8 +60,8 @@ use crate::disk::DiskLayout;
 use crate::error::{Context as _, Result, bail};
 use crate::guest::Guest;
 use crate::qemu::{
-    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
-    X86Paging, X86ShadowStack, build_qemu_argv,
+    Firmware, GdbMode, InterruptRemapping, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr,
+    SecondDisk, X86Paging, X86ShadowStack, build_qemu_argv,
 };
 use crate::qemu_gdb::{Stub, field_hex};
 use crate::qmp;
@@ -405,6 +405,7 @@ fn launch(
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,
+        interrupt_remapping: InterruptRemapping::for_sysroot(ctx),
         debug_port,
         test_devices: false,
         hotplug_port: None,

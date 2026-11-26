@@ -196,10 +196,13 @@ impl<W: WordStore> ProcessIndex<W>
     fn bucket_of(&self, badge: u64) -> u64
     {
         let h = hash(badge);
-        let b = h & self.level.saturating_sub(1);
-        let wide = h & self.level.saturating_mul(2).saturating_sub(1);
+        // `level` is a power of two, at least 1, so the low mask does not wrap.
+        let b = h & self.level.wrapping_sub(1);
+        // A split bucket's badges add the next hash bit, `level`'s own. Kept
+        // as one AND with a mask rather than a choice between two values,
+        // which a target without a conditional move compiles to a branch.
         let split = u64::from(b < self.split).wrapping_neg();
-        (wide & split) | (b & !split)
+        b | (h & self.level & split)
     }
 
     /// The slot keyed by `badge`: a record or a handle state ([`key_of`]).

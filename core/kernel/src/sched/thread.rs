@@ -824,6 +824,23 @@ pub struct ThreadControlBlock
     /// atomic add without it, and every one is read without it.
     pub placement: PlacementCounts,
 
+    /// Whether this thread's latest receive came through
+    /// `SYS_IPC_REPLY_RECV`: a prediction that it answers the call that
+    /// receive takes with a `SYS_IPC_REPLY_RECV` too, whose reply wake is
+    /// placed by whether its receive parks. The synchronous wake rule reads it
+    /// to admit a receiver that outranks its caller to the caller's CPU, when
+    /// the caller has no hard affinity and is not in a fault delivery
+    /// (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
+    /// "Target CPU selection"). Written only by the thread itself, `Relaxed`,
+    /// before its receive can link it on a receive queue, and read `Relaxed`
+    /// without a lock by the wake of a call that dequeued it from that queue
+    /// under `ep.lock`, which orders the write before the read. Advisory: a
+    /// thread that answers such a call with a plain `SYS_IPC_REPLY` after
+    /// all can keep that caller's reply wake queued behind it until it parks,
+    /// or until an idle CPU pulls the caller, the cost the rank check
+    /// otherwise keeps off; each later call it answers so pays it again.
+    pub serves_reply_recv: core::sync::atomic::AtomicBool,
+
     /// Intrusive run-queue link — next TCB in the same run queue.
     /// `None` when not on any run queue. Owned by the `scheduler.lock` of the
     /// CPU whose queue links this TCB (see the struct-level invariant).

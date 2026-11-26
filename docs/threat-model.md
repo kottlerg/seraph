@@ -258,7 +258,7 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   `storage_statement::property::storage_statement_holds` from the seeds in
   `shared/storage-statement/fuzz/storage-statement/seeds/`, and the `proofs` module of
   `shared/storage-statement/src/lib.rs` proves the line parser, the GUID, path and disk forms and
-  the conflict check; the same CI jobs run them.
+  the conflict check. CI's gating `fuzz` job runs the target, and its `kani` jobs the proofs.
 - Planned: the FAT decoders' property function, fuzz target and proof harness (`parse_bpb_geometry`,
   `read_fat_entry`, `parse_dir_entry`; [#680](https://github.com/kottlerg/seraph/issues/680),
   [#756](https://github.com/kottlerg/seraph/issues/756)).

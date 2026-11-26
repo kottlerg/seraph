@@ -7398,8 +7398,10 @@ fn place_by_rank_and_load(view: &impl WakeView, exclude: Option<usize>, hint: Wa
 /// when the woken thread outranks the waker, the scan leaves that CPU out, as
 /// the synchronous wake's guard kept such a thread off its caller's CPU (that
 /// CPU queues other work, or the thread does not answer with
-/// `SYS_IPC_REPLY_RECV`), which stays its pick only as its preferred CPU. On a [`WakeHint::WakerRuns`] wake
-/// the waker runs on, so its CPU is no preferred-CPU pick and ranks by the
+/// `SYS_IPC_REPLY_RECV`), which stays its pick only as its preferred CPU. A
+/// caller that cannot move is the third reason: [`place_unpinned`] then
+/// passes its CPU as `exclude`, so it is no pick at all, the preferred one
+/// included. On a [`WakeHint::WakerRuns`] wake the waker runs on, so its CPU is no preferred-CPU pick and ranks by the
 /// waker in the scan.
 fn place_rt_wake(
     view: &impl WakeView,

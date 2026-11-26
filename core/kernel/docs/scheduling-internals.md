@@ -1326,33 +1326,32 @@ placed on the waker's CPU k when k is eligible and the guard holds:
   to bound the wait.
 -  **The woken thread does not outrank the waker** (`run_queue::outranks` on the two `priority`
   values: one run queue above the other), **or its latest receive was a `SYS_IPC_REPLY_RECV`'s and
-  the waker can leave k** (`serves_reply_recv`, and the waker's `cpu_affinity` `AFFINITY_ANY` and
-  `in_fault_delivery` clear: `ReplyRecvAdmission`, read only when the woken thread outranks the
-  waker). A fair waker's reply wake returns it
-  to k, by its affinity or its sticky `preferred_cpu`; a recipient that outranks it and serves a
-  backlog without parking would hold it off past any slice, since slice expiry never hands the CPU
-  to a lower RT level or from an RT thread to a fair one ([scheduler.md](scheduler.md) § Time Slice
-  Policy). An RT waker's plain reply wake goes by rank (the RT rule, below): it leaves k when the
-  recipient runs there at the waker's level or above. At or below the waker, the recipient is
-  preempted by the reply wake or shares k with the waker within one slice; at the waker's level, a
-  recipient serving a backlog without parking holds a fair waker's `SYS_IPC_REPLY` wake that long,
-  sends an RT waker's to another CPU, and holds an unpinned caller's `SYS_IPC_REPLY_RECV` wake not
-  at all (below). That last is why the second branch admits a recipient that outranks the waker: a
-  `SYS_IPC_REPLY_RECV` wakes its caller after its receive, with `Sync` when the receive parks, onto
-  k with the server gone, and with `WakerRuns` when it runs on, which `wake_replied` places with k
-  excluded when the server outranks the caller (below), so an unpinned caller goes to another CPU.
-  A waker that cannot leave k is not admitted: one with hard affinity, which rule 1 returns to k
-  ahead of any exclusion, so that it would wait behind a recipient serving a backlog there, and a
-  thread in a fault delivery, whose resume reply wakes it at once (`reply_to_fault`,
-  `WakeHint::None`), before the handler's receive, and so by rule 4 to k behind the handler. When
-  the recipient outranks such a waker, the other rules place it with k excluded, as
-  `select_target_cpu_excluding` excludes a CPU, the RT rule's preferred pick included, so the
-  recipient's preferred CPU being k (where it last ran beside an unpinned caller) does not return it
-  there. The waker's two fields are read without a lock: `in_fault_delivery` is
-  its own, written by the waker before its delivery and read on its own CPU in the syscall that
-  wakes the recipient, and `cpu_affinity` is a placement hint, as the woken thread's is; an
-  affinity change racing the call misjudges one placement, which the pull bounds. The bit is the
-  recipient's own
+  the waker can leave k** (the waker's `cpu_affinity` `AFFINITY_ANY` and `in_fault_delivery` clear,
+  `WakerMobility` through `WakeView::waker_can_move`, read only when the woken thread outranks the
+  waker; then `serves_reply_recv`, read only when, in addition, the waker can move). A fair waker's
+  reply wake returns it to k, by its affinity or its sticky `preferred_cpu`; a recipient that
+  outranks it and serves a backlog without parking would hold it off past any slice, since slice
+  expiry never hands the CPU to a lower RT level or from an RT thread to a fair one
+  ([scheduler.md](scheduler.md) § Time Slice Policy). An RT waker's plain reply wake goes by rank
+  (the RT rule, below): it leaves k when the recipient runs there at the waker's level or above. At
+  or below the waker, the recipient is preempted by the reply wake or shares k with the waker within
+  one slice; at the waker's level, a recipient serving a backlog without parking holds a fair
+  waker's `SYS_IPC_REPLY` wake that long, sends an RT waker's to another CPU, and holds an unpinned
+  caller's `SYS_IPC_REPLY_RECV` wake not at all (below). That last is why the second branch admits a
+  recipient that outranks the waker: a `SYS_IPC_REPLY_RECV` wakes its caller after its receive, with
+  `Sync` when the receive parks, onto k with the server gone, and with `WakerRuns` when it runs on,
+  which `wake_replied` places with k excluded when the server outranks the caller (below), so an
+  unpinned caller goes to another CPU. A waker that cannot leave k is not admitted: one with hard
+  affinity, which rule 1 returns to k ahead of any exclusion, so that it would wait behind a
+  recipient serving a backlog there, and a thread in a fault delivery, whose resume reply wakes it
+  at once (`reply_to_fault`, `WakeHint::None`), before the handler's receive, and so by rule 4 to k
+  behind the handler. When the recipient outranks such a waker, the other rules place it with k
+  excluded, as `select_target_cpu_excluding` excludes a CPU, the RT rule's preferred pick included,
+  so the recipient's preferred CPU being k (where it last ran beside an unpinned caller) does not
+  return it there. The waker's two fields are read without a lock: `in_fault_delivery` is its own,
+  written by the waker before its delivery and read on its own CPU in the syscall that wakes the
+  recipient, and `cpu_affinity` is a placement hint, as the woken thread's is; an affinity change
+  racing the call misjudges one placement, which the pull bounds. The bit is the recipient's own
   prediction of how it replies, written by the thread itself (`receive_on`, Relaxed) before its
   receive can link it on the recv queue: true from `sys_ipc_reply_recv`, false from `sys_ipc_recv`.
   The call that wakes it dequeued it under `ep.lock`, which orders the write before the guard's

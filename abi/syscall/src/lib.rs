@@ -539,7 +539,7 @@ pub const THREAD_UPCALL_IN_CALL: u64 = 1 << 2;
 
 /// Thread only — one value of the thread's placement on the CPUs, the view
 /// named in argument 2 (one of the `THREAD_PLACEMENT_*` constants): the CPU
-/// it was last linked or dispatched on, or one of four counts of how its wakes
+/// it was last linked or dispatched on, or one of six counts of how its wakes
 /// and migrations placed it (core/kernel/docs/scheduler.md § Placement
 /// Counters). A diagnostic that decides nothing, read by a benchmark to name
 /// where its threads ran and what their wakes cost. Each count is the thread's
@@ -565,6 +565,14 @@ pub const THREAD_PLACEMENT_WAKE_MOVES: u64 = 3;
 /// [`CAP_INFO_THREAD_PLACEMENT`] view: times the load balancer moved the
 /// thread, queued, to another CPU.
 pub const THREAD_PLACEMENT_PULLS: u64 = 4;
+/// [`CAP_INFO_THREAD_PLACEMENT`] view: wakes of the thread by a synchronous
+/// IPC call or fault delivery whose placement reached the synchronous wake
+/// rule, the thread having no hard affinity and no context save in flight.
+pub const THREAD_PLACEMENT_SYNC_WAKES: u64 = 5;
+/// [`CAP_INFO_THREAD_PLACEMENT`] view: of those, the wakes the rule placed on
+/// the waker's CPU, which queued no other thread and ran a waker the thread
+/// does not outrank.
+pub const THREAD_PLACEMENT_SYNC_LOCAL: u64 = 6;
 
 /// The word [`CAP_INFO_IRQ_REMAP_ENTRY`] answers, from a remapping entry's
 /// handle, the vector it delivers, and its destination APIC id.

@@ -5591,7 +5591,13 @@ unsafe fn dealloc_thread(
             let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
             // SAFETY: bound kept valid by wake_in_flight = 1 above;
             // select_target_cpu_excluding is lock-free.
-            let bcpu = unsafe { crate::sched::select_target_cpu_excluding(bound, Some(this_cpu)) };
+            let bcpu = unsafe {
+                crate::sched::select_target_cpu_excluding(
+                    bound,
+                    Some(this_cpu),
+                    crate::sched::WakeHint::None,
+                )
+            };
             // The reply-wake is never self-pinned to the wedged
             // dealloc CPU unless hard affinity names it or it is the only
             // CPU.

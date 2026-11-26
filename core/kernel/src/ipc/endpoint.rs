@@ -249,8 +249,18 @@ pub enum CallRendezvous
 {
     /// A receiver was waiting: it is dequeued and bound, and its wake is
     /// claimed by `wake_in_flight`. The caller MUST wake it with
-    /// `enqueue_and_wake` after moving any caps.
-    Bound(*mut ThreadControlBlock),
+    /// `enqueue_and_wake` after moving any caps, on the CPU
+    /// `select_target_cpu` chooses under `hint`.
+    Bound
+    {
+        /// The bound receiver.
+        server: *mut ThreadControlBlock,
+        /// [`WakeHint::Sync`](crate::sched::WakeHint::Sync) when the caller's
+        /// park committed, so its `schedule()` follows before any return to
+        /// user mode; [`WakeHint::None`](crate::sched::WakeHint::None) when
+        /// the park was refused and the caller runs on.
+        hint: crate::sched::WakeHint,
+    },
     /// No receiver was waiting: the call is queued on the send queue.
     Queued,
     /// The endpoint has no receiver left ([`EndpointState::receivers`]): the
@@ -421,6 +431,14 @@ pub unsafe fn endpoint_call(
         let committed = unsafe {
             crate::sched::commit_blocked_under_local_lock(caller, parked_state, server.cast::<u8>())
         };
+        let hint = if committed == crate::sched::ParkCommit::Committed
+        {
+            crate::sched::WakeHint::Sync
+        }
+        else
+        {
+            crate::sched::WakeHint::None
+        };
         if committed != crate::sched::ParkCommit::Committed
         {
             // Refused park (a stop won, or a stray coalesced wake; a pending
@@ -448,7 +466,7 @@ pub unsafe fn endpoint_call(
         // server is the live TCB the dequeue claimed, not yet woken, and not
         // the caller (a running thread is on no receive queue).
         unsafe { copy_message(caller, server) };
-        return CallRendezvous::Bound(server);
+        return CallRendezvous::Bound { server, hint };
     }
 
     // No server available — block caller on send queue.
@@ -584,7 +602,8 @@ unsafe fn release_displaced_caller(caller: *mut ThreadControlBlock)
     // woken; no sleep-list lock is held (contract).
     unsafe { crate::ipc::cancel_timed_entry(caller) };
     // SAFETY: the wake_in_flight pin keeps caller a valid TCB.
-    let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
+    let target_cpu =
+        unsafe { crate::sched::select_target_cpu(caller, crate::sched::WakeHint::None) };
     // SAFETY: caller is valid (pinned), target_cpu came from
     // select_target_cpu, and no scheduler lock is held (contract).
     unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
@@ -1109,7 +1128,8 @@ pub unsafe fn release_waiters(ep: *mut EndpointState)
                 .store(1, core::sync::atomic::Ordering::Release);
         }
         // SAFETY: tcb is a valid, initialised TCB.
-        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
+        let target_cpu =
+            unsafe { crate::sched::select_target_cpu(tcb, crate::sched::WakeHint::None) };
         // SAFETY: tcb is a valid TCB; target_cpu came from
         // select_target_cpu.
         unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };

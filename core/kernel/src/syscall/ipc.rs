@@ -839,7 +839,10 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
         )
     };
 
-    if let crate::ipc::endpoint::CallRendezvous::Bound(woken_server) = result
+    if let crate::ipc::endpoint::CallRendezvous::Bound {
+        server: woken_server,
+        hint,
+    } = result
     {
         // The server was already blocked in recv: endpoint_call completed the
         // rendezvous. Move any caps in this caller's context before waking the
@@ -860,8 +863,11 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
             unsafe { (*woken_server).magic },
             crate::sched::thread::TCB_MAGIC
         );
-        // SAFETY: woken_server returned by endpoint_call; is valid TCB.
-        let target_cpu = unsafe { crate::sched::select_target_cpu(woken_server) };
+        // A committed park makes the hint Sync: this thread's schedule() below
+        // follows before any return to user mode, so the server may run here.
+        // SAFETY: woken_server returned by endpoint_call; is valid TCB; a Sync
+        // hint's caller is this running thread, its park committed.
+        let target_cpu = unsafe { crate::sched::select_target_cpu(woken_server, hint) };
         debug_assert!(target_cpu < crate::sched::MAX_CPUS);
         // SAFETY: woken_server is a valid TCB; target_cpu came from
         // select_target_cpu.
@@ -1259,7 +1265,8 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
         );
     }
     // SAFETY: caller is a valid TCB (caller contract).
-    let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
+    let target_cpu =
+        unsafe { crate::sched::select_target_cpu(caller, crate::sched::WakeHint::None) };
     // SAFETY: caller is a valid parked TCB; target_cpu came from
     // select_target_cpu; enqueue_and_wake transitions it to Ready.
     unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
@@ -1449,7 +1456,8 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: caller is pinned by the claim.
     debug_assert_eq!(unsafe { (*caller).magic }, crate::sched::thread::TCB_MAGIC);
     // SAFETY: caller is pinned by the claim.
-    let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
+    let target_cpu =
+        unsafe { crate::sched::select_target_cpu(caller, crate::sched::WakeHint::None) };
     debug_assert!(target_cpu < crate::sched::MAX_CPUS);
     // SAFETY: caller is pinned by the claim; target_cpu came from
     // select_target_cpu.
@@ -1537,7 +1545,8 @@ unsafe fn reply_to_fault(
     // SAFETY: caller pinned by the claim.
     debug_assert_eq!(unsafe { (*caller).magic }, crate::sched::thread::TCB_MAGIC);
     // SAFETY: caller pinned by the claim.
-    let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
+    let target_cpu =
+        unsafe { crate::sched::select_target_cpu(caller, crate::sched::WakeHint::None) };
     debug_assert!(target_cpu < crate::sched::MAX_CPUS);
     // SAFETY: caller pinned by the claim; target_cpu came from
     // select_target_cpu; it transitions to Ready under sched.lock in
@@ -1769,7 +1778,8 @@ pub fn sys_notification_send(tf: UserFrame) -> Result<u64, SyscallError>
             "sys_notification_send: woken waiter magic corrupt"
         );
         // SAFETY: waiter returned by notification_send; is valid TCB.
-        let target_cpu = unsafe { crate::sched::select_target_cpu(waiter) };
+        let target_cpu =
+            unsafe { crate::sched::select_target_cpu(waiter, crate::sched::WakeHint::None) };
         debug_assert!(
             target_cpu < crate::sched::MAX_CPUS,
             "sys_notification_send: target_cpu {target_cpu} out of range"
@@ -1951,7 +1961,8 @@ pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
             // SAFETY: woken returned by event_queue_post; is valid TCB.
             debug_assert_eq!(unsafe { (*woken).magic }, crate::sched::thread::TCB_MAGIC);
             // SAFETY: woken returned by event_queue_post; is valid TCB.
-            let target_cpu = unsafe { crate::sched::select_target_cpu(woken) };
+            let target_cpu =
+                unsafe { crate::sched::select_target_cpu(woken, crate::sched::WakeHint::None) };
             debug_assert!(target_cpu < crate::sched::MAX_CPUS);
             // SAFETY: woken is a valid TCB; target_cpu came from
             // select_target_cpu.

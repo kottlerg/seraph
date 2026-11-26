@@ -1379,10 +1379,12 @@ argument 2 names: `THREAD_PLACEMENT_CPU` (0), the CPU the thread was last linked
 or dispatched on, the one a wake of it next prefers, read under its scheduling lock; or one of its
 placement counters ([scheduler.md](scheduler.md#placement-counters) § Placement Counters):
 `THREAD_PLACEMENT_REMOTE_WAKES` (1), `THREAD_PLACEMENT_IDLE_WAKES` (2),
-`THREAD_PLACEMENT_WAKE_MOVES` (3) and `THREAD_PLACEMENT_PULLS` (4). A counter is a free-running
-32-bit count that wraps, read without a lock, a snapshot, so a reader takes the wrapping difference
-of two reads. They are diagnostics: ktest's round-trip benchmarks read them to report where their
-two threads ran ([core/ktest/README.md](../../ktest/README.md)). An unknown view answers
+`THREAD_PLACEMENT_WAKE_MOVES` (3), `THREAD_PLACEMENT_PULLS` (4), `THREAD_PLACEMENT_SYNC_WAKES` (5)
+and `THREAD_PLACEMENT_SYNC_LOCAL` (6). A counter is a free-running 32-bit count that wraps, read
+without a lock, a snapshot, so a reader takes the wrapping difference of two reads. They are
+diagnostics: ktest's round-trip benchmarks read them to report where their two threads ran, and
+`sync_ipc_placement` reads the synchronous wake rule's two to judge each wake the rule decided
+([core/ktest/README.md](../../ktest/README.md)). An unknown view answers
 `InvalidArgument`.
 
 **Capability requirement:** None for every selector but `CAP_INFO_MEMORY_PHYS_BASE`, which

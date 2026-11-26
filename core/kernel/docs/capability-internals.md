@@ -1737,11 +1737,11 @@ are not tracked for revocation (see [docs/ipc-design.md](../../../docs/ipc-desig
 Call/Reply Model). A reply capability is not a `CapTag` variant; it is an implicit per-thread
 binding outside the process CSpace: the receiving thread's `reply_tcb` field, which the kernel
 points at the caller when a call and a receive rendezvous — in `SYS_IPC_CALL` when the server is
-already waiting, in `SYS_IPC_RECV` when the caller is, or in kernel fault delivery
-(`core/kernel/src/ipc/fault.rs`), which takes the caller role. The kernel clears the binding when
-`SYS_IPC_REPLY` claims it by compare-exchange in `endpoint_reply`, before it reads the caller,
-validates the payload, or moves a capability (a failure after the claim wakes the caller with the
-transfer-failed reply), at the
+already waiting, in `SYS_IPC_RECV` or `SYS_IPC_REPLY_RECV` when the caller is, or in
+kernel fault delivery (`core/kernel/src/ipc/fault.rs`), which takes the caller role. The kernel
+clears the binding when `SYS_IPC_REPLY` or `SYS_IPC_REPLY_RECV` claims it by compare-exchange in
+`endpoint_reply`, before it reads the caller, validates the payload, or moves a capability (a
+failure after the claim wakes the caller with the transfer-failed reply), at the
 thread's next `SYS_IPC_RECV` that passes its capability check and cap-slot pre-allocation and
 either waits or finds a caller (a try-once that finds none leaves the binding), which releases the
 unreplied caller, when a stop (`cancel_ipc_block`) or a teardown claims the bound caller, when a

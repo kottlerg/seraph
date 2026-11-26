@@ -175,8 +175,9 @@ skipping levels, risks deadlock.
    exclusive claim is the `reply_tcb` `compare_exchange(client, null)`, the caller's
    `wake_in_flight` was set when `endpoint_call` published the binding or the receive's send-queue
    dequeue (`bind_next_sender`) claimed the caller, and
-   `sys_ipc_reply` stamps the disposition and calls `enqueue_and_wake` once `endpoint_reply` has won
-   the CAS. Between a claim (a source-lock claim: waiter dequeued, payload deposited,
+   `deposit_reply` stamps the disposition once `endpoint_reply` has won the CAS, and
+   `sys_ipc_reply`, or `sys_ipc_reply_recv` after its receive, calls `enqueue_and_wake`. Between
+   a claim (a source-lock claim: waiter dequeued, payload deposited,
    `wake_in_flight = 1`; or a waking `reply_tcb` claim: the `endpoint_reply` or dying-server dealloc
    `compare_exchange` (the former also serving the `SYS_IPC_REPLY` failure path), the receive-entry
    swap that releases an unreplied caller or the try-once receive's release of a displaced one
@@ -1283,7 +1284,8 @@ and `commit_blocked`'s `Running→Blocked` commit because all three contend for 
 `schedule()` spin against the source CPU's in-flight save), (3) for a
 `WakeHint::Sync` wake, the waker's CPU, under the guard below, (4) sticky
 `preferred_cpu` when its load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD`
-of the global `min_load`, and (5) the least-loaded CPU, a tie going to
+of the global `min_load`, except, for a `WakeHint::WakerRuns` wake, when
+`preferred_cpu` is the waker's CPU, and (5) the least-loaded CPU, a tie going to
 the CPU with the fewest busy SMT siblings, then the lowest index
 (`least_loaded_cpu`; [scheduler.md](scheduler.md) § SMT Awareness). Hard
 affinity overrides the pin, so an in-window wake of a thread whose affinity
@@ -1307,9 +1309,11 @@ that issue).
 thread running on this CPU, its park committed in the same syscall, and its `schedule()` follows
 before any return to user mode: the call rendezvous (`sys_ipc_call` after `endpoint_call`) and
 the fault delivery (`ipc::fault`'s `deliver_once`), each when `CallRendezvous::Bound` carries
-`hint: Sync`, which `endpoint_call` sets only on `ParkCommit::Committed`. A refused park passes
-`WakeHint::None`: its waker runs on, and a recipient left queued behind it would wait out its
-slice while another CPU idles. Every other wake passes `None`. Under `Sync`, the woken thread is
+`hint: Sync`, which `endpoint_call` sets only on `ParkCommit::Committed`, and the reply of a
+`SYS_IPC_REPLY_RECV` whose receive parked (`sys_ipc_reply_recv`'s deferred wake, when
+`receive_on` returns `Received::Parked`, which `endpoint_recv` reports only for a committed park).
+A refused park of a call passes `WakeHint::None`: its waker runs on, and a recipient left queued
+behind it would wait out its slice while another CPU idles. Under `Sync`, the woken thread is
 placed on the waker's CPU k when k is eligible and the guard holds:
 
 - **k queues no thread but its idle thread** (`PerCpuScheduler::has_queued_thread` is false), for
@@ -1322,8 +1326,21 @@ placed on the waker's CPU k when k is eligible and the guard holds:
   would hold it off past any slice, since slice expiry never hands the CPU to a lower RT level or
   from an RT thread to a fair one ([scheduler.md](scheduler.md) § Time Slice Policy). At or below
   the waker, the recipient is preempted by the reply wake or shares k with the waker within one
-  slice; at the waker's level, a recipient serving a backlog without parking holds the reply wake
-  that long, which #1482 closes (scheduler.md § Thread Assignment).
+  slice; at the waker's level, a recipient serving a backlog without parking holds a
+  `SYS_IPC_REPLY` wake that long, and a `SYS_IPC_REPLY_RECV` wake not at all (below).
+
+**The waker that runs on (rule 4's exception).** The reply of a `SYS_IPC_REPLY_RECV` whose receive
+did not park (it bound a queued caller, a try-once found none, its park was refused, or it failed)
+passes `WakeHint::WakerRuns`: the server runs on, so its CPU k is busy whatever its load reads.
+Rule 4 then skips k when it is the caller's `preferred_cpu`, and the caller goes to its preferred
+CPU when that is another and within the threshold, and by least load otherwise. Rules 1, 2 and 5
+may still place it on k. When one does, and the server does not outrank the caller,
+`wake_replied` reports it and the server yields to the caller (`schedule(Requeue::Always)`, at
+the tail of its level) before it returns to user mode, after
+delivering a bound message or before returning an error; a refused park yields through its own
+`schedule()` ([ipc-internals.md](ipc-internals.md) § Reply-and-Receive Path). A caller placed
+there would otherwise wait behind the server until the server parks or its slice ends. Every other
+wake passes `WakeHint::None`.
 
 When the guard holds, the woken thread is the thread k's `schedule()` dispatches when the waker
 blocks, and `enqueue_and_wake` to k sends no IPI (it skips self-wakes). Between the link and that

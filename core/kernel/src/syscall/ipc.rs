@@ -1470,7 +1470,7 @@ pub fn sys_ipc_reply_recv(tf: UserFrame) -> Result<u64, SyscallError>
 /// stamped, placed by `hint`. Returns whether the server must yield to it
 /// before returning to user mode: the wake is [`WakeHint::WakerRuns`], it
 /// placed the caller on this CPU, and the server does not outrank the caller
-/// (core/kernel/docs/ipc-internals.md § Reply Path). A caller above the
+/// (core/kernel/docs/ipc-internals.md § Reply-and-Receive Path). A caller above the
 /// server's rank would preempt it at that return anyway; one at the same
 /// rank would otherwise wait behind it until it blocks or its slice ends.
 ///

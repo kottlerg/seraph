@@ -549,17 +549,19 @@ pass markers ([testing.md](testing.md#reporting-marker) § Reporting marker) and
 marker, which a line reporting the system halting carries, and on which `cargo xtask run` fails a
 boot ([xtask/README.md](../xtask/README.md#cargo-xtask-run) § `cargo xtask run`).
 
-Each example shows a line before and after these rules. The after line is in the console layout
-of the eight-level logging design (design intent; not yet implemented: today a line renders as
-`[sec.usfrac] [name] WARN <line>`, with no tag at info, as ipc-interface.md § Levels states). A
-line longer than the column limit continues on an indented line.
+Each example shows a line before and after these rules. The after line is in the default console
+layout of the logging design. init-logd and logd render a line as
+`[sec.usfrac] LEVEL  [name] <line>`, the tag padded to six columns, as ipc-interface.md § Levels
+states; the seconds right-aligned to five columns, and the kernel's own lines in the same layout,
+are design intent, not yet implemented. A line longer than the column limit continues on an
+indented line.
 
 ```
 kernel: MMIO: 261 MiB address-space windows outside DRAM (PCIe MMCFG / LAPIC / APLIC / CLINT /
     etc. — not RAM)
 [--------] INFO   [kernel] mmio: 261 MiB outside DRAM
 
-[svcmgr] WARN svcmgr: crasher-boot died during its bootstrap (exit reason 0x2000)
+[6.308457] WARN   [svcmgr] svcmgr: crasher-boot died during its bootstrap (exit reason 0x2000)
 [    6.308457] WARN   [svcmgr] crasher-boot died in bootstrap, exit reason 0x2000
 ```
 

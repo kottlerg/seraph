@@ -118,7 +118,8 @@ pub struct HistoryEntry
     /// Receipt microseconds since boot
     /// (`system_info(ElapsedUs)`-derived).
     pub us: u64,
-    /// The entry's level, an `ipc::stream_labels::LEVEL_*` code.
+    /// The entry's level, an `ipc::stream_labels::LEVEL_*` code: its RFC 5424
+    /// severity, 0 to 7.
     pub level: u64,
     /// Whether the entry is a text line or a record, with a record's field
     /// table.
@@ -466,7 +467,7 @@ impl SlotTable
     /// `QUERY_HISTORY` carries it, oldest first.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "an entry's level is a `LEVEL_*` code, which a `u8` holds"
+        reason = "an entry's level is a `LEVEL_*` code, a severity of 0 to 7, which a `u8` holds"
     )]
     pub fn history_views(&self) -> impl Iterator<Item = HistoryEntryView<'_>>
     {

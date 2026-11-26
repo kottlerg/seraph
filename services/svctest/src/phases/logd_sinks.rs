@@ -61,7 +61,7 @@
 
 use std::time::{Duration, Instant};
 
-use ipc::stream_labels::{LEVEL_INFO, LEVEL_SHIFT, STREAM_BYTES};
+use ipc::stream_labels::{LEVEL_INFO, STREAM_BYTES, level_bits};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use logd_codec::sink::{SINK_QUEUE_BYTES, SINK_STALL_MS};
 use syscall_abi::FAULT_CLASS_EXCEPTION;
@@ -366,7 +366,7 @@ fn send_lines(
         let mut line = head.clone();
         line.resize(line.len().max(pad_to.saturating_sub(1)), b'.');
         line.push(b'\n');
-        let label = STREAM_BYTES | ((line.len() as u64) << 16) | (LEVEL_INFO << LEVEL_SHIFT);
+        let label = STREAM_BYTES | ((line.len() as u64) << 16) | level_bits(LEVEL_INFO);
         let msg = IpcMessage::builder(label).bytes(0, &line).build();
         let start_at = Instant::now();
         // SAFETY: ipc_buf is this thread's registered IPC buffer page.

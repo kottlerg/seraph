@@ -201,9 +201,9 @@ mod tests
         log::parse_level(b"warn").unwrap()
     }
 
-    fn trace() -> u64
+    fn emergency() -> u64
     {
-        log::parse_level(b"trace").unwrap()
+        log::parse_level(b"emergency").unwrap()
     }
 
     fn parse_ok(text: &str) -> Levels
@@ -275,7 +275,7 @@ mod tests
     {
         assert_eq!(parse_ok(""), Levels::default());
         assert_eq!(
-            parse_ok("# vfsd = debug\n\n   \n\t# procmgr = trace\n"),
+            parse_ok("# vfsd = debug\n\n   \n\t# procmgr = notice\n"),
             Levels::default()
         );
         for s in Service::ALL
@@ -318,11 +318,11 @@ mod tests
         assert_eq!(levels.get(Service::Svcmgr), None);
         for s in Service::ALL
         {
-            let text = format!("{} = trace", String::from_utf8_lossy(s.name()));
+            let text = format!("{} = emergency", String::from_utf8_lossy(s.name()));
             let one = parse_ok(&text);
             for other in Service::ALL
             {
-                let want = (other == s).then(trace);
+                let want = (other == s).then(emergency);
                 assert_eq!(one.get(other), want, "{text}");
             }
         }
@@ -338,13 +338,16 @@ mod tests
         assert_eq!(levels.get(Service::Svcmgr), Some(warn()));
     }
 
-    // Defect caught: a malformed line aborting the parse or setting a level.
+    // Defect caught: a malformed line aborting the parse or setting a level,
+    // or `trace`, which is no level, read as one.
     #[test]
     fn a_line_that_is_not_a_setting_is_reported_and_ignored()
     {
-        let (levels, errs) =
-            errors("vfsd debug\nfatfs = debug\nvfsd = loud\nDEVMGR = debug\nvfsd = trace\n");
-        assert_eq!(levels.get(Service::Vfsd), Some(trace()));
+        let (levels, errs) = errors(
+            "vfsd debug\nfatfs = debug\nvfsd = loud\nDEVMGR = debug\nvfsd = emergency\n\
+             vfsd = trace\n",
+        );
+        assert_eq!(levels.get(Service::Vfsd), Some(emergency()));
         assert_eq!(levels.get(Service::Devmgr), None);
         assert_eq!(
             errs,
@@ -353,6 +356,7 @@ mod tests
                 ("fatfs = debug".to_string(), LineError::UnknownService),
                 ("vfsd = loud".to_string(), LineError::UnknownLevel),
                 ("DEVMGR = debug".to_string(), LineError::UnknownService),
+                ("vfsd = trace".to_string(), LineError::UnknownLevel),
             ]
         );
     }

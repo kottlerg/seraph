@@ -1106,10 +1106,11 @@ args! {
         /// Verify only the crates the change from the merge base of COMMIT and
         /// HEAD to the working tree can affect: each crate whose package, a
         /// package in its dependency closure, or a file one of them reads, the
-        /// change touches; every crate when it touches an input of every
-        /// build; and, when it selects no crate otherwise but touches
-        /// `.github/workflows/kani.yml` or `build-test.yml`, the crate with the
-        /// fewest harnesses.
+        /// change touches; every crate when it touches an input of every proof
+        /// (an input of every build, this command's source, or
+        /// `.github/workflows/kani.yml`); and, when it touches
+        /// `.github/workflows/build-test.yml`, the crate with the fewest
+        /// harnesses, whose jobs run whatever passes are stored.
         #[arg(long, value_name = "COMMIT", conflicts_with_all = ["component", "harness"])]
         pub since: Option<String>,
 
@@ -1135,13 +1136,25 @@ args! {
         #[arg(long, conflicts_with_all = ["component", "harness", "shard", "list"])]
         pub plan: bool,
 
+        /// With --plan, leave out each job whose pass a run of this repository
+        /// stored (an artifact named by the job's key, read with gh), printing
+        /// the run that proved it.
+        #[arg(long, requires = "plan")]
+        pub skip_passed: bool,
+
+        /// With --shard, when the harnesses judged are exactly the shard's and
+        /// all passed, write the record of the job's pass to DIR, as the file
+        /// CI stores it as: kani-pass-<key>.txt.
+        #[arg(long, value_name = "DIR", requires = "shard")]
+        pub pass_record: Option<PathBuf>,
+
         /// With --plan, append the workflow's outputs to FILE
         /// (`$GITHUB_OUTPUT`): the matrix and whether it holds a job.
         #[arg(long, value_name = "FILE", requires = "plan")]
         pub github_output: Option<PathBuf>,
 
         /// Print the pinned Kani release and exit, verifying nothing.
-        #[arg(long, conflicts_with_all = ["component", "harness", "since", "list", "shard", "plan"])]
+        #[arg(long, conflicts_with_all = ["component", "harness", "since", "list", "shard", "plan", "pass_record"])]
         pub pin: bool,
 
         /// The shared host's launch rules (see xtask/README.md "Host launch

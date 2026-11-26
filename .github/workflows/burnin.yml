@@ -16,6 +16,13 @@ on:
   # dispatch stress-tests whatever ref it targets and mints no version-named
   # artifacts. Release certification reads the tag-push run only.
   workflow_dispatch:
+    inputs:
+      kani-prove-all:
+        description: >-
+          Prove every crate, stored passes or not
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: burnin-${{ github.ref }}
@@ -200,5 +207,12 @@ jobs:
   kani:
     # Every bounded proof, one job per crate or shard, as build-test.yml
     # runs the crates a change can affect (.github/workflows/kani.yml;
-    # docs/testing.md § Bounded verification).
+    # docs/testing.md § Bounded verification). A job whose pass a run of
+    # this repository stored is not run again unless the dispatch's
+    # kani-prove-all asks; reading the stored passes needs `actions: read`.
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/kani.yml
+    with:
+      skip-passed: ${{ !inputs.kani-prove-all }}

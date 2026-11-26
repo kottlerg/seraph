@@ -20,11 +20,12 @@
 
 use crate::LINE_BUF_SIZE;
 use ipc::log_record::RECORD_MAX_BYTES;
-use ipc::stream_labels::LEVEL_MASK;
+use ipc::stream_labels::level_or_info;
 
 /// Bytes of a ring record's header: badge (8), receipt microseconds (8),
 /// entry length (2; an entry is at most [`ENTRY_MAX_BYTES`] bytes, which a
-/// `u16` holds), level (1; an `ipc::stream_labels::LEVEL_*` code), and kind
+/// `u16` holds), level (1; an `ipc::stream_labels::LEVEL_*` code, the RFC 5424
+/// severity), and kind
 /// (1; [`EntryKind`]).
 pub const RECORD_HEADER_BYTES: usize = 20;
 
@@ -81,7 +82,8 @@ pub struct HistoryEntry
     pub badge: u64,
     /// Receipt time in microseconds since boot.
     pub us: u64,
-    /// The entry's level, an `ipc::stream_labels::LEVEL_*` code.
+    /// The entry's level, an `ipc::stream_labels::LEVEL_*` code: its RFC 5424
+    /// severity, 0 to 7.
     pub level: u64,
     /// Whether the entry is a text line or a record.
     pub kind: EntryKind,
@@ -159,7 +161,7 @@ impl<const BYTES: usize> HistoryRing<BYTES>
     }
 
     /// Append one text line at `level` (an `ipc::stream_labels::LEVEL_*`
-    /// code, kept to the level field's bits), evicting the oldest entries
+    /// code; any other code is kept as `LEVEL_INFO`), evicting the oldest entries
     /// until it fits. An empty line is not recorded; a line longer than
     /// [`LINE_BUF_SIZE`] is clipped to it.
     pub fn push(&mut self, badge: u64, us: u64, level: u64, line: &[u8])
@@ -208,7 +210,12 @@ impl<const BYTES: usize> HistoryRing<BYTES>
             reason = "at most ENTRY_MAX_BYTES, which the const assert above fits in a u16"
         )]
         header[16..18].copy_from_slice(&(line.len() as u16).to_le_bytes());
-        header[18] = (level & LEVEL_MASK) as u8;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "`level_or_info` returns one of the eight severities, 0 to 7"
+        )]
+        let severity = level_or_info(level) as u8;
+        header[18] = severity;
         header[19] = kind.byte();
         self.write_at(self.tail, &header);
         self.write_at(Self::wrap(self.tail, RECORD_HEADER_BYTES), line);

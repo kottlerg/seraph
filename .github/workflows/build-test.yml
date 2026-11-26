@@ -24,6 +24,12 @@ on:
           empty proves every crate
         required: false
         default: ''
+      kani-prove-all:
+        description: >-
+          Prove every job the kani plan selects, stored passes or not
+        type: boolean
+        required: false
+        default: false
       cells-since:
         description: >-
           The commit the select job computes the owed cells from; empty
@@ -166,10 +172,16 @@ jobs:
     # verification); burnin.yml proves every crate. On a pull request or a
     # push, from the base the select job found, so a proof a red or
     # cancelled master run left unproven stays owed; on a dispatch from its
-    # input. None proves every crate.
+    # input. None proves every crate. A job whose pass a run of this
+    # repository stored is not run again unless the dispatch's kani-prove-all
+    # asks; reading the stored passes needs `actions: read`.
     needs: select
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/kani.yml
     with:
+      skip-passed: ${{ !inputs.kani-prove-all }}
       since: >-
         ${{ github.event_name != 'workflow_dispatch' && needs.select.outputs.base
         || inputs.kani-since }}
@@ -551,8 +563,8 @@ jobs:
             svctest)
               checks=(--whole-lines whole-lines) ;;
             usertest)
-              checks=(--require '\[vfsd\] DEBUG ' --require '\[fatfs\] DEBUG '
-                      --fail-also '\[(devmgr|procmgr)\] DEBUG ') ;;
+              checks=(--require 'DEBUG  \[vfsd\] ' --require 'DEBUG  \[fatfs\] '
+                      --fail-also 'DEBUG  \[(devmgr|procmgr)\] ') ;;
             ktest)
               checks=(--require 'mapredo knob present; redoing steps 6 and 7'
                       --fail-also ' SKIP ') ;;

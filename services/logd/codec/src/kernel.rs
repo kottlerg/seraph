@@ -16,7 +16,7 @@
 
 use core::fmt::Write;
 
-use ipc::stream_labels::{LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_WARN};
+use ipc::stream_labels::LEVEL_DEBUG;
 use syscall_abi::{KLOG_FLAG_TRUNCATED, KLOG_LINE_MAX, KernelLogRecord};
 
 use crate::{BoundedStr, LINE_BUF_SIZE};
@@ -47,18 +47,12 @@ pub fn stored_name(requested: &[u8]) -> &[u8]
 }
 
 /// The `ipc::stream_labels::LEVEL_*` code of a record's RFC 5424
-/// `severity`: emergency to error are errors, warning a warning, notice and
-/// informational info, and debug, or any value past it, debug.
+/// `severity`: the severity itself, the codes being the severities, and
+/// debug for any value past it.
 #[must_use]
 pub fn level(severity: u8) -> u64
 {
-    match severity
-    {
-        0..=3 => LEVEL_ERROR,
-        4 => LEVEL_WARN,
-        5 | 6 => LEVEL_INFO,
-        _ => LEVEL_DEBUG,
-    }
+    u64::from(severity).min(LEVEL_DEBUG)
 }
 
 /// Bytes of a [`KernelLine`]: the longest record's text and the suffix.
@@ -285,17 +279,30 @@ mod tests
         assert_eq!(stored_name(b""), b"");
     }
 
+    // Defect caught: a kernel severity rendered at another level, or a value
+    // past debug read as more severe than debug.
     #[test]
-    fn severities_map_to_receiver_levels()
+    fn each_kernel_severity_keeps_its_level()
     {
-        for s in 0..=3
+        use ipc::stream_labels::{
+            LEVEL_ALERT, LEVEL_CRITICAL, LEVEL_EMERGENCY, LEVEL_ERROR, LEVEL_INFO, LEVEL_NOTICE,
+            LEVEL_WARN,
+        };
+        let levels = [
+            LEVEL_EMERGENCY,
+            LEVEL_ALERT,
+            LEVEL_CRITICAL,
+            LEVEL_ERROR,
+            LEVEL_WARN,
+            LEVEL_NOTICE,
+            LEVEL_INFO,
+            LEVEL_DEBUG,
+        ];
+        for (severity, want) in (0u8..).zip(levels)
         {
-            assert_eq!(level(s), LEVEL_ERROR);
+            assert_eq!(level(severity), want);
         }
-        assert_eq!(level(4), LEVEL_WARN);
-        assert_eq!(level(5), LEVEL_INFO);
-        assert_eq!(level(6), LEVEL_INFO);
-        assert_eq!(level(7), LEVEL_DEBUG);
+        assert_eq!(level(8), LEVEL_DEBUG);
         assert_eq!(level(200), LEVEL_DEBUG);
     }
 

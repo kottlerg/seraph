@@ -384,7 +384,7 @@ The framebuffer driver's colour is one global state that the terminal shares
 colour back before the rest of the line, so a colour the terminal had set is reset by a log line
 until the terminal next sets one. Per-client colour state arrives with the display broker
 ([#153](https://github.com/kottlerg/seraph/issues/153)). At the framebuffer's default level a log
-line reaches the screen rarely. (Pending the maintainer's approval.)
+line reaches the screen rarely.
 
 ### Display names
 
@@ -479,7 +479,7 @@ waits on no sink's progress for a sender.
 - On the next boot logd reads a ring whose header and checksums are valid, installs its entries as
   `previous` entries ahead of its own, and clears the ring.
 - Serial shows `previous` entries, which no console of this boot has shown, between two notice lines
-  of logd's (pending the maintainer's approval):
+  of logd's:
 
 ```
 [    1.204417] NOTICE [logd] previous boot: 23 lines follow

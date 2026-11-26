@@ -551,6 +551,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
 pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 {
     sysroot::check_arch(ctx, args.arch)?;
+    check_opt_levels(ctx, args)?;
     if !args.skip_lints
     {
         step("Checking formatting");
@@ -731,6 +732,7 @@ pub fn compile_boot(ctx: &BuildContext, args: &BuildArgs, store: &Path, out: &Pa
     let mut cmd = cargo(&ctx.root);
     cmd.arg("build").args(&flags);
     cmd.args(debug_config_flags(args, "boot"));
+    cmd.args(opt_level_config_flags(args));
     cmd.envs(env);
     run_cmd(&mut cmd)?;
 
@@ -928,6 +930,7 @@ fn build_group(
     {
         cmd.args(debug_config_flags(args, pkg));
     }
+    cmd.args(opt_level_config_flags(args));
     cmd.envs(env.iter().copied());
     if let Some(s) = seraph.as_ref()
     {
@@ -1055,6 +1058,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     let mut cmd = cargo(&ctx.root);
     cmd.arg("build").args(&flags_ref);
     cmd.args(debug_config_flags(args, spec.name));
+    cmd.args(opt_level_config_flags(args));
     cmd.envs(env.iter().copied());
     if let Some(s) = seraph.as_ref()
     {
@@ -1540,6 +1544,96 @@ fn debug_config_flags(args: &BuildArgs, pkg: &str) -> Vec<String>
     }
 }
 
+/// Refuse the `--opt-level` overrides of `args` when the build cannot honour
+/// one ([`opt_level_refusal`]), reading the workspace's packages only when
+/// there is an override.
+///
+/// # Errors
+/// The refusal, or a failure to read the workspace.
+fn check_opt_levels(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
+{
+    if args.opt_level.is_empty()
+    {
+        return Ok(());
+    }
+    let workspace = crate::affected::Workspace::load(&ctx.root)?;
+    match opt_level_refusal(args, |name| workspace.package(name).is_some())
+    {
+        Some(reason) => bail!("{reason}"),
+        None => Ok(()),
+    }
+}
+
+/// Why the `--opt-level` overrides of `args` cannot be honoured, `known`
+/// telling the workspace's package names: an override of a package the
+/// workspace does not have, which Cargo would pass over with a warning; of a
+/// component `--debug` selects, which it builds at opt-level 1 (`--debug`
+/// sets the level of components alone, so `--debug all` leaves a library's
+/// to its override); or a second override of one package. `None` when every
+/// override can be.
+fn opt_level_refusal(args: &BuildArgs, known: impl Fn(&str) -> bool) -> Option<String>
+{
+    for (i, o) in args.opt_level.iter().enumerate()
+    {
+        let given = format!("--opt-level {}={}", o.package, o.level);
+        if !known(&o.package)
+        {
+            return Some(format!(
+                "{given}: the workspace has no package {}",
+                o.package
+            ));
+        }
+        let component = o.package == "boot" || spec_name(&o.package).is_some();
+        if component && selects(&args.debug, &o.package)
+        {
+            return Some(format!(
+                "{given}: --debug also names {}, and builds it at opt-level 1",
+                o.package
+            ));
+        }
+        if args
+            .opt_level
+            .iter()
+            .take(i)
+            .any(|p| p.package == o.package)
+        {
+            return Some(format!("{given}: --opt-level names {} twice", o.package));
+        }
+    }
+    None
+}
+
+/// `--config` flags setting the opt-level of each package `--opt-level`
+/// names within the active profile. Every cargo build of the build takes them
+/// all: a library is compiled inside the build of each component that links
+/// it, `-Z build-std`'s included, and an override of a package outside one
+/// build's graph changes nothing in it. The package segment is quoted as in
+/// [`debug_config_flags`]; `s` and `z` are TOML strings, the digits integers.
+fn opt_level_config_flags(args: &BuildArgs) -> Vec<String>
+{
+    let profile = args.profile().cargo_profile();
+    args.opt_level
+        .iter()
+        .flat_map(|o| {
+            let value = if o.level.bytes().all(|b| b.is_ascii_digit())
+            {
+                o.level.to_owned()
+            }
+            else
+            {
+                format!("\"{}\"", o.level)
+            };
+            [
+                "--config".to_owned(),
+                format!(
+                    "profile.{profile}.package.\"{}\".opt-level={value}",
+                    o.package
+                ),
+            ]
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -1557,6 +1651,7 @@ mod tests
             component: BuildComponent::All,
             debug: Vec::new(),
             limited_debug: Vec::new(),
+            opt_level: Vec::new(),
             skip_lints: true,
             ktest_bench_only,
             host: crate::cli::HostArgs::default(),
@@ -1568,6 +1663,105 @@ mod tests
         );
         assert_eq!(feature_flags(&build(true), &["init", "procmgr"]), none);
         assert_eq!(feature_flags(&build(false), &["ktest"]), none);
+    }
+
+    /// A build's arguments with `--debug` and `--opt-level` as given.
+    fn with_opt_levels(
+        profile: Profile,
+        debug: Vec<BuildComponent>,
+        opt_level: &[(&str, &'static str)],
+    ) -> BuildArgs
+    {
+        BuildArgs {
+            arch: Arch::X86_64,
+            release: profile == Profile::Release,
+            component: BuildComponent::All,
+            debug,
+            limited_debug: Vec::new(),
+            opt_level: opt_level
+                .iter()
+                .map(|(package, level)| crate::cli::OptLevelOverride {
+                    package: (*package).to_owned(),
+                    level,
+                })
+                .collect(),
+            skip_lints: true,
+            ktest_bench_only: false,
+            host: crate::cli::HostArgs::default(),
+        }
+    }
+
+    // Defect caught: an `--opt-level` override written to the other
+    // profile's table, or with `s` or `z` unquoted, which Cargo's TOML
+    // parser refuses.
+    #[test]
+    fn an_opt_level_override_sets_its_package_in_the_active_profile()
+    {
+        let flags = opt_level_config_flags(&with_opt_levels(
+            Profile::Release,
+            Vec::new(),
+            &[("shmem", "3"), ("virtio-blk", "s")],
+        ));
+        assert_eq!(
+            flags,
+            [
+                "--config",
+                "profile.release.package.\"shmem\".opt-level=3",
+                "--config",
+                "profile.release.package.\"virtio-blk\".opt-level=\"s\"",
+            ]
+        );
+        let dev = opt_level_config_flags(&with_opt_levels(
+            Profile::Debug,
+            Vec::new(),
+            &[("shmem", "z")],
+        ));
+        assert_eq!(
+            dev,
+            ["--config", "profile.dev.package.\"shmem\".opt-level=\"z\""]
+        );
+        let none: [String; 0] = [];
+        assert_eq!(
+            opt_level_config_flags(&with_opt_levels(Profile::Debug, Vec::new(), &[])),
+            none
+        );
+    }
+
+    // Defect caught: an `--opt-level` override honoured beside the
+    // `--debug` that sets the same package to opt-level 1, so the build's
+    // level depends on the order of Cargo's `--config` flags; one of a
+    // package the workspace lacks, which Cargo passes over with a warning; or
+    // two of one package; or a library's override refused beside `--debug
+    // all`, which sets the level of components alone.
+    #[test]
+    fn an_opt_level_override_is_refused_where_the_build_cannot_honour_it()
+    {
+        let known = |name: &str| ["shmem", "framebuffer", "boot"].contains(&name);
+        let refused = |debug: Vec<BuildComponent>, levels: &[(&str, &'static str)]| {
+            opt_level_refusal(&with_opt_levels(Profile::Debug, debug, levels), known)
+        };
+        assert_eq!(
+            refused(Vec::new(), &[("shmem", "3"), ("framebuffer", "3")]),
+            None
+        );
+        assert_eq!(
+            refused(vec![BuildComponent::Spec("init")], &[("framebuffer", "3")]),
+            None
+        );
+        let reason = refused(
+            vec![BuildComponent::Spec("framebuffer")],
+            &[("framebuffer", "3")],
+        );
+        assert!(reason.is_some_and(|r| r.contains("--debug also names framebuffer")));
+        let reason = refused(vec![BuildComponent::All], &[("framebuffer", "3")]);
+        assert!(reason.is_some_and(|r| r.contains("--debug also names framebuffer")));
+        assert_eq!(refused(vec![BuildComponent::All], &[("shmem", "3")]), None);
+        let reason = refused(vec![BuildComponent::Boot], &[("boot", "1")]);
+        assert!(reason.is_some_and(|r| r.contains("--debug also names boot")));
+        let reason = refused(Vec::new(), &[("shmem", "3"), ("shmem", "2")]);
+        assert!(reason.is_some_and(|r| r.contains("names shmem twice")));
+        let reason = refused(Vec::new(), &[("no-such-crate", "3")]);
+        assert!(reason.is_some_and(|r| r.contains("no package no-such-crate")));
     }
 
     // Defect caught: one cargo invocation building the components of two

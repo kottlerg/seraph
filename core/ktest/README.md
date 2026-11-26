@@ -690,9 +690,12 @@ test (`frame_pool::check_slots`, [§ Test infrastructure](#test-infrastructure))
 - A focused run that passes ends `[ktest] SELECTED TESTS PASSED`, never
   `[ktest] ALL TESTS PASSED` ([docs/testing.md](../../docs/testing.md#reporting-marker)
   § Reporting marker), so no focused boot can pass as a full one.
-- The build records the selection in `sysroot/.ktest-selection`, and `cargo xtask run --runs`
-  refuses an image of a focused ktest without `--ktest-only-ok`, with which it passes on the
-  focused marker. A build of the full ktest removes the record. CI never builds with a selection.
+- The build records the selection in `sysroot/.ktest-selection`, and a build of the full ktest
+  removes it; each pack copies the selection of the ktest it packs into the image's own record,
+  `sysroot/.image-harness`. `cargo xtask run --runs` reads only the image's record, so a later
+  build that does not repack changes nothing it decides: it refuses an image of a focused ktest
+  without `--ktest-only-ok`, with which it passes on the focused marker. CI never builds with a
+  selection.
 
 ---
 

@@ -424,7 +424,8 @@ from its log by patterns in the syntax of § Pattern syntax. Each run boots its 
 disk images (and of the riscv64 firmware variables), so the runs of a wave never share a writable
 drive. The options below require `--runs`; `--debug-port` requires `--parallel 1` (one host
 port), and `--debug-target` stages the GDB stub, repacking the images in the layout they have,
-before the runs copy them, and removes it after the last run.
+before the runs copy them, and removes it after the last run; it is refused for an image that
+boots ktest, which runs no svcmgr to launch the stub.
 
 | Option | Default | Description |
 |---|---|---|
@@ -439,7 +440,7 @@ before the runs copy them, and removes it after the last run.
 | `--whole-lines` | (none) | Check the console in each passing run's log between the lines `<TAG> begin` and `<TAG> end ...`: every line there is one console line, and each sender's numbered lines arrive whole, in order, none missing. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `--whole-lines whole-lines`, the tag svctest's `console_whole_lines` phase logs ([services/svctest/README.md](../services/svctest/README.md); the console is in [docs/console-model.md](../docs/console-model.md)) |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, or the first death line of rule 2 below, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
-| `--ktest-only-ok` | off | Accept an image whose ktest a focused build made (`build --ktest-only`, recorded in `sysroot/.ktest-selection`): without it `--runs` refuses such an image, since a focused boot validates nothing, and with it the default `--pass` is the focused run's marker. Refused for an image that boots no focused ktest |
+| `--ktest-only-ok` | off | Accept an image whose ktest a focused build made (`build --ktest-only`), as the image's pack recorded it in `sysroot/.image-harness`, whatever ktest a later build installed: without it `--runs` refuses such an image, since a focused boot validates nothing, and with it the default `--pass` is the focused run's marker. Refused for an image that boots no focused ktest |
 | `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> icount=<on\|off> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing`, `bench-check` and `bench-baseline` read |
 
 The default `--fail` regex matches the cross-harness terminal marker

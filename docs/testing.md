@@ -455,7 +455,7 @@ the host driver (not `run --runs`, which cannot inject):
 
 ```sh
 cargo xtask build
-cargo xtask mkdisk
+cargo xtask mkdisk --harness init
 cargo xtask test terminal
 ```
 
@@ -1399,7 +1399,7 @@ to the tiers below.
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR: the cells its change owes ([conventions.md § CI Gating](conventions.md#ci-gating)) | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof whose pass no run of the repository stored at the same inputs (the `kani` jobs, [Bounded verification](#bounded-verification)) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation, the large-memory cell, and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
 
@@ -2134,7 +2134,7 @@ budget. The pair is the tpm device cell (Device surfaces above).
 ```sh
 # TPM cell, x86_64 only:
 cargo xtask build --arch x86_64
-cargo xtask mkdisk
+cargo xtask mkdisk --arch x86_64 --harness init
 cargo xtask test tpm
 ```
 
@@ -2147,7 +2147,7 @@ profile (`cargo xtask build --release`, then the same `run` command, per the bou
 above), and the memory variation, the large-memory cell, and every device cell (the disk
 variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the
 CET cell, and the TPM cell) once each, and every bounded proof (`cargo xtask kani` with no
-option, [Bounded
+option, which reads no stored pass, [Bounded
 verification](#bounded-verification)), and the fuzz campaign (§ Fuzzing): a manual dispatch of
 `fuzz.yml` on `master` while the commit to be tagged is its head (`gh workflow run fuzz.yml --ref
 master`), at the default time per target, whose run's head commit is that commit and whose
@@ -2155,9 +2155,9 @@ conclusion is `success`, the report giving the run's URL as its command, `--runs
 its outcome when the conclusion is `success`; so every tag boots at each boundary CPU count in both
 profiles (CI boots release builds only at 4 CPUs), from a 4Kn disk, from two disks, with no IOMMU,
 with a framebuffer, with a debug port, with a hot-added device, on CET shadow stacks, with a TPM,
-and with 8 GiB of RAM under svctest, carries every proof a pull request's selection may have left
-unverified and a campaign of every
-fuzz target, and runs the timing report on the boundary logs, which is reported and blocks nothing.
+and with 8 GiB of RAM under svctest, carries every proof a pull request's selection or a stored
+pass may have left unverified and a campaign of every fuzz target, and runs the timing report on
+the boundary logs, which is reported and blocks nothing.
 A tag's repeated-run check is the burn-in tier, which the tag push starts. The no-IOMMU variant, the
 no-iommu device cell, boots svctest once on each architecture with the machine's IOMMU detached, so
 devmgr's unconfined path still serves every driver (svctest staged as `build-test.yml` stages it, on
@@ -2413,21 +2413,22 @@ before the run's whose `master` run passed, or has not finished with no newer re
 ([conventions.md](conventions.md#ci-gating) § CI Gating): a crate that holds a harness and whose own
 package, a workspace package in its dependency closure (Markdown aside), or a file those read, the
 change touches, and every such crate when the change touches an input of every proof (the workspace
-manifest and lock file, Cargo's configuration, the toolchain pin, and the command's own source,
-which holds the Kani pin, the arguments and the judge). A change to `kani.yml` or `build-test.yml`,
-whose steps run the jobs, that selects no crate otherwise selects the crate with the fewest
-harnesses, so the jobs' steps run. On a push to `master` the plan runs the same selection from the
-newest commit whose `master` run passed, so a harness a red or cancelled `master` run left unproven
-stays owed until a run proves it. A dispatch of `build-test.yml` selects from its `kani-since`
-input, and `burnin.yml` and a dispatch without that input select every crate. The plan gives one
-`prove` job to each crate it selects, or to each shard of a crate split below, and none to a crate
-it does not select: a run that selects none runs no `prove` job and says so in a notice. The
-`kani-result` job runs in every run and judges them: it fails when the plan failed, or a `prove` job
-failed, ran past its timeout or was cancelled, so it can be a required check, which a matrix job
-that runs only when owed cannot be. A pull request is gated on the proofs of the crates its change
-can affect; the whole set runs in burn-in and in the release host runs (§ Coverage tiers;
-[conventions.md](conventions.md#release-production) § Release Production), so a change the selection
-missed is found before a tag.
+manifest and lock file, Cargo's configuration, the toolchain pin, the command's own source, which
+holds the Kani pin, the arguments and the judge, and `kani.yml`, whose `prove` job runs the command
+and stores its pass, Stored passes below). A change to `build-test.yml`, which calls the jobs, also
+selects the crate with the fewest harnesses, whose jobs run past any stored pass, so the call is
+exercised. On a push to `master` the plan runs the same selection from the newest commit whose
+`master` run passed, so a harness a red or cancelled `master` run left unproven stays owed until a
+run proves it. A dispatch of `build-test.yml` selects from its `kani-since` input, and `burnin.yml`
+and a dispatch without that input select every crate. The plan gives one `prove` job to each crate
+it selects, or to each shard of a crate split below, and none to a crate it does not select: a run
+that selects none runs no `prove` job and says so in a notice. The `kani-result` job runs in every
+run and judges them: it fails when the plan failed, or a `prove` job failed, ran past its timeout or
+was cancelled, so it can be a required check, which a matrix job that runs only when owed cannot be.
+A pull request is gated on the proofs of the crates its change can affect. Burn-in runs every job of
+the whole set that no stored pass covers, and the release host runs prove the whole set past every
+stored pass (§ Coverage tiers; [conventions.md](conventions.md#release-production) § Release
+Production), so a change the selection or a key missed is found before a tag.
 
 **Shards.** A crate whose harnesses' verification times sum to more than about 10 minutes on CI's
 runner is proved in several jobs, its shards: the fewest that keep each shard's sum under about 600
@@ -2440,6 +2441,44 @@ Every run closes with each crate's sum of verification times, a shard job's labe
 a run that shows a shard or a whole crate past the 10 minutes, or a split crate whose sum one shard
 fewer would hold under them, moves its count. Each `prove` job has a `timeout-minutes` of 40, the
 backstop beside the time limit below.
+
+**Stored passes.** A job whose harnesses all passed stores its pass, and a later job with the same
+key runs no `prove` job: a harness's verdict depends only on its inputs, so a pass keyed on every
+input stands for any job with that key. The key is the SHA-512, cut to 256 bits, of a scheme version
+(`PASS_SCHEME`), the package, the shard `k/n`, the Kani release the job ran (`cargo kani --version`,
+which the run holds to the pin), the arguments `cargo kani` runs with (the time limit among them),
+the memory limit, and the path and content of each input of the crate's verification: each tracked
+file whose change selects the crate (Where the proofs run above, by the same test the selection
+applies, which a host test checks file by file over the tree), so the workspace manifest, lock file,
+Cargo configuration and toolchain pin, the command's own source and `kani.yml` among them. A `prove`
+job in which every harness of its shard ran and passed, and no other, writes the key's record
+(`cargo xtask kani --pass-record`) and uploads it as the workflow artifact `kani-pass-<key>`, whose
+content gives the key's fields, the run, its head and each harness's time to whoever audits the
+pass; a job that failed, ran past a limit or its timeout, or was cancelled stores nothing, and one
+that judged other harnesses than its shard's fails. The plan (`--skip-passed`) asks GitHub for the
+artifacts of exactly that name, one request a job, and takes a pass only from one that has not
+expired and that a run of this repository made, its head repository the repository itself: a fork's
+run, which can upload an artifact of any name, never counts. A job a pass covers runs no `prove`
+job, and the plan's log names its pass and the run that proved it. A pass is found by its name from
+any run, so every CI run respects the stored passes: a pull request's, a push to `master`, burn-in
+on a tag, and a dispatch. The `kani-prove-all` input of a dispatch of `build-test.yml` or
+`burnin.yml` proves every job the plan selects, stored passes or not. The jobs of the crate a change
+to `build-test.yml` selects for having the fewest harnesses (above) run whatever passes are stored,
+since that workflow is no input of the key.
+
+A pass is kept 90 days, the longest GitHub keeps an artifact of a public repository, and a run that
+uses it does not store it again: each job in use is proved again once a quarter, when its pass
+expires. Expiry is the only way a pass is lost, and it costs a run, never a verdict.
+
+**Trust boundary of a pass.** A stored pass is a claim by a workflow run of this repository, on any
+of its branches: anyone who can push a branch to the repository can store one, the trust that
+pushing a workflow already takes, and a fork's run cannot. What the key leaves out is outside the
+claim: the runner image, which `kani.yml` names by its label and not by its version. A file a
+crate's build reads by a path the key cannot follow, through a build script or an `include!` of a
+computed path, would be outside it too: a host test fails when a package in the dependency closure
+of a crate that holds a harness has a build script or such an include, save one it lists with why
+its read is compiled out of the test build Kani verifies. A pass in doubt is checked by a dispatch
+with `kani-prove-all`.
 
 **Local sizing.** A harness is sized on the development host before CI runs it. The author of a
 change that adds a harness, or changes one's body, bounds or `kani::any` sizes, MUST run it there
@@ -2474,10 +2513,12 @@ limit. Split as `SHARDS` gives, a `prove` job holds at most about 10 minutes of 
 matrix's measured full-set run (`build-test` run 45804003430) ran boot-firmware's harnesses 16%
 slower than run 45738265526 did. In it, boot-firmware's three shards then took 670, 715 and 213 s,
 so the crate is split in five, which put it at 518 s at most by that run's times. devmgr-firmware's
-four shards took 186 to 557 s and elf's two 439 and 377 s. Each job adds about 1.5 minutes of setup
-and build. The whole set runs as 21 jobs side by side. In that run, the 19 jobs of the three-way
-split took 22.5 minutes from the first start to the last end, as runners came free beside the rest
-of the run, which ended a minute later.
+four shards took 186 to 557 s and elf's two 439 and 377 s. In the five-way split's run (`build-test`
+run 45811677579), devmgr-firmware's four shards took 259 to 723 s, so the crate is split in five,
+and objsig's one job 594 s. Each job adds about 1.5 minutes of setup and build. The whole set runs
+as 22 jobs side by side. In that run, the 19 jobs of the three-way split took 22.5 minutes from the
+first start to the last end, as runners came free beside the rest of the run, which ended a minute
+later.
 
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
 tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches

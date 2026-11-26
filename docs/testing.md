@@ -2460,16 +2460,20 @@ process, as GNU `time -v` reports it), and the unwind bounds the harness carries
 whatever § Coverage tiers owes, since a harness change is inert there.
 
 **Measured time.** The whole set, 204 harnesses, took 86 minutes run serially on GitHub's standard
-Linux runner (4 vCPUs, 16 GB; `build-test` run 45738265526), the harnesses' own verification
-times summing to 82 minutes. The slowest,
-devmgr-firmware's proof of the AML IRQ descriptor with its flags byte, took 306 s, and the next
-slowest 234 s. The small AML descriptors are proved one per harness, since all four in one CBMC
-problem took 29 minutes. The time limit of 10 minutes is about twice the slowest harness: room
-for a slower runner, and a harness past it costs the run no more than the limit. Split as
-`SHARDS` gives, those times put at most about 10 minutes of harnesses in one `prove` job
-(boot-firmware's three shards 596, 575 and 207 s; devmgr-firmware's four 209 to 480 s; elf's two
-399 and 367 s), beside about 1.5 minutes of setup and build, so the whole set runs as 19 jobs side
-by side in about the 12 minutes the rest of a `build-test` run takes.
+Linux runner (4 vCPUs, 16 GB; `build-test` run 45738265526), the harnesses' own verification times
+summing to 82 minutes. The slowest, devmgr-firmware's proof of the AML IRQ descriptor with its flags
+byte, took 306 s, and the next slowest 234 s. The small AML descriptors are proved one per harness,
+since all four in one CBMC problem took 29 minutes. The time limit of 10 minutes is about twice the
+slowest harness: room for a slower runner, and a harness past it costs the run no more than the
+limit. Split as `SHARDS` gives, a `prove` job holds at most about 10 minutes of harnesses. The
+matrix's measured full-set run (`build-test` run 45804003430) ran boot-firmware's harnesses 16%
+slower than run 45738265526 did. In it, boot-firmware's three shards then took 670, 715 and 213 s,
+so the crate is split in five, which put it at 518 s at most by that run's times. devmgr-firmware's
+four shards took 186 to 557 s and elf's two 439 and 377 s. Each job adds about 1.5 minutes of setup
+and build. The whole set runs as 21 jobs side by side. In that run, the 19 jobs of the three-way
+split took 22.5 minutes from the first start to the last end, as runners came free beside the rest
+of the run, which ended a minute later.
+
 
 Kani verifies sequential code only: concurrency stays with the booted harnesses and the coverage
 tiers above. It compiles inline assembly to a failing check, so a harness fails only if it reaches

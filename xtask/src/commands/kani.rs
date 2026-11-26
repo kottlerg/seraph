@@ -89,7 +89,7 @@ const SLOWEST: usize = 10;
 /// verification); the closing report's time per crate gives the sums, a
 /// shard run's labelled with its shard. `--plan` fails on an entry that
 /// names no crate holding a harness.
-const SHARDS: &[(&str, usize)] = &[("boot-firmware", 3), ("devmgr-firmware", 4), ("elf", 2)];
+const SHARDS: &[(&str, usize)] = &[("boot-firmware", 5), ("devmgr-firmware", 4), ("elf", 2)];
 
 /// A crate whose proof harnesses the command runs.
 #[derive(Clone, Debug, PartialEq, Eq)]

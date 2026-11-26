@@ -624,10 +624,11 @@ the region between two reads, the benchmark's measured operation, as follows:
   result observable after the closing read, as `ubench.shmem_ring` does by comparing the bytes it
   read with those it wrote.
 - **Under icount.** QEMU retires a vCPU's instructions one at a time in program order, and the
-  counter advances one per instruction. A sample is therefore exactly the instructions retired
-  between the two reads: the region as compiled, and the reads' own instructions on the region's
-  side (on x86-64 the `lfence` after the opening `rdtsc`, and the `mfence; lfence` before the
-  closing one).
+  counter advances one per instruction. In a window on one CPU that does not idle, a sample is
+  therefore exactly the instructions retired between the two reads: the region as compiled, and
+  the reads' own instructions on the region's side (on x86-64 the `lfence` after the opening
+  `rdtsc`, and the `mfence; lfence` before the closing one). A window that idles, and one at
+  four CPUs, count as the paragraphs above say instead.
 - **On hardware, x86-64.** The read is `mfence; lfence; rdtsc; lfence`. `mfence; lfence` holds
   `rdtsc` until every earlier instruction has completed and every earlier load and store is
   globally visible. The last `lfence` holds every later instruction until `rdtsc` has read the
@@ -647,7 +648,8 @@ region's side under icount, and on hardware the cycles of those instructions and
 The `empty_window` benchmark of each suite, `ktest.empty_window` and `ubench.empty_window`,
 measures that offset as two reads with nothing between them, in both modes. A line's p50 includes
 the offset its suite's `empty_window` line reports in the same mode. No tool subtracts it: a
-reader who wants the region's cost alone subtracts it.
+reader who wants the region's cost alone subtracts it, which under icount leaves exactly the
+region's instructions only for a window on one CPU that does not idle.
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host

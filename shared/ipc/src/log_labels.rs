@@ -100,3 +100,19 @@ pub const QUERY_SLOTS: u64 = 16;
 /// [`crate::log_query`]; specified in
 /// `services/logd/docs/ipc-interface.md` § Queries.
 pub const QUERY_HISTORY: u64 = 17;
+
+/// Badge bit on a SEND on the master log endpoint that authorises
+/// [`LOG_FLUSH`]. svcmgr mints it from its master-log source and publishes it
+/// seed-only as [`crate::published_names::LOGD_FLUSH`]. No sender's badge
+/// carries it, as for [`LOG_QUERY_AUTHORITY`].
+pub const LOG_FLUSH_AUTHORITY: u64 = 1u64 << 62;
+
+/// The flush barrier: ask whether every line logd took before the call is
+/// written by the sinks that hold the log, so that the caller can power the
+/// system off without losing them. logd answers at once with a token and
+/// `FLUSHED` or `FLUSH_PENDING` with a retry hint, and the caller asks again
+/// with the token until it is flushed or its own bound passes. Served only
+/// on a badge carrying [`LOG_FLUSH_AUTHORITY`]. Wire format:
+/// [`crate::log_flush`]; specified in `services/logd/docs/ipc-interface.md`
+/// § Flush barrier.
+pub const LOG_FLUSH: u64 = 18;

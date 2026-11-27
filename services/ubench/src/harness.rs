@@ -19,6 +19,11 @@ pub const SUITE: &str = "ubench";
 /// is online on every boot.
 pub const BENCH_CPU: u32 = 0;
 
+/// The longest line the log carries whole: logd's `LINE_BUF_SIZE`
+/// (services/logd/docs/ipc-interface.md). A longer line is split, and its
+/// second part is no result line.
+pub const LOG_LINE_BYTES: usize = 256;
+
 /// A benchmark's outcome: `Ok` once it logged its result lines and the SKIP
 /// lines of the cases it could not run, `Err` with the reason it failed.
 pub type Outcome = Result<(), String>;
@@ -77,8 +82,9 @@ impl IdleSpan
 /// measuring CPU over the measured loop ([`IdleSpan`]), when it has them.
 ///
 /// # Errors
-/// No sample, or a report the line's rules refuse
-/// (shared/bench/README.md § Result line).
+/// No sample, a report the line's rules refuse
+/// (shared/bench/README.md § Result line), or a line longer than
+/// [`LOG_LINE_BYTES`].
 pub fn report(
     name: &str,
     variant: &[(&str, Value<'_>)],
@@ -104,6 +110,13 @@ pub fn report(
     report
         .write(&mut line)
         .map_err(|e| format!("result line: {e}"))?;
+    if line.len() > LOG_LINE_BYTES
+    {
+        return Err(format!(
+            "result line of {} bytes over the log's {LOG_LINE_BYTES}",
+            line.len()
+        ));
+    }
     std::os::seraph::log!("{line}");
     Ok(())
 }

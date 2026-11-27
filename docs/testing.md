@@ -665,13 +665,18 @@ ran where:
   whether it advances while the hart waits in `wfi` is the implementation's choice.
 
 Such a window therefore counts only when both reads ran on the measuring CPU and that CPU did not
-halt between them. A row whose reads a thread pinned to that CPU takes has the first by its pin. A
-row whose measured thread takes them, with no affinity between them, takes the opening read while
-still pinned and closes its idle-halt span right after the closing read: the close fails on
-another CPU than the span's open, and otherwise returns the halts between them. The one move the
-span does not see is a move onto the measuring CPU in the few instructions between the closing
-read and the close, which takes a preemption and a pull there. fsbench's window rows run at
-more than one CPU, so their counts are reported, not gated (below).
+halt between them, or its counter ran through the halt: a row whose pinned reader blocks in the
+window (`ubench.pipeline`) checks each window against the kernel's elapsed microseconds and leaves
+out one whose counter did not count them ([shared/bench/README.md § Window rate
+check](../shared/bench/README.md#window-rate-check)). A row whose reads a thread pinned to that CPU
+takes has the first by its pin. A row whose measured thread takes them, with no affinity between
+them, takes the opening read while still pinned and closes its idle-halt span right after the
+closing read: the close fails on another CPU than the span's open, and otherwise returns the halts
+between them. The one move the span does not see is a move onto the measuring CPU in the few
+instructions between the closing read and the close, which takes a preemption and a pull there.
+fsbench's window rows run at more than one CPU, so their counts are reported, not gated (below);
+`ubench.pipeline`'s line at one CPU, whose threads share the CPU so that its window does not idle,
+gates as any other.
 
 Every sample therefore includes the cost of the reads themselves: their instructions on the
 region's side under icount, and on hardware the cycles of those instructions and of the fences.

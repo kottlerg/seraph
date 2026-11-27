@@ -179,10 +179,10 @@ direct console paths remain as fallbacks for the life of the system.
      drivers-directory pass, which svcmgr posts with `SET_DRIVERS_DIR` before it launches logd, and
      a `QUERY_DEVICE` of logd's that would find no driver waits for that pass; logd's emit path
      never calls devmgr and, while no framebuffer driver is resolved (headless boot), writes the
-     sink nowhere: a driver resolved later starts at the newest `backlog` lines and counts the
-     ones before them that the sink shows as dropped, so serial stays the authoritative channel. The driver
-     clears the screen when it starts (`FramebufferWriter::new`), so the kernel's console stays on
-     it until then.
+     sink nowhere: a driver resolved later starts at the newest `backlog` lines and counts the ones
+     before them that the sink shows as dropped, so serial stays the authoritative channel. The
+     driver clears the screen when it starts (`FramebufferWriter::new`), so the kernel's console
+     stays on it until then.
    - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
      framebuffer write cap via `QUERY_DEVICE` on its framebuffer class SEND, again on the class
      watch when devmgr restarts the driver, and renders the

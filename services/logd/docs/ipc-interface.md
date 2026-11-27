@@ -536,20 +536,20 @@ writer, and the entries the history drops before the writer reaches them.
   reports them as dropped. The writers are spawned
   beside the receive workers, before the handover pull, and write once init-logd has acknowledged
   the release (at once on a restart).
-- **Serial: `hold` by default, at info.** The serial sink writes an entry's chunks as plain writes, then one zero-length
-  write with `serial_labels::SERIAL_WRITE_SENT`, a barrier the driver answers once every byte before
-  it has left the UART ([serial driver](../../drivers/serial/README.md#label-1-serial_write_bytes) §
-  Label 1), and moves its cursor only then, so an entry counts as written when it is on the wire. A
-  step the driver answers `STALLED` (its `TX_STALL_MS`, 1000 ms, without progress) is made again and
-  the cursor does not move; a call that fails, as every call to a driver devmgr has withdrawn does,
-  writes the entry again from its first chunk to the next driver resolved. Any other refusal gives
-  the entry up, counted. A `hold` sink, serial by default, holds senders (§ Hold window), a flush
-  (§ Flush barrier) and the kernel reader while it is *holding*: its level is not `off`, its class
-  SEND was delivered, its writer runs, devmgr serves a driver of its class, and its current write is
-  not older than `SINK_STALL_MS` (1000 ms, [docs/limits.md](../../../docs/limits.md) § init and
-  logd). It holds them only for the entries it shows. A sink that is stalled, unserved, absent or
-  `off` holds nobody, so no driver is required: a stopped driver holds senders for
-  `SINK_STALL_MS` once.
+- **Serial: `hold` by default, at info.** The serial sink writes an entry's chunks as plain writes,
+  then one zero-length write with `serial_labels::SERIAL_WRITE_SENT`, a barrier the driver answers
+  once every byte before it has left the UART ([serial
+  driver](../../drivers/serial/README.md#label-1-serial_write_bytes) § Label 1), and moves its
+  cursor only then, so an entry counts as written when it is on the wire. A step the driver answers
+  `STALLED` (its `TX_STALL_MS`, 1000 ms, without progress) is made again and the cursor does not
+  move; a call that fails, as every call to a driver devmgr has withdrawn does, writes the entry
+  again from its first chunk to the next driver resolved. Any other refusal gives the entry up,
+  counted. A `hold` sink, serial by default, holds senders (§ Hold window), a flush (§ Flush
+  barrier) and the kernel reader while it is *holding*: its level is not `off`, its class SEND was
+  delivered, its writer runs, devmgr serves a driver of its class, and its current write is not
+  older than `SINK_STALL_MS` (1000 ms, [docs/limits.md](../../../docs/limits.md) § init and logd).
+  It holds them only for the entries it shows. A sink that is stalled, unserved, absent or `off`
+  holds nobody, so no driver is required: a stopped driver holds senders for `SINK_STALL_MS` once.
 - **Framebuffer: `skip` by default, at critical.** The framebuffer sink holds nobody. When its
   driver comes up behind, its cursor starts `backlog` (64 by default) entries before the newest,
   and the entries it passes that it shows are counted as dropped. Before an emergency entry it
@@ -575,15 +575,16 @@ writer, and the entries the history drops before the writer reaches them.
 
 ## Hold window
 
-A sender may hold at most `HOLD_WINDOW` (16) entries the serial sink has not written, twice that
-for a message at `error` or more severe. While the serial sink is holding (§ Output sinks), a
-`STREAM_BYTES` or `STREAM_RECORD` message whose completed lines would take its sender past its
-window is refused `stream_labels::WINDOW_FULL` (3), with `data[0]` a retry hint in milliseconds:
-the entries past the window times the serial writer's last time per entry, clamped to 1 ms and
-`SINK_STALL_MS`. Nothing of a refused message is consumed. A sender whose window is empty is never
-refused, and neither are the kernel's records nor logd's own lines. The refusal allocates nothing,
-logs nothing and calls nothing, so a sender that resends at once costs logd a receive and a reply.
-The log library sleeps the hint and sends the message again while its call bound has room, and
+A sender may hold at most `HOLD_WINDOW` (16) entries that a `hold` sink, serial by default, shows
+and has not written, twice that for a message at `error` or more severe; with two `hold` sinks, the
+larger of the two counts. While a `hold` sink is holding (§ Output sinks), a `STREAM_BYTES` or
+`STREAM_RECORD` message whose completed lines would take its sender past its window is refused
+`stream_labels::WINDOW_FULL` (3), with `data[0]` a retry hint in milliseconds: the entries past the
+window times the slowest holding writer's last time per entry, clamped to 1 ms and `SINK_STALL_MS`.
+Nothing of a refused message is consumed. A sender whose window is empty is never refused, and
+neither are the kernel's records nor logd's own lines. The refusal allocates nothing, logs nothing
+and calls nothing, so a sender that resends at once costs logd a receive and a reply. The log
+library sleeps the hint and sends the message again while its call bound has room, and
 drops it, counted, past that; a process that has set `set_no_wait` (procmgr) drops it at once
 ([shared/log/README.md](../../../shared/log/README.md)). The window is a pace, not a capacity: the
 history's bounds (§ History) do not depend on it.
@@ -616,8 +617,8 @@ The recipes of the holders above seed it, and no other. A request on any other b
 included, is refused `FLUSH_DENIED`, and a query on `logd.flush` is refused `QUERY_DENIED`
 (§ Queries).
 
-A receive worker answers at once and waits on nothing. It reads the serial sink's cursor and the
-history's next `seq` under the state lock, and the writer's state, and calls no service. A flush
+A receive worker answers at once and waits on nothing. It reads the `hold` sinks' cursors and the
+history's next `seq` under the state lock, and the writers' state, and calls no service. A flush
 does not wait inside logd: the caller asks again. The wire format is defined in `ipc::log_flush`.
 
 | Request word | Content |
@@ -644,15 +645,16 @@ The reply's label is its status:
   while the new instance has retained fewer entries) answers `FLUSHED`, and a lower one waits on
   the new instance's entries up to it, within the same bounds. `FLUSHED` is 0, so the empty reply
   that init-logd gives a label it does not serve reads as flushed.
-- **Flushed.** The log is flushed for a token once the serial sink's cursor is at or past it: every
-  entry before it written, or given up (§ Output sinks). It is also flushed at once while the
-  serial sink holds nobody: stalled, unserved, absent, or written inline. So no driver is required,
+- **Flushed.** The log is flushed for a token once the cursor of every holding `hold` sink, serial's
+  by default, is at or past it: every entry before it that the sink shows written, or given up
+  (§ Output sinks). A sink that holds nobody (stalled, unserved, absent, `off`, or written inline)
+  is not waited for, so with none holding the log is flushed at once. So no driver is required,
   and one that does not answer holds a flush for `SINK_STALL_MS` at most. Written means sent: the
   serial writer ends each entry with its `SERIAL_WRITE_SENT` barrier. A sink whose driver has just
   resumed after a stall holds nobody until its write in flight returns, so a flush in that moment
   is answered `FLUSHED` at once.
 - **Retry hint.** A pending answer's hint is the expected time of the unwritten entries up to the
-  token: their count times the serial writer's last time per entry, rounded up to whole
+  token: their count times the slowest holding writer's last time per entry, rounded up to whole
   milliseconds, clamped to 1 ms and `SINK_STALL_MS`. A client sleeps it, then asks again with the
   token. Its own bound on the whole wait is its own. pwrmgr uses a log call's bound
   (`log::LOG_CALL_TIMEOUT_MS`) before a requested power-off or reset, and `SINK_STALL_MS` before

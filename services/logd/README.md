@@ -104,13 +104,13 @@ under its sender's name, the first after the restart included
   seeded at startup from init-logd's handover `LINE` and `RECORD` chunks (see
   [`docs/handover-protocol.md`](docs/handover-protocol.md) § `LINE`). The history of every
   sender together is bounded by a byte bound fixed at start, the machine's RAM over 2048 within
-  `HISTORY_BYTES_MIN` (256 KiB) and `HISTORY_BYTES_MAX` (2 MiB): an entry retained past it drops
-  the oldest entry no `hold` sink (serial by default) shows and has not written, else the oldest
-  entry of the slot with the most entries. A sender keeps at most its last `PER_SLOT_HISTORY_MIN` (32) entries, scaled by
-  the byte bound's ratio to the floor; the kernel's slot and logd's own, which no window paces, also
-  keep past it the entries a `hold` sink shows and has not written, within the byte bound. The history is
-  also the journal the sinks write from. An evicted slot is retired with its name and entries, a
-  bounded number of them kept (see
+  `HISTORY_BYTES_MIN` (256 KiB) and `HISTORY_BYTES_MAX` (2 MiB): an entry retained past it drops the
+  oldest entry no `hold` sink (serial by default) shows and has not written, else the oldest entry
+  of the slot with the most entries. A sender keeps at most its last `PER_SLOT_HISTORY_MIN` (32)
+  entries, scaled by the byte bound's ratio to the floor; the kernel's slot and logd's own, which no
+  window paces, also keep past it the entries a `hold` sink shows and has not written, within the
+  byte bound. The history is also the journal the sinks write from. An evicted slot is retired with
+  its name and entries, a bounded number of them kept (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Retired slots).
 
 * **Kernel log reader.** From the handover's release on, and at each restart, a thread of logd reads

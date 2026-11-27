@@ -25,16 +25,16 @@ the rendered text (`record::render`, `record::fields`, `RENDERED_MAX_BYTES`; see
 § `stream_labels::STREAM_RECORD`), the line and name widths both log
 receivers keep per sender (`LINE_BUF_SIZE`, `MAX_NAME_LEN`), `BoundedStr`, the
 fixed-capacity, UTF-8-safe formatter logd uses for its own diagnostics. It holds the rules of
-real-logd's output sinks that need no clock or lock of their own (`SINK_STALL_MS`,
-`write_overdue`, `hint_ms`, `attach_cursor`, `drop_text`: when a sink's write is overdue, the retry
-hint of a refused message, where a `skip` sink's cursor starts, and the text of a drop line; see
-[`docs/ipc-interface.md`](../docs/ipc-interface.md) § Output sinks, § Hold window), a device
-sink's settings and the parser of the recipe syntax that sets them (`settings::SinkSettings`,
-`SinkKind::defaults`), and the two formats a sink renders an entry in, the console format with
-its field list (`console::write`) and the rfc5424 format (`rfc5424::write`; see
-[`docs/sinks.md`](../docs/sinks.md) § Settings, § The console format, § The rfc5424 format). It issues no
-syscall and no IPC, so both ends keep the IPC calls and the logic stays host-reachable, per
-[coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
+real-logd's output sinks that need no clock or lock of their own (`SINK_STALL_MS`, `write_overdue`,
+`hint_ms`, `attach_cursor`, `drop_text`: when a sink's write is overdue, the retry hint of a refused
+message, where a `skip` sink's cursor starts, and the text of a drop line; see
+[`docs/ipc-interface.md`](../docs/ipc-interface.md) § Output sinks, § Hold window), a device sink's
+settings and the parser of the recipe syntax that sets them (`settings::SinkSettings`,
+`SinkKind::defaults`), and the two formats a sink renders an entry in, the console format with its
+field list (`console::write`) and the rfc5424 format (`rfc5424::write`; see
+[`docs/sinks.md`](../docs/sinks.md) § Settings, § The console format, § The rfc5424 format). It
+issues no syscall and no IPC, so both ends keep the IPC calls and the logic stays host-reachable,
+per [coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
 
 `no_std`; depends on `shared/ipc` (`IpcMessage`, `log_record`, `log_query`), `shared/log`
 (`parse_level`, the level keywords a sink's `level` takes) and `abi/syscall`

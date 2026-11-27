@@ -60,7 +60,8 @@ services/svctest/
         │                      #   and restarted while memory is critical (logd in the reserve)
         ├── logd_sinks.rs      # logd's sinks: serial and framebuffer drivers attachable; lines
         │                      #   answered with either stopped, and with the framebuffer killed
-        │                      #   and restarted; and logd's flush barrier
+        │                      #   and restarted; a debug line retained and not on serial; and
+        │                      #   logd's flush barrier
         ├── logd_flood.rs      # Probe lines logged between `log-flood begin` and `end` while two
         │                      #   processes flood logd, which refuses the flooders
         │                      #   `WINDOW_FULL` and not the probe; `run --whole-lines`

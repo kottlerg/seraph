@@ -16,7 +16,7 @@ timestamp, the history as the journal the sinks write from, the serial and frame
 two sinks with a cursor and a writer thread each, the hold window and its `WINDOW_FULL` refusal, the
 serial sink's `hold` pace (its writes of an entry as plain chunks and then a zero-length
 `SERIAL_WRITE_SENT` barrier, its cursor moving once the entry is sent) and the framebuffer's `skip`
-pace, the drop lines, and `LOG_FLUSH` over the serial sink's cursor, whose token is the next `seq`
+pace, the drop lines, and `LOG_FLUSH` over the `hold` sinks' cursors, whose token is the next `seq`
 ([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks, § Hold window, § Flush barrier).
 
 Everything else this document states is design intent, not yet implemented, unless a sentence names
@@ -267,11 +267,11 @@ each entry, each write bounded by `SINK_STALL_MS`.
   flushed at once.
 - **framebuffer.** For the person at the screen. Its level is critical, so a healthy boot shows no
   log line on it. When an emergency entry reaches it, the sink first writes the last `backlog`
-  entries at info or more severe that precede the emergency entry in the history and that it has
-  not written (a `relayed` entry only when the sink shows those), then the emergency entry, so the screen of a dead machine carries its context. The
-  backlog is a walk back through the history, not a buffer of the sink's own. On a (re)attach, its
-  cursor starts `backlog` entries before the newest, `relayed` ones included, when it is further
-  behind than that.
+  entries at info or more severe that precede the emergency entry in the history and that it has not
+  written (a `relayed` entry only when the sink shows those), then the emergency entry, so the
+  screen of a dead machine carries its context. The backlog is a walk back through the history, not
+  a buffer of the sink's own. On a (re)attach, its cursor starts `backlog` entries before the
+  newest, `relayed` ones included, when it is further behind than that.
 - **pstore.** A RAM ring that survives a warm reset (§ pstore).
 
 The panic sink stays outside this contract: logd's own panic and allocation-failure output goes to

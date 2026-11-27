@@ -23,6 +23,7 @@ priority        = 20
 restart         = on_failure
 critical        = no
 provides        = crashd.core:grant
+seed            = logd.flush
 env             = CORE_DUMP=crashme CRASHD_OOM_STALL_MS=5000
 namespace       = subtree:/crash:LOOKUP+READDIR+STAT+WRITE+MUTATE_DIR
 debug_authority = yes

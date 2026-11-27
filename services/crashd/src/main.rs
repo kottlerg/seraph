@@ -30,6 +30,7 @@ mod hold;
 mod live;
 
 use std::os::seraph::call_time_left;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use core_file::notes::Cause;
@@ -84,6 +85,12 @@ fn bounded(log: impl FnOnce())
     std::os::seraph::with_call_deadline(deadline_in(FAULT_BOUND), log);
 }
 
+/// The `logd.flush` seed: a `LOG_FLUSH_AUTHORITY`-badged SEND on logd's
+/// master log endpoint, which carries logd's flush barrier and nothing else
+/// (`services/logd/docs/ipc-interface.md` § Flush barrier). Zero without the
+/// seed. Set once in `main` before any fault is served.
+static LOG_FLUSH: AtomicU64 = AtomicU64::new(0);
+
 /// The wait-set badge of procmgr's crash endpoint.
 const WAKE_FAULT: u64 = 0;
 
@@ -116,13 +123,17 @@ fn main() -> !
     };
 
     // The recipe's `provides` delivers the live-core endpoint's RECV in slot
-    // 0, and its `debug_authority = yes` the authority cap in the slot after
-    // the (absent) seeds.
+    // 0, its one seed, `logd.flush`, in slot 1, and its
+    // `debug_authority = yes` the authority cap in the slot after the seeds.
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let (live, authority) =
-        match unsafe { ipc::bootstrap::request_slots::<2>(info.creator_endpoint, ipc_buf) }
+        match unsafe { ipc::bootstrap::request_slots::<3>(info.creator_endpoint, ipc_buf) }
         {
-            Ok([live, authority]) if authority != 0 => (live, authority),
+            Ok([live, flush, authority]) if authority != 0 =>
+            {
+                LOG_FLUSH.store(flush, Ordering::Relaxed);
+                (live, authority)
+            }
             _ =>
             {
                 std::os::seraph::log!(error: "no debug authority delivered; not reporting crashes");
@@ -436,8 +447,9 @@ enum Dump
 /// reaches and log the block, under a call deadline of [`FAULT_BOUND`],
 /// write a core of the process when `policy` may name it, `dump` allows
 /// one, and the report read it whole, under the dump's own deadline, and log
-/// the dump's line, then end the thread with the report id as the decline
-/// reason. The block and the dump's line are logged before the decline, so
+/// the dump's line, wait for logd to write what was logged
+/// ([`await_log_written`], within what is left of the report's deadline),
+/// then end the thread with the report id as the decline reason. The block and the dump's line are logged before the decline, so
 /// the kernel's serial diagnostic of the kill, which the decline triggers,
 /// does not land among them. A report that passes its deadline ends there:
 /// the thread is declined at once, with no dump, and the block's remaining
@@ -447,8 +459,9 @@ fn handle_fault(msg: &IpcMessage, policy: &Policy, authority: u64, ipc_buf: *mut
     let id = report_id();
     let ip = msg.word(3);
     let (fault, cause) = decode(msg);
+    let deadline = deadline_in(FAULT_BOUND);
     let (gathered, lines, logged, cancelled) =
-        std::os::seraph::with_call_deadline(deadline_in(FAULT_BOUND), || {
+        std::os::seraph::with_call_deadline(deadline, || {
             let gathered = gather(msg.badge, ip, authority, ipc_buf);
             let report = Report {
                 id,
@@ -513,6 +526,7 @@ fn handle_fault(msg: &IpcMessage, policy: &Policy, authority: u64, ipc_buf: *mut
     {
         log_core(id, &outcome);
     }
+    await_log_written(deadline, ipc_buf);
 
     let decline = IpcMessage::builder(FAULT_REPLY_KILL).word(0, id).build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -532,6 +546,34 @@ fn handle_fault(msg: &IpcMessage, policy: &Policy, authority: u64, ipc_buf: *mut
     {
         std::os::seraph::log!("{line}");
     }
+}
+
+/// Wait, until `deadline`, the report's own (one bound over the block and the
+/// wait), for logd to write the lines it took before the wait to the sinks
+/// that hold the log (its flush barrier, through [`LOG_FLUSH`];
+/// `ipc::log_flush::wait` holds the steps). The decline that follows can kill
+/// logd itself, whose unwritten lines die with it
+/// (`services/logd/docs/ipc-interface.md` § Flush barrier), so the report of
+/// logd's own fault reaches the sinks first. Returns at once without the seed
+/// or with the deadline passed, and as soon as logd answers flushed, refuses,
+/// or does not answer; the decline follows in every case.
+fn await_log_written(deadline: Instant, ipc_buf: *mut u64)
+{
+    let cap = LOG_FLUSH.load(Ordering::Relaxed);
+    if cap == 0
+    {
+        return;
+    }
+    let start = Instant::now();
+    let bound_ms =
+        u32::try_from(deadline.saturating_duration_since(start).as_millis()).unwrap_or(u32::MAX);
+    ipc::log_flush::wait(
+        bound_ms,
+        || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        |request, timeout| unsafe { ipc::ipc_call_timeout(cap, request, ipc_buf, timeout) }.ok(),
+        |ms| std::thread::sleep(Duration::from_millis(ms)),
+    );
 }
 
 /// The fault `msg` reports, and the cause the core records for it.

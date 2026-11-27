@@ -29,6 +29,10 @@ pub const LOG_BADGE_PROCMGR: u64 = 2;
 /// `kernel` (`logd_codec::kernel`). No SEND cap on the log endpoint carries
 /// it, so no message arrives under it.
 pub const LOG_BADGE_KERNEL: u64 = 3;
+/// logd's own slot in logd: the lines logd logs about itself are kept
+/// under this key, named `logd`, and reach its sinks as a sender's do. No
+/// SEND cap on the log endpoint carries it, so no message arrives under it.
+pub const LOG_BADGE_LOGD: u64 = 4;
 /// Floor of every per-child badge: procmgr draws child badges at
 /// random and redraws any below it. Lower values are reserved for the
 /// system specials above; raising this leaves room to reserve more.

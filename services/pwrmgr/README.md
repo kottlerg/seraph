@@ -16,7 +16,6 @@ pwrmgr/
     ├── guard.rs      # The allocation guard the core-death power-off runs under
     ├── core_death.rs # The core-death queue's entries: the member and the exit reason
     ├── power_off.rs  # The register the x86-64 core-death power-off writes, from QUERY_SLEEP
-    ├── log_flush.rs  # The steps of the wait on logd's flush barrier before a power-off
     ├── caps.rs       # svcmgr bootstrap: the service endpoint, three seeds, the core-death queue
     └── arch/
         ├── mod.rs         # Arch dispatch: `arch::current` (Actuator, resolve,
@@ -87,7 +86,7 @@ log have written the lines it had taken, for at most 5 s (`log::LOG_CALL_TIMEOUT
 logged before the request, a harness's pass marker and crash reports among them, reach the serial
 console before the platform stops. logd answers at once when no sink holds the log or the one that
 does is stalled; without the seed, on a refusal, or with no answer, pwrmgr acts without the wait
-(`pwrmgr::log_flush` holds the steps).
+(`ipc::log_flush::wait` holds the steps).
 
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.

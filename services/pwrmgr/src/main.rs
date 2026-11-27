@@ -377,14 +377,12 @@ fn core_died(
 /// `ipc::log_labels::LOG_FLUSH`, through [`LOG_FLUSH`]), so a power-off or
 /// reset that follows does not cut them off. Returns at once without the
 /// seed, and as soon as logd answers flushed, refuses, or does not answer;
-/// the steps are `pwrmgr::log_flush`'s. Logs, allocates and frees nothing,
+/// the steps are `ipc::log_flush::wait`'s. Logs, allocates and frees nothing,
 /// since the core-death power-off runs it with [`ALLOCATOR`] armed: the
 /// request and reply are on the stack, and the clock and the sleep are
 /// system calls.
 pub(crate) fn drain_log(bound_ms: u32)
 {
-    use pwrmgr::log_flush::{Next, call_timeout, next};
-
     let cap = LOG_FLUSH.load(Ordering::Relaxed);
     if cap == 0
     {
@@ -392,31 +390,13 @@ pub(crate) fn drain_log(bound_ms: u32)
     }
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let start = Instant::now();
-    let elapsed_ms = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let mut token = None;
-    loop
-    {
-        let Some(timeout) = call_timeout(elapsed_ms(), bound_ms)
-        else
-        {
-            return;
-        };
-        let request = ipc::log_flush::request(token);
+    ipc::log_flush::wait(
+        bound_ms,
+        || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
         // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer.
-        let reply = unsafe { ipc::ipc_call_timeout(cap, &request, ipc_buf, timeout) }.ok();
-        match next(reply.as_ref(), elapsed_ms(), bound_ms)
-        {
-            Next::Done => return,
-            Next::Again {
-                token: again,
-                wait_ms,
-            } =>
-            {
-                token = Some(again);
-                std::thread::sleep(Duration::from_millis(wait_ms));
-            }
-        }
-    }
+        |request, timeout| unsafe { ipc::ipc_call_timeout(cap, request, ipc_buf, timeout) }.ok(),
+        |ms| std::thread::sleep(Duration::from_millis(ms)),
+    );
 }
 
 /// Wait out [`RESET_GRACE`] after a power-off or reset request (`op`) that

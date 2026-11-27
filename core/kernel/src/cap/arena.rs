@@ -450,3 +450,82 @@ mod tests
         }
     }
 }
+
+/// Bounded proofs of the span cut (docs/testing.md § Bounded verification).
+/// A span's ends and its holes are symbolic page addresses over the whole
+/// 64-bit address space, its top page included.
+#[cfg(kani)]
+mod proofs
+{
+    use super::for_each_run;
+
+    const PAGE: u64 = crate::mm::PAGE_SIZE as u64;
+
+    /// Holes a harness gives the cut.
+    const HOLES: usize = 3;
+
+    /// Runs a cut of `HOLES` holes can make: one before each hole and one
+    /// after the last.
+    const RUNS: usize = HOLES + 1;
+
+    /// Any page address.
+    fn any_page() -> u64
+    {
+        let addr: u64 = kani::any();
+        kani::assume(addr.is_multiple_of(PAGE));
+        addr
+    }
+
+    /// The runs `for_each_run` reports for the span `[start, end)` and any
+    /// `HOLES` or fewer ascending holes lie inside the span, ascending and
+    /// disjoint, each non-empty and page-aligned, and between them they cover
+    /// exactly the span's pages that are not holes: a symbolic page of the
+    /// span is a hole or lies in one run, never both. A hole below the span
+    /// or past it, the address space's top page among them, cuts nothing.
+    ///
+    /// The cut makes one pass over the holes, each step comparing one hole
+    /// with the cursor alone, so three holes cover every step: one below the
+    /// cursor, one inside the span and one past it, in any order the
+    /// assumptions allow. The loops are the cut's over `HOLES` holes and
+    /// the harness's over at most `RUNS` runs, so an unwind bound of
+    /// `RUNS + 1` covers both.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn the_runs_cover_the_span_but_its_holes_in_order()
+    {
+        let start = any_page();
+        let end = any_page();
+        kani::assume(start <= end);
+        let holes = [any_page(), any_page(), any_page()];
+        let count: usize = kani::any();
+        kani::assume(count <= HOLES);
+        kani::assume(count < 2 || holes[0] < holes[1]);
+        kani::assume(count < 3 || holes[1] < holes[2]);
+
+        let mut runs = [(0u64, 0u64); RUNS];
+        let mut made = 0usize;
+        for_each_run(start, end, holes.iter().copied().take(count), |from, to| {
+            assert!(made < RUNS);
+            runs[made] = (from, to);
+            made += 1;
+        });
+
+        let mut floor = start;
+        for &(from, to) in runs.iter().take(made)
+        {
+            assert!(floor <= from && from < to && to <= end);
+            assert!(from.is_multiple_of(PAGE) && to.is_multiple_of(PAGE));
+            floor = to;
+        }
+
+        let page = any_page();
+        kani::assume(start <= page && page < end);
+        let is_hole = holes.iter().take(count).any(|&h| h == page);
+        let in_runs = runs
+            .iter()
+            .take(made)
+            .filter(|&&(from, to)| from <= page && page < to)
+            .count();
+        assert_eq!(in_runs, usize::from(!is_hole));
+    }
+}

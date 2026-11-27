@@ -172,3 +172,100 @@ mod tests
         assert!(h.failed(), "dominant value must trip the APT");
     }
 }
+
+/// Bounded proofs of the health tests (docs/testing.md § Bounded
+/// verification), by induction over the bytes a source produces: `new`
+/// starts in the invariant `holds` states, and one `push` of any byte
+/// from any state in it keeps it, counts what NIST SP 800-90B §4.4 defines,
+/// and fails only when a cutoff is passed. Every field of the state and the
+/// byte are symbolic, so the two harnesses cover byte sequences of every
+/// length with no loop to unwind (`push` has none; `push_word` is its eight
+/// calls).
+///
+/// By induction: `rct_run` is the length of the current run of equal bytes,
+/// saturated, so a run of `RCT_CUTOFF` equal bytes fails the source;
+/// `apt_count` counts the window's first byte among the window's
+/// `apt_pos` bytes, so a window holding it more than `APT_CUTOFF` times
+/// fails it; failure is permanent; and the source is trusted exactly when
+/// `STARTUP_BYTES` bytes have passed with no failure.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{APT_CUTOFF, APT_WINDOW, Health, RCT_CUTOFF, STARTUP_BYTES};
+
+    /// The invariant every reachable state keeps.
+    fn holds(h: &Health) -> bool
+    {
+        (1..=APT_WINDOW).contains(&h.apt_pos)
+            && h.apt_count <= h.apt_pos
+            && h.startup_remaining <= STARTUP_BYTES
+            && (h.rct_run < RCT_CUTOFF || h.failed)
+            && (h.apt_count <= APT_CUTOFF || h.failed)
+    }
+
+    /// A fresh state is in the invariant, failed on nothing and not yet
+    /// trusted.
+    #[kani::proof]
+    fn a_fresh_source_starts_in_the_invariant_untrusted()
+    {
+        let h = Health::new();
+        assert!(holds(&h));
+        assert!(!h.failed() && !h.trusted());
+    }
+
+    /// One byte from any state in the invariant keeps it; extends the run
+    /// of equal bytes or starts a new one of length 1; counts the byte in
+    /// the APT window or, past the window's end, opens a new window with it;
+    /// counts startup down by one; and sets failure, which it never clears,
+    /// only when `rct_run` reaches `RCT_CUTOFF` or `apt_count` passes
+    /// `APT_CUTOFF`.
+    #[kani::proof]
+    fn each_byte_keeps_the_invariant_and_fails_only_past_a_cutoff()
+    {
+        let mut h = Health {
+            rct_last: kani::any(),
+            rct_run: kani::any(),
+            apt_first: kani::any(),
+            apt_count: kani::any(),
+            apt_pos: kani::any(),
+            startup_remaining: kani::any(),
+            failed: kani::any(),
+        };
+        kani::assume(holds(&h));
+        let before = Health { ..h };
+        let byte: u8 = kani::any();
+        h.push(byte);
+
+        assert!(holds(&h));
+        if before.rct_run != 0 && byte == before.rct_last
+        {
+            assert_eq!(h.rct_run, before.rct_run.saturating_add(1));
+        }
+        else
+        {
+            assert!(h.rct_run == 1 && h.rct_last == byte);
+        }
+        if before.apt_pos == APT_WINDOW
+        {
+            assert!(h.apt_first == byte && h.apt_count == 1 && h.apt_pos == 1);
+        }
+        else
+        {
+            assert!(h.apt_first == before.apt_first && h.apt_pos == before.apt_pos + 1);
+            assert_eq!(
+                h.apt_count,
+                before.apt_count + u32::from(byte == before.apt_first)
+            );
+        }
+        assert_eq!(
+            h.startup_remaining,
+            before.startup_remaining.saturating_sub(1)
+        );
+        assert!(h.failed || !before.failed);
+        if h.failed && !before.failed
+        {
+            assert!(h.rct_run >= RCT_CUTOFF || h.apt_count > APT_CUTOFF);
+        }
+        assert_eq!(h.trusted(), !h.failed && h.startup_remaining == 0);
+    }
+}

@@ -150,6 +150,7 @@ pub mod image_sharing;
 pub mod layout;
 pub mod log_client;
 pub mod logd_flood;
+pub mod logd_follow;
 pub mod logd_restart;
 pub mod logd_sinks;
 pub mod memmgr;
@@ -327,6 +328,7 @@ fn ordered() -> Vec<Phase>
     // probe's lines.
     out.extend_from_slice(logd_flood::phases());
     out.extend_from_slice(logd_sinks::phases());
+    out.extend_from_slice(logd_follow::phases());
     out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());
     out.extend_from_slice(unmount::phases());

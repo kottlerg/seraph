@@ -397,7 +397,7 @@ which a `kprintln!` or `kprintln_direct!` line written to the console mirrors to
 userspace can read back, and the kernel log, whose records a holder of a `KernelLog` capability
 reads as data with `SYS_KERNEL_LOG_READ` ([kernel-log.md](kernel-log.md)). In a normally-composed
 boot that holder is init-logd and then logd, which keeps each record in the kernel's slot of its
-history, so every holder of `logd.query` reads the records as well
+history, so every holder of `logd.query` or `logd.follow` reads the records as well
 ([services/logd/README.md](../../../services/logd/README.md)). Only the serial-only
 class ([docs/console-model.md](../../../docs/console-model.md) § Ownership across the boot
 lifecycle) is not userspace-readable. A line becomes a record only through `kprintln!` and

@@ -481,6 +481,81 @@ impl SinkSettings
     }
 }
 
+/// The name of each level in the recipe syntax, by its `LEVEL_*` code: the
+/// names `log::parse_level` reads.
+const LEVEL_NAMES: [&str; 8] = [
+    "emergency",
+    "alert",
+    "critical",
+    "error",
+    "warn",
+    "notice",
+    "info",
+    "debug",
+];
+
+/// The longest settings string [`SinkSettings`]'s `Display` writes: every key
+/// at its longest value.
+pub const RENDERED_SETTINGS_MAX: usize = 160;
+
+/// The settings in the recipe syntax, every key given, so that
+/// [`SinkSettings::parse_over`] reads them back to these settings over any
+/// settings of the same sink.
+impl fmt::Display for SinkSettings
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+    {
+        let level = match self.level
+        {
+            None => "off",
+            Some(level) => usize::try_from(level)
+                .ok()
+                .and_then(|i| LEVEL_NAMES.get(i))
+                .copied()
+                .unwrap_or("info"),
+        };
+        let format = match self.format
+        {
+            Format::Console => "console",
+            Format::Rfc5424 => "rfc5424",
+        };
+        write!(f, "level={level},format={format},fields=")?;
+        for (i, field) in self.fields.as_slice().iter().enumerate()
+        {
+            if i > 0
+            {
+                f.write_str(":")?;
+            }
+            f.write_str(field.key())?;
+        }
+        let time = match self.time
+        {
+            Time::Uptime => "uptime",
+            Time::Wall => "wall",
+        };
+        let pace = match self.pace
+        {
+            Pace::Hold => "hold",
+            Pace::Skip => "skip",
+        };
+        let relayed = match self.relayed
+        {
+            Relayed::Show => "yes",
+            Relayed::Pass => "no",
+        };
+        let colour = match self.colour
+        {
+            Colour::On => "yes",
+            Colour::Off => "no",
+        };
+        write!(
+            f,
+            ",time={time},pace={pace},backlog={},relayed={relayed},colour={colour},facility={}",
+            self.backlog, self.facility
+        )
+    }
+}
+
 /// A settings key.
 #[derive(Clone, Copy)]
 enum Key
@@ -846,5 +921,76 @@ mod tests
             assert_eq!(HostName::parse(bad), None, "{bad:?}");
         }
         assert_eq!(HostName::parse(&"h".repeat(HOSTNAME_MAX + 1)), None);
+    }
+
+    // Defect caught: a sink's settings listed in a form that does not set
+    // them back, so an operator who copies a listed setting changes another.
+    #[test]
+    fn rendered_settings_parse_back_to_themselves()
+    {
+        let mut cases = vec![
+            SinkKind::Serial.defaults(),
+            SinkKind::Framebuffer.defaults(),
+        ];
+        for (kind, text) in [
+            (
+                SinkKind::Serial,
+                "level=off,format=rfc5424,facility=23,backlog=256",
+            ),
+            (
+                SinkKind::Framebuffer,
+                "level=emergency,fields=procid:msg:time:host:level:name,time=wall,relayed=no",
+            ),
+            (
+                SinkKind::Serial,
+                "level=debug,pace=skip,colour=no,fields=msg",
+            ),
+        ]
+        {
+            cases.push(kind.defaults().parse_over(kind, text).unwrap());
+        }
+        for (i, settings) in cases.iter().enumerate()
+        {
+            let kind = if settings.colour == Colour::On
+            {
+                SinkKind::Framebuffer
+            }
+            else
+            {
+                SinkKind::Serial
+            };
+            let text = settings.to_string();
+            assert!(text.len() <= RENDERED_SETTINGS_MAX, "{text}");
+            // Over another sink's defaults, every key is set back.
+            let over = if i % 2 == 0
+            {
+                SinkKind::Framebuffer.defaults()
+            }
+            else
+            {
+                SinkKind::Serial.defaults()
+            };
+            assert_eq!(over.parse_over(kind, &text), Ok(*settings), "{text}");
+        }
+        let longest = SinkSettings {
+            level: Some(LEVEL_EMERGENCY),
+            format: Format::Rfc5424,
+            fields: Fields::parse("procid:host:level:name:time:msg").unwrap(),
+            backlog: BACKLOG_MAX,
+            relayed: Relayed::Show,
+            colour: Colour::On,
+            facility: FACILITY_MAX,
+            ..SinkKind::Framebuffer.defaults()
+        };
+        assert!(longest.to_string().len() <= RENDERED_SETTINGS_MAX);
+    }
+
+    #[test]
+    fn level_names_are_the_ones_the_parser_reads()
+    {
+        for (code, name) in LEVEL_NAMES.iter().enumerate()
+        {
+            assert_eq!(log::parse_level(name.as_bytes()), Some(code as u64));
+        }
     }
 }

@@ -63,7 +63,14 @@ pub fn read_volume<R: Read + Seek>(
 ) -> Result<BTreeMap<String, Node>>
 {
     let boot = read_at(image, offset, usize::try_from(block)?)?;
-    let geo = fat_parse::parse_bpb_geometry(&boot, block)
+    // The volume may declare no more sectors than the image holds past it,
+    // as fatfs holds it to its partition's length.
+    let end = image.seek(SeekFrom::End(0))?;
+    let image_sectors = end
+        .saturating_sub(offset)
+        .checked_div(u64::from(block))
+        .context("a block size of zero")?;
+    let geo = fat_parse::parse_bpb_geometry(&boot, block, image_sectors)
         .map_err(|_| err!("the boot sector does not decode"))?;
     let sector = u64::from(geo.bytes_per_sector);
     let fat_bytes = u64::from(geo.fat_size)
@@ -332,7 +339,7 @@ fn display_name(lfn: &LfnAccum, entry: &fat_parse::DirEntry) -> Result<String>
     }
     else
     {
-        entry.write_display_name(&mut name)
+        entry.write_display_name(&mut name, fat_parse::MAX_LFN_UTF8)
     };
     let Some(bytes) = name.get(..len)
     else
@@ -369,7 +376,7 @@ mod tests
         write_volume(&mut image, 0, 17 * MIB, 512, 1, &tree).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let bytes = image.into_inner();
-        let Ok(geo) = fat_parse::parse_bpb_geometry(&bytes[..512], 512)
+        let Ok(geo) = fat_parse::parse_bpb_geometry(&bytes[..512], 512, 17 * MIB / 512)
         else
         {
             panic!("the volume written does not decode");

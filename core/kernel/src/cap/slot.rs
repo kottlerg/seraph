@@ -1153,3 +1153,94 @@ mod tests
         assert_eq!(id.index.get(), 3);
     }
 }
+
+/// Bounded proofs of the rights algebra (docs/testing.md § Bounded
+/// verification). A rights word is the slot's 16 bits and a syscall's rights
+/// argument its full 64, each symbolic over every value, and a right is any
+/// one of the word's 16 bits; no harness loops.
+#[cfg(kani)]
+mod proofs
+{
+    use core::marker::PhantomData;
+
+    use super::{MemoryCap, Rights, TypedRights};
+
+    /// Any rights word.
+    fn any_rights() -> Rights
+    {
+        Rights(kani::any())
+    }
+
+    /// Any single right of the 16-bit word.
+    fn any_right() -> Rights
+    {
+        let bit: u32 = kani::any();
+        kani::assume(bit < u16::BITS);
+        Rights(1 << bit)
+    }
+
+    /// Attenuation, the word `Rights::from_mask(arg) & src` the copy, derive
+    /// and badge handlers store (`syscall::cap`), holds a right exactly when
+    /// the source holds it and the argument names its bit: it never grows the
+    /// source's rights, the bits above the word drop no right, and the full
+    /// mask (`syscall::RIGHTS_ALL`) keeps the source whole.
+    #[kani::proof]
+    fn attenuation_keeps_exactly_the_rights_the_source_and_the_mask_share()
+    {
+        let src = any_rights();
+        let arg: u64 = kani::any();
+        let derived = Rights::from_mask(arg) & src;
+        let right = any_right();
+        let named = arg & u64::from(right.0) != 0;
+        assert_eq!(derived.contains(right), src.contains(right) && named);
+        assert!(src.contains(derived));
+        assert_eq!(Rights::from_mask(syscall::RIGHTS_ALL) & src, src);
+    }
+
+    /// `contains` is a partial order on rights words (reflexive,
+    /// antisymmetric, transitive), `&` is the greatest lower bound under it
+    /// and `|` the least upper bound, so attenuating twice is attenuating by
+    /// the meet, and a derived capability never regains a right an ancestor
+    /// dropped.
+    #[kani::proof]
+    fn containment_is_a_lattice_order_with_and_as_meet_and_or_as_join()
+    {
+        let a = any_rights();
+        let b = any_rights();
+        let c = any_rights();
+        assert!(a.contains(a));
+        if a.contains(b) && b.contains(a)
+        {
+            assert_eq!(a, b);
+        }
+        if a.contains(b) && b.contains(c)
+        {
+            assert!(a.contains(c));
+        }
+        let meet = a & b;
+        assert!(a.contains(meet) && b.contains(meet));
+        assert_eq!(a.contains(c) && b.contains(c), meet.contains(c));
+        let join = a | b;
+        assert!(join.contains(a) && join.contains(b));
+        assert_eq!(c.contains(a) && c.contains(b), c.contains(join));
+        let mut assigned = a;
+        assigned |= b;
+        assert_eq!(assigned, join);
+    }
+
+    /// A typed rights word erases to the same 16 bits, so a typed constant
+    /// tests the slot's word bit for bit, and `|` and `|=` on typed words
+    /// erase to `|` on the erased words (`TypedRights` is generic over its
+    /// marker, which carries no data, so one marker proves every type).
+    #[kani::proof]
+    fn typed_rights_erase_to_the_same_word_and_commute_with_or()
+    {
+        let a: TypedRights<MemoryCap> = TypedRights(kani::any(), PhantomData);
+        let b: TypedRights<MemoryCap> = TypedRights(kani::any(), PhantomData);
+        assert_eq!(a.erase(), Rights(a.0));
+        assert_eq!((a | b).erase(), a.erase() | b.erase());
+        let mut assigned = a;
+        assigned |= b;
+        assert_eq!(assigned.erase(), a.erase() | b.erase());
+    }
+}

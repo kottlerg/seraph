@@ -1053,6 +1053,9 @@ const SEED_ONLY_NAMES: &[&[u8]] = &[
     ipc::published_names::VFSD_SWAP,
     ipc::published_names::MEMMGR_SWAP,
     ipc::published_names::LOGD_QUERY,
+    ipc::published_names::LOGD_FOLLOW,
+    ipc::published_names::LOGD_CONTROL,
+    ipc::published_names::LOGD_FLUSH,
     b"devmgr.class.block",
     b"devmgr.class.serial",
     b"devmgr.class.framebuffer",
@@ -1078,8 +1081,8 @@ const PUBLIC_NAMES: &[&[u8]] = &[
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show twenty of the refused names are
-/// published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.acpi`,
+/// cap. svctest's own non-zero seeds show twenty-three of the refused names
+/// are published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.acpi`,
 /// which only acpid seeds, are published by the same loop as
 /// `devmgr.registry` and `devmgr.bind`, `acpid.power`,
 /// which only pwrmgr seeds, by the same `provides` loop as `acpid.deny`,
@@ -1112,6 +1115,9 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         (caps.memmgr_swap, "memmgr.swap"),
         (caps.rtc_class, "devmgr.class.rtc"),
         (caps.svcmgr_grant, "svcmgr.grant"),
+        (caps.logd_follow, "logd.follow"),
+        (caps.logd_control, "logd.control"),
+        (caps.logd_flush, "logd.flush"),
     ]
     {
         assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");

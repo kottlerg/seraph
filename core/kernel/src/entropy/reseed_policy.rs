@@ -174,3 +174,93 @@ mod tests
         assert_eq!(decide(true, false, 0, 100, 200), Action::None);
     }
 }
+
+/// Bounded proofs of the reseed decision (docs/testing.md § Bounded
+/// verification). Every input is symbolic over every value; no harness
+/// loops. Together the two harnesses fix `decide` on every input.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{
+        Action, RESEED_DRAW_INTERVAL, RESEED_OVERDUE_FACTOR, RESEED_TIME_BUDGET_US, decide,
+    };
+
+    /// The strength of an action: a stronger one reseeds at least as surely.
+    fn strength(action: Action) -> u8
+    {
+        match action
+        {
+            Action::None => 0,
+            Action::Opportunistic => 1,
+            Action::Mandatory => 2,
+        }
+    }
+
+    /// An unseeded pool or a new VM generation always forces a mandatory
+    /// reseed; otherwise the action is mandatory exactly when the time
+    /// budget is overdue by `RESEED_OVERDUE_FACTOR`, at least opportunistic
+    /// when the draw interval or the time budget is spent, and none only when
+    /// neither is. An uncalibrated clock (`now_us` zero) spends no time.
+    #[kani::proof]
+    fn each_trigger_forces_its_action_and_no_other_input_does()
+    {
+        let seeded: bool = kani::any();
+        let guid_changed: bool = kani::any();
+        let draws: u64 = kani::any();
+        let now_us: u64 = kani::any();
+        let last_us: u64 = kani::any();
+        let action = decide(seeded, guid_changed, draws, now_us, last_us);
+        if !seeded || guid_changed
+        {
+            assert_eq!(action, Action::Mandatory);
+            return;
+        }
+        let elapsed = if now_us == 0
+        {
+            0
+        }
+        else
+        {
+            now_us.saturating_sub(last_us)
+        };
+        let overdue = u128::from(elapsed)
+            >= u128::from(RESEED_TIME_BUDGET_US) * u128::from(RESEED_OVERDUE_FACTOR);
+        let spent = draws >= RESEED_DRAW_INTERVAL || elapsed >= RESEED_TIME_BUDGET_US;
+        let expected = if overdue
+        {
+            Action::Mandatory
+        }
+        else if spent
+        {
+            Action::Opportunistic
+        }
+        else
+        {
+            Action::None
+        };
+        assert_eq!(action, expected);
+    }
+
+    /// The action never weakens as draws accumulate or as the clock advances
+    /// past the last reseed, so a generator that defers a reseed meets an
+    /// equal or stronger demand at its next draw.
+    #[kani::proof]
+    fn the_action_never_weakens_with_more_draws_or_a_later_clock()
+    {
+        let seeded: bool = kani::any();
+        let guid_changed: bool = kani::any();
+        let draws: u64 = kani::any();
+        let more_draws: u64 = kani::any();
+        let now_us: u64 = kani::any();
+        let later_us: u64 = kani::any();
+        let last_us: u64 = kani::any();
+        kani::assume(draws <= more_draws && now_us <= later_us);
+        let before = decide(seeded, guid_changed, draws, now_us, last_us);
+        assert!(
+            strength(before) <= strength(decide(seeded, guid_changed, more_draws, now_us, last_us))
+        );
+        assert!(
+            strength(before) <= strength(decide(seeded, guid_changed, draws, later_us, last_us))
+        );
+    }
+}

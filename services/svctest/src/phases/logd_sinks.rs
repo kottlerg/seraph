@@ -74,7 +74,11 @@
 //!   1 ms to the stall bound, before the stall bound has passed. Asked again
 //!   with its token, it is answered `FLUSHED` while the driver is still
 //!   stopped, once the sink is stalled, within twice the stall bound: logd
-//!   does not hold a flush on a sink that writes nothing.
+//!   does not hold a flush on a sink that writes nothing. A stop that cuts
+//!   off a write in flight makes logd's writer give it up, which stalls the
+//!   sink at once, and every flush is then answered `FLUSHED`; the phase
+//!   starts the driver, lets a write end the stall, and stops it again, at
+//!   most three stops in all.
 
 use std::time::{Duration, Instant};
 
@@ -142,6 +146,17 @@ const DEATH_TIMEOUT: Duration = Duration::from_secs(30);
 /// well under a millisecond, and one that waits on a blocked writer waits
 /// until the bound from the writer's call, sent a few milliseconds earlier.
 const STALL_SEEN: Duration = Duration::from_millis(SINK_STALL_MS as u64 / 2);
+
+/// How many times the flush phase stops the serial driver, at most, for a
+/// stop that finds logd's serial writer not stalled: a stop that cuts off a
+/// write in flight (logd's own, or a kernel line's) makes the writer give it
+/// up, which stalls the sink, and a flush then rightly reads it as flushed.
+const STOP_ATTEMPTS: u32 = 3;
+
+/// How long the flush phase lets the restarted serial driver run before it
+/// stops it again: time for logd's writer to complete a write, which ends
+/// the sink's stall.
+const STALL_CLEAR: Duration = Duration::from_millis(100);
 
 /// How long the phase waits between tries for logd to resolve the restarted
 /// framebuffer driver.
@@ -263,18 +278,45 @@ pub fn logd_flush_phase(caps: &Caps)
     let serial = super::crash::badge_named(authority, SERIAL_NAME)
         .expect("logd_flush: LIST_PROCESSES lists no serial driver");
     let threads = attach(authority, serial, "serial");
-    stop(&threads, "serial");
-    // The line's call waits on the stopped driver up to the stall bound, so
-    // another thread makes it while this one flushes. No assertion panics
-    // until the driver runs again, since its message would wait behind it.
-    let line = std::thread::spawn(|| {
-        std::os::seraph::log!("logd_flush: a line while the serial driver is stopped");
-    });
-    let stopped = flush_while_stopped(flush);
-    start(&threads, "serial");
-    let _ = line.join();
+    let mut stopped = None;
+    for attempt in 1..=STOP_ATTEMPTS
+    {
+        stop(&threads, "serial");
+        // The line's call waits on the stopped driver up to the stall bound,
+        // so another thread makes it while this one flushes. No assertion
+        // panics until the driver runs again, since its message would wait
+        // behind it.
+        let line = std::thread::spawn(|| {
+            std::os::seraph::log!("logd_flush: a line while the serial driver is stopped");
+        });
+        let answered = flush_while_stopped(flush);
+        start(&threads, "serial");
+        let _ = line.join();
+        if matches!(answered, Ok(None)) && attempt < STOP_ATTEMPTS
+        {
+            std::os::seraph::log!(
+                "logd_flush: the serial sink was stalled at the driver's stop (attempt \
+                 {attempt} of {STOP_ATTEMPTS}); stopping it again"
+            );
+            // The line above returns once queued on the stalled sink; the
+            // writer's next completed write ends the stall.
+            std::thread::sleep(STALL_CLEAR);
+            continue;
+        }
+        stopped = Some(answered);
+        break;
+    }
     detach(authority, serial, threads, "serial");
-    let (hint, took) = stopped.unwrap_or_else(|e| panic!("{e}"));
+    let (hint, took) = match stopped
+    {
+        Some(Ok(Some(answer))) => answer,
+        Some(Err(e)) => panic!("{e}"),
+        Some(Ok(None)) | None => panic!(
+            "logd_flush: no flush pending within {} ms of the serial driver's stop, in \
+             {STOP_ATTEMPTS} stops",
+            STALL_SEEN.as_millis()
+        ),
+    };
     std::os::seraph::log!(
         "logd_flush: pending with a {hint} ms hint, then flushed in {} ms with the serial driver \
          stopped",
@@ -285,8 +327,10 @@ pub fn logd_flush_phase(caps: &Caps)
 /// With the serial driver stopped: start flushes until one is pending, which
 /// must happen before [`STALL_SEEN`] passes, with a hint within the stall
 /// bound, then ask again with its token until it is flushed, within twice the
-/// stall bound. The hint and the time to flushed, or the first failure.
-fn flush_while_stopped(flush: u64) -> Result<(u32, Duration), String>
+/// stall bound. The hint and the time to flushed; `None` when no flush was
+/// pending, since the sink was stalled from the stop on (a write the stop cut
+/// off); or the first failure.
+fn flush_while_stopped(flush: u64) -> Result<Option<(u32, Duration)>, String>
 {
     let start_at = Instant::now();
     let (token, hint) = loop
@@ -298,13 +342,7 @@ fn flush_while_stopped(flush: u64) -> Result<(u32, Duration), String>
             {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            FlushAnswer::Flushed { .. } =>
-            {
-                return Err(format!(
-                    "logd_flush: no flush pending within {} ms of the serial driver's stop",
-                    STALL_SEEN.as_millis()
-                ));
-            }
+            FlushAnswer::Flushed { .. } => return Ok(None),
         }
     };
     if !(1..=SINK_STALL_MS).contains(&hint)
@@ -321,7 +359,7 @@ fn flush_while_stopped(flush: u64) -> Result<(u32, Duration), String>
         },
         STALL_BOUND.saturating_mul(2),
     )?;
-    Ok((hint, took))
+    Ok(Some((hint, took)))
 }
 
 /// Ask again, after each pending answer's hint, until `flush` answers flushed

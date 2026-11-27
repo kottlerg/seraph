@@ -31,11 +31,11 @@ use syscall::{
     cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
     cap_create_thread, cap_delete, cap_derive, cap_info, cap_info_memory_mappings, cap_insert,
     cap_move, event_queue_create_observed, event_try_recv_death, mem_map, memory_merge,
-    memory_split, mmio_map, thread_bind_notification,
+    memory_split, mmio_map, system_info, thread_bind_notification,
 };
 use syscall_abi::{
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, MAP_WRITABLE,
-    PAGE_SIZE, RIGHTS_ALL,
+    PAGE_SIZE, RIGHTS_ALL, SystemInfoType,
 };
 
 use crate::latency::{self, Bracket, Call, Measured};
@@ -44,9 +44,9 @@ use crate::{TestContext, TestResult};
 /// Endpoints whose last capabilities the cascade case's dying `CSpace`
 /// holds: as many teardowns, each popped from the cascade.
 const ENDPOINTS: u32 = 4096;
-/// Pages of the Memory piece the cascade case retypes its endpoints from:
-/// [`ENDPOINTS`] 128-byte bodies fill 128 pages, and the rest is margin.
-const ENDPOINT_PIECE_PAGES: u64 = 192;
+/// Pages of margin the cascade case's Memory piece holds beyond the pages its
+/// [`ENDPOINTS`] endpoints take ([`endpoint_piece_pages`]).
+const ENDPOINT_PIECE_MARGIN_PAGES: u64 = 64;
 /// Copies of one notification between the release-pass case's first and last
 /// slots: 293 slot leaves, 73 batches of the kernel's `RELEASE_BATCH_LEAVES`.
 const RELEASED_COPIES: u32 = 16_384;
@@ -198,6 +198,21 @@ pub(crate) fn run(
     latency::check_measured(line, &m)
 }
 
+/// Pages of the Memory piece the cascade case retypes its endpoints from:
+/// [`ENDPOINTS`] endpoints of this boot's debit
+/// (`SystemInfoType::EndpointRetypeBytes`, which the CPU count sizes) in its
+/// size class, and [`ENDPOINT_PIECE_MARGIN_PAGES`].
+fn endpoint_piece_pages() -> Result<u64, &'static str>
+{
+    let debit = system_info(SystemInfoType::EndpointRetypeBytes as u64)
+        .map_err(|_| "teardown_windows::cascade: system_info(EndpointRetypeBytes) failed")?;
+    syscall_abi::retype_class_bytes(debit)
+        .checked_mul(u64::from(ENDPOINTS))
+        .map(|bytes| bytes.div_ceil(PAGE_SIZE))
+        .and_then(|pages| pages.checked_add(ENDPOINT_PIECE_MARGIN_PAGES))
+        .ok_or("teardown_windows::cascade: the endpoint piece's size overflows")
+}
+
 /// The dealloc cascade of a `CSpace` holding the last capabilities to
 /// [`ENDPOINTS`] endpoints takes interrupts between their teardowns. The
 /// endpoints are retyped from a piece of their own, whose available bytes
@@ -208,7 +223,7 @@ pub fn cascade_takes_interrupts(ctx: &TestContext) -> TestResult
     {
         return Ok(());
     }
-    let piece = Piece::split(ctx, ENDPOINT_PIECE_PAGES)?;
+    let piece = Piece::split(ctx, endpoint_piece_pages()?)?;
     let whole = available(piece.cap)?;
     run("ktest: teardown_windows call=cascade", || {
         let pages = crate::cspace_geometry::pages_to_cover(u64::from(ENDPOINTS)).saturating_add(1);

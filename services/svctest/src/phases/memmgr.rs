@@ -1319,10 +1319,8 @@ pub fn frame_reclaim_live_object_phase(_: &Caps)
     /// Spawns after the death, each drawing frames from the pool.
     const SPAWNS: u32 = 4;
 
-    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .expect("frame_reclaim_live_object: endpoint creation failed");
+    let ep = std::os::seraph::create_endpoint()
+        .expect("frame_reclaim_live_object: endpoint creation failed");
     let root = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND)
         .expect("frame_reclaim_live_object: root SEND derive failed");
     let stop = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, RECLAIM_STOP_BADGE)

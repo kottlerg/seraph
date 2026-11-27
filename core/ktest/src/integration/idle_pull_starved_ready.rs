@@ -13,7 +13,7 @@
 //!   `INIT_PRIORITY`): pinned to the last CPU, posts its "spinning" bit, then
 //!   spins on [`STOP`] with no syscall, so it never blocks or yields that CPU
 //!   to a lower level.
-//! - Low, [`ROUNDS`] times, one child after another (a lower RT level): started
+//! - Low, [`ROUNDS`] times, one child after another (a fair level): started
 //!   pinned to the spinner's CPU, where it is `Ready` behind the spinner, then
 //!   cleared to `AFFINITY_ANY`, which migrates nothing
 //!   (core/kernel/docs/scheduler.md § Active migration on affinity change). It
@@ -55,9 +55,12 @@ const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 /// expiry should it share the spinner's CPU.
 const SPINNER_PRIORITY: u8 = 26;
 
-/// Level of the low children: an RT level below [`SPINNER_PRIORITY`], so
-/// strict priority keeps them off the spinner's CPU while it spins.
-const LOW_PRIORITY: u8 = 24;
+/// Level of the low children: a fair level, below [`SPINNER_PRIORITY`], so
+/// strict priority keeps them off the spinner's CPU while it spins, and not an
+/// RT one, which the spinner's CPU would push to an idle CPU at its tick
+/// (core/kernel/docs/scheduler.md § Load Balancing, "RT push") before an idle
+/// CPU's pull could take it.
+const LOW_PRIORITY: u8 = 10;
 
 /// `SYS_THREAD_SET_AFFINITY`'s value clearing a hard affinity.
 const AFFINITY_ANY: u32 = u32::MAX;
@@ -126,7 +129,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     // ktest is loaded as init and holds the root SchedControl spanning the full
-    // userspace range; use it to place the children at RT levels.
+    // userspace range; use it to place the spinner at an RT level.
     let sched_cap = ctx.sched_control_cap;
     if sched_cap == 0
     {

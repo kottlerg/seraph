@@ -227,7 +227,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     // ── Mixed batch — mint several types, delete all, verify reclaim. ────────
     //
     // Validates that the per-MemoryObject sub-allocator's free lists handle
-    // multi-type churn without leaking bytes. Endpoints land in BIN_128;
+    // multi-type churn without leaking bytes. Endpoints land in BIN_128 up to
+    // 224 CPUs;
     // WaitSets in BIN_512; AddressSpace in the page-aligned free list.
     let e1 =
         cap_create_endpoint(memory).map_err(|_| "integration::retype_reclaim: batch ep1 failed")?;

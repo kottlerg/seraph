@@ -4904,10 +4904,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // dispatch_for is total over the kernel's retypable types; the
             // Endpoint arm always returns Some. Unwrap-or-fall-through with
             // a fallback raw size keeps the lint quiet without panicking. The
-            // fallback is the ABI constant the Endpoint arm returns, so it
-            // cannot drift from the alloc-side size.
+            // fallback is the boot's endpoint debit the Endpoint arm returns,
+            // so it cannot drift from the alloc-side size.
             let raw_bytes = dispatch_for(ObjectType::Endpoint, 0)
-                .map_or(syscall::ENDPOINT_RETYPE_BYTES, |e| e.raw_bytes);
+                .map_or_else(crate::ipc::endpoint::retype_bytes, |e| e.raw_bytes);
 
             // SAFETY: ancestor_ptr is non-null; it was set by `with_ancestor`
             // at retype time and points at the source MemoryObject's header.

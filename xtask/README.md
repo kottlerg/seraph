@@ -2130,10 +2130,10 @@ from every configuration traced with `cargo xtask path-account write` (`cargo xt
 between architectures). A trace runs every instruction of the boot through the plugin and takes
 several minutes. The userspace rows of both architectures take about 30 minutes of the host,
 builds included: per architecture two builds, the reference boot and the trace, each boot of
-one vCPU and so needing no grant. A kernel change on a path those rows run owes them as well as
-ktest's configurations
-([hot-path-account-userspace.md](../core/kernel/docs/hot-path-account-userspace.md#regenerating-it)
-§ Regenerating It).
+one vCPU and so needing no grant. Which PRs regenerate an account, and the regeneration of both
+at each release, are stated in
+[hot-path-account.md](../core/kernel/docs/hot-path-account.md#regenerating-it)
+§ Regenerating It.
 
 **Method.** `trace` builds the path-account plugin
 ([path-account-plugin/](path-account-plugin/README.md)) for the host and boots the sysroot's

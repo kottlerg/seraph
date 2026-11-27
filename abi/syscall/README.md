@@ -12,7 +12,8 @@ capability-handle encoding, the `CAP_INFO_*` selectors and `CAP_TAG_*` discrimin
 protection and unmap flags, the floor of the user range (`USER_VA_FLOOR`), the `SYS_THREAD_START`
 flags (`THREAD_START_SUSPENDED`), the `SYS_THREAD_POST_UPCALL` flag (`UPCALL_ANY_INSTRUCTION`), the
 `IRQ_MODE_*` interrupt-line mode bits, the per-type `RIGHTS_*` masks, the per-object retype costs
-(`*_RETYPE_BYTES`, `event_queue_retype_bytes`, `wait_set_retype_bytes`), the `CSpace` funding
+(`*_RETYPE_BYTES`, `event_queue_retype_bytes`, `wait_set_retype_bytes`) and the size class a
+retype debits (`retype_class_bytes`), the `CSpace` funding
 constants (`CSPACE_SLOTS_PER_PAGE`, `CSPACE_BODIES_PER_PAGE`, `IOPORT_BINDING_TABLE_PAGES`), the
 scheduling, message, event-queue, and wait-set limits, the exit-reason and fault-protocol constants,
 the register-file and extended-state image layouts (`REGS_*`, `EXT_REGS_*`), the

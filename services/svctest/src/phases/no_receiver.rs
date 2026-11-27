@@ -87,10 +87,7 @@ fn child_main() -> !
 
 fn new_endpoint() -> u64
 {
-    std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .expect("call_no_receiver: endpoint creation failed")
+    std::os::seraph::create_endpoint().expect("call_no_receiver: endpoint creation failed")
 }
 
 /// A walk from an endpoint whose only Receive right is in a child that never

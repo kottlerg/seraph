@@ -1121,10 +1121,7 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
     use ipc::{procmgr_errors, procmgr_labels};
     use std::sync::mpsc;
 
-    let endpoint =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
+    let endpoint = std::os::seraph::create_endpoint()
         .expect("procmgr_concurrent_spawn: endpoint creation failed");
     // With Grant, as a node cap is: procmgr's FS_SESSION moves a cap on it.
     let file = syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND_GRANT)
@@ -1326,10 +1323,7 @@ impl ReadStall
         let len = data.len() as u64;
         let (page, region, first_page) = first_page_of(&data);
 
-        let endpoint =
-            std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-                syscall::cap_create_endpoint(slab).ok()
-            })
+        let endpoint = std::os::seraph::create_endpoint()
             .expect("procmgr_concurrent_spawn: read-stall endpoint creation failed");
         let derive = |rights| {
             syscall::cap_derive(endpoint, rights)

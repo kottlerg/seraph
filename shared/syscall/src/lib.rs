@@ -613,9 +613,11 @@ pub fn notification_try_wait(sig: u64) -> Result<u64, i64>
 /// (slot index plus generation).
 ///
 /// `memory_cap` is the source Memory-cap slot; it MUST carry `RIGHTS_MEM_RETYPE`
-/// and have at least 128 B of `available_bytes` (the `BIN_128` size class the
-/// Endpoint wrapper plus state is debited as). Bytes are debited from the
-/// Memory cap and credited back when the Endpoint is destroyed.
+/// and have at least `syscall_abi::retype_class_bytes(d)` of `available_bytes`,
+/// `d` being the boot's Endpoint debit (`SystemInfoType::EndpointRetypeBytes`,
+/// which the CPU count sizes): 128 B up to 224 CPUs, 512 B up to 1760, a page
+/// above. Bytes are debited from the Memory cap and credited back when the
+/// Endpoint is destroyed.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks

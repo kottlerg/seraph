@@ -650,8 +650,8 @@ the region between two reads, the benchmark's measured operation, as follows:
   order. An out-of-order hart may overlap a small window's edges with the work around it, so a
   window shorter than its pipeline's depth measures the region only to within that overlap.
 
-A window whose thread may run on another CPU between its two reads, as in a window-mean row
-([shared/bench/README.md § Window-mean rows](../shared/bench/README.md#window-mean-rows)), takes
+A window whose thread may run on another CPU between its two reads, as in a window row
+([shared/bench/README.md § Window rows](../shared/bench/README.md#window-rows)), takes
 both reads on the CPU it measures on, since riscv64 keeps no two harts' counters in step. Their
 difference then measures the window only while that CPU's counter advanced throughout, whatever
 ran where:
@@ -670,7 +670,7 @@ row whose measured thread takes them, with no affinity between them, takes the o
 still pinned and closes its idle-halt span right after the closing read: the close fails on
 another CPU than the span's open, and otherwise returns the halts between them. The one move the
 span does not see is a move onto the measuring CPU in the few instructions between the closing
-read and the close, which takes a preemption and a pull there. fsbench's window-mean rows run at
+read and the close, which takes a preemption and a pull there. fsbench's window rows run at
 more than one CPU, so their counts are reported, not gated (below).
 
 Every sample therefore includes the cost of the reads themselves: their instructions on the

@@ -3,10 +3,9 @@
 
 // shared/bench/src/window.rs
 
-//! Window-mean measurements: a benchmark whose measured path may run on
-//! another CPU between two counter reads times windows of several operations,
-//! each sample the mean per operation of one window
-//! (`shared/bench/README.md` § Window-mean rows).
+//! Window measurements: a benchmark whose measured path may run on another
+//! CPU between two counter reads times windows of several operations, each
+//! sample one window's whole count (`shared/bench/README.md` § Window rows).
 //!
 //! The counters are read on the CPU measured on, at the opening and at the
 //! closing of each window. A window measures only when both reads ran on that
@@ -21,7 +20,7 @@
 /// Operations per window when the benchmark runs at least this many.
 pub const WINDOW_OPS: u32 = 16;
 
-/// The extra naming the operations each sample is the mean of.
+/// The extra naming the operations each window, so each sample, holds.
 pub const WINDOW_OPS_KEY: &str = "window_ops";
 
 /// The extra counting the windows left out because a read ran on another CPU
@@ -56,7 +55,7 @@ impl WindowShape
     }
 
     /// The fewest counted windows a row reports a sample from: half the
-    /// windows, rounded up. Fewer leave the row the mean of the windows the
+    /// windows, rounded up. Fewer leave the row a measure of the windows the
     /// pair happened to stay together in, not of the case.
     #[must_use]
     pub const fn floor(self) -> u32
@@ -129,18 +128,10 @@ impl WindowTally
     }
 }
 
-/// The mean per operation of a window whose two reads differ by `elapsed`
-/// over `ops` operations, rounded down; `elapsed` itself for no operation.
-#[must_use]
-pub fn window_mean(elapsed: u64, ops: u32) -> u64
-{
-    elapsed.checked_div(u64::from(ops)).unwrap_or(elapsed)
-}
-
 #[cfg(test)]
 mod tests
 {
-    use super::{WINDOW_OPS, WindowEnd, WindowShape, WindowTally, window_mean};
+    use super::{WINDOW_OPS, WindowEnd, WindowShape, WindowTally};
 
     #[test]
     fn operations_split_into_whole_windows_of_at_most_the_window_size()
@@ -209,12 +200,5 @@ mod tests
         assert!(!tally.reaches_floor(shape));
         tally.record(WindowEnd::Counted);
         assert!(tally.reaches_floor(shape));
-    }
-
-    #[test]
-    fn a_window_mean_divides_by_its_operations_rounding_down()
-    {
-        assert_eq!(window_mean(1607, 16), 100);
-        assert_eq!(window_mean(42, 0), 42);
     }
 }

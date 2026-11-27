@@ -26,7 +26,7 @@
 //! thread woken on another CPU would subtract one CPU's cycle counter from
 //! another's, which riscv64 does not keep in step. At more than one CPU the
 //! `unpinned` module then times windows of a client with no affinity, which
-//! report window-mean rows (`shared/bench/README.md` § Window-mean rows).
+//! report window rows (`shared/bench/README.md` § Window rows).
 //!
 //! Writes go through page-sized `write_all` calls on a page-aligned offset,
 //! which the std client sends as one `FS_WRITE_MEMORY` each.

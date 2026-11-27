@@ -103,25 +103,24 @@ that outranks it, so each round trip with fatfs, an RT server, wakes another CPU
 Assignment](../../../core/kernel/docs/scheduler.md#thread-assignment)).
 At more than one CPU, `fsbench` therefore also measures the client real filesystem clients are,
 one with no affinity, which the rule runs on one CPU with its server: after the pinned reads, the
-16-byte inline read, and after the pinned opens, the open, each in the window-mean form
-([shared/bench/README.md § Window-mean rows](../../../shared/bench/README.md#window-mean-rows)).
+16-byte inline read, and after the pinned opens, the open, each in the window form
+([shared/bench/README.md § Window rows](../../../shared/bench/README.md#window-rows)).
 A sample cannot cover one operation once the thread may move between its two counter reads, so
 each covers a window of 16 operations (all of them when `ITERS` is smaller), and the case's
 iterations make its windows: 16 of 16 in the full benchmark.
 
-After 8 untimed warm-up operations, each window runs one untimed operation pinned to CPU 0,
-which blocks and so leaves the thread running there; then, still pinned, it opens the thread's
-idle-halt span on CPU 0 and reads the counters, clears the thread's affinity, runs the window's
-operations, reads the counters again, closes the span, and pins the thread to CPU 0 again.
-Clearing an affinity, or setting the one CPU the thread runs on, moves nothing, so no blocking
-call falls inside the window but the measured operations; the window holds the affinity clear's
-syscall. The window counts when the span closes on CPU 0 with no halt: the closing read ran on
-CPU 0 too, and its counter ran throughout
-([docs/testing.md § Benchmarks](../../../docs/testing.md#benchmarks-bench-cell)). Its sample is
-the window's cycles divided by its operations. A window whose span closed on another CPU, or
-saw CPU 0 halt, is left out and counted. The open window's files stay open until the next
-untimed operation, so, as in the pinned case, no close is measured, and their closes fall outside
-the span and the placement reads too.
+After 8 untimed warm-up operations, each window runs one untimed operation pinned to CPU 0, which
+blocks and so leaves the thread running there; then, still pinned, it opens the thread's idle-halt
+span on CPU 0 and reads the counters, clears the thread's affinity, runs the window's operations,
+reads the counters again, closes the span, and pins the thread to CPU 0 again. Clearing an affinity,
+or setting the one CPU the thread runs on, moves nothing, so no blocking call falls inside the
+window but the measured operations; the window holds the affinity clear's syscall. The window counts
+when the span closes on CPU 0 with no halt: the closing read ran on CPU 0 too, and its counter ran
+throughout ([docs/testing.md § Benchmarks](../../../docs/testing.md#benchmarks-bench-cell)). Its
+sample is the window's cycles, so its cost per operation is the sample divided by `window_ops=`. A
+window whose span closed on another CPU, or saw CPU 0 halt, is left out and counted. The open
+window's files stay open until the next untimed operation, so, as in the pinned case, no close is
+measured, and their closes fall outside the span and the placement reads too.
 
 ---
 
@@ -162,12 +161,12 @@ bench fsbench.open depth=3 affinity=any arch=<arch> cpus=<k> unit=cycles
     window_ops=<n> moved=<n> halted=<n> idle_halts=<n> remote_wakes=<n>
 ```
 
-`n=` is the windows that counted, `window_ops=` the operations each sample is the mean of,
+`n=` is the windows that counted, `window_ops=` the operations each sample holds,
 `moved=` and `halted=` the windows left out, `idle_halts=` CPU 0's halts over every window whose
 span closed, and `remote_wakes=` the wakes of the thread, over the counted windows, that linked it
 on another CPU than its waker's (`CAP_INFO_THREAD_PLACEMENT`): a reply from a server on another
 CPU is one, so `0` with `idle_halts=0` says that every round trip ran on CPU 0. A failed placement
-read leaves `remote_wakes=` out. When fewer than half the windows count, the row is no mean of
+read leaves `remote_wakes=` out. When fewer than half the windows count, the row does not measure
 the case: `fsbench` logs no result line for it, and logs at WARN
 `<name> affinity=any: counted windows below the floor` with the counts.
 

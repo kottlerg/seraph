@@ -5,7 +5,7 @@
 
 //! The rows of a client with no affinity: `fsbench.read size=16 path=inline
 //! affinity=any` and `fsbench.open depth=3 affinity=any`, at more than one
-//! CPU, in the window-mean form (`shared/bench/README.md` § Window-mean rows).
+//! CPU, in the window form (`shared/bench/README.md` § Window rows).
 //!
 //! The pinned rows measure a client the synchronous wake rule keeps apart
 //! from its RT server (`core/kernel/docs/scheduler.md` § Thread Assignment);
@@ -24,7 +24,7 @@ use std::fs::File;
 
 use bench::{
     Counters, HALTED, IDLE_HALTS, MOVED, Report, Unit, Value, WINDOW_OPS_KEY, WindowEnd,
-    WindowShape, WindowTally, window_mean,
+    WindowShape, WindowTally,
 };
 
 use crate::open::{OPEN_DEPTH, OPEN_PATH, open};
@@ -43,7 +43,7 @@ const REMOTE_WAKES: &str = "remote_wakes";
 /// What the windows of one row measured.
 struct Windows
 {
-    /// One sample per counted window: its mean per operation.
+    /// One sample per counted window: its whole count.
     samples: Vec<u64>,
     tally: WindowTally,
     /// Halts of `BENCH_CPU` over every span that closed.
@@ -112,7 +112,7 @@ fn run_windows(shape: WindowShape, counters: &Counters, mut body: impl FnMut(Ste
         out.tally.record(end);
         if end == WindowEnd::Counted
         {
-            out.samples.push(window_mean(elapsed, shape.ops));
+            out.samples.push(elapsed);
             // The counter is a wrapping 32-bit count.
             let wakes = wakes_before
                 .zip(wakes_after)

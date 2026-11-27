@@ -178,7 +178,8 @@ to a capability are type-specific.
 
 A capability to one or more contiguous physical frames. Rights:
 - **Map** — may map these frames into an address space
-- **Write** — authority to create writable mappings
+- **Write** — authority to create writable mappings, and, with Map, to have the
+  kernel zero the region's pages through its direct map (`SYS_MEMORY_ZERO`)
 - **Execute** — authority to create executable mappings
 - **Retype** — authority to consume bytes of this Memory's region as the
   backing storage for a newly created kernel object (see

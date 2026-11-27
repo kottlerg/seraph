@@ -787,11 +787,16 @@ pub const SYS_IPC_REPLY_RECV: u64 = 77;
 /// reset points before the kernel raises [`FAULT_EXC_RUN_LIMIT`] on it. See
 /// `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_RUN_LIMIT` (78).
 pub const SYS_THREAD_SET_RUN_LIMIT: u64 = 78;
+/// Memory: zero pages of a Memory capability through the kernel's direct map,
+/// returning the number zeroed, which is fewer than asked when the call stops
+/// early to let the caller be preempted. See `core/kernel/docs/syscalls.md`
+/// § `SYS_MEMORY_ZERO` (79).
+pub const SYS_MEMORY_ZERO: u64 = 79;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_THREAD_SET_RUN_LIMIT + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_MEMORY_ZERO + 1;
 
 // ── Kernel log records ──────────────────────────────────────────────────────
 
@@ -1364,7 +1369,8 @@ pub const RIGHTS_ALL: u64 = !0u64;
 /// Memory: may map this memory into an address space.
 pub const RIGHTS_MEM_MAP: u64 = 1 << 0;
 
-/// Memory: authority to create writable mappings from this memory.
+/// Memory: authority to create writable mappings from this memory, and, with
+/// [`RIGHTS_MEM_MAP`], to have the kernel zero its pages ([`SYS_MEMORY_ZERO`]).
 pub const RIGHTS_MEM_WRITE: u64 = 1 << 1;
 
 /// Memory: authority to create executable mappings from this memory.

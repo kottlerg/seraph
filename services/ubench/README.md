@@ -138,12 +138,16 @@ logs one of:
   ```
 
   wrapped above for width only, `idle_halts=` being the halts of the measuring CPU over the
-  measured loop ([shared/bench/README.md § Idle halts](../../shared/bench/README.md#idle-halts)),
-  over every window whose span closed in a window row, whose `n=` is the windows that counted
-  and whose other extras are those of § Benchmarks; a failed placement read leaves
-  `remote_wakes=` out;
-- for a window row whose counted windows fall below half its windows, no result line but a WARN
-  line, `<name> <variant>: counted windows below the floor`, with the counts;
+  measured loop ([shared/bench/README.md § Idle halts](../../shared/bench/README.md#idle-halts)):
+  in `fault_fill path=grant affinity=any`, a window row whose reads the measured thread takes,
+  over every window whose span closed, and in `pipeline`, whose reads its pinned observer takes,
+  over one span around its calibration, warm-up and timed windows; a window row's `n=` is the
+  windows that counted, and its other extras are those of § Benchmarks; a failed placement read
+  leaves `remote_wakes=` out;
+- for a window row whose reads the measured thread takes and whose counted windows fall below half
+  its windows, no result line but a WARN line, `fault_fill path=grant affinity=any: counted windows
+  below the floor`, with the counts (`pipeline` has no floor: it reports the windows that counted,
+  however few, and fails when none did, § Benchmarks);
 - `bench <name> SKIP (<why>)` for a case the boot cannot run (a thread count above the CPUs
   online, or no framebuffer), beside the lines of the cases it ran;
 - `bench <name> FAIL (<why>)` when the benchmark failed: a failed call, a reply of the wrong

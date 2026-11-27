@@ -369,7 +369,8 @@ define_typed_rights! {
     {
         /// May map this memory into an address space.
         MAP = syscall::RIGHTS_MEM_MAP;
-        /// Authority to create writable mappings from this memory.
+        /// Authority to create writable mappings from this memory, and, with
+        /// `MAP`, to have the kernel zero its pages (`SYS_MEMORY_ZERO`).
         WRITE = syscall::RIGHTS_MEM_WRITE;
         /// Authority to create executable mappings from this memory.
         EXECUTE = syscall::RIGHTS_MEM_EXECUTE;

@@ -1854,7 +1854,9 @@ far; the return to user mode that follows switches, stops or delivers. The retur
 only between batches, so every call zeroes at least one batch, and a caller that is always
 outranked still advances. A slice expiry does not end the call: a tick that lands in a window
 between batches refills the slice without rescheduling, as in every preemption-disabled window
-(§ `SYS_THREAD_STOP`, Latency contract), so a thread at the caller's own level runs once the call
+(§ `SYS_THREAD_STOP`, Latency contract). The return switches only to a thread that outranks the
+caller, so a thread at the caller's own level runs at the caller's first slice expiry with
+preemption enabled after that refill, a full slice later at the least, not when the call
 returns. A batch after the first whose checks fail (a split shrank the region, a retype reached
 the range, the handle was revoked or deleted) also ends the call with the count so far, and the
 next call, starting at that batch, returns the error.

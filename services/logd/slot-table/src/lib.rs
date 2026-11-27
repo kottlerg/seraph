@@ -22,14 +22,16 @@
 //! (`services/logd/docs/ipc-interface.md` § Wait-set).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::Bound;
 
 use ipc::log_query::{
-    ENTRY_RECORD, ENTRY_TEXT, HistoryEntryView, SLOT_EVICTED_DEATH, SLOT_EVICTED_RESYNC, SLOT_LIVE,
+    ENTRY_RECORD, ENTRY_TEXT, HistoryEntryView, ORIGIN_LIVE, ORIGIN_RELAYED, SLOT_EVICTED_DEATH,
+    SLOT_EVICTED_RESYNC, SLOT_LIVE, SlotFields,
 };
 use ipc::log_record::{FieldSpan, RECORD_MAX_BYTES, Record, Span};
 use ipc::stream_labels::level_or_info;
 use logd_codec::history::ENTRY_MAX_BYTES;
-use logd_codec::query::SlotRow;
+use logd_codec::query::HistoryRow;
 use logd_codec::settings::{Pace, Relayed};
 pub use logd_codec::{LINE_BUF_SIZE, MAX_NAME_LEN};
 
@@ -188,6 +190,12 @@ pub struct HistoryEntry
     /// Receipt microseconds since boot
     /// (`system_info(ElapsedUs)`-derived).
     pub us: u64,
+    /// The serial of the sender's slot when the entry was retained
+    /// ([`Slot::serial`]); set by [`History`] as it retains the entry.
+    pub serial: u64,
+    /// The slot's name generation when the entry was retained
+    /// ([`Slot::generation`]); set by [`History`] as it retains the entry.
+    pub generation: u32,
     /// The entry's level, an `ipc::stream_labels::LEVEL_*` code: its RFC 5424
     /// severity, 0 to 7.
     pub level: u64,
@@ -211,6 +219,19 @@ pub enum Origin
     /// Installed from init-logd's handover: init-logd wrote it to the console
     /// itself.
     Relayed,
+}
+
+impl Origin
+{
+    /// The origin code a `QUERY_HISTORY` entry carries.
+    const fn wire(self) -> u8
+    {
+        match self
+        {
+            Self::Live => ORIGIN_LIVE,
+            Self::Relayed => ORIGIN_RELAYED,
+        }
+    }
 }
 
 impl HistoryEntry
@@ -237,7 +258,15 @@ impl HistoryEntry
 #[derive(Default)]
 pub struct Slot
 {
-    pub name: Vec<u8>,
+    /// The display name; set only through [`Self::set_name`], which counts
+    /// it in [`Self::generation`].
+    name: Vec<u8>,
+    /// The slot serial (`services/logd/docs/sinks.md` § The record): from 1,
+    /// one per slot the table creates, never reused within the logd instance.
+    serial: u64,
+    /// The name generation: the names the slot registered, from 0; it stops at
+    /// `u32::MAX`, and the name with it ([`Self::set_name`]).
+    generation: u32,
     pub partial: Vec<u8>,
     /// Level of the in-progress line: that of the `STREAM_BYTES` message
     /// that carried its first byte. Meaningful only once that byte has
@@ -251,6 +280,44 @@ pub struct Slot
 
 impl Slot
 {
+    /// The display name; empty for a slot that registered none.
+    #[must_use]
+    pub fn name(&self) -> &[u8]
+    {
+        &self.name
+    }
+
+    /// The slot serial.
+    #[must_use]
+    pub const fn serial(&self) -> u64
+    {
+        self.serial
+    }
+
+    /// The name generation.
+    #[must_use]
+    pub const fn generation(&self) -> u32
+    {
+        self.generation
+    }
+
+    /// Register `name`, truncated to `MAX_NAME_LEN` bytes, as the slot's
+    /// name, and count it in its generation. A slot whose generation is at
+    /// `u32::MAX` keeps its name and generation, so the count never wraps
+    /// and a reader never takes a newer name for an older one.
+    pub fn set_name(&mut self, name: &[u8])
+    {
+        let Some(generation) = self.generation.checked_add(1)
+        else
+        {
+            return;
+        };
+        self.generation = generation;
+        self.name.clear();
+        self.name
+            .extend_from_slice(name.get(..MAX_NAME_LEN).unwrap_or(name));
+    }
+
     /// Note that the next byte, a line byte or the newline that ends the
     /// line, arrived in a message at `level`; it sets the line's level when
     /// it is the line's first.
@@ -428,6 +495,8 @@ impl History
             slot,
             HistoryEntry {
                 badge,
+                serial: 0,
+                generation: 0,
                 us,
                 level,
                 kind: EntryKind::Text,
@@ -463,8 +532,10 @@ impl History
     /// and has not written past [`Bounds::per_slot`], within
     /// [`Bounds::bytes`]: nothing else paces it to the sink, and the kernel's
     /// records are acknowledged once written.
-    fn push(&mut self, slot: &mut Slot, entry: HistoryEntry) -> u64
+    fn push(&mut self, slot: &mut Slot, mut entry: HistoryEntry) -> u64
     {
+        entry.serial = slot.serial;
+        entry.generation = slot.generation;
         let keep_unwritten = unwindowed(entry.badge);
         while slot.seqs.len() >= self.bounds.per_slot
         {
@@ -755,6 +826,8 @@ fn record_entry(
 {
     HistoryEntry {
         badge,
+        serial: 0,
+        generation: 0,
         us,
         level,
         kind: EntryKind::Record {
@@ -763,6 +836,28 @@ fn record_entry(
         },
         bytes: record.payload().into(),
         origin,
+    }
+}
+
+/// A retained entry as `QUERY_HISTORY` carries it, with its sender's badge.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "an entry's level is a `LEVEL_*` code, a severity of 0 to 7, which a `u8` holds"
+)]
+fn history_row<'a>((&seq, e): (&u64, &'a HistoryEntry)) -> HistoryRow<'a>
+{
+    HistoryRow {
+        badge: e.badge,
+        entry: HistoryEntryView {
+            seq,
+            us: e.us,
+            serial: e.serial,
+            generation: e.generation,
+            level: e.level as u8,
+            kind: e.kind.wire(),
+            origin: e.origin.wire(),
+            bytes: &e.bytes,
+        },
     }
 }
 
@@ -807,6 +902,8 @@ pub struct SlotTable
     evicted: VecDeque<u64>,
     /// Every live and retired slot's entries.
     history: History,
+    /// The serial of the last slot the table created; 0 before the first.
+    serials: u64,
 }
 
 impl SlotTable
@@ -824,7 +921,16 @@ impl SlotTable
     /// its entries in.
     fn slot_with_history(&mut self, badge: u64) -> (&mut Slot, &mut History)
     {
-        (self.slots.entry(badge).or_default(), &mut self.history)
+        let serials = &mut self.serials;
+        let slot = self.slots.entry(badge).or_insert_with(|| {
+            // One per slot created: a `u64` counting them does not wrap.
+            *serials = serials.saturating_add(1);
+            Slot {
+                serial: *serials,
+                ..Slot::default()
+            }
+        });
+        (slot, &mut self.history)
     }
 
     /// The live slot of the sender `badge`, created when absent, and the
@@ -934,7 +1040,7 @@ impl SlotTable
             if slot.name.is_empty()
                 && let Some(named) = slots.get(&entry.badge)
             {
-                slot.name.clone_from(&named.name);
+                slot.set_name(&named.name);
             }
             history.push(slot, entry);
         }
@@ -974,12 +1080,14 @@ impl SlotTable
 
     /// Every live and retired slot, as `QUERY_SLOTS` reports it, in no
     /// order.
-    pub fn slot_rows(&self) -> impl Iterator<Item = SlotRow<'_>>
+    pub fn slot_rows(&self) -> impl Iterator<Item = SlotFields<'_>>
     {
-        let live = self.slots.iter().map(|(&badge, slot)| SlotRow {
+        let live = self.slots.iter().map(|(&badge, slot)| SlotFields {
             badge,
             state: SLOT_LIVE,
             exit_reason: 0,
+            serial: slot.serial,
+            generation: slot.generation,
             name: &slot.name,
         });
         let retired = self.retired.iter().map(|r| {
@@ -988,35 +1096,36 @@ impl SlotTable
                 Eviction::Death { exit_reason } => (SLOT_EVICTED_DEATH, exit_reason),
                 Eviction::Resync => (SLOT_EVICTED_RESYNC, 0),
             };
-            SlotRow {
+            SlotFields {
                 badge: r.badge,
                 state,
                 exit_reason,
+                serial: r.slot.serial,
+                generation: r.slot.generation,
                 name: &r.slot.name,
             }
         });
         live.chain(retired)
     }
 
-    /// Every history entry of every live and retired slot, as
-    /// `QUERY_HISTORY` carries it, oldest first.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "an entry's level is a `LEVEL_*` code, a severity of 0 to 7, which a `u8` holds"
-    )]
-    pub fn history_views(&self) -> impl Iterator<Item = HistoryEntryView<'_>>
+    /// The history entries of every live and retired slot older than
+    /// `before`, or every one when `None`, as `QUERY_HISTORY` carries them,
+    /// newest first.
+    pub fn history_down(&self, before: Option<u64>) -> impl Iterator<Item = HistoryRow<'_>>
     {
+        let end = before.map_or(Bound::Unbounded, Bound::Excluded);
         self.history
             .entries
-            .iter()
-            .map(|(&seq, e)| HistoryEntryView {
-                seq,
-                us: e.us,
-                badge: e.badge,
-                level: e.level as u8,
-                kind: e.kind.wire(),
-                bytes: &e.bytes,
-            })
+            .range((Bound::Unbounded, end))
+            .rev()
+            .map(history_row)
+    }
+
+    /// The history entries of every live and retired slot from `from` on,
+    /// that one included, as `QUERY_HISTORY` carries them, oldest first.
+    pub fn history_up(&self, from: u64) -> impl Iterator<Item = HistoryRow<'_>>
+    {
+        self.history.entries.range(from..).map(history_row)
     }
 
     /// Install one slot's (badge, name) pair from the init-logd
@@ -1025,10 +1134,7 @@ impl SlotTable
     pub fn install_from_handover(&mut self, badge: u64, name: &[u8])
     {
         let (slot, _) = self.slot_with_history(badge);
-        let n = name.len().min(MAX_NAME_LEN);
-        slot.name.clear();
-        slot.name
-            .extend_from_slice(name.get(..n).unwrap_or_default());
+        slot.set_name(name);
     }
 
     /// Append one history line from the init-logd handover as a `relayed`
@@ -1044,6 +1150,8 @@ impl SlotTable
             slot,
             HistoryEntry {
                 badge,
+                serial: 0,
+                generation: 0,
                 us,
                 level,
                 kind: EntryKind::Text,
@@ -1141,9 +1249,9 @@ mod tests
     fn seqs_of(table: &SlotTable, badge: u64) -> Vec<u64>
     {
         table
-            .history_views()
-            .filter(|e| e.badge == badge)
-            .map(|e| e.seq)
+            .history_up(0)
+            .filter(|r| r.badge == badge)
+            .map(|r| r.entry.seq)
             .collect()
     }
 
@@ -1169,7 +1277,7 @@ mod tests
         }
         assert_eq!(table.history.bytes(), recount(&table));
         // The newest entries are the ones kept, as many as the bound holds.
-        let kept: Vec<u64> = table.history_views().map(|e| e.seq).collect();
+        let kept: Vec<u64> = table.history_up(0).map(|r| r.entry.seq).collect();
         assert_eq!(kept.last(), Some(&last));
         assert_eq!(
             kept.len(),
@@ -1212,9 +1320,9 @@ mod tests
             table.install_history_line(1, i, INFO, b"line");
         }
         let us: Vec<u64> = table
-            .history_views()
-            .filter(|e| e.badge == 1)
-            .map(|e| e.us)
+            .history_up(0)
+            .filter(|r| r.badge == 1)
+            .map(|r| r.entry.us)
             .collect();
         assert_eq!(us, (4..PER_SLOT_HISTORY_MIN as u64 + 4).collect::<Vec<_>>());
         assert_eq!(seqs_of(&table, 9), [0]);
@@ -1231,7 +1339,7 @@ mod tests
         table.retire(1, Eviction::Resync);
         table.install_history_line(1, 1, INFO, b"second life");
         table.retire(1, Eviction::Death { exit_reason: 0 });
-        let us: Vec<u64> = table.history_views().map(|e| e.us).collect();
+        let us: Vec<u64> = table.history_up(0).map(|r| r.entry.us).collect();
         assert_eq!(us, [1]);
         // A full set of retired slots drops its oldest, badge 1, and its
         // entry.
@@ -1727,5 +1835,78 @@ mod tests
             &*table.history.entry_from(seq).unwrap().1.bytes,
             b"framebuffer: 1000 lines dropped"
         );
+    }
+
+    // Defect caught: two slots sharing a serial, a badge that lives again
+    // taking its retired slot's serial, or an entry naming the slot or the
+    // name generation of another moment than its retention.
+    #[test]
+    fn each_slot_has_its_own_serial_and_entries_keep_theirs()
+    {
+        let mut table = SlotTable::default();
+        table.install_history_line(5, 0, INFO, b"unnamed");
+        table.install_from_handover(5, b"five");
+        table.install_history_line(5, 1, INFO, b"named");
+        table.install_history_line(6, 2, INFO, b"six");
+        table.retire(5, Eviction::Resync);
+        table.install_history_line(5, 3, INFO, b"again");
+        let rows: Vec<(u64, u8, u64, u32)> = {
+            let mut v: Vec<_> = table
+                .slot_rows()
+                .map(|r| (r.badge, r.state, r.serial, r.generation))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            rows,
+            [
+                (5, SLOT_LIVE, 3, 0),
+                (5, SLOT_EVICTED_RESYNC, 1, 1),
+                (6, SLOT_LIVE, 2, 0)
+            ]
+        );
+        let entries: Vec<(u64, u64, u32)> = table
+            .history_up(0)
+            .map(|r| (r.badge, r.entry.serial, r.entry.generation))
+            .collect();
+        assert_eq!(entries, [(5, 1, 0), (5, 1, 1), (6, 2, 0), (5, 3, 0)]);
+    }
+
+    // Defect caught: a name generation that wraps, so a reader keeping a
+    // slot's name takes an older name for a newer one.
+    #[test]
+    fn a_name_generation_at_its_limit_keeps_the_last_name()
+    {
+        let mut table = SlotTable::default();
+        table.install_from_handover(1, b"first");
+        let slot = table.slots.get_mut(&1).unwrap();
+        assert_eq!(slot.generation(), 1);
+        slot.generation = u32::MAX - 1;
+        slot.set_name(b"last");
+        assert_eq!((slot.name(), slot.generation()), (&b"last"[..], u32::MAX));
+        slot.set_name(b"ignored");
+        assert_eq!((slot.name(), slot.generation()), (&b"last"[..], u32::MAX));
+    }
+
+    #[test]
+    fn history_walks_start_where_they_are_asked_both_ways()
+    {
+        let mut table = SlotTable::default();
+        for us in 0..5
+        {
+            table.install_history_line(1, us, INFO, b"x");
+        }
+        let seqs = |it: &mut dyn Iterator<Item = HistoryRow<'_>>| -> Vec<u64> {
+            it.map(|r| r.entry.seq).collect()
+        };
+        assert_eq!(seqs(&mut table.history_up(0)), [0, 1, 2, 3, 4]);
+        assert_eq!(seqs(&mut table.history_up(3)), [3, 4]);
+        assert_eq!(seqs(&mut table.history_up(5)), [0u64; 0]);
+        assert_eq!(seqs(&mut table.history_down(None)), [4, 3, 2, 1, 0]);
+        assert_eq!(seqs(&mut table.history_down(Some(2))), [1, 0]);
+        assert_eq!(seqs(&mut table.history_down(Some(0))), [0u64; 0]);
+        let origins: Vec<u8> = table.history_up(0).map(|r| r.entry.origin).collect();
+        assert!(origins.iter().all(|&o| o == ORIGIN_RELAYED));
     }
 }

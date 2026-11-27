@@ -248,21 +248,40 @@ impl Reply
     /// its caps lost, where the endpoint's queue would have kept it. Any other
     /// send before work is [`Self::flush`]. The outcome is
     /// [`Self::undelivered`]'s; the caps of an undelivered reply set with
-    /// [`Self::set_or_delete_caps`] are deleted.
+    /// [`Self::set_or_delete_caps`] are deleted. A call an earlier
+    /// [`Self::flush`] bound, which the slot holds and the thread will not
+    /// serve, is answered `refusal` alone, as its caller would be told of a
+    /// failure to serve it, and the caps it carried into this thread's
+    /// `CSpace` are deleted.
     ///
     /// # Safety
     /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer
     /// page as registered via `syscall::ipc_buffer_set`.
-    pub unsafe fn send_last(&mut self, ipc_buf: *mut u64)
+    pub unsafe fn send_last(&mut self, refusal: u64, ipc_buf: *mut u64)
     {
-        self.send_last_with(&mut Kernel {
-            ipc_buf,
-            wait: Unbounded,
-        });
+        self.send_last_with(
+            &mut Kernel {
+                ipc_buf,
+                wait: Unbounded,
+            },
+            refusal,
+        );
     }
 
-    fn send_last_with<T: Transport>(&mut self, kernel: &mut T)
+    fn send_last_with<T: Transport>(&mut self, kernel: &mut T, refusal: u64)
     {
+        if let Some(after) = self.state.unheld()
+        {
+            for &cap in self.msg.caps()
+            {
+                kernel.delete_cap(cap);
+            }
+            self.state = after;
+            // The caller is gone or will be answered by no one else: either
+            // way nothing is left to undo.
+            let _ = kernel.reply(&IpcMessage::new(refusal));
+            return;
+        }
         if self.state != Slot::Pending
         {
             return;
@@ -575,6 +594,8 @@ mod tests
         reply_recv: Result<u64, i64>,
         /// The bound the transport gives, which every receive must carry.
         timeout: u64,
+        /// Whether a delivered call carries [`HELD_CAP`].
+        held_caps: u8,
         calls: [Option<Call>; 8],
         count: usize,
     }
@@ -593,6 +614,10 @@ mod tests
     const NEXT: u64 = 0x22;
     /// The cap every test reply moves.
     const CAP: u64 = 0x7;
+    /// The cap a delivered call carries when the script says so.
+    const HELD_CAP: u64 = 0x9;
+    /// The status a last send answers a held call with.
+    const REFUSAL: u64 = 0x33;
 
     fn err(e: SyscallError) -> i64
     {
@@ -608,6 +633,7 @@ mod tests
                 reply: Ok(()),
                 reply_recv: Ok(NEXT),
                 timeout: 0,
+                held_caps: 0,
                 calls: [None; 8],
                 count: 0,
             }
@@ -662,10 +688,19 @@ mod tests
             self.log(Call::Delete(cap));
         }
 
-        /// A delivered call is its label alone, with no words or caps.
+        /// A delivered call is its label alone, with no words, and with
+        /// [`HELD_CAP`] when `held_caps` is set.
         fn read(&mut self, got: &u64, msg: &mut IpcMessage)
         {
-            *msg = IpcMessage::builder(*got).build();
+            let built = IpcMessage::builder(*got);
+            *msg = if self.held_caps == 0
+            {
+                built.build()
+            }
+            else
+            {
+                built.cap(HELD_CAP).build()
+            };
         }
     }
 
@@ -805,21 +840,41 @@ mod tests
     {
         let mut kernel = Script::new();
         let mut reply = with_reply();
-        reply.send_last_with(&mut kernel);
-        reply.send_last_with(&mut kernel);
-        Reply::new().send_last_with(&mut kernel);
+        reply.send_last_with(&mut kernel, REFUSAL);
+        reply.send_last_with(&mut kernel, REFUSAL);
+        Reply::new().send_last_with(&mut kernel, REFUSAL);
         assert_eq!(kernel.calls(), &[Some(Call::Reply(REPLY))]);
         assert!(!reply.undelivered());
 
         let mut kernel = Script::new();
         kernel.reply = Err(err(SyscallError::InvalidCapability));
         let mut reply = with_owned_reply();
-        reply.send_last_with(&mut kernel);
+        reply.send_last_with(&mut kernel, REFUSAL);
         assert_eq!(
             kernel.calls(),
             &[Some(Call::Reply(REPLY)), Some(Call::Delete(CAP))]
         );
         assert!(reply.undelivered());
+    }
+
+    // The defect caught: an exit that leaves a call its flush bound unanswered
+    // (the caller sees `Interrupted`) or keeps that call's caps.
+    #[test]
+    fn a_last_send_refuses_a_held_call_and_deletes_its_caps()
+    {
+        let mut kernel = Script::new();
+        kernel.held_caps = 1;
+        let mut reply = with_reply();
+        reply.flush_with(&mut kernel, EP);
+        assert!(reply.holds_call());
+        reply.send_last_with(&mut kernel, REFUSAL);
+        assert!(!reply.holds_call());
+        assert!(!reply.undelivered());
+        let calls = kernel.calls();
+        assert_eq!(
+            calls.get(1..),
+            Some(&[Some(Call::Delete(HELD_CAP)), Some(Call::Reply(REFUSAL))][..])
+        );
     }
 
     // The defect caught: a flush whose receive found no call, or was refused

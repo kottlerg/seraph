@@ -69,11 +69,12 @@ place (`IpcMessage::read_delivery`), so the loop copies no whole message; `next_
 without a bound and returns the request. A handler with work after its reply (an IPC call, a
 syscall), and a loop with work before its next receive, set the reply and send it first with
 `Reply::flush(ep, ipc_buf)`, so no reply waits behind work; a thread about to exit sends its last
-reply alone with `Reply::send_last`, so that no receive binds a call the exit would fail. `flush`
-sends it with a receive that does not wait (`SYS_IPC_REPLY_RECV` at `WAIT_TRY_ONCE`), not alone: a
-server that outranks its caller and last received through `SYS_IPC_REPLY_RECV` may run on the
-caller's CPU, where a plain reply leaves the caller's wake queued behind it until it parks, while
-the wake of a reply whose receive does not park goes to another CPU
+reply alone with `Reply::send_last`, so that no receive binds a call the exit would fail, and
+answers a call an earlier `flush` bound with the refusal it is given, deleting that call's caps.
+`flush` sends it with a receive that does not wait (`SYS_IPC_REPLY_RECV` at `WAIT_TRY_ONCE`), not
+alone: a server that outranks its caller and last received through `SYS_IPC_REPLY_RECV` may run on
+the caller's CPU, where a plain reply leaves the caller's wake queued behind it until it parks,
+while the wake of a reply whose receive does not park goes to another CPU
 ([scheduler.md](../../core/kernel/docs/scheduler.md) § Thread Assignment). A call that receive binds
 is held in the `Reply`, and the next `next_request` or `next_request_timeout` returns it with no
 syscall, so it is served once the loop's work is done, as it would have been from the endpoint's

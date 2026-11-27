@@ -583,9 +583,11 @@ fn service_loop(
         if cache::device_gone()
         {
             // The last turn's reply goes out before the exit, alone: a
-            // receive could bind a call the exit would fail (`Reply::send_last`).
+            // receive could bind a call the exit would fail. A call an
+            // earlier flush bound is answered as a failed block access
+            // (`Reply::send_last`).
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            unsafe { reply.send_last(ipc_buf) };
+            unsafe { reply.send_last(ipc::fs_errors::IO_ERROR, ipc_buf) };
             std::process::exit(fs_labels::EXIT_DEVICE_GONE.cast_signed());
         }
         // The last request may have met a full cache on a path that does
@@ -2071,8 +2073,18 @@ fn reply_err(code: u64, reply: &mut Reply)
 fn reply_now(msg: IpcMessage, reply: &mut Reply, service: u64, ipc_buf: *mut u64) -> bool
 {
     reply.set(msg);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    unsafe { reply.flush(service, ipc_buf) };
+    // A request that found the device gone ends the driver once it is
+    // answered, so its reply takes up no further request.
+    if cache::device_gone()
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { reply.send_last(ipc::fs_errors::IO_ERROR, ipc_buf) };
+    }
+    else
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { reply.flush(service, ipc_buf) };
+    }
     !reply.undelivered()
 }
 

@@ -1097,7 +1097,9 @@ kernel about the block device capability whenever a block request's
 the request in flight as for any failed block access (`IO_ERROR`, or what
 the label's section names), issues no further block request, and exits with
 `fs_labels::EXIT_DEVICE_GONE` ([§ Driver exit](#driver-exit)) before it
-receives another request. The exception is an `FS_UNMOUNT` whose `FSInfo`
+receives another request. A request the driver took up while it answered an
+earlier one, before the loss was found, is answered `IO_ERROR` as well, and
+the capabilities it carried are deleted. The exception is an `FS_UNMOUNT` whose `FSInfo`
 write finds the loss: it replies success and exits with `EXIT_UNMOUNTED`,
 as § Driver exit states. Until a block request reaches the device, the
 driver does not learn of the loss: an idle driver, or one serving requests

@@ -693,10 +693,7 @@ mod tests
         {
             let mut kernel = Script::new();
             kernel.reply_recv = Err(err(e));
-            assert_eq!(
-                next_with(&mut kernel, EP, &mut with_reply()),
-                Err(err(e))
-            );
+            assert_eq!(next_with(&mut kernel, EP, &mut with_reply()), Err(err(e)));
             assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))], "{e:?}");
         }
     }
@@ -747,20 +744,11 @@ mod tests
         const WAIT: u64 = 2;
         let mut kernel = Script::new();
         kernel.timeout = WAIT;
-        assert_eq!(
-            next_with(&mut kernel, EP, &mut Reply::new()),
-            Ok(NEXT)
-        );
-        assert_eq!(
-            next_with(&mut kernel, EP, &mut with_reply()),
-            Ok(NEXT)
-        );
+        assert_eq!(next_with(&mut kernel, EP, &mut Reply::new()), Ok(NEXT));
+        assert_eq!(next_with(&mut kernel, EP, &mut with_reply()), Ok(NEXT));
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         kernel.reply = Err(err(SyscallError::InvalidCapability));
-        assert_eq!(
-            next_with(&mut kernel, EP, &mut with_reply()),
-            Ok(NEXT)
-        );
+        assert_eq!(next_with(&mut kernel, EP, &mut with_reply()), Ok(NEXT));
         assert_eq!(
             kernel.calls(),
             &[

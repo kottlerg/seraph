@@ -107,7 +107,8 @@ fn sub_node_fails(memmgr: u64, ipc_buf: *mut u64)
     // SAFETY: ipc_buf is the registered IPC buffer page.
     match unsafe { ipc::ipc_call(memmgr, &msg, ipc_buf) }
     {
-        Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED => {}
+        Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED =>
+        {}
         Ok(reply) =>
         {
             std::os::seraph::log!("CREATE_SUB_NODE unexpected reply label {}", reply.label);

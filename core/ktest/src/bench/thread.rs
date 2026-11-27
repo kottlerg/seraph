@@ -196,7 +196,7 @@ fn stage_means() -> Option<StageMeans>
 /// each stage's mean cycles over the switches CPU 0 made in the measured loop
 /// (core/kernel/docs/scheduler.md § Stage Breakdown).
 ///
-/// Two more lines, variant `iopb=` (x86-64; they log a SKIP line on riscv64),
+/// Two more lines, variant `iopb=` (x86-64 alone; riscv64 has no I/O ports),
 /// run the ping-pong between two children with the harness waiting, so no
 /// switch is into ktest's harness thread and its I/O port bindings: neither
 /// child holds a binding (`none`), or the timing child holds ktest's widest
@@ -206,8 +206,11 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, h: &mut Harness)
     if ctx.sched_control_cap == 0
     {
         h.skip(CTXSWITCH, "no SchedControl cap");
-        h.skip(CTXSWITCH, "iopb=none: no SchedControl cap");
-        h.skip(CTXSWITCH, "iopb=bound: no SchedControl cap");
+        if crate::arch::HAS_IO_PORTS
+        {
+            h.skip(CTXSWITCH, "iopb=none: no SchedControl cap");
+            h.skip(CTXSWITCH, "iopb=bound: no SchedControl cap");
+        }
         return;
     }
     bench_context_switch_harness(ctx, h);
@@ -339,9 +342,11 @@ fn bench_context_switch_iopb(ctx: &crate::TestContext, h: &mut Harness, iopb: Io
 {
     let bound = iopb == Iopb::Bound;
     let word = if bound { "bound" } else { "none" };
+    // An architecture without I/O ports has no such case, and what an
+    // architecture decides is no SKIP (core/ktest/README.md).
     if !crate::arch::HAS_IO_PORTS
     {
-        return h.skip(CTXSWITCH, format_args!("iopb={word}: no I/O ports"));
+        return;
     }
     let port_cap = match (bound, crate::arch::io_port_cap())
     {

@@ -45,7 +45,7 @@
 //! space twice and the two lines differ by those switches alone. ktest's text
 //! is not mapped in the caller's space, hence the stub.
 //!
-//! The case `words=0 iopb=none` (x86-64; it logs a SKIP line on riscv64)
+//! The case `words=0 iopb=none` (x86-64 alone; riscv64 has no I/O ports)
 //! runs the empty message between two children pinned to CPU 0, the caller
 //! timing its own calls while the harness waits: no thread of a round trip
 //! holds an I/O port binding, where the harness thread of every other case
@@ -1505,9 +1505,10 @@ extern "C" fn timed_caller_entry(arg: u64) -> !
 /// [`Harness::iters`] empty calls while the harness waits for it.
 fn bench_iopb_none(ctx: &crate::TestContext, h: &mut Harness)
 {
+    // An architecture without I/O ports has no such case, and what an
+    // architecture decides is no SKIP (core/ktest/README.md).
     if !crate::arch::HAS_IO_PORTS
     {
-        h.skip(NAME, "words=0 iopb=none: no I/O ports");
         return;
     }
     let Ok(ep) = cap_create_endpoint(ctx.memory_base)

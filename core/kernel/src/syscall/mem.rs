@@ -284,9 +284,9 @@ fn requested_rights(prot_bits: u64) -> crate::cap::slot::Rights
     )
 }
 
-/// Frame-map pins over a span of frames, held by `sys_mem_map` from before its
-/// retype-cursor check until it returns, and dropped (each count lowered) when
-/// the guard drops.
+/// Frame-map pins over a span of frames, held by `sys_mem_map`, and by each
+/// batch of `sys_memory_zero`, from before the retype-cursor check until the
+/// stores are done, and dropped (each count lowered) when the guard drops.
 #[cfg(not(test))]
 struct FramePins
 {
@@ -305,6 +305,12 @@ impl FramePins
     ///
     /// # Errors
     /// `OutOfMemory` when a frame's count is saturated; nothing stays pinned.
+    #[expect(
+        clippy::inline_always,
+        reason = "SYS_MEM_MAP and each SYS_MEMORY_ZERO batch pin; out of line, every map pays a \
+                  call, a frame and the callee-saved spills of the loop"
+    )]
+    #[inline(always)]
     fn pin(phys: u64, end: u64) -> Result<Self, SyscallError>
     {
         let mut pins = Self {

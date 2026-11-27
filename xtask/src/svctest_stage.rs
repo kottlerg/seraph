@@ -105,7 +105,8 @@ fn staged_by(harness: ImageHarness) -> &'static str
         ImageHarness::Ubench => "staged by `cargo xtask mkdisk --ubench`",
         ImageHarness::Usertest =>
         {
-            "copied from config/svcmgr/tests/ and packed by `cargo xtask mkdisk --repack-only`"
+            "copied from config/svcmgr/tests/ into the default staging, with terminal.svc \
+             removed, and packed by `cargo xtask mkdisk --repack-only` (docs/testing.md § Gating)"
         }
         // The ktest bundle's init has no recipe, so no staging holds it.
         ImageHarness::Ktest => "booted by `cargo xtask mkdisk --harness ktest`, with no recipe",
@@ -136,9 +137,9 @@ pub fn services_layer(sysroot: &Path) -> Result<bool>
             .map(|(recipe, harness)| format!("{recipe} ({})", staged_by(*harness)))
             .collect();
         bail!(
-            "{} holds the recipes of {} harnesses, and an image boots one: {}; remove all \
-             but one, or restore the default staging with `cargo xtask mkdisk` without \
-             --repack-only",
+            "{} holds the recipes of {} harnesses, and an image boots one: {}; restore the \
+             default staging with `cargo xtask mkdisk` without --repack-only, then stage the \
+             one harness the boot runs as named above",
             services.display(),
             staged.len(),
             named.join(", ")

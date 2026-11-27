@@ -364,14 +364,25 @@ boots side by side do not. Builds and 4-CPU boots therefore take no grant: the c
 host's launch rules themselves (`xtask/README.md` § Host launch rules). A boot of more than 4
 vCPUs and any timing-sensitive measurement take the exclusive grant:
 
-- A worker hands back the exact command list of its exclusive runs with an estimate. Answer
-  `host free`, naming the holder, when no other grant is outstanding and the host is quiet
-  (`cargo xtask host status`), or queue it. `cargo xtask orch grant set` also writes the grant
-  to the host lock, which then refuses every boot not passed `--grant <holder>`, and
-  `orch grant clear` removes it. Grant nothing beside an exclusive grant, and for a
-  timing-sensitive measurement tell the other workers to launch no build until it ends. Never
-  grant on an idle observation while a grant is outstanding: the holder may be between steps. A
-  grant ends when the holder reports its results.
+- A worker hands back the exact command list of its exclusive runs with an estimate. Answer `host
+  free`, naming the holder, when no other grant is outstanding and the host is quiet (`cargo xtask
+  host status`, or a timing grant's own wait, below), or queue it. `cargo xtask orch grant set` also
+  writes the grant to the host lock, which then refuses every boot not passed `--grant <holder>`,
+  and `orch grant clear` removes it. For a list with a timing-sensitive measurement, set a timing
+  grant (`orch grant set --timing`): the lock then holds every other worker's builds as well as its
+  boots, and the command returns once nothing else holds the host. Two things it cannot hold:
+  cargo's compile of xtask itself, which any `cargo xtask` command (a status line and the Bash hook
+  included) runs before any admission when its checkout's build of xtask is not current (a file it
+  is built from changed: `xtask/`, a crate xtask's build reaches, directly or through another
+  (`cargo tree -p xtask -e normal,build`), the root `Cargo.toml` or `Cargo.lock`, `.cargo/` or the
+  toolchain; or a new worktree), and a worker whose branch predates the timing grant, which runs its
+  own branch's older xtask. Before `host free`, tell each worker whose branch lacks the timing
+  grant, and each whose scope edits a file xtask is built from, to run no `cargo` command until the
+  grant ends; while it runs, say `master quiet` to no one, spawn no worker into a new worktree, and
+  merge nothing nor fast-forward your own checkout, since a merge that changes a file xtask is built
+  from would make your next `cargo xtask` command there compile xtask. No other worker needs a
+  message. Grant nothing beside an exclusive grant. Never grant on an idle observation while a grant
+  is outstanding: the holder may be between steps. A grant ends when the holder reports its results.
 - Grant a speculative set (a run at a head that a sync still owed will change) only when the
   host is otherwise idle.
 - `master quiet` tells a worker to sync now, right before its validation runs, so one run

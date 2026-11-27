@@ -290,6 +290,7 @@ dependencies = [
  "devmgr-firmware",
  "driver-binding",
  "elf",
+ "fatfs-parse",
  "firmware-tables",
  "fuzz-engine",
  "hwrng-protocol",

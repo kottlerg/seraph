@@ -659,7 +659,9 @@ Victim selection is mode-dependent:
 The idle CPU's pull below the threshold is what keeps a thread from starving while a CPU
 idles. A thread queued behind a running thread that never blocks or yields to its level
 (an RT thread spinning on a lock the queued thread holds, under § Scheduling Classes'
-strict priority) stays queued for as long as that thread runs. The threshold does not see
+strict priority) stays queued for as long as that thread runs, save an unpinned RT thread, which
+the RT push below moves to a CPU running a lower level when one exists; a fair or pinned thread,
+and an RT thread while every other CPU runs at or above its level, stays. The threshold does not see
 one queued thread as an imbalance (a load of 2 with the linked idle thread), and
 `select_target_cpu` keeps a woken thread on its preferred CPU at that load. An idle CPU
 therefore pulls it, or another queued thread, within 2 + 2k + 2d + 2r idle ticks: one tick to
@@ -720,7 +722,8 @@ of a lower rank, an idle CPU among them (§ Thread Assignment), unless the save-
 synchronous wake's guard keeps it there. An RT thread that outranks the thread it shares a CPU with
 does stay, since it runs there at once, save when its wake is the reply of a server that runs on
 there (`WakeHint::WakerRuns`, § Thread Assignment), and the lower thread waits behind it until it
-blocks or the idle pull takes the lower one. What the episode leaves is bounded by the threshold: a
+blocks, the idle pull takes the lower one, or, for an unpinned RT lower thread, the RT push moves it
+to a CPU running a lower level (below). What the episode leaves is bounded by the threshold: a
 load above it is pulled at once, so a backlog the pull leaves to
 break and re-form is one at a load of at most `LOAD_BALANCE_IMBALANCE_THRESHOLD` (2), the
 running thread and one queued behind it. A call or a fault delivery places its receiver by its
@@ -797,14 +800,17 @@ The bound for a movable waiting thread is one tick of the CPU it waits on in a b
 `RT_PUSH_SCAN_CPUS + 1` (129) CPUs, since the window then reads every other CPU. In a boot of n
 CPUs above that it is ceil((n - 1) / 128) ticks: successive misses read successive windows, so a CPU
 whose level is below the thread's at all of those ticks is read by one of them; that is 64 ticks at
-8192 CPUs. Each push that a contended try-lock defers (`PullOutcome::Deferred`) adds a tick, and so
-does one that a dispatch on the target overtakes: a dispatch records its level after it releases
-its run-queue lock (`mark_dispatched`), so a push can read a level the target is leaving, move the
-thread there, and find it waiting again, where that CPU's tick pushes it on. A tick pushes one
-thread, so each movable waiting thread that the pushes take first adds a tick too, and so does a
-priority change of the running thread, whose stale level hides the waiting queues until the
-tick's return to user mode records it again. A thread pinned
-by hard affinity is never pushed; it waits for the thread above it, as before.
+8192 CPUs. Each push that a contended try-lock defers (`PullOutcome::Deferred`), or that the
+re-check under the locks refuses because a thread was linked on the target since the scan read its
+ranks (`PullOutcome::RuleFailed`), adds a tick, since a push that found a target leaves the cursor
+where it was. One that a dispatch on the target overtakes adds the bound again, now on the target:
+a dispatch records its level after it releases its run-queue lock (`mark_dispatched`), so a push
+can read a level the target is leaving, move the thread there, and find it waiting again, where
+that CPU's pushes move it on from its own cursor, within one tick up to 129 CPUs and
+ceil((n - 1) / 128) ticks above. A tick pushes one thread, so each movable waiting thread that the
+pushes take first adds a tick too, and so does a priority change of the running thread, whose stale
+level hides the waiting queues until the tick's return to user mode records it again. A thread
+pinned by hard affinity is never pushed; it waits for the thread above it, as before.
 
 What a push adds to the worst-case tick of the thread it interrupts, beyond the balancer's work
 below: the waiting test, two Relaxed loads; on a hit, the walk of the waiting queues under the CPU's
@@ -1160,13 +1166,14 @@ wakes placed on one CPU at once). An unpinned thread so waiting, or one left wai
 CPU's dispatch lowers that CPU's level, is moved by the RT push of the CPU it waits on (§ Load
 Balancing, "RT push") to a CPU whose running and queued threads it outranks, where the wake IPI
 preempts as above: within one tick of the CPU it waits on in a boot of up to 129 CPUs, and within
-ceil((n - 1) / 128) such ticks in a boot of n CPUs above that (64 at the 8192 of `MAX_CPUS`), plus
-one tick per push that a contended try-lock defers or that a dispatch on the target, raising its
-level after the push read it, refuses or overtakes, one per movable waiting thread that the
-CPU's pushes take ahead of it, since a tick pushes one thread, and one after a priority change of
-the thread it waits behind. A thread waits for the higher one to block,
-yield or expire only while no CPU it may run on runs and queues only lower levels: when every such
-CPU runs or queues its level or above, or when hard affinity pins it.
+ceil((n - 1) / 128) such ticks in a boot of n CPUs above that (64 at the 8192 of `MAX_CPUS`). Each
+push that a contended try-lock defers, or that the re-check under the locks refuses (a thread linked
+on the target since the push read its ranks), adds one tick; each push that a dispatch on the target
+overtakes adds that bound again, on the target; each movable waiting thread that the CPU's pushes
+take ahead of it adds one tick, since a tick pushes one thread; and a priority change of the thread
+it waits behind adds one. A thread waits for the higher one to block, yield or expire only while no
+CPU it may run on runs and queues only lower levels: when every such CPU runs or queues its level or
+above, or when hard affinity pins it.
 
 **Timed wakes** stay on CPU 0's tick (§ Timer-Driven Preemption): every ABI timeout is in
 milliseconds and the tick is 1 ms, so a one-shot timer buys no resolution the ABI can ask for, and

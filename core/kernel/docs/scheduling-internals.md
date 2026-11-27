@@ -796,11 +796,13 @@ of its own to a thread's lifecycle:
    thread of the window or none (`NothingPullable`, or an empty window and `RuleFailed`). A
    dispatch on the target that runs after the push read its ranks lock-free, and raises its level,
    either holds the target's lock before the push, whose re-check then reads the raised queued
-   rank, or records its running level after its lock release (`mark_dispatched`),
-   which the re-check cannot see: the thread then waits on the target, which the waiting test of
-   the target's next tick finds and pushes on. The pull's wake IPI to the target (always sent,
-   § Wake Protocol Invariants) makes the target's next return to user mode decide the preemption
-   under its lock.
+   rank, or records its running level after its lock release (`mark_dispatched`), which the
+   re-check cannot see: the thread then waits on the target, whose ticks' waiting test finds it and
+   whose pushes move it on from the target's own cursor, within the push's bound again (one tick
+   up to 129 CPUs, ceil((n - 1) / 128) ticks above;
+   [scheduler.md § Load Balancing](scheduler.md#load-balancing), "RT push"). The pull's wake IPI
+   to the target (always sent, § Wake Protocol Invariants) makes the target's next return to user
+   mode decide the preemption under its lock.
 4. **Lock-free reads.** The waiting test reads the source's own `non_empty` and `outranking`
    under its lock with interrupts masked. Only that CPU records its level in `outranking`, so the
    test is exact, save for `LEVEL_STALE`, which `sys_thread_set_priority` on any CPU stores when
@@ -810,7 +812,7 @@ of its own to a thread's lifecycle:
    The target's choice reads other CPUs' `ranks`, `current_load` and, on a tie, their siblings'
    `has_no_work`, all Relaxed and advisory (§ Lock-free readers of a CPU's run queues), and the
    source's own `rt_push_cursor`. Every decision those reads feed is made again under the locks,
-   save the target's running level, whose staleness costs the tick of item 3.
+   save the target's running level, whose staleness costs the push's bound again (item 3).
 
 The host tests `a_thread_a_push_moves_behind_a_racing_dispatch_waits_on_for_that_cpus_push`
 (`sched::run_queue`) model item 3's race, and `sched::rt_push_tests` the target choice and the
@@ -1906,7 +1908,7 @@ Four invariants make their samples sound:
    places an RT wake behind a thread it does not outrank (§ Wake Protocol Invariants, "The RT
    rule"). The RT push's consumer re-reads the target's ranks under its lock, so a stale sample
    costs it a futile lock round, save a running level the target records after its lock release,
-   which costs a tick (§ ThreadState Transitions, "The RT push").
+   which costs the push's bound again (§ ThreadState Transitions, "The RT push").
    Invariant 2 keeps `relink` from making any reader miss a thread that stays queued.
 
 A new writer of a CPU's run queues MUST keep all four: in particular, it moves a queued thread

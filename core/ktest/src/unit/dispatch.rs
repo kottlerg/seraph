@@ -45,9 +45,10 @@ fn call(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 /// `SYSCALL_NR_BOUND` and each neighbour of a hot number whose call can fail
 /// with no effect: not `SYS_THREAD_EXIT`, which ends the thread,
 /// `SYS_IPC_BUFFER_SET`, which takes no slot, nor `SYS_SBI_CALL`, which
-/// fails on its other arguments before its slot lookup. `SYS_IPC_REPLY` is left out because a reply with a bound caller
-/// completes that caller's call; `SYS_THREAD_YIELD` returns 0 and
-/// `SYS_SYSTEM_INFO` has its own test.
+/// fails on its other arguments before its slot lookup. `SYS_IPC_REPLY` is
+/// left out because a reply with a bound caller completes that caller's
+/// call; `SYS_THREAD_YIELD` returns 0 and `SYS_SYSTEM_INFO` has its own
+/// test.
 pub fn hot_and_neighbouring_cold_numbers_reach_their_handlers(_ctx: &TestContext) -> TestResult
 {
     let invalid = SyscallError::InvalidCapability as i64;

@@ -95,25 +95,77 @@ mod tests
         );
         assert_eq!(hart_caps(|_| false), 0);
     }
+
+    #[test]
+    fn hart_caps_ors_the_bits_of_every_subset_of_the_names()
+    {
+        for subset in 0u32..1 << HART_CAP_NAMES.len()
+        {
+            let named = |ext: &[u8]| {
+                HART_CAP_NAMES
+                    .iter()
+                    .enumerate()
+                    .any(|(i, (name, _))| *name == ext && subset & (1 << i) != 0)
+            };
+            let bits = HART_CAP_NAMES
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| subset & (1 << i) != 0)
+                .fold(0, |caps, (_, (_, bit))| caps | bit);
+            assert_eq!(hart_caps(named), bits, "subset {subset:#b}");
+        }
+    }
 }
 
 #[cfg(kani)]
 mod proofs
 {
+    use super::HART_CAP_NAMES;
     use crate::property::acpi as property;
 
-    /// Every ISA string of at most 9 bytes names an extension exactly when
-    /// one of its underscore-separated segments before its first NUL is it: 9
-    /// bytes hold the longest name, `svinval`, between two separators, and
-    /// every shorter segment, cut or joined. The loops are the string's
-    /// bytes, once per name.
+    /// The length of the longest name in [`HART_CAP_NAMES`].
+    const LONGEST: usize = {
+        let mut longest = 0;
+        let mut i = 0;
+        while i < HART_CAP_NAMES.len()
+        {
+            if HART_CAP_NAMES[i].0.len() > longest
+            {
+                longest = HART_CAP_NAMES[i].0.len();
+            }
+            i += 1;
+        }
+        longest
+    };
+
+    /// Every ISA string of up to two bytes past the longest name names any
+    /// one recognized extension exactly when one of its underscore-separated
+    /// segments before its first NUL is it: the string holds the longest
+    /// name between two separators, and every shorter segment, cut or
+    /// joined. The extension is any one entry of `HART_CAP_NAMES`, copied
+    /// into a buffer of the longest name's size, so the harness checks one
+    /// name a path whatever the table's size, and the bits the names give
+    /// are `hart_caps`'s, which the host tests check over every subset of
+    /// the table. The loops are the string's bytes and the name's, at most
+    /// `LONGEST + 3` passes with the closing one, which the bound covers for
+    /// names of up to 7 bytes, the longest the table holds; a longer name
+    /// fails the build until the bound is raised.
     #[kani::proof]
     #[kani::unwind(11)]
     fn every_isa_string_names_its_whole_segments()
     {
-        let bytes: [u8; 9] = kani::any();
+        const _: () = assert!(
+            LONGEST + 4 <= 11,
+            "raise the unwind bound with the longest name"
+        );
+        let index: usize = kani::any();
+        kani::assume(index < HART_CAP_NAMES.len());
+        let ext = HART_CAP_NAMES[index].0;
+        let mut name = [0u8; LONGEST];
+        name[..ext.len()].copy_from_slice(ext);
+        let bytes: [u8; LONGEST + 2] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= bytes.len());
-        property::isa_holds(&bytes[..len]);
+        property::isa_ext_holds(&bytes[..len], &name[..ext.len()]);
     }
 }

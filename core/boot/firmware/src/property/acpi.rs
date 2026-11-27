@@ -218,51 +218,61 @@ fn aia_holds(madt: &[u8], aia: &MadtAia)
     }
 }
 
-/// The `HART_CAP_*` bits an ISA string names, read as underscore-separated
-/// segments up to its first NUL.
-fn isa_caps(isa: &[u8]) -> u64
+/// Whether the ISA string `isa`, read as underscore-separated segments up to
+/// its first NUL, holds `ext` as one of them.
+pub(crate) fn isa_names(isa: &[u8], ext: &[u8]) -> bool
 {
     let nul = (0..isa.len()).find(|&at| isa.get(at) == Some(&0));
     let isa = isa.get(..nul.unwrap_or(isa.len())).unwrap_or_default();
-    let mut caps = 0;
-    for (ext, bit) in HART_CAP_NAMES
+    let mut start = 0;
+    for at in 0..=isa.len()
     {
-        let mut start = 0;
-        for at in 0..=isa.len()
+        if at == isa.len() || isa.get(at) == Some(&b'_')
         {
-            if at == isa.len() || isa.get(at) == Some(&b'_')
+            if isa.get(start..at) == Some(ext)
             {
-                if isa.get(start..at) == Some(ext)
-                {
-                    caps |= bit;
-                }
-                start = at.saturating_add(1);
+                return true;
             }
+            start = at.saturating_add(1);
         }
     }
-    caps
+    false
 }
 
-/// Check the ISA-string reading of `isa` for every recognized extension.
+/// The `HART_CAP_*` bits an ISA string names.
+fn isa_caps(isa: &[u8]) -> u64
+{
+    HART_CAP_NAMES
+        .iter()
+        .filter(|(ext, _)| isa_names(isa, ext))
+        .fold(0, |caps, (_, bit)| caps | bit)
+}
+
+/// Check the ISA-string reading of `isa` for the extension `ext`.
+///
+/// # Panics
+///
+/// When the reading breaks its contract.
+pub(crate) fn isa_ext_holds(isa: &[u8], ext: &[u8])
+{
+    assert_eq!(isa_string_has_ext(isa, ext), isa_names(isa, ext));
+}
+
+/// Check the ISA-string reading of `isa` for every recognized extension,
+/// and the bits it gives.
 ///
 /// # Panics
 ///
 /// When the reading breaks its contract.
 pub(crate) fn isa_holds(isa: &[u8])
 {
-    let caps = isa_caps(isa);
-    let has = HART_CAP_NAMES.map(|(ext, _)| isa_string_has_ext(isa, ext));
-    for ((_, bit), has) in HART_CAP_NAMES.iter().zip(has)
+    for (ext, _) in HART_CAP_NAMES
     {
-        assert_eq!(has, caps & bit != 0);
+        isa_ext_holds(isa, ext);
     }
-    // The names are the table's own, so the lookup compares constants.
     assert_eq!(
-        crate::isa::hart_caps(|ext| HART_CAP_NAMES
-            .iter()
-            .zip(has)
-            .any(|((name, _), has)| *name == ext && has)),
-        caps
+        crate::isa::hart_caps(|ext| isa_string_has_ext(isa, ext)),
+        isa_caps(isa)
     );
 }
 

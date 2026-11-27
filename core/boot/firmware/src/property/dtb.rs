@@ -14,6 +14,7 @@
 use boot_protocol::riscv_paging::PagingMode;
 use firmware_tables::fdt::{Fdt, FdtEvent};
 
+use super::acpi::isa_names;
 use super::{be32, be64, list_holds};
 use crate::dtb::{
     CompatibleWalk, Cpu, CpuIntcWalk, CpuState, CpuWalk, FdtNode, IntcState, Limits, MAX_DEPTH,
@@ -124,7 +125,8 @@ fn cpu_walks_hold(fdt: &Fdt<'_>, tree: &Tree<'_>)
                     *slot = cpu.hart_id;
                 }
                 cpus = cpus.saturating_add(1);
-                caps &= cpu.caps;
+                assert_eq!(cpu.caps(), cpu_caps(&cpu));
+                caps &= cpu.caps();
             }
             Step::Stop => break,
             Step::Continue =>
@@ -342,29 +344,27 @@ pub(crate) fn compatible_step_holds<'a, const D: usize>(
     step
 }
 
+/// The `HART_CAP_*` bits of the extensions the CPU node `cpu`'s
+/// `riscv,isa-extensions` list or `riscv,isa` string names.
+fn cpu_caps(cpu: &Cpu<'_>) -> u64
+{
+    HART_CAP_NAMES
+        .iter()
+        .filter(|(ext, _)| list_holds(cpu.isa_extensions, ext) || isa_names(cpu.isa, ext))
+        .fold(0, |caps, (_, bit)| caps | bit)
+}
+
 /// The CPU-node state `s` becomes once the property `name` of value `data`
 /// is recorded.
-fn cpu_reading(mut s: CpuState, name: &[u8], data: &[u8]) -> CpuState
+fn cpu_reading<'a>(mut s: CpuState<'a>, name: &[u8], data: &'a [u8]) -> CpuState<'a>
 {
     match name
     {
         b"compatible" => s.is_riscv_cpu = s.is_riscv_cpu || list_holds(data, b"riscv"),
         b"reg" if data.len() >= 4 => s.hart_id = be32(data, 0),
         b"status" => s.disabled = s.disabled || data.get(..8) == Some(b"disabled"),
-        b"riscv,isa-extensions" =>
-        {
-            for (ext, bit) in HART_CAP_NAMES
-            {
-                if list_holds(data, ext)
-                {
-                    s.caps |= bit;
-                }
-            }
-        }
-        b"riscv,isa" =>
-        {
-            s.caps |= crate::isa::hart_caps(|ext| crate::isa::isa_string_has_ext(data, ext));
-        }
+        b"riscv,isa-extensions" => s.isa_extensions = data,
+        b"riscv,isa" => s.isa = data,
         b"mmu-type" => s.mmu = mmu_type(data),
         _ =>
         {}
@@ -377,10 +377,10 @@ fn cpu_reading(mut s: CpuState, name: &[u8], data: &[u8]) -> CpuState
 /// # Panics
 ///
 /// When the step breaks its contract.
-pub(crate) fn cpu_step_holds<const D: usize>(
-    walk: &mut CpuWalk<D>,
-    event: FdtEvent<'_>,
-) -> Step<Cpu>
+pub(crate) fn cpu_step_holds<'a, const D: usize>(
+    walk: &mut CpuWalk<'a, D>,
+    event: FdtEvent<'a>,
+) -> Step<Cpu<'a>>
 {
     let (depth, before, limits) = (walk.depth, walk.states, walk.limits);
     let step = walk.step(event);
@@ -396,7 +396,8 @@ pub(crate) fn cpu_step_holds<const D: usize>(
         {
             Some(hart_id) if s.is_riscv_cpu && !s.disabled => Some(Cpu {
                 hart_id,
-                caps: s.caps,
+                isa_extensions: s.isa_extensions,
+                isa: s.isa,
                 mmu: s.mmu,
             }),
             _ => None,

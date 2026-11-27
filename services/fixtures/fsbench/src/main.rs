@@ -24,7 +24,9 @@
 //! The thread is pinned to CPU 0 before it reads anything, and opens its
 //! counters there: each timed read blocks on the filesystem driver, and a
 //! thread woken on another CPU would subtract one CPU's cycle counter from
-//! another's, which riscv64 does not keep in step.
+//! another's, which riscv64 does not keep in step. At more than one CPU the
+//! `unpinned` module then times windows of a client with no affinity, which
+//! report window rows (`shared/bench/README.md` § Window rows).
 //!
 //! Writes go through page-sized `write_all` calls on a page-aligned offset,
 //! which the std client sends as one `FS_WRITE_MEMORY` each.
@@ -53,6 +55,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use bench::{Counters, IDLE_HALTS, Report, Unit, Value};
 
 mod open;
+mod unpinned;
 
 const PAGE_SIZE: u64 = 4096;
 const PAGE_SIZE_USIZE: usize = 4096;
@@ -438,6 +441,10 @@ fn main()
         measure(&mut f, size, ReadPath::Inline, &mut buf, &run);
         measure(&mut f, size, ReadPath::Frame, &mut buf, &run);
     }
+    if run.cpus > 1
+    {
+        unpinned::measure_read(&mut f, &mut buf, &run);
+    }
     drop(f);
 
     // The write pattern differs from every fixture page's, so a write that
@@ -447,6 +454,10 @@ fn main()
         .collect();
     measure_writes(&page, &run);
     open::measure(&run);
+    if run.cpus > 1
+    {
+        unpinned::measure_open(&run);
+    }
 
     std::os::seraph::log!("done");
 }

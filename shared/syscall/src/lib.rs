@@ -68,10 +68,10 @@ use syscall_abi::{
     SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER,
     SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM,
     SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
-    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
-    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
-    ipc_delivered_cap_count, ipc_delivered_data_count,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_RUN_LIMIT, SYS_THREAD_SET_UPCALL_MASK,
+    SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT, SyscallError, ipc_delivered_cap_count, ipc_delivered_data_count,
 };
 
 pub use syscall_abi::{
@@ -2413,7 +2413,7 @@ pub struct EventEntry
 pub struct DeathEvent
 {
     /// The thread's exit reason (`encode_exit_code` range, `EXIT_FAULT_BASE +
-    /// vector`, or the other `EXIT_*` values), every bit kept.
+    /// vector`, `EXIT_RUN_LIMIT`, or the other `EXIT_*` values), every bit kept.
     pub exit_reason: u64,
     /// The correlator the observer was bound with.
     pub correlator: u64,
@@ -2937,6 +2937,34 @@ pub fn thread_set_priority(thread_cap: u64, priority: u8, sched_cap: u64) -> Res
             thread_cap,
             u64::from(priority),
             sched_cap,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Set a thread's run limit: the timer ticks it may run between two syscalls
+/// that reset its count (every syscall that can block, and
+/// `SYS_THREAD_YIELD`) before the kernel raises `FAULT_EXC_RUN_LIMIT` on it.
+/// `ticks` of 0 removes the limit. Setting a limit sets the thread's count to
+/// zero (`core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_RUN_LIMIT`).
+///
+/// `thread_cap` must carry Control rights; `sched_cap` must be a
+/// `SchedControl` cap (presence only).
+///
+/// # Errors
+/// Returns a negative `i64` error code if the thread cap is invalid or lacks
+/// Control rights, or `sched_cap` is not a `SchedControl`.
+#[inline]
+pub fn thread_set_run_limit(thread_cap: u64, sched_cap: u64, ticks: u32) -> Result<(), i64>
+{
+    // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
+    // (thread cap, sched cap, tick count); kernel validates caps.
+    let ret = unsafe {
+        syscall3(
+            SYS_THREAD_SET_RUN_LIMIT,
+            thread_cap,
+            sched_cap,
+            u64::from(ticks),
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }
@@ -3865,7 +3893,7 @@ pub fn thread_bind_notification(
 /// entry `(exit_reason, correlator)` to `event_queue_cap` (see
 /// [`DeathEvent`]), where `exit_reason` is the encoded exit code for an exit
 /// and the fault class for a fault (`EXIT_FAULT_BASE + vector` on x86-64,
-/// `EXIT_FAULT_BASE + cause` on riscv64). The space ends once: a later fault
+/// `EXIT_FAULT_BASE + cause` on riscv64, or `EXIT_RUN_LIMIT`). The space ends once: a later fault
 /// or exit of another of its threads posts nothing, so a binding receives one
 /// entry. A fault of a thread's own access is terminal on any kill outcome of
 /// the fault protocol:

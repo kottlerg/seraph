@@ -1158,6 +1158,25 @@ pub struct ThreadControlBlock
     /// lock-free by the thread at its own delivery points.
     pub upcall_masked: core::sync::atomic::AtomicBool,
 
+    // === Run limit ===
+    /// The thread's run limit in timer ticks, 0 for none
+    /// (core/kernel/docs/scheduler.md § Run Limit). Written by
+    /// `SYS_THREAD_SET_RUN_LIMIT`; read by the timer tick of the CPU the
+    /// thread is current on and by the delivery of a pending run-limit fault.
+    pub run_limit: core::sync::atomic::AtomicU32,
+
+    /// Ticks counted toward [`run_limit`](Self::run_limit) since the last
+    /// reset. Added to by the timer tick of the CPU the thread is current on,
+    /// and set to 0 by that tick when it reaches the limit, by the thread's
+    /// own entry to a syscall that resets it, by the resume of its run-limit
+    /// fault, and by `SYS_THREAD_SET_RUN_LIMIT`.
+    pub run_count: core::sync::atomic::AtomicU32,
+
+    /// A run-limit fault is pending, for the thread's next return to user
+    /// mode. Set by the tick that reaches the limit; taken by the delivery
+    /// under [`sched_lock`](Self::sched_lock) while the thread is `Running`.
+    pub run_limit_pending: core::sync::atomic::AtomicBool,
+
     // === Context ===
     /// Whether this thread executes in user mode (ring 3 / U-mode). Immutable
     /// after construction (the Identity row).
@@ -1383,7 +1402,8 @@ pub struct ThreadControlBlock
     /// teardown): by `sys_exit` (`SYS_THREAD_EXIT`, clean exit, value `0`),
     /// by `sys_aspace_exit` (`encode_exit_code(arg0)`, a voluntary code in
     /// `[0, EXIT_FAULT_BASE)`), by the architecture fault handlers (value
-    /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`,
+    /// `EXIT_FAULT_BASE + vector`) and the run-limit end (`EXIT_RUN_LIMIT`)
+    /// before they call `post_death_notification`,
     /// and by object teardown (`syscall::EXIT_KILLED`; that stop posts
     /// nothing). A commit that finds the thread already `Exited` writes
     /// nothing, so the winning writer's reason survives; a thread killed while

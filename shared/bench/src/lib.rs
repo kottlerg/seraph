@@ -7,7 +7,8 @@
 //! measured operation ([`Counters`]), the samples it records and their
 //! summary ([`Samples`], [`Summary`]), and the one result line it reports,
 //! with the parser a comparison reads it back with ([`Report`],
-//! [`parse_line`]). `shared/bench/README.md` specifies the line.
+//! [`parse_line`]), and the check that a window whose CPU may halt counted
+//! its elapsed time ([`CycleRate`]). `shared/bench/README.md` specifies the line.
 //!
 //! `no_std`, no allocation, no dependency. The architecture-specific counter
 //! reads live under `arch/`, built with the default `counters` feature; a
@@ -20,6 +21,7 @@ mod arch;
 #[cfg(feature = "counters")]
 mod counters;
 mod line;
+mod rate;
 mod stats;
 
 #[cfg(feature = "counters")]
@@ -29,4 +31,5 @@ pub use counters::{Counters, EVENT_SLOTS, Reading};
 pub use line::{
     IDLE_HALTS, LineError, ParseError, Parsed, RESERVED_KEYS, Report, TAG, Unit, Value, parse_line,
 };
+pub use rate::{CycleRate, RATE_SLACK_MICROS, RATE_TOLERANCE_PERCENT};
 pub use stats::{Samples, Summary, summarize};

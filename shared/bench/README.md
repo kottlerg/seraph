@@ -16,6 +16,7 @@ bench/
     ├── lib.rs              # Crate root and re-exports
     ├── counters.rs         # Counters, Reading
     ├── stats.rs            # Samples, Summary, summarize
+    ├── rate.rs             # CycleRate: the window rate check
     ├── line.rs             # Report, Unit, Value, parse_line, Parsed, LineError, ParseError
     └── arch/
         ├── mod.rs          # Architecture dispatch
@@ -92,6 +93,14 @@ The line is a single line of space-separated tokens, wrapped above for width onl
 | `n=` to `max=` | The summary of the samples |
 | Extras | Further measurements of the run (`tlb_elided=`, `workers=`, `idle_halts=` of § Idle halts); after `max=` |
 
+A window line's sample is one window of several operations: the cycles between two reads that
+bracket all of them, the extra `window_ops=` naming the operations a window holds, so that `n=`
+counts windows and one operation's mean cost is a sample over `window_ops=`. Its reads are taken
+by a thread pinned to the CPU whose counter they read, which need not be a thread that runs the
+operations (`ubench.pipeline`). The sample is the whole window's count, never the mean, so that
+under icount it is the window's instructions, as every gated sample is
+([xtask/README.md § `cargo xtask path-account`](../../xtask/README.md#cargo-xtask-path-account)).
+
 The suite, the name and the variant parameters identify a measurement: a comparison of two runs
 pairs their lines by them, and compares the columns from `arch=` on. The extras are measured
 with the samples, never part of the identity.
@@ -145,13 +154,43 @@ carries no count.
 
 ---
 
+## Window rate check
+
+A window whose reading thread blocks while other threads do its work elsewhere
+(`ubench.pipeline`) leaves the reading CPU with nothing to run, and the CPU halts in it. The
+window then counts its elapsed time only if the counter runs through a halt:
+
+| Counter | Through a halt |
+|---|---|
+| x86-64 `rdtsc`, a CPU with an invariant TSC | Runs at its constant rate in every C-state |
+| x86-64 `rdtsc` under KVM | The host's TSC: runs |
+| riscv64 `cycle` on hardware | Left to the implementation: a hart may stop it while it waits in `wfi` |
+| riscv64 `cycle` under QEMU's TCG | Runs: the host's tick counter (from QEMU's source) |
+| Either under icount | Runs: the shared icount clock, which follows the host's time while every vCPU idles ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)) |
+
+riscv64's `time` runs through a halt, but U-mode does not read it: the kernel grants `cycle`
+alone, as
+[core/kernel/docs/cross-boundary-disclosure.md](../../core/kernel/docs/cross-boundary-disclosure.md)
+records.
+Such a benchmark therefore reads, around each window, a clock that runs through a halt, the
+kernel's elapsed microseconds (`SYS_SYSTEM_INFO(ElapsedUs)`, from `rdtsc` on x86-64 and `time`
+on riscv64), and measures the counter's rate against it over a span in which its CPU is kept
+busy. `CycleRate::counted` takes a window whose cycles reach its elapsed microseconds at that
+rate, less `RATE_SLACK_MICROS` (3) for the clock's truncation to whole microseconds and its
+reads, within `RATE_TOLERANCE_PERCENT` (5); a window that falls short did not count all of its
+elapsed time and is left out of the samples, so a counter that stops in a halt shows as windows
+left out, never as a sample short of its time. On x86-64 the elapsed clock is the TSC itself, so
+the check holds by construction and rests on the invariant TSC § Counters requires.
+
+---
+
 ## Consumers
 
 | Consumer | Suite | What it reports |
 |---|---|---|
 | [`core/ktest`](../../core/ktest/README.md) | `ktest` | Tier 3, one line per kernel benchmark (§ Tier 3) |
 | [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3` |
-| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.console_write`, per variant, and `ubench.empty_window` |
+| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.pipeline`, `ubench.console_write`, per variant, and `ubench.empty_window` |
 
 ---
 

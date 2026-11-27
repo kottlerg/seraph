@@ -1450,9 +1450,10 @@ placement counters ([scheduler.md](scheduler.md#placement-counters) § Placement
 `THREAD_PLACEMENT_WAKE_MOVES` (3), `THREAD_PLACEMENT_PULLS` (4), `THREAD_PLACEMENT_SYNC_WAKES` (5)
 and `THREAD_PLACEMENT_SYNC_LOCAL` (6). A counter is a free-running 32-bit count that wraps, read
 without a lock, a snapshot, so a reader takes the wrapping difference of two reads. They are
-diagnostics: ktest's round-trip benchmarks read them to report where their two threads ran, and
-`sync_ipc_placement` reads the synchronous wake rule's two to judge each wake the rule decided
-([core/ktest/README.md](../../ktest/README.md)). An unknown view answers
+diagnostics: ktest's round-trip benchmarks and ubench's `pipeline` read them to report where
+their two threads ran, and `sync_ipc_placement` reads the synchronous wake rule's two to judge
+each wake the rule decided ([core/ktest/README.md](../../ktest/README.md),
+[services/ubench/README.md](../../../services/ubench/README.md)). An unknown view answers
 `InvalidArgument`.
 
 **Capability requirement:** None for every selector but `CAP_INFO_MEMORY_PHYS_BASE`, which

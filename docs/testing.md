@@ -659,6 +659,15 @@ reader who wants the region's cost alone subtracts it, which under icount leaves
 region's instructions only for a window on one CPU that does not idle and that no interrupt or
 other thread enters.
 
+A window line ([shared/bench/README.md § Result line](../shared/bench/README.md#result-line))
+whose reading thread waits while other threads run its work (`ubench.pipeline`) bounds the same
+region: everything between its two reads, wherever it ran. At more than one CPU the reading CPU may
+halt in it, and the window counts that time only where the counter runs through a halt, which
+riscv64 hardware leaves to the implementation; each such window is checked against the kernel's
+elapsed microseconds and left out when its counter did not count them
+([shared/bench/README.md § Window rate check](../shared/bench/README.md#window-rate-check)). At one
+CPU its threads share the CPU, the window does not idle, and its count gates as any other.
+
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
 (`--mode host`, x86_64 under KVM, on the release build the cell measures, per-measurement bands

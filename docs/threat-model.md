@@ -177,15 +177,25 @@ service executes as built, since procmgr verified it.
 - The `proofs` module of `shared/hwrng-protocol/src/lib.rs` proves `requested_len` on every request
   and, by induction over a reply's words, `decode_reply` and `encode_reply`
   ([testing.md](testing.md) § Bounded verification); CI's `kani` jobs run them.
-- Planned: property functions, fuzz targets and proof harnesses for the decoders of `shared/ipc` and
-  `shared/namespace-protocol` (`gate_open`, `compose_forward_lookup_rights`, `validate_name`), in
+- `namespace-protocol` (`xtask/fuzz/targets/src/bin/namespace-protocol.rs`) drives
+  `namespace_protocol::property::namespace_protocol_holds` over a server's rights gate (`gate`,
+  `gate_open`), its rights composition of a forwarded lookup (`compose_forward_lookup_rights`), its
+  decode of an `NS_LOOKUP` path (`validate_name` on each component), and a client's decode of a
+  lookup reply (`PathWalk::advance`), from the seeds in
+  `shared/namespace-protocol/fuzz/namespace-protocol/seeds/`; CI's gating `fuzz` job runs it as it
+  runs `hwrng-protocol`.
+- The `proofs` modules of `shared/namespace-protocol` prove the badge decode and the rights gate on
+  every badge and label, the forwarded rights on every pair of rights words, the path's cut on every
+  request, the name and path checks by their steps (each character from any scan state, and every
+  name and path to a short bound), and a reply's count on every count and its kind on every kind
+  ([testing.md](testing.md) § Bounded verification); CI's `kani` jobs run them.
+- Planned: property functions, fuzz targets and proof harnesses for the decoders of `shared/ipc`, in
   [#680](https://github.com/kottlerg/seraph/issues/680) and
   [#756](https://github.com/kottlerg/seraph/issues/756).
 
 **Gaps.**
 
-- No decoder of `shared/ipc` or `shared/namespace-protocol` has a property function, a fuzz target
-  or a proof harness yet.
+- No decoder of `shared/ipc` has a property function, a fuzz target or a proof harness yet.
 - Each server's dispatcher checks its own labels, word counts, versions and badges; no shared layer
   checks them, and no review has yet covered every label of every service against this attacker. The
   audit of this section ([#680](https://github.com/kottlerg/seraph/issues/680)) is the first.

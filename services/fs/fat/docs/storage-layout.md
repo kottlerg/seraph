@@ -93,7 +93,10 @@ each mutation in [crash-safety.md](crash-safety.md).
 * **NodeTable** (`src/backend.rs`): dedupes by on-disk slot
   `(sector_lba, offset_in_sector)`; two distinct on-disk entries
   always allocate distinct `NodeId`s, even when both are empty files
-  at cluster 0. The table is a heap-grown `fat_parse::node_slab::NodeSlab`:
+  at cluster 0. The table is a heap-grown `fat_parse::node_slab::NodeSlab`,
+  whose key index hashes with std's `RandomState`, keyed per process from
+  the kernel's random source, since whoever wrote the disk chooses every
+  slot and so could otherwise aim them all at one probe run:
   a `NodeId` packs a 24-bit index and a 16-bit generation, and every holder
   of an entry shares its one node. `FS_CLOSE` frees an open, never a
   node; `FS_REMOVE` and `FS_RENAME` free the unlinked slot's node, and

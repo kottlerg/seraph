@@ -647,6 +647,8 @@ fn service_loop(
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     let mut session_sweeps = SweepSchedule::new();
     let mut reply = Reply::new();
+    // The page an `FS_READ_MEMORY` reply hands over, until that reply is sent.
+    let mut pending: Option<PendingRelease> = None;
     loop
     {
         // The last request found the block device capability revoked and
@@ -669,6 +671,7 @@ fn service_loop(
             // The last turn's reply goes out before this work.
             // SAFETY: ipc_buf is the registered IPC buffer page.
             unsafe { reply.flush(caps.service, ipc_buf) };
+            settle_pending(&mut pending, &reply, opens, cache);
             let req = opens
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -685,6 +688,7 @@ fn service_loop(
             // The last turn's reply goes out before this work.
             // SAFETY: ipc_buf is the registered IPC buffer page.
             unsafe { reply.flush(caps.service, ipc_buf) };
+            settle_pending(&mut pending, &reply, opens, cache);
             sweep_sessions(opens, &mut session_sweeps, cache);
         }
         // The pressure thread marked a release and woke the loop with a
@@ -694,10 +698,13 @@ fn service_loop(
             // The last turn's reply goes out before this work.
             // SAFETY: ipc_buf is the registered IPC buffer page.
             unsafe { reply.flush(caps.service, ipc_buf) };
+            settle_pending(&mut pending, &reply, opens, cache);
             release_under_pressure(cache, ipc_buf);
         }
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { next_request(caps.service, &mut reply, ipc_buf) }
+        let received = unsafe { next_request(caps.service, &mut reply, ipc_buf) };
+        settle_pending(&mut pending, &reply, opens, cache);
+        let msg = match received
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -1045,7 +1052,7 @@ fn service_loop(
         {
             (fs_labels::FS_READ_MEMORY, Some(open)) =>
             {
-                handle_read_memory_open_cap(
+                pending = handle_read_memory_open_cap(
                     node_id,
                     open,
                     &msg,
@@ -1057,7 +1064,8 @@ fn service_loop(
                     ipc_buf,
                     eviction,
                     &mut reply,
-                );
+                )
+                .map(|cookie| PendingRelease { open, cookie });
             }
             (fs_labels::FS_RELEASE_MEMORY, Some(open)) =>
             {
@@ -1197,6 +1205,10 @@ fn handle_read(
 /// derivation, and outstanding-page tracking on that open. The file's size
 /// and first cluster come from `node`, the node table's current view, so a
 /// write or truncate through any cap on the node is seen at once.
+///
+/// Returns the cookie of the page it handed the client, which the loop
+/// gives back if the reply is not delivered ([`PendingRelease`]); `None`
+/// when the reply hands over no page.
 #[expect(
     clippy::too_many_lines,
     reason = "the read is one sequence (validate, resolve the sector, pin a cache page, mint and \
@@ -1223,7 +1235,7 @@ fn read_memory_for_open(
     ipc_buf: *mut u64,
     eviction: &EvictionState,
     reply: &mut Reply,
-)
+) -> Option<u64>
 {
     let offset = msg.word(0);
     let cookie = msg.word(1);
@@ -1232,7 +1244,7 @@ fn read_memory_for_open(
     {
         // Cookie 0 collides with the OutstandingPage::None sentinel.
         reply.set_status(ipc::fs_errors::BAD_MEMORY_OFFSET);
-        return;
+        return None;
     }
 
     let Some(left_in_file) = u64::from(node.size).checked_sub(offset).filter(|&n| n > 0)
@@ -1244,7 +1256,7 @@ fn read_memory_for_open(
             .word(1, cookie)
             .build();
         reply.set(answer);
-        return;
+        return None;
     };
 
     // A non-empty file's first cluster comes from its directory entry,
@@ -1255,7 +1267,7 @@ fn read_memory_for_open(
     else
     {
         reply_err(ipc::fs_errors::IO_ERROR, reply);
-        return;
+        return None;
     };
     // Walk the cluster chain to find the sector at `offset`, from the open's
     // cursor when it still serves (storage-layout.md, Open table).
@@ -1278,7 +1290,7 @@ fn read_memory_for_open(
             // A FAT sector read that met a full cache fails the walk.
             relieve_pressure(opens, cache, eviction);
             reply_err(ipc::fs_errors::IO_ERROR, reply);
-            return;
+            return None;
         }
     }
     let cursor = fat_parse::ChainCursor {
@@ -1308,7 +1320,7 @@ fn read_memory_for_open(
     else
     {
         reply_err(ipc::fs_errors::IO_ERROR, reply);
-        return;
+        return None;
     };
 
     // A sequential scan that misses fills a run of the pages it reads next
@@ -1341,14 +1353,14 @@ fn read_memory_for_open(
         // the client retries this read on IO_ERROR.
         relieve_pressure(opens, cache, eviction);
         reply.set_status(ipc::fs_errors::IO_ERROR);
-        return;
+        return None;
     };
     let slot_cap = cache.slot_memory_cap(slot_idx);
     if slot_cap == 0
     {
         cache.release_slot(slot_idx);
         reply.set_status(ipc::fs_errors::IO_ERROR);
-        return;
+        return None;
     }
 
     let Ok(ancestor) = syscall::cap_derive(slot_cap, RIGHTS_MEM_MAP)
@@ -1356,7 +1368,7 @@ fn read_memory_for_open(
     {
         cache.release_slot(slot_idx);
         reply.set_status(ipc::fs_errors::IO_ERROR);
-        return;
+        return None;
     };
     let Ok(child) = syscall::cap_derive(ancestor, RIGHTS_MEM_MAP)
     else
@@ -1364,7 +1376,7 @@ fn read_memory_for_open(
         let _ = syscall::cap_delete(ancestor);
         cache.release_slot(slot_idx);
         reply.set_status(ipc::fs_errors::IO_ERROR);
-        return;
+        return None;
     };
 
     // From here the client may map the page; the slot is reused only once
@@ -1395,7 +1407,7 @@ fn read_memory_for_open(
         let _ = syscall::cap_delete(ancestor);
         cache.release_slot(slot_idx);
         reply.set_status(ipc::fs_errors::TOO_MANY_OPEN);
-        return;
+        return None;
     }
 
     let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
@@ -1404,7 +1416,11 @@ fn read_memory_for_open(
         .word(2, memory_data_offset)
         .cap(child)
         .build();
-    reply.set(answer);
+    // A reply the client's `CSpace` cannot take leaves the child cap here,
+    // and the send deletes it; the loop then gives the page back
+    // ([`PendingRelease`]).
+    reply.set_or_delete_caps(answer);
+    Some(cookie)
 }
 
 /// Where a memory-cap read's sector lies, for sizing its run fill
@@ -2003,18 +2019,18 @@ fn handle_read_memory_open_cap(
     ipc_buf: *mut u64,
     eviction: &EvictionState,
     reply: &mut Reply,
-)
+) -> Option<u64>
 {
     let Some(node) = nodes.get(node_id)
     else
     {
         reply_err(ipc::fs_errors::INVALID_BADGE, reply);
-        return;
+        return None;
     };
     if node.kind != NodeKind::File || opens.node(open).is_none()
     {
         reply_err(ipc::fs_errors::INVALID_BADGE, reply);
-        return;
+        return None;
     }
     read_memory_for_open(
         msg,
@@ -2027,7 +2043,7 @@ fn handle_read_memory_open_cap(
         ipc_buf,
         eviction,
         reply,
-    );
+    )
 }
 
 /// Reply `code` holding none of the caps the request carried: an
@@ -2158,6 +2174,46 @@ fn reply_now(msg: IpcMessage, reply: &mut Reply, service: u64, ipc_buf: *mut u64
         unsafe { reply.flush(service, ipc_buf) };
     }
     !reply.undelivered()
+}
+
+/// A page an `FS_READ_MEMORY` reply hands the client, held on the open until
+/// the reply is sent: a reply that does not arrive (the client is gone, or its
+/// `CSpace` cannot take the page's cap) leaves the client with no page to
+/// release, so the loop releases it ([`settle_pending`]).
+#[derive(Clone, Copy)]
+struct PendingRelease
+{
+    open: OpenRef,
+    cookie: u64,
+}
+
+/// After a send of the loop's reply: release `pending`'s page when the reply
+/// that handed it over was not delivered, as `FS_RELEASE_MEMORY` would, and
+/// clear it either way. A no-op when no page is pending, or when the reply is
+/// still set (a send that found none to send leaves it).
+fn settle_pending(
+    pending: &mut Option<PendingRelease>,
+    reply: &Reply,
+    opens: &Mutex<Opens>,
+    cache: &PageCache,
+)
+{
+    if reply.is_set()
+    {
+        return;
+    }
+    let Some(page) = pending.take()
+    else
+    {
+        return;
+    };
+    if reply.undelivered()
+    {
+        opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release_held(page.open, page.cookie, cache);
+    }
 }
 
 /// The status a request the driver took up but will not serve, since the

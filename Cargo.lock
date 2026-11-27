@@ -294,6 +294,7 @@ dependencies = [
  "fuzz-engine",
  "hwrng-protocol",
  "init-protocol",
+ "namespace-protocol",
  "objsig",
  "storage-statement",
  "vfsd-gpt",
@@ -457,6 +458,7 @@ version = "0.1.5"
 name = "kernel"
 version = "0.1.5"
 dependencies = [
+ "bench",
  "boot-protocol",
  "crypto",
  "elf",

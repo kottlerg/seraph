@@ -23,6 +23,7 @@ pub mod idle_wake;
 pub mod registry_list;
 pub mod run_limit;
 pub mod run_queue;
+pub mod stages;
 pub mod thread;
 #[cfg(not(test))]
 pub mod thread_registry;
@@ -8232,6 +8233,7 @@ pub unsafe fn schedule(requeue: Requeue)
         !unsafe { idle_wake_for(cpu) }.polling(),
         "schedule: cpu {cpu} entered with its idle wake flag set"
     );
+    stages::start(cpu);
 
     // The scheduler lock is taken with lock_raw/unlock_raw below, paired before
     // function return (or before the context switch that may change the stack).
@@ -8262,6 +8264,7 @@ pub unsafe fn schedule(requeue: Requeue)
     // SAFETY: lock_raw paired with unlock_raw / release_lock_only before any
     // return or the context switch.
     let mut saved_flags = unsafe { sched.lock.lock_raw() };
+    stages::lap(cpu, stages::Stage::Lock);
 
     // Decide whether `current` must be (re)placed on a run queue before we pick
     // the next thread.
@@ -8515,6 +8518,7 @@ pub unsafe fn schedule(requeue: Requeue)
             );
         }
     }
+    stages::lap(cpu, stages::Stage::Pick);
 
     // If the scheduler selected the same thread, nothing to do.
     if next == current
@@ -8625,6 +8629,7 @@ pub unsafe fn schedule(requeue: Requeue)
         // its saved flags are restored by restore_interrupts_from after switch().
         unsafe { cur_lock.release_lock_only() };
     }
+    stages::lap(cpu, stages::Stage::Release);
 
     // Incoming dispatch flip — THE exclusivity point. Mark `next` Running under
     // its `sched_lock` so a concurrent enqueue_and_wake(next) serialises here and
@@ -8730,6 +8735,7 @@ pub unsafe fn schedule(requeue: Requeue)
                     tid
                 );
             }
+            stages::lap(cpu, stages::Stage::Flip);
             #[cfg(not(test))]
             {
                 // SAFETY: next is a valid TCB; next.sched_lock, held here,
@@ -8743,6 +8749,7 @@ pub unsafe fn schedule(requeue: Requeue)
                 // unchanged under next.sched_lock, held here.
                 unsafe { crate::arch::current::gdt::load_iopb(iopb) };
             }
+            stages::lap(cpu, stages::Stage::Iopb);
         }
         // SAFETY: paired with lock_raw above.
         unsafe { next_lock.unlock_raw(ns) };
@@ -8812,6 +8819,7 @@ pub unsafe fn schedule(requeue: Requeue)
     // SAFETY: interrupts are disabled by the scheduler lock, on this CPU with
     // its per-CPU pointer installed.
     unsafe { crate::mm::stack_guard::flush_before_run(next_guard_epoch) };
+    stages::lap(cpu, stages::Stage::Guard);
 
     // Switch address space tracking and page tables.
     //
@@ -8886,6 +8894,7 @@ pub unsafe fn schedule(requeue: Requeue)
         // ring 0 / S-mode, in kernel mappings every address space shares.
         unsafe { nxt_space.activate() };
     }
+    stages::lap(cpu, stages::Stage::Aspace);
 
     // Extended-state (FPU, SIMD, vector) switch-out (`sched::fpu_switch`): save
     // the outgoing user thread's live registers into its area (x86-64 XSAVE when
@@ -9000,6 +9009,7 @@ pub unsafe fn schedule(requeue: Requeue)
             crate::arch::current::fpu::switch_in_restore(next);
         }
     }
+    stages::before_switch(cpu);
 
     if !current_state.is_null()
     {
@@ -9010,6 +9020,7 @@ pub unsafe fn schedule(requeue: Requeue)
             switch(current_state, next_state, save_flag);
         }
     }
+    stages::after_switch();
 
     // Now on the new thread's stack. Restore the caller's interrupt state. With
     // `current.sched_lock` as the outermost lock, ITS saved flags

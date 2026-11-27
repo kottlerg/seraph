@@ -538,3 +538,34 @@ mod tests
         assert_eq!(compose_forward_lookup_rights(badge, raw), rights::LOOKUP,);
     }
 }
+
+/// Proofs of the gates' contract (docs/testing.md § Bounded verification,
+/// Parser proofs), each on every input.
+///
+/// [`gate`] and [`gate_open`] read a label and a badge, two words, and
+/// [`compose_forward_lookup_rights`] a badge and a rights word, so each proof
+/// takes every value of both words and the property whole.
+#[cfg(kani)]
+mod proofs
+{
+    use crate::property;
+
+    /// Every label and badge is gated as README § Rights gate says. The longest
+    /// loop is the search of the 16 rows of `RIGHTS_TABLE`, so an unwind bound
+    /// of 17 covers it.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn every_badged_request_is_gated_by_its_kind_label_and_rights()
+    {
+        const _: () = assert!(super::RIGHTS_TABLE.len() < 17);
+        property::gate_holds(kani::any(), kani::any());
+    }
+
+    /// Every forwarded lookup asks for the caller's request within its
+    /// badge's rights, for every badge and rights word. No loop.
+    #[kani::proof]
+    fn every_forwarded_lookup_asks_within_the_callers_rights()
+    {
+        property::forward_rights_holds(kani::any(), kani::any());
+    }
+}

@@ -492,7 +492,11 @@ returned page is an outstanding page of the open the badge names, and of
 no other: the open's own [`FS_RELEASE_MEMORY`](#client-to-driver-release)
 or [`FS_CLOSE`](#label-3-fs_close) releases it, and eviction sends its
 cooperative release to that open's release endpoint. One open holds at
-most as many outstanding pages as the cache has slots.
+most as many outstanding pages as the cache has slots. A success reply
+whose memory cap the client's `CSpace` cannot take arrives as
+`IPC_REPLY_TRANSFER_FAILED` with no cap, and the driver then releases the
+page as `FS_RELEASE_MEMORY` would, so the open holds no page the client
+never received.
 
 **Reply (success)**
 

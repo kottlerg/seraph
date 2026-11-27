@@ -42,6 +42,8 @@ mod thread;
 mod tlb;
 mod wait_set;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use ::bench::{Counters, IDLE_HALTS, Report, Samples, Summary, Unit, Value};
 
 /// Most samples one benchmark records, and so most iterations it runs. The
@@ -54,9 +56,9 @@ pub const MAX_ITERS: u32 = 4096;
 pub(super) const MAX_SAMPLES: usize = MAX_ITERS as usize;
 
 /// Most extras a benchmark passes to [`Harness::report`], which adds
-/// `idle_halts` after them: the round trips' placement extras are the most
-/// any passes.
-const MAX_EXTRAS: usize = 8;
+/// `idle_halts` after them: `context_switch_pair`'s two TLB counts and its
+/// nine stage means are the most any passes.
+const MAX_EXTRAS: usize = 11;
 
 /// The `SYS_THREAD_SET_AFFINITY` argument that clears a thread's hard
 /// affinity.
@@ -64,6 +66,20 @@ const AFFINITY_ANY: u32 = u32::MAX;
 
 /// The sample buffer every benchmark records into in turn (ktest has no heap).
 static mut SAMPLES: [u64; MAX_SAMPLES] = [0; MAX_SAMPLES];
+
+/// Samples that child threads time on their own, which the harness reads once
+/// a child has signalled its notification: the stripes of `ipc_round_trip`'s
+/// `fan_in` callers, and from the start the timing child of an `iopb=` case,
+/// which counts them in [`CHILD_COMPLETED`].
+///
+/// Relaxed is sufficient for the samples and the count: the harness reads them
+/// only after the child's signal, and the `notification_send`/
+/// `notification_wait` pair orders them before the read.
+pub(super) static CHILD_SAMPLES: [AtomicU64; MAX_SAMPLES] =
+    [const { AtomicU64::new(0) }; MAX_SAMPLES];
+
+/// Samples the timing child of an `iopb=` case stored in [`CHILD_SAMPLES`].
+pub(super) static CHILD_COMPLETED: AtomicU64 = AtomicU64::new(0);
 
 /// What [`run_all`] hands each benchmark: its iteration count, the sample
 /// buffer, ktest's counters and the CPU count its result lines carry.
@@ -94,6 +110,18 @@ impl Recorder<'_>
     pub(super) fn record(&mut self, sample: u64) -> bool
     {
         self.samples.record(sample)
+    }
+
+    /// Record the samples an `iopb=` case's timing child stored, the first
+    /// [`CHILD_COMPLETED`] of [`CHILD_SAMPLES`]; call it once the child has
+    /// signalled.
+    pub(super) fn record_children(&mut self)
+    {
+        let count = usize::try_from(CHILD_COMPLETED.load(Ordering::Relaxed)).unwrap_or(0);
+        for sample in CHILD_SAMPLES.iter().take(count)
+        {
+            self.samples.record(sample.load(Ordering::Relaxed));
+        }
     }
 
     /// End the measured loop: the halts of CPU 0 since the recorder was

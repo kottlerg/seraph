@@ -139,6 +139,7 @@ core/kernel/
 │   │   ├── thread.rs           # Thread control block (TCB) definition
 │   │   ├── thread_registry.rs  # Live-thread registry: teardown stops, watchdog walks
 │   │   ├── thread_slot.rs      # Thread retype slot size, from the boot CPU's save area
+│   │   ├── stages.rs           # Stage breakdown of schedule(), the sched-stages feature
 │   │   └── run_queue.rs        # Per-CPU run queues and priority levels
 │   └── syscall/                # Syscall dispatch
 │       ├── mod.rs              # Dispatch; yield/exit/sleep, IPC-buffer and notification binding

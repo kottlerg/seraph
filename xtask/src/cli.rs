@@ -446,6 +446,16 @@ args! {
         #[arg(long, value_name = "PREFIXES", value_parser = parse_ktest_selection)]
         pub ktest_only: Option<String>,
 
+        /// Build the kernel with its `sched-stages` feature: `schedule()`
+        /// stamps the cycle counter at its stages and answers
+        /// `SystemInfoType::SchedStages`, whose means ktest's
+        /// `context_switch_pair` line reports (core/kernel/docs/scheduler.md
+        /// "Stage Breakdown"). The stamps add their own cycles to every switch.
+        /// Needs a build that includes the kernel (`--component all` or
+        /// `kernel`).
+        #[arg(long)]
+        pub sched_stages: bool,
+
         /// The shared host's launch rules (see xtask/README.md "Host launch
         /// rules").
         #[command(flatten)]

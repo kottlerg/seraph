@@ -244,10 +244,11 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  75  SYS_KERNEL_LOG_READ
                                  76  SYS_KERNEL_LOG_BIND
                                  77  SYS_IPC_REPLY_RECV
+                                 78  SYS_THREAD_SET_RUN_LIMIT
 ```
 
-**Implementation status.** Every number 0–77 has a handler; every number at or past
-`SYSCALL_NR_BOUND` (78) returns `UnknownSyscall`. The kernel refuses a number at or past the
+**Implementation status.** Every number 0–78 has a handler; every number at or past
+`SYSCALL_NR_BOUND` (79) returns `UnknownSyscall`. The kernel refuses a number at or past the
 bound, then selects the handler with one `match` on the number, clamped as data
 ([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and calls
 it directly. The `match` and a build-time check of its numbers come from one list
@@ -1396,8 +1397,9 @@ its pool ([memory-pool.md § Reclamation](../../../services/memmgr/docs/memory-p
 
 `CAP_INFO_ASPACE_END` (14) returns, for an AddressSpace cap, `0` while the address space has not
 ended, and otherwise `ASPACE_ENDED` (bit 32) ORed with the retained reason of its first terminal
-end: a terminal fault of any of its threads (`EXIT_FAULT_BASE` plus the fault vector or cause) or a
-`SYS_ASPACE_EXIT` (the encoded code, `0` for a clean exit, which the flag tells from no end).
+end: a terminal fault of any of its threads (`EXIT_FAULT_BASE` plus the fault vector or cause, or
+`EXIT_RUN_LIMIT` for a run-limit fault) or a `SYS_ASPACE_EXIT` (the encoded code, `0` for a clean
+exit, which the flag tells from no end).
 Later ends do not overwrite it; `syscall_abi::aspace_end_reason` decodes the answer. It is the
 reason a `SYS_ASPACE_BIND_NOTIFICATION` observer of the space receives, read under the same lock
 that serialises the end's record and the bind, so a holder that missed the post reads the outcome
@@ -1456,9 +1458,10 @@ placement counters ([scheduler.md](scheduler.md#placement-counters) § Placement
 `THREAD_PLACEMENT_WAKE_MOVES` (3), `THREAD_PLACEMENT_PULLS` (4), `THREAD_PLACEMENT_SYNC_WAKES` (5)
 and `THREAD_PLACEMENT_SYNC_LOCAL` (6). A counter is a free-running 32-bit count that wraps, read
 without a lock, a snapshot, so a reader takes the wrapping difference of two reads. They are
-diagnostics: ktest's round-trip benchmarks read them to report where their two threads ran, and
-`sync_ipc_placement` reads the synchronous wake rule's two to judge each wake the rule decided
-([core/ktest/README.md](../../ktest/README.md)). An unknown view answers
+diagnostics: ktest's round-trip benchmarks and ubench's `pipeline` read them to report where
+their two threads ran, and `sync_ipc_placement` reads the synchronous wake rule's two to judge
+each wake the rule decided ([core/ktest/README.md](../../ktest/README.md),
+[services/ubench/README.md](../../../services/ubench/README.md)). An unknown view answers
 `InvalidArgument`.
 
 **Capability requirement:** None for every selector but `CAP_INFO_MEMORY_PHYS_BASE`, which
@@ -2122,6 +2125,36 @@ from the first timer tick after it
 **Errors:** `InvalidCapability` (bad `thread_cap`, or no valid `SchedControl` at
 `sched_cap`), `InsufficientRights` (`thread_cap` lacks Control, or band does not cover
 `priority`), `InvalidArgument` (priority 0, priority 31, or out of range).
+
+---
+
+### `SYS_THREAD_SET_RUN_LIMIT` (78)
+
+Set a thread's run limit: the timer ticks it may run between two reset points before the kernel
+raises a run-limit fault on it ([scheduler.md § Run Limit](scheduler.md#run-limit)).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `thread_cap` | Thread capability (Control rights) |
+| 1 | `sched_cap` | `SchedControl` capability; presence only, no band is checked |
+| 2 | `ticks` | The limit in timer ticks, 0 for none; a register value above `u32::MAX` is out of range |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+Sets the limit, sets the thread's count to zero, and drops a run-limit fault pending on it. A
+thread's limit is 0 from its creation. The fault is `FAULT_KIND_EXCEPTION` with
+`FAULT_EXC_RUN_LIMIT`, delivered through the thread's exception binding; with none bound, or a
+handler that declines it, the thread ends with `EXIT_RUN_LIMIT`
+([fault-handling.md § Run-Limit Faults](../../../docs/fault-handling.md#run-limit-faults)). The
+syscalls that reset the count are listed under § Atomicity and Preemption Guarantees.
+
+**Capability requirements:** `thread_cap` (Control rights); `sched_cap` (a `SchedControl`).
+
+**Errors:** `InvalidCapability` (bad `thread_cap`, or no valid `SchedControl` at `sched_cap`),
+`InsufficientRights` (`thread_cap` lacks Control), `InvalidArgument` (`ticks` above
+`u32::MAX`).
 
 ---
 
@@ -4135,6 +4168,11 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   from its receive, after its reply was delivered and its caller woken: a retry receives with
   `SYS_IPC_RECV` and does not reply again. `SYS_THREAD_START` returns `Interrupted` when its caller
   is stopped while the start waits for the target to settle; nothing is started.
+
+- **Blocking syscalls and `SYS_THREAD_YIELD` reset the run-limit count.** Entry to each syscall
+  the bullet above names as one that can block, whether or not it then blocks, and to
+  `SYS_THREAD_YIELD`, sets the calling thread's run-limit count to zero; no other syscall does
+  ([scheduler.md § Run Limit](scheduler.md#run-limit)).
 
 ---
 

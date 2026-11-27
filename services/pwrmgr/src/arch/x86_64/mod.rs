@@ -362,7 +362,7 @@ pub fn watch_events(act: Actuator)
 }
 
 /// The event thread: call `WAIT_EVENT` with no bound, and on the power
-/// button power off as `SHUTDOWN` does. A call that fails in transit is
+/// button power off as `SHUTDOWN` does, the log flushed first. A call that fails in transit is
 /// made again after [`WAIT_EVENT_RETRY`], and a superseded one at once; any
 /// other reply (acpid has no event to wait for, or refuses the call) ends
 /// the thread, logged.
@@ -383,6 +383,7 @@ fn events(act: &Actuator)
                 if reply.word(0) & acpid_labels::EVENT_POWER_BUTTON != 0
                 {
                     std::os::seraph::log!("power button: shutting down");
+                    crate::drain_log(crate::FLUSH_BOUND_MS);
                     shutdown(act, ipc_buf);
                 }
             }

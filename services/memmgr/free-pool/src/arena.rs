@@ -19,6 +19,7 @@ use syscall_abi::PAGE_SIZE;
 
 use crate::budget::{BudgetNode, Reclaim};
 use crate::chunk::{ChunkEntry, DIR_FANOUT};
+use crate::pool::PooledRun;
 use crate::pressure::PressureBits;
 use crate::{DemandRegion, FreeRun};
 
@@ -354,6 +355,7 @@ const _: () = assert!(size_of::<ZeroFrame>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<Reclaim>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<FrameDesc>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<HolderLink>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<PooledRun>() <= size_of::<ProcessRecord>());
 
 /// Where a write stands ([`DiskNode`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,7 +403,12 @@ pub struct DiskNode
 pub enum Node
 {
     Free,
+    /// A run on a list of runs: a demand chunk's, a compressed chunk's store
+    /// runs, or one on its way into the free pool.
     Run(FreeRun),
+    /// A run on the free pool, filed by physical base and by size
+    /// ([`crate::FreePool`]).
+    Pooled(PooledRun),
     Deferred(DeferredRun),
     Budget(BudgetNode),
     Region(RegionNode),

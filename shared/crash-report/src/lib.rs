@@ -259,6 +259,7 @@ pub fn exception_name(code: u64) -> &'static str
         syscall_abi::FAULT_EXC_ACCESS => "access",
         syscall_abi::FAULT_EXC_PROTECTION => "protection",
         syscall_abi::FAULT_EXC_FP => "fp",
+        syscall_abi::FAULT_EXC_RUN_LIMIT => "run-limit",
         _ => "unknown",
     }
 }

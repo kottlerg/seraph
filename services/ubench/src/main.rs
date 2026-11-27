@@ -9,9 +9,10 @@
 //! svctest's recipe is, and measures, in cycles, what the system's userspace
 //! paths cost a process: an IPC round trip through `shared/ipc`, the backing
 //! of fresh memory by a demand fault and by a grant, the fault path on several
-//! CPUs at once, the stdio pipe's byte ring, console text on the framebuffer,
-//! and `std::fs::File` reads and writes (services/ubench/README.md
-//! § Benchmarks).
+//! CPUs at once, the stdio pipe's byte ring, a producer and a consumer
+//! thread handing items through it, console text on the framebuffer,
+//! `std::fs::File` reads and writes, and the counter reads' own cost
+//! (services/ubench/README.md § Benchmarks).
 //!
 //! Each benchmark logs its result lines (shared/bench/README.md § Result
 //! line), a SKIP line for a case the boot cannot run, or one FAIL line. The run
@@ -19,10 +20,12 @@
 //! otherwise, and powers the system off through the `pwrmgr.shutdown` seed.
 
 mod console;
+mod empty_window;
 mod fault;
 mod fsbench;
 mod harness;
 mod ipc_rt;
+mod pipeline;
 mod shmem_ring;
 
 use bench::Counters;
@@ -78,13 +81,15 @@ fn setup() -> Result<(Counters, u32), String>
 /// FAIL line.
 fn run_all(counters: &Counters, cpus: u32, fb_class: u64) -> usize
 {
-    let benches: [(&str, &dyn Fn() -> Outcome); 6] = [
+    let benches: [(&str, &dyn Fn() -> Outcome); 8] = [
         ("ipc_rt", &|| ipc_rt::run(counters, cpus)),
         ("fault_fill", &|| fault::fill(counters, cpus)),
         ("fault_scaling", &|| fault::scaling(cpus)),
         ("shmem_ring", &|| shmem_ring::run(counters, cpus)),
+        ("pipeline", &|| pipeline::run(counters, cpus)),
         ("console_write", &|| console::run(fb_class, counters, cpus)),
         ("fsbench", &fsbench::run),
+        ("empty_window", &|| empty_window::run(counters, cpus)),
     ];
     let mut failed = 0usize;
     for (name, bench) in benches

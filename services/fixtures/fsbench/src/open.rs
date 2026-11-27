@@ -20,9 +20,9 @@ use crate::{Bench, IdleSpan, WARMUP_ITERS, idle_extras};
 
 /// The path the case opens: three components, every one on the root
 /// filesystem.
-const OPEN_PATH: &str = "/services/fs/fatfs";
+pub(crate) const OPEN_PATH: &str = "/services/fs/fatfs";
 /// The number of components of [`OPEN_PATH`], the `depth=` of the result line.
-const OPEN_DEPTH: u64 = 3;
+pub(crate) const OPEN_DEPTH: u64 = 3;
 
 /// Time `run.read_iters` opens of [`OPEN_PATH`], after [`WARMUP_ITERS`] untimed
 /// ones, each file closed outside its sample, and log their result line.
@@ -69,7 +69,8 @@ pub(crate) fn measure(run: &Bench)
     std::os::seraph::log!("{line}");
 }
 
-fn open() -> File
+/// Open [`OPEN_PATH`], panicking on failure.
+pub(crate) fn open() -> File
 {
     File::open(OPEN_PATH).unwrap_or_else(|e| panic!("fsbench: open {OPEN_PATH}: {e}"))
 }

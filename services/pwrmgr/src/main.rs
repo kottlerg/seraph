@@ -27,8 +27,14 @@
 //! to, and pwrmgr waits on that queue beside its service endpoint. An entry
 //! is a core death, and pwrmgr powers the platform off at once: svcmgr
 //! creates it pinned, so it takes no page fault, and the power-off allocates
-//! nothing ([`pwrmgr::guard`]), logs nothing and calls no service, so it
-//! holds no matter which member died.
+//! nothing ([`pwrmgr::guard`]) and logs nothing, and the one service it calls
+//! is logd's flush barrier, for at most logd's stall bound, whose failure or
+//! silence only ends that wait, so it holds no matter which member died.
+//!
+//! Before every power-off and reset pwrmgr waits on logd's flush barrier
+//! (`LOG_FLUSH`, through its `logd.flush` seed; [`drain_log`]), so the lines
+//! logged before it, the test harness's pass marker and crash reports among
+//! them, reach the serial console before the machine stops.
 //!
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
@@ -36,11 +42,12 @@
 mod arch;
 mod caps;
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use ipc::{IpcMessage, pwrmgr_errors, pwrmgr_labels};
 use pwrmgr::guard::AllocGuard;
 use std::alloc::System;
 use std::os::seraph::startup_info;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// pwrmgr's allocator, guarded so the core-death power-off can check that it
 /// allocates nothing ([`core_died`]).
@@ -61,6 +68,21 @@ fn thread_identity() -> usize
 /// executing well within this (QEMU at once); the wait keeps the error
 /// reply from racing a reset that lands shortly after the request returns.
 const RESET_GRACE: Duration = Duration::from_secs(1);
+
+/// The bound on the wait for logd's flush barrier before a requested
+/// power-off or reset: a log call's own bound, which logd's answers to the
+/// lines logged before it keep within.
+const FLUSH_BOUND_MS: u32 = log::LOG_CALL_TIMEOUT_MS;
+
+/// The bound on that wait before the power-off of a core death: logd's
+/// stall bound, after which its serial sink counts as stalled and the flush
+/// answers at once, so a log that cannot be written holds the power-off no
+/// longer than that.
+const CORE_DEATH_FLUSH_BOUND_MS: u32 = logd_codec::sink::SINK_STALL_MS;
+
+/// pwrmgr's `logd.flush` seed, `0` when absent: set once at start, before
+/// any thread that powers off or resets runs.
+static LOG_FLUSH: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> !
 {
@@ -85,6 +107,7 @@ fn main() -> !
         std::os::seraph::log!(error: "no service endpoint, exiting");
         syscall::thread_exit();
     }
+    LOG_FLUSH.store(bootstrap.log_flush, Ordering::Relaxed);
 
     // Resolve the actuation state. `None` means the platform authority
     // could not be resolved; pwrmgr still serves so callers get a clean
@@ -165,6 +188,7 @@ fn serve(msg: &IpcMessage, actuator: Option<&arch::current::Actuator>, ipc_buf: 
             std::os::seraph::log!("SHUTDOWN requested");
             if let Some(act) = actuator
             {
+                drain_log(FLUSH_BOUND_MS);
                 arch::current::shutdown(act, ipc_buf);
             }
             // Reached here → no actuator or shutdown failed. Reply so
@@ -176,6 +200,7 @@ fn serve(msg: &IpcMessage, actuator: Option<&arch::current::Actuator>, ipc_buf: 
             std::os::seraph::log!("REBOOT requested");
             if let Some(act) = actuator
             {
+                drain_log(FLUSH_BOUND_MS);
                 arch::current::reboot(act, ipc_buf);
             }
             reject(pwrmgr_errors::INVALID_REQUEST, ipc_buf);
@@ -286,9 +311,11 @@ fn arm_core_death(
 /// A core member has died: drain the entries its observers posted to
 /// `core_death` and power the platform off through `power_off`, the
 /// architecture's immediate power-off, with [`ALLOCATOR`] armed against this
-/// thread. Nothing between the wake and the power-off allocates, frees, logs
-/// or calls a service, so it needs neither memmgr, a dead member's pages, nor
-/// any service that waits on them. Only when the platform keeps running, or
+/// thread. Nothing between the wake and the power-off allocates, frees or
+/// logs, and the one service it calls is logd's flush barrier ([`drain_log`]),
+/// for at most [`CORE_DEATH_FLUSH_BOUND_MS`], whose refusal, failure or
+/// silence only ends that wait; so it needs neither memmgr, a dead member's
+/// pages, nor any service that waits on them. Only when the platform keeps running, or
 /// no immediate power-off is held, does pwrmgr disarm, drain what was posted
 /// since, log each entry of the first entry's member as the end it is (its
 /// main thread's or its address space's, which can carry different reasons:
@@ -313,6 +340,7 @@ fn core_died(
     deaths.drain(next);
     if let Some(power_off) = power_off
     {
+        drain_log(CORE_DEATH_FLUSH_BOUND_MS);
         arch::current::power_off_now(power_off);
     }
     ALLOCATOR.disarm();
@@ -335,8 +363,59 @@ fn core_died(
     }
     match actuator
     {
-        Some(act) => arch::current::shutdown(act, ipc_buf),
+        Some(act) =>
+        {
+            drain_log(CORE_DEATH_FLUSH_BOUND_MS);
+            arch::current::shutdown(act, ipc_buf);
+        }
         None => std::os::seraph::log!(error: "{member} died; no shutdown actuator to power off"),
+    }
+}
+
+/// Wait, for at most `bound_ms`, until logd has written the lines it took
+/// before the wait to the sinks that hold the log (its flush barrier,
+/// `ipc::log_labels::LOG_FLUSH`, through [`LOG_FLUSH`]), so a power-off or
+/// reset that follows does not cut them off. Returns at once without the
+/// seed, and as soon as logd answers flushed, refuses, or does not answer;
+/// the steps are `pwrmgr::log_flush`'s. Logs, allocates and frees nothing,
+/// since the core-death power-off runs it with [`ALLOCATOR`] armed: the
+/// request and reply are on the stack, and the clock and the sleep are
+/// system calls.
+pub(crate) fn drain_log(bound_ms: u32)
+{
+    use pwrmgr::log_flush::{Next, call_timeout, next};
+
+    let cap = LOG_FLUSH.load(Ordering::Relaxed);
+    if cap == 0
+    {
+        return;
+    }
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let start = Instant::now();
+    let elapsed_ms = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let mut token = None;
+    loop
+    {
+        let Some(timeout) = call_timeout(elapsed_ms(), bound_ms)
+        else
+        {
+            return;
+        };
+        let request = ipc::log_flush::request(token);
+        // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer.
+        let reply = unsafe { ipc::ipc_call_timeout(cap, &request, ipc_buf, timeout) }.ok();
+        match next(reply.as_ref(), elapsed_ms(), bound_ms)
+        {
+            Next::Done => return,
+            Next::Again {
+                token: again,
+                wait_ms,
+            } =>
+            {
+                token = Some(again);
+                std::thread::sleep(Duration::from_millis(wait_ms));
+            }
+        }
     }
 }
 

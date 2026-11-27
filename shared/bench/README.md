@@ -16,7 +16,9 @@ bench/
     ├── lib.rs              # Crate root and re-exports
     ├── counters.rs         # Counters, Reading
     ├── stats.rs            # Samples, Summary, summarize
+    ├── rate.rs             # CycleRate: the window rate check
     ├── line.rs             # Report, Unit, Value, parse_line, Parsed, LineError, ParseError
+    ├── window.rs           # WindowShape, WindowEnd, WindowTally
     └── arch/
         ├── mod.rs          # Architecture dispatch
         ├── x86_64/mod.rs   # ARCH, the rdtsc read
@@ -46,6 +48,12 @@ programmable `events`. The cycle counter is the only one read; the others read `
 |---|---|---|
 | x86-64 | `rdtsc`: reference cycles at a constant rate on a CPU with an invariant TSC | The kernel clears `CR4.TSD` on every CPU |
 | riscv64 | `csrr cycle`: the hart's cycles | The kernel sets `scounteren.CY` on every hart |
+
+A read bounds the region between two reads as
+[docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell) states. Its inline
+assembly declares that it may read and write memory, so the compiler keeps each load and store on
+the side of the read where the program puts it. On x86-64 the read is `mfence; lfence; rdtsc;
+lfence`, so that the CPU orders it too. On riscv64 the hart orders `csrr cycle` only with itself.
 
 ---
 
@@ -104,6 +112,43 @@ whole log can be scanned. A program logs no other text of the form `bench <word>
 
 ---
 
+## Window rows
+
+A benchmark that cannot time one operation per sample, because a thread of the measured path may
+run on another CPU between two counter reads, times windows of several operations instead and
+reports a window row: a result line of the form above, each of whose samples is one window's
+whole count, the difference of two counter reads taken on one CPU, so `n=` counts windows. The
+row carries the extra `window_ops=` (`WINDOW_OPS_KEY`), the operations each window holds, so a
+sample's cost per operation is the sample divided by `window_ops=`, and names itself by a
+variant parameter, so it never pairs with a per-operation row of the same case.
+`WindowShape::for_ops` splits a benchmark's operations into windows of `WINDOW_OPS` (16), or
+one window of all of them when there are fewer. Whether a row gates follows the rule of its CPU
+count and benchmark, as for any row
+([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)).
+
+A difference of two reads on one CPU measures the window, wherever the measured threads ran in
+between, only when both reads ran on that CPU and the CPU's counter ran throughout: the CPU did not
+halt between them, or its counter runs through a halt
+([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)). A row whose reads are
+taken by a thread pinned to the measuring CPU, which does not itself run the measured path, meets
+the first condition by its pin. When that thread blocks while the measured threads run, its CPU
+may halt in the window, so such a row (`ubench.pipeline`) checks each window against a clock that
+runs through a halt (§ Window rate check) and counts the windows it leaves out in
+`clock_stopped=`. A row whose reads are taken by the measured thread, with no affinity
+between them, cannot, and meets it as fsbench's rows do: pinned to the measuring CPU, the thread
+opens its idle-halt span (§ Idle halts) and takes the opening read, then clears its affinity, which
+moves nothing, so the window holds that syscall too; after the window's operations it takes the
+closing read and closes the span at once, with no blocking call between, and `WindowEnd::from_close`
+classifies the window by the close. A close that fails ran on another CPU than the open (`Moved`),
+one that returns halts saw the CPU halt (`Halted`), and one that returns `0` counts the window
+(`Counted`). Such a row carries the counts of the windows it left out, `moved=` (`MOVED`) and
+`halted=` (`HALTED`), and a row whose counted windows are fewer than half its windows
+(`WindowShape::floor`) does not measure its case, only the windows that happened to stay on the CPU,
+so the benchmark logs no result line for it. fsbench's `affinity=any` rows are such rows
+([services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md)).
+
+---
+
 ## Idle halts
 
 Under QEMU's icount (`cargo xtask run --icount`) a timed window that idles counts host time: while
@@ -112,11 +157,12 @@ every vCPU idles, the guest's clock follows the host's
 therefore calls `SYS_SYSTEM_INFO(IdleHalts)` (`syscall::idle_halts`, which answers for the
 calling CPU alone) right before a measured loop, which marks that CPU's idle-halt count in the
 calling thread, and right after it, which returns the halts since the mark, both outside every
-timed window, with the thread pinned to that CPU across both calls and making no other such call
-between them. The line reports that count as the extra `idle_halts=` (`IDLE_HALTS`): the times
-the CPU found no thread to run while the loop ran. The kernel counts only from the mark: a call
-that has none on its CPU (the thread's first, or one after a move) returns an error, and the line
-then carries no count.
+timed window, with the thread pinned to that CPU across both calls (a window row's thread,
+unpinned between them, is held to the CPU by the close, § Window rows) and making no other
+such call between them. The line reports that count as the extra `idle_halts=` (`IDLE_HALTS`):
+the times the CPU found no thread to run while the loop ran. The kernel counts only from the mark:
+a call that has none on its CPU (the thread's first, or one after a move) returns an error, and
+the line then carries no count.
 
 The span holds every timed window of the line and the untimed work of the loop between them (a
 warm-up iteration, a check, a step that readies the next sample). A count of zero says that no
@@ -132,10 +178,45 @@ where a count says that the loop waited on an event.
 |---|---|---|
 | [ktest](../../core/ktest/README.md) Tier 3 | `Harness::recorder`, taken right before the loop, to its `Recorder::summary`, right after | CPU 0 |
 | [ubench](../../services/ubench/README.md) | `IdleSpan::open` and `close` around each loop, its warm-up iterations included; in `fault_scaling`, each worker around its own loop, the line summing them | `BENCH_CPU` (0); each worker's CPU |
-| [fsbench](../../services/fixtures/fsbench/README.md) | Around each timed loop, after its warm-up | CPU 0 |
+| [fsbench](../../services/fixtures/fsbench/README.md) | Around each timed loop, after its warm-up; in a window row, around each window, the line summing the spans that closed (§ Window rows) | CPU 0 |
 
 A line whose samples other threads took on their own CPUs (`ktest.tlb_shootdown_concurrent`)
 carries no count.
+
+---
+
+## Window rate check
+
+A window whose reading thread blocks while other threads do its work elsewhere
+(`ubench.pipeline`) leaves the reading CPU with nothing to run, and the CPU halts in it. The
+window then counts its elapsed time only if the counter runs through a halt:
+
+| Counter | Through a halt |
+|---|---|
+| x86-64 `rdtsc`, a CPU with an invariant TSC | Runs at its constant rate in every C-state |
+| x86-64 `rdtsc` under KVM | The host's TSC: runs |
+| riscv64 `cycle` on hardware | Left to the implementation: a hart may stop it while it waits in `wfi` |
+| riscv64 `cycle` under QEMU's TCG | Runs: the host's tick counter (from QEMU's source) |
+| Either under icount | Runs: the shared icount clock, which follows the host's time while every vCPU idles ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)) |
+
+riscv64's `time` runs through a halt, but U-mode does not read it: the kernel grants `cycle`
+alone, as
+[core/kernel/docs/cross-boundary-disclosure.md](../../core/kernel/docs/cross-boundary-disclosure.md)
+records.
+Such a benchmark therefore reads, around each window, a clock that runs through a halt, the
+kernel's elapsed microseconds (`SYS_SYSTEM_INFO(ElapsedUs)`, from `rdtsc` on x86-64 and `time`
+on riscv64), and measures the counter's rate against it over a span in which its CPU is kept
+busy. `CycleRate::counted` takes a window whose cycles reach its elapsed microseconds at that
+rate, less `RATE_SLACK_MICROS` (3) for the clock's truncation to whole microseconds and its
+reads, within `RATE_TOLERANCE_PERCENT` (5); a window that falls short is left out of the samples,
+so a counter that stops in a halt shows as windows left out, never as a sample short of its time.
+The clock's reads bracket the counter's, so a window also falls short when its thread is delayed
+between a clock read and the counter read beside it by more than the slack: under QEMU without
+icount, where the host may stall a vCPU at any instruction, a short window is left out now and
+then with its counter running (`ubench.pipeline` at `work=0` on riscv64). A left-out window
+therefore says that its sample could not be shown whole, not that the counter stopped; a window
+that counted its time is never left out. On x86-64 the elapsed clock is the TSC itself, so only
+such a delay leaves a window out, and the check rests on the invariant TSC § Counters requires.
 
 ---
 
@@ -144,8 +225,8 @@ carries no count.
 | Consumer | Suite | What it reports |
 |---|---|---|
 | [`core/ktest`](../../core/ktest/README.md) | `ktest` | Tier 3, one line per kernel benchmark (§ Tier 3) |
-| [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3` |
-| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring` and `ubench.console_write`, per variant |
+| [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3`; at more than one CPU, the window rows `fsbench.read size=16 path=inline affinity=any` and `fsbench.open depth=3 affinity=any` |
+| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.pipeline`, `ubench.console_write`, per variant, and `ubench.empty_window` |
 
 ---
 

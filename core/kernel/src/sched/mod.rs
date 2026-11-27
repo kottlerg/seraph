@@ -20,6 +20,7 @@ pub mod deadline_heap;
 pub mod fpu_switch;
 pub mod hold;
 pub mod registry_list;
+pub mod run_limit;
 pub mod run_queue;
 pub mod thread;
 #[cfg(not(test))]
@@ -2898,6 +2899,9 @@ fn idle_tcb(cpu: usize, stack_top: u64) -> ThreadControlBlock
         upcall_cookie: core::sync::atomic::AtomicU64::new(0),
         upcall_any_instruction: core::sync::atomic::AtomicBool::new(false),
         upcall_masked: core::sync::atomic::AtomicBool::new(false),
+        run_limit: core::sync::atomic::AtomicU32::new(0),
+        run_count: core::sync::atomic::AtomicU32::new(0),
+        run_limit_pending: core::sync::atomic::AtomicBool::new(false),
         is_user: false,
         saved_state: idle_saved_state(cpu, stack_top),
         kernel_stack_top: stack_top,
@@ -5757,6 +5761,13 @@ enum PullRule
     /// not run the backlog dry since the idle CPU sampled it, and the locked
     /// pick of a queued unpinned thread takes from it.
     Backlog(u32),
+    /// A waiting RT thread its own CPU pushes at its tick: the source is the
+    /// CPU that takes the pull, and the pick is the highest unpinned
+    /// fully-saved thread of the source's waiting RT queues whose level outranks
+    /// every thread of the destination ([`run_queue::push_window`]), read
+    /// under both locks; no load decides (core/kernel/docs/scheduler.md § Load
+    /// Balancing, "RT push").
+    Waiting,
 }
 
 impl PullRule
@@ -5771,6 +5782,21 @@ impl PullRule
         {
             Self::Imbalance => exceeds_imbalance(src_load, dst_load),
             Self::Backlog(episode) => src_backlog == Some(episode),
+            Self::Waiting => true,
+        }
+    }
+
+    /// The run queues of the source the rule's pick may take from, given
+    /// `src_waiting`, the source's waiting RT queues
+    /// (`PerCpuScheduler::waiting_rt`), and `dst`, the destination's ranks,
+    /// both read under the two locks: every queue for a load-balancing rule,
+    /// the push window for [`Self::Waiting`]. An empty set fails the rule.
+    fn queues(self, src_waiting: u32, dst: CpuRanks) -> u32
+    {
+        match self
+        {
+            Self::Imbalance | Self::Backlog(_) => u32::MAX,
+            Self::Waiting => run_queue::push_window(src_waiting, dst),
         }
     }
 }
@@ -6467,8 +6493,6 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize, rule: PullRule) ->
 #[cfg(not(test))]
 unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -> PullOutcome
 {
-    use core::sync::atomic::Ordering;
-
     // SAFETY: both CPUs valid (caller's contract).
     let src_ptr = unsafe { scheduler_ptr(src_cpu) };
     // SAFETY: the slot holds src_cpu's initialised scheduler, reached through
@@ -6479,6 +6503,11 @@ unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -
     // SAFETY: as for src.
     let dst = unsafe { &*dst_ptr };
     if !rule.passes(src.current_load(), src.backlog(), dst.current_load())
+    {
+        return PullOutcome::RuleFailed;
+    }
+    let queues = rule.queues(src.waiting_rt(), dst.ranks());
+    if queues == 0
     {
         return PullOutcome::RuleFailed;
     }
@@ -6499,15 +6528,13 @@ unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -
     // CPU's `switch()` republishes `cs = 1` once the register save is
     // committed). A skipped mid-handoff thread is dispatched by its source CPU
     // and pulled on a later balance tick once `cs == 1`.
-    let pullable = |tcb: *mut ThreadControlBlock| {
-        // SAFETY: tcb is linked on src, whose lock the caller holds, so it is a
-        // valid TCB; the read is read-only.
-        let unpinned = unsafe { (*tcb).cpu_affinity } == AFFINITY_ANY;
-        // SAFETY: as for cpu_affinity; context_saved is atomic.
-        unpinned && unsafe { (*tcb).context_saved.load(Ordering::Acquire) } == 1
+    let movable = |tcb| {
+        // SAFETY: src's lock is held (caller's contract), so every TCB the
+        // predicate sees is linked on src.
+        unsafe { pullable(tcb) }
     };
     // SAFETY: src's lock held (caller's contract); the predicate is read-only.
-    let pick = unsafe { src.find_runnable(pullable) };
+    let pick = unsafe { src.find_runnable(queues, movable) };
     let Some((tcb, priority)) = pick
     else
     {
@@ -6561,6 +6588,133 @@ unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -
     {
         PullOutcome::Deferred
     }
+}
+
+/// Whether a pull may take `tcb`, a thread queued on a CPU whose lock the
+/// caller holds: it has no hard affinity and is fully saved
+/// (`context_saved == 1`; see `pull_under_cpu_locks`). Read advisorily under
+/// the run-queue lock; `relocate_ready_thread` decides again under the
+/// thread's `sched_lock`.
+///
+/// # Safety
+/// `tcb` is linked on a run queue whose lock the caller holds.
+#[cfg(not(test))]
+unsafe fn pullable(tcb: *mut ThreadControlBlock) -> bool
+{
+    // SAFETY: tcb is linked on a run queue whose lock the caller holds, so it
+    // is a valid TCB; the read is read-only.
+    let unpinned = unsafe { (*tcb).cpu_affinity } == AFFINITY_ANY;
+    // SAFETY: as for cpu_affinity; context_saved is atomic.
+    unpinned
+        && unsafe {
+            (*tcb)
+                .context_saved
+                .load(core::sync::atomic::Ordering::Acquire)
+        } == 1
+}
+
+/// Most CPUs one RT push scan reads: every other CPU of a boot of up to
+/// `RT_PUSH_SCAN_CPUS + 1` CPUs, so the push's bound is one tick there; a
+/// larger boot is read a window per tick, the cost each tick adds to the
+/// running thread's being capped at two loads per CPU of the window
+/// (core/kernel/docs/scheduler.md § Load Balancing, "RT push").
+const RT_PUSH_SCAN_CPUS: usize = 128;
+
+/// What one RT push scan found ([`rt_push_target`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PushScan
+{
+    /// The CPU to push to, `None` when no CPU read runs and queues only
+    /// threads the waiting one outranks.
+    target: Option<usize>,
+    /// The CPU after the last one read: where the next scan starts after a
+    /// miss.
+    next: usize,
+}
+
+/// The CPU a waiting RT thread at `level` on `this_cpu` is pushed to, read
+/// from at most [`RT_PUSH_SCAN_CPUS`] other CPUs below `cpu_count`, in index
+/// order from `start` and wrapping: of those whose effective rank by `rank`
+/// is below `level`'s, so that the thread outranks everything there, the one
+/// of the lowest rank, a tie going to the lower load by `load`, then to the
+/// fewest busy SMT siblings by `busy_siblings`, then to the first read, as an
+/// RT wake is placed (core/kernel/docs/scheduler.md § Thread Assignment,
+/// § Load Balancing, "RT push"). Two `rank` reads and one `load` read per CPU
+/// below the level, one `rank` read for any other.
+fn rt_push_target(
+    this_cpu: usize,
+    cpu_count: usize,
+    start: usize,
+    level: u8,
+    rank: impl Fn(usize) -> u32,
+    load: impl Fn(usize) -> u32,
+    busy_siblings: impl Fn(usize) -> u32,
+) -> PushScan
+{
+    let level_rank = run_queue::level_rank(level);
+    let start = start.checked_rem(cpu_count).unwrap_or(0);
+    let mut last = None;
+    let best = least_loaded_cpu(
+        (start..cpu_count)
+            .chain(0..start)
+            .filter(|&cpu| cpu != this_cpu)
+            .take(RT_PUSH_SCAN_CPUS)
+            .inspect(|&cpu| last = Some(cpu))
+            .filter(|&cpu| rank(cpu) < level_rank),
+        |cpu| (rank(cpu), load(cpu)),
+        busy_siblings,
+    );
+    PushScan {
+        target: best.map(|(cpu, _)| cpu),
+        next: last.map_or(start, |cpu| cpu_after(cpu, cpu_count)),
+    }
+}
+
+/// The RT push of `this_cpu`'s busy tick: `level` is the level of the
+/// highest unpinned fully-saved thread of this CPU's waiting RT queues, which
+/// the tick found under this CPU's lock. Picks the target by
+/// [`rt_push_target`] from the other CPUs' ranks, read lock-free from this
+/// CPU's `rt_push_cursor`, which a miss moves past the CPUs it read, and
+/// moves the thread through [`pull_unpinned_ready`] under
+/// [`PullRule::Waiting`], which decides again under both locks and sends the
+/// wake IPI that preempts at the target (core/kernel/docs/scheduler.md § Load
+/// Balancing, "RT push").
+///
+/// # Safety
+/// Called from `this_cpu`'s `timer_tick` with no scheduler lock held;
+/// `this_cpu` is below `CPU_COUNT`.
+#[cfg(not(test))]
+unsafe fn try_push_waiting_rt(this_cpu: usize, level: u8)
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let scheduler = |cpu: usize| -> &'static PerCpuScheduler {
+        // SAFETY: cpu < CPU_COUNT (rt_push_target reads only CPUs below
+        // cpu_count) and the slab is initialised.
+        let sched = unsafe { scheduler_ptr(cpu) };
+        // SAFETY: the slot holds CPU `cpu`'s initialised scheduler, which lives
+        // for the kernel's life and is reached through shared references only.
+        unsafe { &*sched }
+    };
+    let own = scheduler(this_cpu);
+    let scan = rt_push_target(
+        this_cpu,
+        cpu_count,
+        own.rt_push_cursor(),
+        level,
+        |cpu| scheduler(cpu).ranks().effective(),
+        |cpu| scheduler(cpu).current_load(),
+        |cpu| crate::topology::busy_siblings(cpu, |sibling| !scheduler(sibling).has_no_work()),
+    );
+    let Some(target) = scan.target
+    else
+    {
+        own.set_rt_push_cursor(scan.next);
+        return;
+    };
+    // SAFETY: target and this_cpu are below cpu_count and distinct
+    // (rt_push_target leaves this_cpu out); no scheduler lock is held
+    // (contract).
+    unsafe { pull_unpinned_ready(this_cpu, target, PullRule::Waiting) };
 }
 
 /// Test stub.
@@ -7877,6 +8031,8 @@ unsafe fn mark_dispatched(
         (*tcb).wake_pending = false;
         (was_pending, (*tcb).thread_id)
     };
+    // A pending upcall follows the thread to this CPU; a pending run-limit
+    // fault follows it in `schedule()`, after its `context_saved` Acquire.
     // SAFETY: tcb is a valid TCB whose sched_lock is held (contract).
     let upcall = unsafe { crate::ipc::upcall::return_work_of(tcb) };
     if upcall != 0
@@ -8687,6 +8843,16 @@ pub unsafe fn schedule(requeue: Requeue)
         spin_site_exit();
     }
 
+    // A run-limit fault pending on `next` follows it to this CPU. Read after
+    // the Acquire of its `context_saved` above (the check or the spin), which
+    // follows every tick its previous CPU took while it was current there: a
+    // tick in its block window, after this CPU's claim, posts the bit on that
+    // CPU, and this read sees the fault it marked
+    // (core/kernel/docs/scheduler.md § Run Limit). Idle has none.
+    // SAFETY: next is null or a valid TCB; this CPU's per-CPU pointer is
+    // installed and interrupts are disabled.
+    unsafe { run_limit::follow_to_cpu(next) };
+
     // Extended-state switch-in: make `next`'s state live unless this CPU's
     // registers still hold it (`fpu_owner` and `next`'s `fpu_cpu` naming each
     // other). It runs after the Acquire load of `next`'s `context_saved` above
@@ -9100,6 +9266,14 @@ pub unsafe fn timer_tick()
         saved = unsafe { sched.lock.lock_raw() };
     }
 
+    // Count the tick toward the run limit of a non-idle current thread, under
+    // this CPU's scheduler lock and before the slice decision, so a tick that
+    // skips a switch still counts (core/kernel/docs/scheduler.md § Run Limit).
+    // The idle thread has no limit.
+    // SAFETY: current validated non-null above and is this CPU's current
+    // thread; interrupt context with this CPU's scheduler lock held.
+    unsafe { run_limit::tick(current) };
+
     // SAFETY: current validated non-null above; slice_remaining is always valid.
     let remaining = unsafe { (*current).slice_remaining };
     let Some((slice, reschedule)) = sched.tick_outcome(remaining).slice_and_reschedule()
@@ -9118,8 +9292,36 @@ pub unsafe fn timer_tick()
     // timer_tick under this CPU's scheduler lock, held here.
     unsafe { (*current).slice_remaining = slice };
 
+    // A waiting RT thread: one queued at the running level or below. One AND
+    // of two words in the common case; only a hit walks the waiting queues for
+    // the highest thread a push can move (unpinned, fully saved), so a CPU
+    // whose waiting threads are all pinned scans no other CPU
+    // (core/kernel/docs/scheduler.md § Load Balancing, "RT push").
+    let waiting = sched.waiting_rt();
+    let push_level = if waiting == 0 || cpu_count < 2
+    {
+        None
+    }
+    else
+    {
+        let movable = |tcb| {
+            // SAFETY: this CPU's scheduler lock is held, so every TCB the
+            // predicate sees is linked on this CPU.
+            unsafe { pullable(tcb) }
+        };
+        // SAFETY: this CPU's scheduler lock is held; the predicate is
+        // read-only.
+        unsafe { sched.find_runnable(waiting, movable) }.map(|(_, level)| level)
+    };
+
     // SAFETY: Unlock before calling schedule(), which will re-acquire.
     unsafe { sched.lock.unlock_raw(saved) };
+
+    if let Some(level) = push_level
+    {
+        // SAFETY: cpu validated against cpu_count above; no lock held.
+        unsafe { try_push_waiting_rt(cpu, level) };
+    }
 
     // Run the cross-CPU load balancer with no scheduler lock held, on every
     // tick: cheap on the steady-state hot path (a few Relaxed atomic loads),
@@ -9250,8 +9452,9 @@ unsafe fn preempt_outranked(sched: &PerCpuScheduler) -> bool
 /// this CPU's return-work word ([`crate::percpu::return_work_pending`]) for
 /// the bits this return handles (`percpu::return_work::AT_INTERRUPT`), and,
 /// only when one is set, [`interrupt_return_slow`] with `deliver`, the
-/// interrupt delivery point of an upcall (docs/fault-handling.md § Delivery
-/// points; core/kernel/docs/scheduling-internals.md § Return Work).
+/// delivery of a pending run-limit fault ([`run_limit::deliver_at_interrupt`])
+/// and the interrupt delivery point of an upcall (docs/fault-handling.md
+/// § Delivery points; core/kernel/docs/scheduling-internals.md § Return Work).
 ///
 /// # Safety
 /// As for [`preempt_if_outranked`], at the end of an interrupt taken from user
@@ -10559,6 +10762,189 @@ mod idle_pull_tests
         }
         assert_eq!(model.moved_from, Some(1));
         assert!(pulled_at.is_some_and(|tick| tick <= 2));
+    }
+}
+
+#[cfg(test)]
+mod rt_push_tests
+{
+    use super::*;
+
+    /// `rt_push_target` over per-CPU effective ranks and loads, with no SMT
+    /// sibling at work.
+    fn target(this_cpu: usize, level: u8, ranks: &[u32], loads: &[u32]) -> Option<usize>
+    {
+        rt_push_target(
+            this_cpu,
+            ranks.len(),
+            0,
+            level,
+            |cpu| ranks[cpu],
+            |cpu| loads[cpu],
+            |_| 0,
+        )
+        .target
+    }
+
+    /// Run missed scans of `cpu_count` CPUs from `this_cpu` with its cursor
+    /// at `start`, every other CPU ranking at or above the thread's level, as
+    /// the tick does (the cursor moves to each scan's `next`); return the
+    /// number of ticks until every other CPU was read, or `None` if `ticks`
+    /// did not suffice or `this_cpu` was read.
+    fn ticks_to_visit_all(
+        cpu_count: usize,
+        this_cpu: usize,
+        start: usize,
+        ticks: usize,
+    ) -> Option<usize>
+    {
+        let level = RT_PRIORITY_MIN;
+        let above = run_queue::level_rank(RT_PRIORITY_MIN + 1);
+        let read = core::cell::RefCell::new(vec![false; cpu_count]);
+        let unread = core::cell::Cell::new(cpu_count - 1);
+        let mut cursor = start;
+        for tick in 1..=ticks
+        {
+            let scan = rt_push_target(
+                this_cpu,
+                cpu_count,
+                cursor,
+                level,
+                |cpu| {
+                    let mut read = read.borrow_mut();
+                    if !read[cpu]
+                    {
+                        read[cpu] = true;
+                        unread.set(unread.get() - 1);
+                    }
+                    above
+                },
+                |_| 0,
+                |_| 0,
+            );
+            if scan.target.is_some() || read.borrow()[this_cpu]
+            {
+                return None;
+            }
+            cursor = scan.next;
+            if unread.get() == 0
+            {
+                return Some(tick);
+            }
+        }
+        None
+    }
+
+    // Defect caught: a scan that reads more than RT_PUSH_SCAN_CPUS CPUs, so a
+    // tick's cost grows with the CPU count, or a cursor that skips or
+    // revisits CPUs, so a CPU running lower is not found within
+    // ceil((n - 1) / RT_PUSH_SCAN_CPUS) ticks, the bound scheduler.md states.
+    #[test]
+    fn missed_scans_read_every_other_cpu_within_one_tick_per_window()
+    {
+        for cpu_count in [2, RT_PUSH_SCAN_CPUS + 1, RT_PUSH_SCAN_CPUS + 2, MAX_CPUS]
+        {
+            let bound = (cpu_count - 1).div_ceil(RT_PUSH_SCAN_CPUS);
+            let this_cpus = [0, cpu_count / 2, cpu_count - 1];
+            for this_cpu in this_cpus
+            {
+                for start in 0..cpu_count
+                {
+                    assert_eq!(
+                        ticks_to_visit_all(cpu_count, this_cpu, start, bound),
+                        Some(bound),
+                        "n={cpu_count} cpu={this_cpu} start={start}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Defect caught: a scan that reads past its window (a cost that grows
+    // with the CPU count) or a cursor that does not move after a miss.
+    #[test]
+    fn one_scan_reads_at_most_one_window_and_moves_past_it()
+    {
+        let cpu_count = 3 * RT_PUSH_SCAN_CPUS;
+        let reads = core::cell::Cell::new(0usize);
+        let above = run_queue::level_rank(RT_PRIORITY_MIN + 1);
+        let scan = rt_push_target(
+            5,
+            cpu_count,
+            0,
+            RT_PRIORITY_MIN,
+            |_| {
+                reads.set(reads.get() + 1);
+                above
+            },
+            |_| 0,
+            |_| 0,
+        );
+        assert_eq!(reads.get(), RT_PUSH_SCAN_CPUS);
+        assert_eq!(
+            scan,
+            PushScan {
+                target: None,
+                next: RT_PUSH_SCAN_CPUS + 1
+            }
+        );
+        // A CPU running lower past the window is found by the next scan.
+        let fair = run_queue::level_rank(syscall::PRIORITY_MIN);
+        let rank = |cpu: usize| {
+            if cpu == 2 * RT_PUSH_SCAN_CPUS
+            {
+                fair
+            }
+            else
+            {
+                above
+            }
+        };
+        let first = rt_push_target(5, cpu_count, 0, RT_PRIORITY_MIN, rank, |_| 0, |_| 0);
+        assert_eq!(first.target, None);
+        let second = rt_push_target(
+            5,
+            cpu_count,
+            first.next,
+            RT_PRIORITY_MIN,
+            rank,
+            |_| 0,
+            |_| 0,
+        );
+        assert_eq!(second.target, Some(2 * RT_PUSH_SCAN_CPUS));
+    }
+
+    // Defect caught: a push to a CPU whose effective rank is at or above the
+    // thread's level, where it waits again, or a push to its own CPU.
+    #[test]
+    fn a_push_goes_only_to_another_cpu_that_ranks_below_the_thread()
+    {
+        let level = RT_PRIORITY_MIN + 3;
+        let own = run_queue::level_rank(level);
+        let above = run_queue::level_rank(RT_PRIORITY_MIN + 7);
+        assert_eq!(target(0, level, &[0, own, above], &[0, 0, 0]), None);
+        assert_eq!(
+            target(1, level, &[own, above, own - 1], &[0, 0, 0]),
+            Some(2)
+        );
+        assert_eq!(target(0, level, &[0], &[0]), None);
+    }
+
+    // Defect caught: a target choice that differs from the RT wake's
+    // placement: not the lowest rank, a tie not to the lower load, or a full
+    // tie not to the lowest index.
+    #[test]
+    fn a_push_takes_the_lowest_rank_then_the_lower_load_then_the_lowest_index()
+    {
+        let level = RT_PRIORITY_MIN + 5;
+        let fair = run_queue::level_rank(syscall::PRIORITY_MIN);
+        let rt = run_queue::level_rank(RT_PRIORITY_MIN);
+        assert_eq!(target(0, level, &[0, rt, fair, rt], &[0, 0, 4, 0]), Some(2));
+        assert_eq!(target(0, level, &[0, fair, 0, 0], &[0, 0, 3, 1]), Some(3));
+        assert_eq!(
+            target(3, level, &[fair, fair, 0, 0], &[1, 1, 1, 1]),
+            Some(2)
+        );
     }
 }
 

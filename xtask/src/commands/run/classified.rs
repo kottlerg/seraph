@@ -41,7 +41,7 @@ use crate::cli::{CrashReportExpect, RunArgs};
 use crate::context::Context as BuildContext;
 use crate::crash_log::{SysrootImages, symbolize_log};
 use crate::disk::{logical_block_size, second_disk_block_size};
-use crate::qemu::{Execution, QemuDisplay};
+use crate::qemu::{Execution, InterruptRemapping, QemuDisplay, X86Irqchip};
 use crate::qemu::{
     Firmware, GdbMode, QemuLaunchSpec, SecondDisk, SecondSlot, build_qemu_argv_for,
     validate_sysroot_for_launch,
@@ -157,6 +157,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
     };
     let focus = check_focus(image_selection(&harnesses, recorded.as_deref()), accepted)?;
     let markers = Markers::for_image(args, &harnesses, focus)?;
+    let interrupt_remapping = InterruptRemapping::for_image(&harnesses);
     // Held until the command returns, after the last wave's QEMUs have
     // exited; a wave runs `--parallel` QEMUs side by side.
     let _host =
@@ -164,7 +165,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
     let (Some(target), Some(port)) = (&args.launch.debug_target, args.launch.debug_port)
     else
     {
-        return run_waves(ctx, args, runs, display, &markers);
+        return run_waves(ctx, args, runs, display, &markers, interrupt_remapping);
     };
     // The stub is staged into `disk.img` before the slots copy it, and
     // unstaged after the last run, whatever its outcome.
@@ -174,7 +175,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
         "GDB stub staged for {target}; connect with:\n    {}",
         crate::debug_stub::gdb_command(args.launch.arch, port, binary.as_deref())
     ));
-    let ran = run_waves(ctx, args, runs, display, &markers);
+    let ran = run_waves(ctx, args, runs, display, &markers, interrupt_remapping);
     crate::debug_stub::unstage(ctx, args.launch.arch, layout)?;
     ran
 }
@@ -192,6 +193,7 @@ fn run_waves(
     runs: u32,
     display: QemuDisplay,
     markers: &Markers,
+    interrupt_remapping: InterruptRemapping,
 ) -> Result<()>
 {
     let checks = Arc::new(PassChecks::new(
@@ -222,11 +224,17 @@ fn run_waves(
     let accel = execution.accel(args.launch.arch).name();
 
     step(&format!(
-        "Starting run: arch={:?} parallel={} runs={} timeout={}s workdir={}",
+        "Starting run: arch={:?} parallel={} runs={} timeout={}s{} workdir={}",
         args.launch.arch,
         args.parallel,
         runs,
         args.timeout,
+        X86Irqchip::launch_field(
+            args.launch.arch,
+            args.launch.iommu,
+            interrupt_remapping,
+            execution
+        ),
         workdir.display()
     ));
 
@@ -350,6 +358,7 @@ fn run_waves(
                     x86_paging,
                     x86_shadow_stack,
                     iommu,
+                    interrupt_remapping,
                     debug_port,
                     test_devices,
                     hotplug_port: None,

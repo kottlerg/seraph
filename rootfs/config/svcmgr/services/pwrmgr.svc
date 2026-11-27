@@ -8,7 +8,7 @@
 #     recipes that seed it hold it.
 #   * pwrmgr.deny:deny    — a no-authority twin (sentinel token 1) that the
 #     SHUTDOWN/REBOOT gate rejects; svctest uses it to assert the deny path.
-# `seed = devmgr.shutdown acpid.power` delivers cap[1] and cap[2]:
+# `seed = devmgr.shutdown acpid.power logd.flush` delivers cap[1] to cap[3]:
 #   * devmgr.shutdown — the REGISTRY_QUERY_AUTHORITY |
 #     SHUTDOWN_DEVICE_AUTHORITY-tokened SEND on devmgr's registry; on
 #     RISC-V pwrmgr acquires its SbiControl through QUERY_SHUTDOWN_DEVICE.
@@ -18,7 +18,13 @@
 #     and waits in its WAIT_EVENT for the power button
 #     (services/acpid/README.md § Power requests). svcmgr launches acpid
 #     before pwrmgr because of this seed.
-# Each architecture deletes the seed it does not use. devmgr is the hardware
+#   * logd.flush — the LOG_FLUSH_AUTHORITY-tokened SEND on the master log
+#     endpoint, which svcmgr mints itself; pwrmgr waits on logd's flush
+#     barrier before every power-off and reset, so the lines logged before it
+#     reach the serial console (services/logd/docs/ipc-interface.md § Flush
+#     barrier). pwrmgr is the only service recipe seeding it.
+# Each architecture deletes the one of devmgr.shutdown and acpid.power it does
+# not use. devmgr is the hardware
 # authority and acpid holds the ACPI registers; on x86-64 pwrmgr also holds a
 # derivation from acpid's QUERY_SLEEP of its capability over PM1a_CNT, or
 # over SLEEP_CONTROL_REG on a hardware-reduced platform, for its core-death
@@ -32,7 +38,7 @@
 # shutdown actuator: when a `critical = yes` service is permanently down,
 # svcmgr calls SHUTDOWN through a SEND it derives from pwrmgr's endpoint
 # with the `pwrmgr.shutdown` entry's SHUTDOWN_AUTHORITY badge, and serves
-# pwrmgr as cap[3] the RECV-only derivation of the core-death queue, on
+# pwrmgr as cap[4] the RECV-only derivation of the core-death queue, on
 # which pwrmgr observes the death of svcmgr, memmgr and procmgr and powers
 # the platform off. svcmgr creates pwrmgr pinned (CREATE_PINNED) for this role.
 # `critical = no`: a permanently-dead pwrmgr cannot power the system off,
@@ -44,5 +50,5 @@ restart           = on_failure
 critical          = no
 namespace         = none
 provides          = pwrmgr.shutdown:auth pwrmgr.deny:deny
-seed              = devmgr.shutdown acpid.power
+seed              = devmgr.shutdown acpid.power logd.flush
 shutdown_actuator = pwrmgr.shutdown

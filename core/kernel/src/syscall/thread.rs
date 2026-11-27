@@ -2527,6 +2527,51 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
     Ok(handle1)
 }
 
+/// `SYS_THREAD_SET_RUN_LIMIT` (78): set a thread's run limit.
+///
+/// arg0 = Thread cap index (must have CONTROL).
+/// arg1 = `SchedControl` cap index (presence only, as for the RT class of
+/// `SYS_THREAD_SET_PRIORITY`).
+/// arg2 = Limit in timer ticks, 0 for none; at most `u32::MAX`.
+///
+/// Sets the limit, sets the thread's count to zero and drops a run-limit fault
+/// pending on it (core/kernel/docs/scheduler.md § Run Limit).
+///
+/// Returns 0 on success.
+#[cfg(not(test))]
+pub fn sys_thread_set_run_limit(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::slot::{SchedRights, ThreadRights};
+    use crate::syscall::current_tcb;
+
+    let thread_idx = tf.arg(0);
+    let sched_idx = tf.arg(1);
+    // Validate the full 64-bit argument: a value above u32 is out of range,
+    // not its low word.
+    let limit = u32::try_from(tf.arg(2)).map_err(|_| SyscallError::InvalidArgument)?;
+
+    // SAFETY: current_tcb() returns the current thread in syscall context.
+    let caller_tcb = unsafe { current_tcb() };
+    if caller_tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: caller_tcb validated non-null; cspace set at thread creation.
+    let caller_cspace = unsafe { (*caller_tcb).cspace };
+
+    // Setting a limit requires a SchedControl cap. Presence-only: no rights
+    // bit and no band to check.
+    // SAFETY: caller_cspace validated; lookup_cap checks the tag.
+    let _sched = unsafe { super::lookup_cap(caller_cspace, sched_idx, SchedRights::NONE) }?;
+    // SAFETY: caller_cspace validated; thread_with_rights checks tag and rights.
+    let (_pin, target_tcb) =
+        unsafe { thread_with_rights(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
+
+    // SAFETY: target_tcb is a valid TCB the pin keeps live; no lock is held.
+    unsafe { crate::sched::run_limit::set(target_tcb, limit) };
+    Ok(0)
+}
+
 /// `SYS_THREAD_SET_AFFINITY` (38): set a thread's CPU affinity.
 ///
 /// arg0 = Thread cap index (must have CONTROL).

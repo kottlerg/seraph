@@ -478,7 +478,8 @@ pub const CAP_INFO_SOLE_REFERENCE: u64 = 13;
 /// Returns `0` while the address space has not ended, and otherwise
 /// [`ASPACE_ENDED`] `|` the reason of its first terminal end, which a later
 /// end does not overwrite: a terminal fault of any of its threads
-/// ([`EXIT_FAULT_BASE`] + vector or cause) or a `SYS_ASPACE_EXIT` by any of
+/// ([`EXIT_FAULT_BASE`] + vector or cause, or [`EXIT_RUN_LIMIT`]) or a
+/// `SYS_ASPACE_EXIT` by any of
 /// them (the encoded exit code, `0` for a clean exit, so the flag, not the
 /// reason, tells an ended space from a running one). [`aspace_end_reason`]
 /// decodes the answer. The reason is the one an
@@ -593,8 +594,8 @@ pub const THREAD_PLACEMENT_IDLE_WAKES: u64 = 2;
 /// [`CAP_INFO_THREAD_PLACEMENT`] view: wakes that linked the thread on a CPU
 /// other than the one it was last on.
 pub const THREAD_PLACEMENT_WAKE_MOVES: u64 = 3;
-/// [`CAP_INFO_THREAD_PLACEMENT`] view: times the load balancer moved the
-/// thread, queued, to another CPU.
+/// [`CAP_INFO_THREAD_PLACEMENT`] view: times the load balancer or the RT push
+/// moved the thread, queued, to another CPU.
 pub const THREAD_PLACEMENT_PULLS: u64 = 4;
 /// [`CAP_INFO_THREAD_PLACEMENT`] view: wakes of the thread by a synchronous
 /// IPC call, a fault delivery, or the reply of a `SYS_IPC_REPLY_RECV` to a
@@ -782,11 +783,15 @@ pub const SYS_KERNEL_LOG_BIND: u64 = 76;
 /// endpoint as `SYS_IPC_RECV` does, in one syscall. See
 /// `core/kernel/docs/syscalls.md` § `SYS_IPC_REPLY_RECV` (77).
 pub const SYS_IPC_REPLY_RECV: u64 = 77;
+/// Thread: set a thread's run limit, the timer ticks it may run between two
+/// reset points before the kernel raises [`FAULT_EXC_RUN_LIMIT`] on it. See
+/// `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_RUN_LIMIT` (78).
+pub const SYS_THREAD_SET_RUN_LIMIT: u64 = 78;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_IPC_REPLY_RECV + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_THREAD_SET_RUN_LIMIT + 1;
 
 // ── Kernel log records ──────────────────────────────────────────────────────
 
@@ -1575,7 +1580,8 @@ const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 //   |                   |                     | `SYS_ASPACE_EXIT(0)`)              |
 //   | `1 ..= 0x0FFF`    | Voluntary, code     | `SYS_ASPACE_EXIT(code)`, where     |
 //   |                   |                     | reason == `encode_exit_code(code)` |
-//   | `0x1000 ..0x2000` | Fault               | `EXIT_FAULT_BASE + vector/cause`   |
+//   | `0x1000 ..0x2000` | Fault               | `EXIT_FAULT_BASE + vector/cause`,  |
+//   |                   |                     | or `EXIT_RUN_LIMIT`                |
 //   | `0x2000`          | Killed              | `EXIT_KILLED`: recorded by         |
 //   |                   |                     | object teardown (not posted by     |
 //   |                   |                     | it); posted by procmgr for a       |
@@ -1593,6 +1599,12 @@ pub const EXIT_VOLUNTARY: u64 = 0;
 /// range `[1, EXIT_FAULT_BASE)` below it, so a fault and an exit code can never
 /// alias.
 pub const EXIT_FAULT_BASE: u64 = 0x1000;
+
+/// Exit reason of a thread an unhandled run-limit fault
+/// ([`FAULT_EXC_RUN_LIMIT`]) ended. The fault is raised by the kernel, not by
+/// a vector or a cause, so it takes a value in the fault range past every
+/// x86-64 vector (below 256) and every RISC-V exception cause (below 64).
+pub const EXIT_RUN_LIMIT: u64 = EXIT_FAULT_BASE + 0x100;
 
 /// Exit reason of a thread killed rather than exited or faulted. The kernel
 /// records it as the retained reason of every thread it stops when the last
@@ -1766,6 +1778,14 @@ pub const FAULT_EXC_ACCESS: u64 = 8;
 pub const FAULT_EXC_PROTECTION: u64 = 9;
 /// Normalized exception: floating-point / SIMD error (x86-64 `#MF` / `#XM`).
 pub const FAULT_EXC_FP: u64 = 10;
+/// Normalized exception: the thread ran past its run limit
+/// ([`SYS_THREAD_SET_RUN_LIMIT`]). Raised by the kernel's timer tick, not by
+/// the CPU, on both architectures: `arch_aux_code` is 0, and the instruction
+/// pointer is where the thread returns to user mode, except on RISC-V at a
+/// syscall's return, where it names the `ecall`, which the kernel steps past on
+/// resume unless the handler wrote another `pc` (`docs/fault-handling.md`
+/// § Run-Limit Faults). A handler that resumes the thread gives it a fresh limit.
+pub const FAULT_EXC_RUN_LIMIT: u64 = 11;
 
 /// Fault reply label: resume the faulting thread (re-execute the faulting
 /// instruction, or the syscall whose user copy faulted, or continue from a

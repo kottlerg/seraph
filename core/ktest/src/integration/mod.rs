@@ -68,8 +68,10 @@ pub mod reply_recv_placement;
 pub mod return_work;
 pub mod retype_over_mapped_refused;
 pub mod retype_reclaim;
+pub mod rt_push_waiting;
 pub mod rt_wake_placement;
 pub mod rt_wake_preempt;
+pub mod run_limit;
 pub mod shared_memory_two_aspaces;
 pub mod smt_siblings;
 pub mod stop_read_regs_remote;
@@ -225,6 +227,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::idle_pull_starved_ready",
         idle_pull_starved_ready::run(ctx)
     );
+    run_integration_test!("integration::rt_push_waiting", rt_push_waiting::run(ctx));
     run_integration_test!("integration::smt_siblings", smt_siblings::run(ctx));
     run_integration_test!(
         "integration::busy_cpu_placement",
@@ -287,6 +290,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::fault_handler_declines_kills",
         fault_handler_declines_kills::run(ctx)
     );
+    run_integration_test!("integration::run_limit", run_limit::run(ctx));
     run_integration_test!("integration::fault_forward", fault_forward::run(ctx));
     run_integration_test!("integration::fault_redirect", fault_redirect::run(ctx));
     run_integration_test!(

@@ -421,7 +421,14 @@ fn an_unrecognized_exception_code_is_the_unknown_class()
         exception_name(syscall_abi::FAULT_EXC_PROTECTION),
         "protection"
     );
-    assert_eq!(exception_name(syscall_abi::FAULT_EXC_FP + 1), "unknown");
+    assert_eq!(
+        exception_name(syscall_abi::FAULT_EXC_RUN_LIMIT),
+        "run-limit"
+    );
+    assert_eq!(
+        exception_name(syscall_abi::FAULT_EXC_RUN_LIMIT + 1),
+        "unknown"
+    );
 }
 
 #[test]

@@ -1843,7 +1843,8 @@ fn scrub_child_main() -> !
 /// region of [`SCRUB_PAGES`] pages each with [`SCRUB_MARKER`] and exits
 /// holding both, so memmgr reclaims them when it dies. Once memmgr's free
 /// total is back, svctest draws [`SCRUB_DRAWS`] contiguous grants of the same
-/// size, which best fit takes from the runs the death returned, and reads a
+/// size, which the pool's size-class fit takes from the runs the death
+/// returned, and reads a
 /// fresh demand region of [`SCRUB_DEMAND_PAGES`] pages.
 ///
 /// The release path through the deferred list: svctest fills a one-page grant,

@@ -70,6 +70,7 @@ pub const fn key_of(node: &Node) -> Option<u64>
         | Node::Reclaim(_)
         | Node::Holder(_)
         | Node::Run(_)
+        | Node::Pooled(_)
         | Node::Deferred(_)
         | Node::Budget(_)
         | Node::Region(_)
@@ -189,18 +190,19 @@ impl<W: WordStore> ProcessIndex<W>
         }
     }
 
+    /// The live bucket of `badge`: its bucket at this round's level, or at
+    /// the next level once that bucket is split. Chosen by mask, so the steps
+    /// do not follow whether the badge's bucket has split.
     fn bucket_of(&self, badge: u64) -> u64
     {
         let h = hash(badge);
-        let b = h & self.level.saturating_sub(1);
-        if b < self.split
-        {
-            h & self.level.saturating_mul(2).saturating_sub(1)
-        }
-        else
-        {
-            b
-        }
+        // `level` is a power of two, at least 1, so the low mask does not wrap.
+        let b = h & self.level.wrapping_sub(1);
+        // A split bucket's badges add the next hash bit, `level`'s own. Kept
+        // as one AND with a mask rather than a choice between two values,
+        // which a target without a conditional move compiles to a branch.
+        let split = u64::from(b < self.split).wrapping_neg();
+        b | (h & self.level & split)
     }
 
     /// The slot keyed by `badge`: a record or a handle state ([`key_of`]).
@@ -219,6 +221,47 @@ impl<W: WordStore> ProcessIndex<W>
             {
                 Some(key) if key == badge => return Some(cur),
                 Some(_) => cur = slot.next,
+                None => return None,
+            }
+        }
+        None
+    }
+
+    /// The slot keyed by `badge`, as [`ProcessIndex::find`], moved to the
+    /// head of its bucket's chain, so a later lookup of the same key reads
+    /// one slot of the chain whatever keys collided with it before. For the
+    /// lookups a process repeats on its hot paths (a fault, a grant), whose
+    /// cost then does not follow where the random badges placed its slot.
+    pub fn find_front<S: SlotStore>(&mut self, arena: &mut Arena<S>, badge: u64)
+    -> Option<NodeIdx>
+    {
+        if self.capacity == 0
+        {
+            return None;
+        }
+        let b = self.bucket_of(badge);
+        let mut prev = NODE_NULL;
+        let mut cur = self.head(b);
+        while cur != NODE_NULL
+        {
+            let slot = arena.get(cur);
+            match key_of(&slot.node)
+            {
+                Some(key) if key == badge =>
+                {
+                    if prev != NODE_NULL
+                    {
+                        arena.set_next(prev, slot.next);
+                        arena.set_next(cur, self.head(b));
+                        self.set_head(b, cur);
+                    }
+                    return Some(cur);
+                }
+                Some(_) =>
+                {
+                    prev = cur;
+                    cur = slot.next;
+                }
                 None => return None,
             }
         }
@@ -443,6 +486,37 @@ mod tests
             assert_eq!(ix.find(&a, b), Some(s));
         }
         assert!(ix.find(&a, 0xDEAD).is_none());
+    }
+
+    #[test]
+    fn find_front_moves_the_found_slot_to_its_chain_head_and_keeps_the_rest()
+    {
+        // Three keys of one hash parity share a bucket while there are two.
+        let (mut a, mut ix) = setup();
+        let badges: Vec<u64> = (1u64..).filter(|&b| hash(b) & 1 == 0).take(3).collect();
+        let slots: Vec<NodeIdx> = badges.iter().map(|&b| insert(&mut a, &mut ix, b)).collect();
+        assert_eq!(ix.buckets(), 2);
+        let bucket = ix.bucket_of(badges[0]);
+        // The chain's last slot, whatever order the inserts and splits left.
+        let mut last = ix.head(bucket);
+        while a.get(last).next != NODE_NULL
+        {
+            last = a.get(last).next;
+        }
+        assert_ne!(ix.head(bucket), last);
+        let key = badges[slots.iter().position(|&s| s == last).unwrap()];
+        assert_eq!(ix.find_front(&mut a, key), Some(last));
+        assert_eq!(ix.head(bucket), last);
+        // A miss changes nothing.
+        assert_eq!(ix.find_front(&mut a, 0xDEAD), None);
+        assert_eq!(ix.head(bucket), last);
+        for (&b, &s) in badges.iter().zip(&slots)
+        {
+            assert_eq!(ix.find(&a, b), Some(s));
+        }
+        let mut seen = 0;
+        ix.for_each(&a, |_| seen += 1);
+        assert_eq!(seen, 3);
     }
 
     #[test]

@@ -93,9 +93,9 @@ use crate::error::{Context as _, Result, bail};
 use crate::guest::{QemuStderr, explain_exit};
 use crate::qemu::{
     EDU_DMA_MASK, Firmware, GdbMode, HOTPLUG_DISK_PORT_ID, HOTPLUG_PORT_ID, HotplugControl,
-    HotplugPort, Iommu, PORT_DISK_ID, PORT_DISK_LOCATION, PortDisk, QemuDisplay, QemuLaunchSpec,
-    RiscvMmu, RiscvZkr, SecondDisk, X86Paging, X86ShadowStack, build_qemu_argv,
-    port_disk_properties, validate_sysroot_for_launch,
+    HotplugPort, InterruptRemapping, Iommu, PORT_DISK_ID, PORT_DISK_LOCATION, PortDisk,
+    QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging, X86ShadowStack,
+    build_qemu_argv, port_disk_properties, validate_sysroot_for_launch,
 };
 use crate::qmp::{self, Property};
 use crate::socket_dir::SocketDir;
@@ -459,6 +459,7 @@ fn boot(
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
         iommu: IOMMU,
+        interrupt_remapping: InterruptRemapping::for_sysroot(ctx),
         debug_port: None,
         test_devices: false,
         hotplug_port: Some(port),

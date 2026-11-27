@@ -285,7 +285,7 @@ pub struct AddressSpace
     /// (core/kernel/docs/thread-lifecycle-and-sleep.md § Address-Space Hold).
     hold: AtomicU8,
     /// Retained terminal-end reason, valid when `ended`: `EXIT_FAULT_BASE +
-    /// vector` for a fault, the encoded exit code (`0` for a clean exit) for
+    /// vector` or `EXIT_RUN_LIMIT` for a fault, the encoded exit code (`0` for a clean exit) for
     /// an exit. Owned by `death_lock`.
     end_reason: u64,
 }
@@ -905,8 +905,8 @@ impl AddressSpace
         first
     }
 
-    /// The retained terminal-end reason (`EXIT_FAULT_BASE + vector` for a
-    /// fault, the encoded exit code for an exit, `0` among them), or `None`
+    /// The retained terminal-end reason (`EXIT_FAULT_BASE + vector` or
+    /// `EXIT_RUN_LIMIT` for a fault, the encoded exit code for an exit, `0` among them), or `None`
     /// while this address space has not ended. Read under `death_lock`, so it
     /// never sees the flag without its reason. Backs `SYS_CAP_INFO`'s
     /// `CAP_INFO_ASPACE_END`.

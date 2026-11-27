@@ -3,22 +3,23 @@
 
 // core/ktest/src/bench/ipc.rs
 
-//! Synchronous IPC round-trip benchmark, in three message sizes and one case
+//! Synchronous IPC round-trip benchmark, in six message sizes and one case
 //! that uses the vector registers.
 //!
 //! Each case spawns one child caller that loops `ipc_call`; the parent loops
 //! `ipc_recv` / `ipc_reply`, the request and the reply carrying the case's
 //! number of data words. Per-iteration bracketing on the parent side. The
 //! cases, the variant `words=` of the `ipc_round_trip` line, are an empty
-//! message, the largest message the message registers carry, and one word
-//! more, which travels in the IPC buffer page (docs/ipc-design.md § Message
-//! Format). ktest is soft-float, so none of these touches the FPU. The fourth
+//! message, one word, the largest message the message registers carry, one
+//! word more, which travels in the IPC buffer page (docs/ipc-design.md
+//! § Message Format), 16 words, and the largest message, `MSG_DATA_WORDS_MAX`
+//! words. ktest is soft-float, so none of these touches the FPU. The next
 //! case, `words=0 fpu=both`, is the empty message with each side writing and
 //! reading one vector register per round trip, as every std-built thread does
 //! through its SIMD copies: the line without `fpu=` minus this one is the cost
 //! of the FPU and vector state on the IPC path.
 //!
-//! A sixth case, `words=0 server=reply_recv`, is the empty message served by
+//! The last case, `words=0 server=reply_recv`, is the empty message served by
 //! `ipc_reply_recv`: each sample is one reply-and-receive, the reply to one call
 //! and the receive of the next (core/kernel/docs/syscalls.md
 //! § `SYS_IPC_REPLY_RECV`); the line without `server=` minus this one is what
@@ -162,9 +163,14 @@ struct Case
 }
 
 /// The cases.
-const CASES: [Case; 5] = [
+const CASES: [Case; 8] = [
     Case {
         words: 0,
+        fpu: Fpu::None,
+        serve: Serve::RecvReply,
+    },
+    Case {
+        words: 1,
         fpu: Fpu::None,
         serve: Serve::RecvReply,
     },
@@ -175,6 +181,16 @@ const CASES: [Case; 5] = [
     },
     Case {
         words: REG_WORDS + 1,
+        fpu: Fpu::None,
+        serve: Serve::RecvReply,
+    },
+    Case {
+        words: 16,
+        fpu: Fpu::None,
+        serve: Serve::RecvReply,
+    },
+    Case {
+        words: syscall_abi::MSG_DATA_WORDS_MAX,
         fpu: Fpu::None,
         serve: Serve::RecvReply,
     },
@@ -190,11 +206,8 @@ const CASES: [Case; 5] = [
     },
 ];
 
-/// The largest message the message registers carry. A literal, so the bench
-/// builds unchanged at a head before `MSG_REGS_DATA_MAX` existed, for a
-/// before-and-after comparison; the assertion keeps the two equal.
-const REG_WORDS: usize = 6;
-const _: () = assert!(REG_WORDS == syscall_abi::MSG_REGS_DATA_MAX);
+/// The largest message the message registers carry.
+const REG_WORDS: usize = syscall_abi::MSG_REGS_DATA_MAX;
 
 /// One caller child's stack per case, so a case's child never shares a stack
 /// with the previous case's, which may still be on its way to exit.

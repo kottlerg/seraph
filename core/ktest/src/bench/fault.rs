@@ -207,7 +207,7 @@ fn bench_side(ctx: &crate::TestContext, h: &mut Harness, side: Side)
         );
     };
     let pages = (h.iters() as usize).min(FAULT_PAGES);
-    let unmapped = match make_leaf_tables(ctx, frame, pages)
+    match make_leaf_tables(ctx, frame, pages)
     {
         Ok(()) => match spawn::new_child(ctx)
         {
@@ -221,24 +221,17 @@ fn bench_side(ctx: &crate::TestContext, h: &mut Harness, side: Side)
                 // a fault after an early stop.
                 child.delete_thread().ok();
                 child.delete_cspace().ok();
-                // SAFETY: the range is the scratch pages this benchmark maps,
-                // which hold no Rust object, and the child that stored to them
-                // is gone.
-                unsafe { syscall::mem_unmap_reclaim(ctx.aspace_cap, FAULT_VA, pages as u64) }
-                    .is_ok()
             }
-            Err(e) =>
-            {
-                h.skip(NAME, format_args!("placement={word}: {e}"));
-                true
-            }
+            Err(e) => h.skip(NAME, format_args!("placement={word}: {e}")),
         },
-        Err(e) =>
-        {
-            h.skip(NAME, format_args!("placement={word}: {e}"));
-            true
-        }
-    };
+        Err(e) => h.skip(NAME, format_args!("placement={word}: {e}")),
+    }
+    // Unmap the range and reclaim its leaf tables on every path, a failed
+    // table pass's included, which can leave `frame` mapped at a page.
+    // SAFETY: the range is the scratch pages this benchmark maps, which hold
+    // no Rust object, and any child that stored to them is gone.
+    let unmapped =
+        unsafe { syscall::mem_unmap_reclaim(ctx.aspace_cap, FAULT_VA, pages as u64) }.is_ok();
     // A frame an unmap left mapped stays out of the pool rather than alias the
     // next test's mapping.
     if unmapped

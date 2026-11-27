@@ -1291,8 +1291,8 @@ The wait is a monitored wait on the CPU's idle wake word where every CPU has one
 `HART_CAP_ZAWRS`, [docs/platform-requirements.md](../../../docs/platform-requirements.md)).
 The boot CPU chooses it once, before any other CPU starts
 (`arch::current::cpu::init_idle_wait`, which logs `idle: wait mwait`, `hlt`, `wrs.nto` or
-`wfi`). The word (`PerCpuScheduler`'s `IdleWake`, alone in its cache line) holds a polling
-flag:
+`wfi`). The word (an `IdleWake`, alone in its cache line in a per-CPU slab beside the scheduler)
+holds a polling flag:
 
 - With interrupts masked, the idle thread sets the flag before its run-queue check. Finding work,
   it clears the flag before it runs anything else. Finding none, it arms the wait on the word

@@ -191,6 +191,39 @@ unsafe fn scheduler_ptr(cpu: usize) -> *mut PerCpuScheduler
     unsafe { base.add(cpu) }
 }
 
+/// Base pointer for the `[IdleWake; cpu_count]` array of idle wake words,
+/// allocated in [`init_per_cpu_storage`]: slot `cpu` is the word CPU `cpu`'s
+/// idle thread waits on with the monitored wait
+/// (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants). A slab
+/// of its own, one cache line per CPU, keeps each word alone in its line and
+/// leaves `PerCpuScheduler`'s size, the stride of every `scheduler_for`, as it
+/// is.
+#[cfg(not(test))]
+static IDLE_WAKES_PTR: core::sync::atomic::AtomicPtr<idle_wake::IdleWake> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Return CPU `cpu`'s idle wake word.
+///
+/// # Safety
+/// As [`scheduler_ptr`]: `cpu < CPU_COUNT`, and [`init_per_cpu_storage`] has
+/// run.
+#[cfg(not(test))]
+#[inline]
+unsafe fn idle_wake_for(cpu: usize) -> &'static idle_wake::IdleWake
+{
+    let base = IDLE_WAKES_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(
+        !base.is_null(),
+        "idle_wake_for: IDLE_WAKES_PTR not initialised"
+    );
+    // SAFETY: cpu < cpu_count by caller contract; the slab covers cpu_count
+    // words.
+    let slot = unsafe { base.add(cpu) };
+    // SAFETY: init_per_cpu_storage initialised every word before publishing
+    // the slab, which is never freed.
+    unsafe { &*slot }
+}
+
 /// Return the idle-TCB slot pointer for `cpu`.
 ///
 /// # Safety
@@ -2797,7 +2830,9 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             // IPI; a waker before here found it clear and sent the IPI, which
             // the masking holds pending until the wait.
             // See core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants.
-            let wake = idle_sched.idle_wake();
+            // SAFETY: current_cpu() is this CPU's index, below CPU_COUNT, and
+            // the idle thread runs only after init_per_cpu_storage.
+            let wake = unsafe { idle_wake_for(crate::arch::current::cpu::current_cpu() as usize) };
             let monitored = crate::arch::current::cpu::idle_wait_available();
             if monitored
             {
@@ -3106,6 +3141,14 @@ const _: () = assert!(
     "LAST_NON_IDLE_TICK slab overflows"
 );
 
+/// The idle-wake slab: one [`idle_wake::IdleWake`] word, in its own cache line,
+/// per CPU.
+const IDLE_WAKES_SLAB: PerCpuSlab = PerCpuSlab::of::<idle_wake::IdleWake>("IDLE_WAKES");
+const _: () = assert!(
+    IDLE_WAKES_SLAB.sized_at_every_width(),
+    "IDLE_WAKES slab overflows"
+);
+
 /// The diagnostic-record slab: one [`CpuDiag`] per CPU.
 const CPU_DIAG_SLAB: PerCpuSlab = PerCpuSlab::of::<CpuDiag>("CPU_DIAG");
 const _: () = assert!(
@@ -3243,6 +3286,18 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     let tick_ptr =
         alloc_per_cpu_slab::<core::sync::atomic::AtomicU64>(LAST_NON_IDLE_TICK_SLAB, n, allocator);
     LAST_NON_IDLE_TICK_PTR.store(tick_ptr, core::sync::atomic::Ordering::Release);
+
+    // Per-CPU idle wake words, every flag clear.
+    let wake_ptr = alloc_per_cpu_slab::<idle_wake::IdleWake>(IDLE_WAKES_SLAB, n, allocator);
+    for cpu in 0..n
+    {
+        // SAFETY: the slab covers n words; cpu < n.
+        let slot = unsafe { wake_ptr.add(cpu) };
+        // SAFETY: slot is an aligned slot of the fresh slab, which nothing
+        // else reaches before IDLE_WAKES_PTR is published below.
+        unsafe { core::ptr::write(slot, idle_wake::IdleWake::new()) };
+    }
+    IDLE_WAKES_PTR.store(wake_ptr, core::sync::atomic::Ordering::Release);
 
     // Per-CPU diagnostic records. Zero is every field's idle value, the
     // idle-halt count's included, except the last-syscall stamp, whose "none
@@ -7882,9 +7937,9 @@ unsafe fn wake_idle_cpu(target_cpu: usize)
     if crate::arch::current::cpu::idle_wait_available()
     {
         // SAFETY: target_cpu is a valid online CPU index (caller contract), so
-        // its scheduler is initialised.
-        let target = unsafe { scheduler_for(target_cpu) };
-        if target.idle_wake().wake()
+        // its idle wake word is initialised.
+        let target = unsafe { idle_wake_for(target_cpu) };
+        if target.wake()
         {
             return;
         }
@@ -8157,7 +8212,9 @@ pub unsafe fn schedule(requeue: Requeue)
     // return work runs only on a return to user mode). A flag left set here
     // would let wakers skip the IPI a running thread's preemption needs.
     debug_assert!(
-        !sched.idle_wake().polling(),
+        // SAFETY: cpu < CPU_COUNT, asserted above; schedule() runs after
+        // init_per_cpu_storage.
+        !unsafe { idle_wake_for(cpu) }.polling(),
         "schedule: cpu {cpu} entered with its idle wake flag set"
     );
 

@@ -1714,7 +1714,7 @@ or body):
   one names it, so a change to the count it passes is on the surface); `kernel_reserve_pages` (the
   CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
   `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
-  `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, `TlbShootdownRequest`, `VectorRow`,
+  `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, `IdleWake`, `TlbShootdownRequest`, `VectorRow`,
   `SlotEntry` (the riscv64 IMSIC identity rows, and each `VectorRow`'s entries), `DeliveryGate`,
   `CoreSlot` (the per-CPU core key and index of the SMT topology), and `SyscallScratch` (the
   per-CPU syscall scratch buffer)

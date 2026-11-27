@@ -284,9 +284,9 @@ fn requested_rights(prot_bits: u64) -> crate::cap::slot::Rights
     )
 }
 
-/// Frame-map pins over a span of frames, held by `sys_mem_map` from before its
-/// retype-cursor check until it returns, and dropped (each count lowered) when
-/// the guard drops.
+/// Frame-map pins over a span of frames, held by `sys_mem_map`, and by each
+/// batch of `sys_memory_zero`, from before the retype-cursor check until the
+/// stores are done, and dropped (each count lowered) when the guard drops.
 #[cfg(not(test))]
 struct FramePins
 {
@@ -305,6 +305,12 @@ impl FramePins
     ///
     /// # Errors
     /// `OutOfMemory` when a frame's count is saturated; nothing stays pinned.
+    #[expect(
+        clippy::inline_always,
+        reason = "SYS_MEM_MAP and each SYS_MEMORY_ZERO batch pin; out of line, every map pays a \
+                  call, a frame and the callee-saved spills of the loop"
+    )]
+    #[inline(always)]
     fn pin(phys: u64, end: u64) -> Result<Self, SyscallError>
     {
         let mut pins = Self {
@@ -1337,11 +1343,292 @@ pub fn sys_memory_merge(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Err(SyscallError::NotSupported)
 }
 
+// ── SYS_MEMORY_ZERO ───────────────────────────────────────────────────────────
+
+/// Pages one batch of `SYS_MEMORY_ZERO` zeroes: the kernel's clear batch
+/// (`cap::retype::CLEAR_BATCH_PAGES`), so the call keeps interrupts masked
+/// no longer than a free's clear does.
+const ZERO_BATCH_PAGES: usize = crate::cap::retype::CLEAR_BATCH_PAGES;
+
+/// The return-work bits on which `SYS_MEMORY_ZERO` stops between two batches
+/// whatever else holds, and returns the pages zeroed so far: the caller is
+/// stopped (`STOPPED`), it has an upcall to take (`UPCALL_SYSCALL`,
+/// `UPCALL_ANY`), or a run-limit fault (`RUN_LIMIT`). The return to user mode
+/// that follows handles each. `PREEMPT` (posted by a local or a remote link,
+/// a stale level, or the wake IPI) stops the call only when a thread queued on
+/// this CPU outranks the caller ([`zero_stops`]): on riscv64 every TLB
+/// shootdown IPI posts it too, and a set bit without such a thread would end
+/// the call for a return that switches nothing. `RECLAIM` and `SOLE_REF` are
+/// housekeeping that the return makes whenever the call ends, and do not stop
+/// it. A slice expiry posts no bit: a tick that lands in a window between
+/// batches, where preemption is disabled, refills the slice and does not
+/// reschedule (core/kernel/docs/scheduler.md § Kernel-Mode Preemption Points),
+/// so it does not end the call.
+const ZERO_STOP_WORK: u32 = {
+    use crate::percpu::return_work::{RUN_LIMIT, STOPPED, UPCALL_ANY, UPCALL_SYSCALL};
+    STOPPED | UPCALL_SYSCALL | UPCALL_ANY | RUN_LIMIT
+};
+
+/// Pages the next batch of a `SYS_MEMORY_ZERO` zeroes with `remaining` pages
+/// of the request left: a whole batch, or the rest when it is shorter.
+fn zero_batch_pages(remaining: usize) -> usize
+{
+    remaining.min(ZERO_BATCH_PAGES)
+}
+
+/// Whether `SYS_MEMORY_ZERO` stops after a batch, given the return-work bits
+/// `pending` on this CPU (`percpu::return_work_pending`): on a bit of
+/// [`ZERO_STOP_WORK`], or on `PREEMPT` when `outranked`, consulted only
+/// then, says a thread queued on this CPU outranks the caller
+/// (`PerCpuScheduler::outranked`, the test the return's preemption decision
+/// makes first, true for any queued thread while the level is stale).
+fn zero_stops(pending: u32, outranked: impl FnOnce() -> bool) -> bool
+{
+    pending & ZERO_STOP_WORK != 0
+        || (pending & crate::percpu::return_work::PREEMPT != 0 && outranked())
+}
+
+/// `SYS_MEMORY_ZERO` (79): zero pages of a Memory cap through the kernel's
+/// direct map.
+///
+/// Arguments, return, and errors: `core/kernel/docs/syscalls.md`
+/// § `SYS_MEMORY_ZERO` (79). The range is checked whole against the cap's
+/// size first, so a request past its end zeroes nothing. It is then zeroed in
+/// batches of [`ZERO_BATCH_PAGES`], each checked and committed on its own
+/// ([`zero_batch`]), with no lock and no frame pin held from one batch to the
+/// next. Between two batches the call opens an interrupt window
+/// (`cap::object::interrupt_window`) and then returns the pages zeroed so
+/// far when [`zero_stops`] says the return work wants it; the caller calls
+/// again for the rest. The bits are read only between batches,
+/// so every call zeroes at least one batch and a caller that is always
+/// outranked still advances. A later batch whose checks fail also ends the
+/// call with the count so far, and the next call, starting at that batch,
+/// reports the error.
+#[cfg(not(test))]
+pub fn sys_memory_zero(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::object::MemoryObject;
+    use crate::cap::slot::MemRights;
+    use crate::mm::PAGE_SIZE;
+    use crate::syscall::current_tcb;
+
+    let memory_idx = tf.arg(0);
+    let offset_pages = tf.arg(1) as usize;
+    let page_count = tf.arg(2) as usize;
+    if page_count == 0
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null; cspace set at thread creation.
+    let caller_cspace = unsafe { (*tcb).cspace };
+    if caller_cspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    // Zeroing is what a writable mapping and stores could do: Map and Write,
+    // as SYS_MEM_MAP asks of a writable mapping.
+    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    let memory_slot =
+        unsafe { super::lookup_cap(caller_cspace, memory_idx, MemRights::MAP | MemRights::WRITE) }?;
+    let memory_obj_nn = memory_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: tag confirmed Memory; `memory_slot` pins the object for the
+    // whole call.
+    let memory_ref = unsafe { &*(memory_obj_nn.as_ptr().cast::<MemoryObject>()) };
+
+    // The whole range lies inside the cap's current size.
+    let byte_offset = offset_pages
+        .checked_mul(PAGE_SIZE)
+        .ok_or(SyscallError::InvalidArgument)? as u64;
+    let byte_len = page_count
+        .checked_mul(PAGE_SIZE)
+        .ok_or(SyscallError::InvalidArgument)? as u64;
+    let byte_end = byte_offset
+        .checked_add(byte_len)
+        .ok_or(SyscallError::InvalidArgument)?;
+    {
+        let _size_guard = crate::cap::object::MemoryReadGuard::acquire(memory_ref);
+        if byte_end > memory_ref.size
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
+    }
+
+    let mut zeroed: usize = 0;
+    loop
+    {
+        // `zeroed` stays below `page_count` here, and their sum with
+        // `offset_pages` passed the checks above, so neither saturates.
+        let pages = zero_batch_pages(page_count.saturating_sub(zeroed));
+        let first = offset_pages.saturating_add(zeroed);
+        // SAFETY: caller_cspace is the caller's CSpace, validated above;
+        // memory_ref is the object memory_slot pins.
+        let batch = unsafe {
+            zero_batch(
+                caller_cspace,
+                memory_idx,
+                &memory_slot,
+                memory_ref,
+                first,
+                pages,
+            )
+        };
+        if let Err(error) = batch
+        {
+            if zeroed == 0
+            {
+                return Err(error);
+            }
+            break;
+        }
+        zeroed = zeroed.saturating_add(pages);
+        if zeroed >= page_count
+        {
+            break;
+        }
+        crate::cap::object::interrupt_window();
+        // SAFETY: syscall context, on a CPU whose per-CPU pointer is
+        // installed; preemption is enabled again, but a syscall is not
+        // preempted, so the word read is this CPU's.
+        let pending = unsafe { crate::percpu::return_work_pending() };
+        let outranked = || {
+            // SAFETY: as for the word; the window has closed, so interrupts
+            // are masked, as `PerCpuScheduler::outranked` reads them.
+            unsafe { crate::percpu::current_scheduler() }.outranked()
+        };
+        if zero_stops(pending, outranked)
+        {
+            break;
+        }
+    }
+    Ok(zeroed as u64)
+}
+
+/// Zero `pages` pages of `memory` from page `first`, one batch of
+/// `SYS_MEMORY_ZERO`, under `sys_mem_map`'s protocol for its range: under
+/// the object's read lock, bound the batch by the current size, pin its
+/// frames in the frame map, check it lies at or above the page-rounded retype
+/// cursor, resolve `handle` again to the object `held` names, and only then
+/// store (core/kernel/docs/memory-internals.md § Frame Map Table).
+///
+/// # Errors
+/// `InvalidArgument` (the batch lies past the current size, or below the
+/// retype cursor), `InvalidCapability` or `InsufficientRights` (the handle no
+/// longer names `held`'s object with Map and Write), `OutOfMemory` (a
+/// frame's count is saturated). Nothing is zeroed on an error.
+///
+/// # Safety
+/// `cspace` is the caller's `CSpace`, non-null; `memory` is the Memory
+/// object `held` pins. Syscall context with no lock held.
+#[cfg(not(test))]
+unsafe fn zero_batch(
+    cspace: *mut crate::cap::cspace::CSpace,
+    handle: u64,
+    held: &super::PinnedCap,
+    memory: &crate::cap::object::MemoryObject,
+    first: usize,
+    pages: usize,
+) -> Result<(), SyscallError>
+{
+    use crate::cap::slot::MemRights;
+    use crate::mm::PAGE_SIZE;
+
+    // The handle's second pin, declared before the read guard so that it
+    // drops after it: a pin's release runs with no lock held
+    // (`cap::object::release_ref`'s contract).
+    let still_held;
+    // Read-lock the object across the batch's checks and stores: a
+    // concurrent `sys_memory_split` would otherwise shrink `memory.size` under
+    // them.
+    let _frame_guard = crate::cap::object::MemoryReadGuard::acquire(memory);
+
+    let byte_offset = first
+        .checked_mul(PAGE_SIZE)
+        .ok_or(SyscallError::InvalidArgument)? as u64;
+    let byte_len = pages
+        .checked_mul(PAGE_SIZE)
+        .ok_or(SyscallError::InvalidArgument)? as u64;
+    let byte_end = byte_offset
+        .checked_add(byte_len)
+        .ok_or(SyscallError::InvalidArgument)?;
+    // A split since the call's own check may have shrunk the region.
+    if byte_end > memory.size
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // The physical span of the batch, the offset and the length clamped as
+    // data (`nospec::mask_span_u64`), so the pins and the stores of a path
+    // past a mispredicted bound cover no frame outside the object.
+    let (span_offset, span_len) =
+        crate::arch::nospec::mask_span_u64(byte_offset, byte_len, memory.size);
+    let phys_base = memory
+        .base
+        .checked_add(span_offset)
+        .ok_or(SyscallError::InvalidArgument)?;
+    let phys_end = phys_base
+        .checked_add(span_len)
+        .ok_or(SyscallError::InvalidArgument)?;
+
+    // Retype/zero boundary, as `sys_mem_map`'s retype/map boundary: with the
+    // frames pinned before the cursor is read, either this batch sees a
+    // concurrent retype's cursor or the retype sees the pins, so no object is
+    // carved under the stores.
+    let pins = FramePins::pin(phys_base, phys_end)?;
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    let retyped_end = crate::cap::retype::current_bump(memory)
+        .div_ceil(PAGE_SIZE as u64)
+        .saturating_mul(PAGE_SIZE as u64);
+    if byte_offset < retyped_end
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // Revocation/zero boundary, as `sys_mem_map`'s: either this lookup sees
+    // a revoke's cleared slot and the batch stores nothing, or the revoke's
+    // issuer, reading the mapping count after it cleared the slot, sees the
+    // pins and waits for them to drop, after the stores.
+    // SAFETY: cspace is the caller's CSpace (contract); lookup_cap checks tag
+    // and rights.
+    still_held = unsafe { super::lookup_cap(cspace, handle, MemRights::MAP | MemRights::WRITE) }?;
+    if still_held.object != held.object
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    let virt = crate::mm::paging::phys_to_virt(phys_base);
+    // SAFETY: [phys_base, phys_end) lies inside the Memory object's region,
+    // which the kernel direct map covers. It lies at or above the page-rounded
+    // retype cursor with its frames pinned, so it holds no kernel object and
+    // none can be carved there before the pins drop; the kernel holds no
+    // reference into it. User code may access these frames through a mapping
+    // at the same time, as through any writable mapping of them: that is the
+    // holder's own memory, which no kernel invariant reads.
+    unsafe { core::ptr::write_bytes(virt as *mut u8, 0, span_len as usize) };
+
+    drop(pins);
+    Ok(())
+}
+
+// Test stub.
+#[cfg(test)]
+pub fn sys_memory_zero(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
 #[cfg(test)]
 mod tests
 {
-    use super::requested_rights;
+    use super::{ZERO_BATCH_PAGES, ZERO_STOP_WORK, requested_rights, zero_batch_pages, zero_stops};
     use crate::cap::slot::{MemRights, Rights};
+    use crate::percpu::return_work;
 
     #[test]
     fn requested_rights_are_the_write_and_execute_of_prot_bits_alone()
@@ -1356,5 +1643,93 @@ mod tests
         );
         // Bits outside the two name no right a map or protect checks.
         assert_eq!(requested_rights(!syscall::MAP_WRITABLE), execute);
+    }
+
+    /// The batches of a zero cover the request exactly, in order, none past
+    /// one batch, each but the last whole.
+    #[test]
+    fn zero_batches_cover_the_request_one_batch_at_a_time()
+    {
+        assert_eq!(ZERO_BATCH_PAGES, 16);
+        for count in [1, 15, 16, 17, 31, 32, 33, 512, 1000]
+        {
+            let mut zeroed = 0;
+            let mut batches = 0;
+            while zeroed < count
+            {
+                let pages = zero_batch_pages(count - zeroed);
+                assert!(pages > 0 && pages <= ZERO_BATCH_PAGES, "count {count}");
+                if zeroed + pages < count
+                {
+                    assert_eq!(pages, ZERO_BATCH_PAGES, "count {count}");
+                }
+                zeroed += pages;
+                batches += 1;
+            }
+            assert_eq!(zeroed, count);
+            assert_eq!(batches, count.div_ceil(ZERO_BATCH_PAGES), "count {count}");
+        }
+    }
+
+    /// The scheduler's test, for a call that must not consult it.
+    fn not_consulted() -> bool
+    {
+        panic!("the outranked test was consulted")
+    }
+
+    /// A zero stops between batches for a stop, an upcall or a run-limit
+    /// fault, alone or with others and whatever the scheduler says, and for
+    /// none of the housekeeping kinds.
+    #[test]
+    fn zero_stops_for_a_stop_an_upcall_and_a_run_limit_alone()
+    {
+        for bit in [
+            return_work::STOPPED,
+            return_work::UPCALL_SYSCALL,
+            return_work::UPCALL_ANY,
+            return_work::RUN_LIMIT,
+        ]
+        {
+            assert!(zero_stops(bit, not_consulted), "bit {bit:#x}");
+            assert!(
+                zero_stops(bit | return_work::RECLAIM, not_consulted),
+                "bit {bit:#x}"
+            );
+            assert!(
+                zero_stops(bit | return_work::PREEMPT, || false),
+                "bit {bit:#x}"
+            );
+        }
+        assert!(!zero_stops(0, not_consulted));
+        assert!(!zero_stops(return_work::RECLAIM, not_consulted));
+        assert!(!zero_stops(return_work::SOLE_REF, not_consulted));
+        assert!(!zero_stops(
+            return_work::RECLAIM | return_work::SOLE_REF,
+            not_consulted
+        ));
+        // Every kind a syscall's return handles is a stop, the preemption
+        // the scheduler's test decides, or one of the two housekeeping kinds.
+        assert_eq!(
+            ZERO_STOP_WORK | return_work::PREEMPT | return_work::RECLAIM | return_work::SOLE_REF,
+            return_work::AT_SYSCALL
+        );
+    }
+
+    /// `PREEMPT` stops a zero only when a queued thread outranks the caller:
+    /// a set bit with none (a shootdown IPI on riscv64, a link below the
+    /// caller's level) lets the call go on.
+    #[test]
+    fn zero_stops_on_preempt_only_when_outranked()
+    {
+        assert!(zero_stops(return_work::PREEMPT, || true));
+        assert!(!zero_stops(return_work::PREEMPT, || false));
+        assert!(zero_stops(
+            return_work::PREEMPT | return_work::RECLAIM,
+            || true
+        ));
+        assert!(!zero_stops(
+            return_work::PREEMPT | return_work::SOLE_REF,
+            || false
+        ));
     }
 }

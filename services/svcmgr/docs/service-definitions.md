@@ -336,8 +336,8 @@ A log-sink service's bootstrap round is **not** assembled from `seed` or
 at handover (the master-log endpoint source, the procmgr `SEND|GRANT`
 death-auth source and the `KernelLog` source — see
 [`process-lifecycle.md`](../../../docs/process-lifecycle.md)) and from
-its `devmgr.class.serial` and `devmgr.class.framebuffer` publications. The round has six
-positional slots, carried with a presence word as
+its `devmgr.class.serial`, `devmgr.class.framebuffer` and `timed` publications. The round has
+seven positional slots, carried with a presence word as
 [`seed`](#seed) describes, so an absent slot rides as no cap:
 
 | Index | Cap |
@@ -348,15 +348,15 @@ positional slots, carried with a presence word as
 | 3 | the `serial` class SEND, derived from the `devmgr.class.serial` publication (logd resolves the serial driver via `QUERY_DEVICE`; see [logd README](../../logd/README.md#bootstrap-caps)) |
 | 4 | the `framebuffer` class SEND, derived from the `devmgr.class.framebuffer` publication (logd resolves the framebuffer driver via `QUERY_DEVICE`) |
 | 5 | a `KernelLog` cap carrying `Read`, derived with `RIGHTS_KLOG_READ` from the endowed `KernelLog` source (logd reads the kernel's console lines through it; see [logd handover protocol](../../logd/docs/handover-protocol.md#kernel-log)) |
+| 6 | the `timed` SEND, derived from the `timed` publication (logd reads the wall clock once through it; see [logd sinks](../../logd/docs/sinks.md#wall-time)) |
 
 Because these slots are svcmgr-minted, `seed` and `provides` have no
 position in the round; declaring either alongside `log_sink = yes` is a
-parser error. The same svcmgr-minted round drives the first launch (`cap[1]`
-present, history pulled from init-logd per the
-[logd handover protocol](../../logd/docs/handover-protocol.md)). A slot whose source is absent
-from the endowment or not published (slots 3 and 4 when no class file configured the class, slot 5
-when init held no `KernelLog`), or whose derive fails, is absent from the round; logd requires only
-`cap[0]`.
+parser error. The same svcmgr-minted round drives the first launch (`cap[1]` present, history pulled
+from init-logd per the [logd handover protocol](../../logd/docs/handover-protocol.md)). A slot whose
+source is absent from the endowment or not published (slots 3 and 4 when no class file configured
+the class, slot 5 when init held no `KernelLog`, slot 6 when no recipe provides `timed`), or whose
+derive fails, is absent from the round; logd requires only `cap[0]`.
 svcmgr holds the master-log source and the `KernelLog` source for the system's life, so the round
 also drives every restart (`cap[1]` absent and the history pull skipped once
 procmgr reports init reaped; present, with the pull, on a

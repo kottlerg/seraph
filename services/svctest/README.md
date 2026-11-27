@@ -56,8 +56,9 @@ services/svctest/
         │                      # spawned IPC buffers in the arena; stack note parse
         ├── log_client.rs      # Log-call bounds against a log receiver that never answers
         ├── logd_restart.rs    # logd killed through an attach and restarted: svcmgr's lines,
-        │                      #   names restored by refusal, a death forward on the new instance;
-        │                      #   and restarted while memory is critical (logd in the reserve)
+        │                      #   names restored by refusal, the new instance's wall clock notice,
+        │                      #   a death forward on the new instance; and restarted while memory
+        │                      #   is critical (logd in the reserve)
         ├── logd_sinks.rs      # logd's sinks: serial and framebuffer drivers attachable; lines
         │                      #   answered with either stopped, and with the framebuffer killed
         │                      #   and restarted; a debug line retained and not on serial; and
@@ -407,8 +408,8 @@ resolves the RTC past the withdrawn ordinal ([services/timed/README.md](../timed
 The `logd_sinks` phase's framebuffer-restarted case queries the framebuffer class's ordinal 1
 through `caps[13]`, finds, attaches to, and stops the instance devmgr restarted through `caps[23]`,
 sends as many lines at critical as the stopped case, each answered within half logd's stall bound,
-starts the instance, and requires logd's notice of the framebuffer's drops after the last of them
-through `caps[6]`.
+starts the instance, and requires through `caps[6]` a notice of the framebuffer's drops that logd's
+history did not hold before the stop: a new one, or one logd updated in place with a new count.
 
 The `logd_flush` phase ([`logd_sinks.rs`](src/phases/logd_sinks.rs) states its cases) checks logd's
 flush barrier through `caps[22]`: `LOG_FLUSH` on `caps[6]` and `QUERY_SLOTS` on `caps[22]` are

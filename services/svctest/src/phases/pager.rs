@@ -745,7 +745,8 @@ fn fragment_bounds(floor: u64) -> (u64, usize)
 /// 1. Draw from the largest runs until `target` pages outside `promised` are
 ///    free.
 /// 2. Cut what is free into hole-sized grants (`DEMAND_CHUNK_PAGES - 1`
-///    pages), the smallest run that fits first and each run front first,
+///    pages), a run of the smallest size class that fits first and each run
+///    front first,
 ///    keeping every other one as a hole, until a grant is refused at the
 ///    floor. A hole lies between two grants svctest holds, or at the end of
 ///    its run beside a remainder too short to cut.

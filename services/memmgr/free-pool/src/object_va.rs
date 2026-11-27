@@ -51,8 +51,9 @@ impl ObjectVa
         self.spans.free_pages()
     }
 
-    /// Take a span of `pages` pages, returning its first address: the
-    /// smallest free span that holds it, split to size. `None` when no free
+    /// Take a span of `pages` pages, returning its first address: a free
+    /// span that holds it, chosen by the pool's size-class fit
+    /// ([`FreePool::covering`]), split to size. `None` when no free
     /// span holds `pages`, `pages` is 0 or does not fit a `u32`, or the
     /// arena has no slot for the split's remainder (none is needed: the
     /// remainder keeps the span's slot).

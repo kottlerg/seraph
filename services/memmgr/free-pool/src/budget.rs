@@ -257,6 +257,7 @@ pub fn node<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<BudgetNode>
         Node::Budget(b) => Some(b),
         Node::Free
         | Node::Run(_)
+        | Node::Pooled(_)
         | Node::Deferred(_)
         | Node::Region(_)
         | Node::Frame(_)

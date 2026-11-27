@@ -6608,11 +6608,12 @@ impl IdlePullView for KernelCpus
 /// thread, run from that CPU's `timer_tick`; an idle CPU balances through
 /// [`try_pull_idle`] instead. It clears this CPU's idle-pull candidate, then
 /// picks a victim by its own load (a pseudo-random one when its load is
-/// non-zero, otherwise the most-loaded one of the window from its
-/// `balance_cursor`, which a miss moves past the window and a pull that finds
-/// nothing pullable past the victim) and pulls from it only past the imbalance
-/// threshold, through the try-lock-only
-/// `pull_unpinned_ready` (#375). The modes, their rationale, and their hot-path cost are
+/// non-zero, otherwise a CPU past the imbalance threshold in the window from
+/// its `balance_cursor`: the most-loaded when the window holds every other
+/// CPU, else the first in the window's order ([`empty_queue_victim`]; a miss
+/// moves the cursor past the window and a pull that finds nothing pullable
+/// past the victim) and pulls from it only past the imbalance threshold,
+/// through the try-lock-only `pull_unpinned_ready` (#375). The modes, their rationale, and their hot-path cost are
 /// core/kernel/docs/scheduler.md § Load Balancing's.
 ///
 /// # Safety

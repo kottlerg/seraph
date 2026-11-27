@@ -776,7 +776,9 @@ pub fn delay_us(us: u64);
 
 Architecture-specific syscall entry/return glue. Shared code does not call into this beyond
 initialisation; the arch entry stub saves user state, calls `crate::syscall::dispatch`
-(which calls the number's handler directly, [syscalls.md](syscalls.md) § Syscall Numbers),
+(which calls the number's handler directly, from a `match` of the hot syscalls or, for every
+other number, from an out-of-line `match` of the cold ones, [syscalls.md](syscalls.md)
+§ Dispatch),
 restores state, and returns to userspace (on x86-64 no non-canonical return RIP can reach
 `sysretq`, since `paging::user_va_top` keeps the top user page unmappable; the exit path
 still checks and terminates the thread as for an unhandled user `#GP`, per

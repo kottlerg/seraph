@@ -71,8 +71,8 @@ pub fn run_all(ctx: &TestContext)
 
     // ── Syscall dispatch ──────────────────────────────────────────────────────
     run_test!(
-        "dispatch::table_edges_reach_their_handlers",
-        dispatch::table_edges_reach_their_handlers(ctx)
+        "dispatch::hot_and_neighbouring_cold_numbers_reach_their_handlers",
+        dispatch::hot_and_neighbouring_cold_numbers_reach_their_handlers(ctx)
     );
     run_test!(
         "dispatch::number_reaches_its_own_handler",

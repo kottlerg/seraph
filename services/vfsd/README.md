@@ -146,7 +146,7 @@ vfsd/
   for every block device (`QUERY_DEVICE` on the `block` class SEND at instance ordinals 0,
   1, …, passing a `WITHDRAWN` one, until another reply is not
   `SUCCESS`), and again from the first ordinal not yet queried before
-  each runtime role lookup (a `MOUNT`, the first `GET_SWAP_PARTITION`),
+  each runtime role lookup (a `MOUNT`, a `GET_SWAP_PARTITION`),
   asks devmgr where each new disk's device sits (`QUERY_DEVICE_LOCATION`
   on the same SEND: the PCI function devmgr bound its driver to, kept with
   the disk and logged; the boot-disk identification reads it),
@@ -204,7 +204,7 @@ devmgr discovers storage hardware, spawns block device drivers, and
 publishes their endpoints in the device registry. vfsd queries the
 registry at startup, once per instance ordinal, to obtain the
 `MOUNT_AUTHORITY`-badged whole-disk cap on every virtio-blk instance.
-For each mount, and for the swap partition on the first
+For each mount, and for the swap partition on each
 `GET_SWAP_PARTITION`, vfsd sends `REGISTER_PARTITION` on the cap of the disk
 that holds the partition, and that virtio-blk instance mints and returns
 a partition-badged cap. See

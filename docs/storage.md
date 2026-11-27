@@ -78,10 +78,12 @@ kernel (phase 7) mints Mmio caps from BootInfo.mmio_apertures and the root IRQ r
                       → init distributes copies via CONFIGURE_NAMESPACE
 ```
 
-The swap partition takes a shorter branch from the `REGISTER_PARTITION` step: vfsd keeps the
-partition cap virtio-blk returns, runs no fs driver on it, and hands a derivation of it to the
-holder of the `vfsd.swap` SEND on `GET_SWAP_PARTITION`, revoking the derivation it handed out
-before ([`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md)
+The swap partition takes a shorter branch from the `REGISTER_PARTITION` step: on each
+`GET_SWAP_PARTITION` from the holder of the `vfsd.swap` SEND, vfsd cuts off the grant it made
+before (revoke its derivations, retire its badge, delete the kept cap), registers the partition
+again as a new grant, runs no fs driver on it, and hands the caller a derivation of the new
+partition cap
+([`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md)
 § Label 14).
 
 The kernel half (BootInfo → Mmio mint → devmgr → driver binding)
@@ -203,7 +205,7 @@ label, or a filesystem UUID. The model is:
   (`QUERY_DEVICE_LOCATION`), and parses each disk's GPT: the primary, or, when the primary's
   header or entry array fails its CRC32 or `MyLBA` check or cannot be read, the backup at the
   disk's last LBA, as UEFI 2.10 § 5.3.2 directs; vfsd writes neither copy. Before a runtime
-  `MOUNT` and the first `GET_SWAP_PARTITION` resolve their role, vfsd queries again from
+  `MOUNT` and each `GET_SWAP_PARTITION` resolve their role, vfsd queries again from
   the first ordinal not yet queried and holds each disk devmgr served
   since, a disk added or inserted again after startup among them, so a
   partition the statement names on such a disk is found. A disk neither

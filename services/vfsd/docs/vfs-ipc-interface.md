@@ -268,26 +268,24 @@ reads and writes the partition's blocks, and no block outside it
 MUST carry `SWAP_AUTHORITY`: vfsd replies `UNAUTHORIZED` otherwise, before it checks the version
 word.
 
-The first request that finds the partition resolves the role (the same
-resolution as `MOUNT`: the statement's `swap` line, else the boot disk by type GUID and
-priority), registers the partition's range with that disk's block driver,
-and keeps the partition cap the driver returns for vfsd's life. vfsd's startup does none of this,
-so a disk with no swap partition is a supported configuration: vfsd boots and mounts as it would
-otherwise, and each request then replies `NO_MOUNT`. A lookup or registration that fails keeps
-nothing, and the next request tries again.
-
 Every request derives the caller's cap from a grant of its own. One holder at a time reaches the
-partition: a request after the first cuts off the grant the previous one made (revoke the caps
-derived from the kept cap, the previous holder's among them; retire the grant, which ends the
-block regions registered through it and refuses every later request carrying its badge; delete
-the kept cap;
-[virtio-blk README](../../drivers/virtio/blk/README.md#grants-and-regions) § Grants and regions),
-then registers the partition again, a new grant it keeps, and derives the new holder's cap from
-it. One lock covers the whole hand-out, so two concurrent requests leave exactly one live cap. A
-retire that fails other than for the block driver's death derives nothing, leaving the previous
-holder the only one, and the next request tries the cut-off again; a registration or a derivation
-that fails leaves no holder, never a stale one, until a later request succeeds. The pure
-decisions are [`vfsd-swap`](../swap/src/lib.rs) and [`vfsd-grant`](../grant/src/lib.rs),
+partition: a request first cuts off the grant the previous one made, if one stands (revoke the
+caps derived from the kept cap, the previous holder's among them; retire the grant, which ends
+the block regions registered through it and refuses every later request carrying its badge;
+delete the kept cap;
+[virtio-blk README](../../drivers/virtio/blk/README.md#grants-and-regions) § Grants and regions).
+A grant its holder retired already counts as cut off. The request then resolves the role (the
+same resolution as `MOUNT`: the statement's `swap` line, else the boot disk by type GUID and
+priority), registers the partition's range with that disk's block driver as a new grant, keeps
+the partition cap the driver returns until the next request cuts it off, and derives the new
+holder's cap from it. vfsd's startup does none of this, so a disk with no swap partition is a
+supported configuration: vfsd boots and mounts as it would otherwise, and each request then
+replies `NO_MOUNT`. A lookup or registration that fails keeps nothing, and the next request
+tries again. One lock covers the whole hand-out, so two concurrent requests leave exactly one
+live cap. A retire that fails other than for the block driver's death derives nothing, leaving
+the previous holder the only one, and the next request tries the cut-off again; a registration
+or a derivation that fails leaves no holder, never a stale one, until a later request succeeds.
+The pure decisions are [`vfsd-swap`](../swap/src/lib.rs) and [`vfsd-grant`](../grant/src/lib.rs),
 host-tested.
 
 **Request**
@@ -309,7 +307,7 @@ host-tested.
 `VFSD_LABELS_VERSION`, `NO_MOUNT` when the swap role resolves to no partition (none of the swap
 type on the boot disk, two there tied at the highest priority, or the partition the statement names
 not on the disk it binds it to, of another type there, or there twice), and `IO_ERROR` when the
-registration, the revoke of the previous holder's cap, or the derivation fails).
+registration, the cut-off of the previous holder's grant, or the derivation fails).
 
 ---
 

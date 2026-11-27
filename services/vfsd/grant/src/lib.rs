@@ -58,6 +58,23 @@ impl Step
             Ok(false) | Err(_) => Self::Failed,
         }
     }
+
+    /// Classify the reply to `BLK_RETIRE_PARTITION` on a partition cap vfsd kept: `Ok` the
+    /// reply's status, `Err` the IPC call's error code, as [`Step::of`] reads it.
+    ///
+    /// `OUT_OF_BOUNDS` is [`Step::Done`]: the kept cap carries a partition badge the driver
+    /// minted, so the driver refuses it only once the badge is retired, by its holder or by an
+    /// earlier retire whose reply was lost (`services/drivers/virtio/blk/README.md` § Label 10).
+    #[must_use]
+    pub fn of_retire(reply: Result<u64, i64>) -> Self
+    {
+        match reply
+        {
+            Ok(ipc::blk_errors::SUCCESS | ipc::blk_errors::OUT_OF_BOUNDS) => Self::Done,
+            Ok(_) => Self::Failed,
+            Err(code) => Self::of(Err(code)),
+        }
+    }
 }
 
 /// The operations a cut-off runs on a kept partition cap, which vfsd carries out with
@@ -67,7 +84,8 @@ pub trait GrantOps
     /// Revoke every cap derived from `cap`, keeping `cap` (`cap_revoke_all`).
     fn revoke_descendants(&mut self, cap: u64) -> Step;
 
-    /// Retire the grant `cap` carries (`BLK_RETIRE_PARTITION` on `cap`).
+    /// Retire the grant `cap` carries (`BLK_RETIRE_PARTITION` on `cap`), its reply classified
+    /// by [`Step::of_retire`].
     fn retire(&mut self, cap: u64) -> Step;
 
     /// Delete `cap` from vfsd's `CSpace`.
@@ -88,7 +106,8 @@ pub struct CutOffFailed;
 ///
 /// # Errors
 /// [`CutOffFailed`] when the retire failed for another reason; `cap` is kept, so the cut-off
-/// can be tried again.
+/// can be tried again. A retry finds the badge retired when the failed call was served
+/// ([`Step::of_retire`]).
 pub fn cut_off(ops: &mut impl GrantOps, cap: u64) -> Result<(), CutOffFailed>
 {
     if ops.revoke_descendants(cap) != Step::DriverGone && ops.retire(cap) == Step::Failed
@@ -119,6 +138,18 @@ mod tests
 {
     use super::*;
 
+    /// A failure the model injects.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fault
+    {
+        /// Every revoke fails.
+        Revoke,
+        /// Every retire is refused.
+        Retire,
+        /// The next retire is served and its reply lost: the call fails as interrupted.
+        LoseRetireReply,
+    }
+
     /// A model of one block driver and vfsd's caps on it: the grants the driver holds, the
     /// derivations of each kept cap, and the regions each grant's holder registered.
     #[derive(Default)]
@@ -134,8 +165,8 @@ mod tests
         regions: Vec<(u64, u64)>,
         /// Kept caps vfsd still holds.
         held: Vec<u64>,
-        fail_revoke: bool,
-        fail_retire: bool,
+        /// The step that fails, if any.
+        fault: Option<Fault>,
         /// Die right before the step this many steps on (`Some(0)`: the next one).
         die_before: Option<usize>,
         calls: Vec<&'static str>,
@@ -197,6 +228,24 @@ mod tests
             }
         }
 
+        /// The driver's side of `BLK_RETIRE_PARTITION` on `cap`, sent by vfsd or by the holder
+        /// of a derivation, which carries the same badge.
+        fn serve_retire(&mut self, cap: u64) -> Result<u64, i64>
+        {
+            if !self.grants.contains(&cap)
+            {
+                return Ok(ipc::blk_errors::OUT_OF_BOUNDS);
+            }
+            self.grants.retain(|&g| g != cap);
+            self.regions.retain(|&(k, _)| k != cap);
+            if self.fault == Some(Fault::LoseRetireReply)
+            {
+                self.fault = None;
+                return Err(syscall_abi::SyscallError::Interrupted as i64);
+            }
+            Ok(ipc::blk_errors::SUCCESS)
+        }
+
         fn die(&mut self)
         {
             self.dead = true;
@@ -215,7 +264,7 @@ mod tests
             {
                 return Step::DriverGone;
             }
-            if self.fail_revoke
+            if self.fault == Some(Fault::Revoke)
             {
                 return Step::Failed;
             }
@@ -232,13 +281,11 @@ mod tests
             {
                 return Step::DriverGone;
             }
-            if self.fail_retire || !self.grants.contains(&cap)
+            if self.fault == Some(Fault::Retire)
             {
-                return Step::Failed;
+                return Step::of_retire(Ok(ipc::blk_errors::LABEL_VERSION_MISMATCH));
             }
-            self.grants.retain(|&g| g != cap);
-            self.regions.retain(|&(k, _)| k != cap);
-            Step::Done
+            Step::of_retire(self.serve_retire(cap))
         }
 
         fn delete(&mut self, cap: u64)
@@ -291,7 +338,7 @@ mod tests
         let mut d = Driver::default();
         let kept = d.register().unwrap();
         d.derive(kept).unwrap();
-        d.fail_revoke = true;
+        d.fault = Some(Fault::Revoke);
         assert_eq!(cut_off(&mut d, kept), Ok(()));
         assert_eq!(d.derived.len(), 1, "the revoke missed the derivation");
         assert!(!d.reached(kept));
@@ -306,13 +353,43 @@ mod tests
         let mut d = Driver::default();
         let kept = d.register().unwrap();
         d.derive(kept).unwrap();
-        d.fail_retire = true;
+        d.fault = Some(Fault::Retire);
         assert_eq!(cut_off(&mut d, kept), Err(CutOffFailed));
         assert!(d.reached(kept), "the region is live until the retire");
         assert_eq!(d.held, [kept]);
-        d.fail_retire = false;
+        d.fault = None;
         assert_eq!(cut_off(&mut d, kept), Ok(()));
         assert!(!d.reached(kept));
+        assert_eq!(d.held, Vec::<u64>::new());
+    }
+
+    // Defect caught: a grant its holder retired treated as a failed cut-off, so the granter
+    // never grants the partition again.
+    #[test]
+    fn a_grant_its_holder_retired_cuts_off()
+    {
+        let mut d = Driver::default();
+        let kept = d.register().unwrap();
+        d.derive(kept).unwrap();
+        assert_eq!(d.serve_retire(kept), Ok(ipc::blk_errors::SUCCESS));
+        assert_eq!(cut_off(&mut d, kept), Ok(()));
+        assert!(!d.reached(kept));
+        assert_eq!(d.held, Vec::<u64>::new());
+    }
+
+    // Defect caught: a retire served but its reply lost failing every retry, the badge being
+    // retired already.
+    #[test]
+    fn a_retry_after_a_served_retire_whose_reply_was_lost_completes()
+    {
+        let mut d = Driver::default();
+        let kept = d.register().unwrap();
+        d.derive(kept).unwrap();
+        d.fault = Some(Fault::LoseRetireReply);
+        assert_eq!(cut_off(&mut d, kept), Err(CutOffFailed));
+        assert!(!d.reached(kept));
+        assert_eq!(d.held, [kept]);
+        assert_eq!(cut_off(&mut d, kept), Ok(()));
         assert_eq!(d.held, Vec::<u64>::new());
     }
 
@@ -321,11 +398,11 @@ mod tests
     {
         let mut d = Driver::default();
         let kept = d.register().unwrap();
-        d.fail_retire = true;
+        d.fault = Some(Fault::Retire);
         assert_eq!(release(&mut d, kept), Err(CutOffFailed));
         assert_eq!(d.held, Vec::<u64>::new());
         let other = d.register().unwrap();
-        d.fail_retire = false;
+        d.fault = None;
         assert_eq!(release(&mut d, other), Ok(()));
         assert_eq!(d.held, Vec::<u64>::new());
         assert_eq!(d.grants, [kept]);
@@ -363,6 +440,24 @@ mod tests
         );
         assert_eq!(
             Step::of(Err(SyscallError::Interrupted as i64)),
+            Step::Failed
+        );
+    }
+
+    #[test]
+    fn a_retire_reply_counts_an_already_retired_badge_as_done()
+    {
+        use ipc::blk_errors::{LABEL_VERSION_MISMATCH, OUT_OF_BOUNDS, SUCCESS};
+        use syscall_abi::SyscallError;
+        assert_eq!(Step::of_retire(Ok(SUCCESS)), Step::Done);
+        assert_eq!(Step::of_retire(Ok(OUT_OF_BOUNDS)), Step::Done);
+        assert_eq!(Step::of_retire(Ok(LABEL_VERSION_MISMATCH)), Step::Failed);
+        assert_eq!(
+            Step::of_retire(Err(SyscallError::NoReceiver as i64)),
+            Step::DriverGone
+        );
+        assert_eq!(
+            Step::of_retire(Err(SyscallError::Interrupted as i64)),
             Step::Failed
         );
     }

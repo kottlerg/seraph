@@ -8,10 +8,10 @@
 //! syscalls and IPC that carry them out.
 //!
 //! [`SwapPartition`] keeps the partition cap of the current grant of the swap partition, and
-//! each hand-out derives the caller's cap from a new grant. One holder at a time reaches the
-//! partition: a hand-out after the first cuts the previous grant off (`grant::cut_off`:
-//! revoke, retire, delete), then registers the partition again, under a new badge, and derives
-//! the caller's cap from it; it refuses when the cut-off fails. vfsd calls
+//! each hand-out derives the caller's cap from a grant of its own. One holder at a time reaches
+//! the partition: a hand-out cuts the previous grant off (`grant::cut_off`: revoke, retire,
+//! delete), refusing when that fails, then looks the partition up, registers it under a new
+//! badge, and derives the caller's cap from that grant. vfsd calls
 //! [`SwapPartition::hand_out`] under one lock, so two hand-outs never interleave.
 //!
 //! The crate performs no I/O; vfsd supplies the operations through [`SwapOps`], so the hand-out
@@ -66,26 +66,21 @@ pub enum HandOutError
     Derive,
 }
 
-/// The swap partition vfsd found, and the partition cap of its current grant.
+/// The partition cap of the swap partition's current grant.
 #[derive(Debug, Default)]
 pub struct SwapPartition
 {
-    /// The partition the first successful lookup found; later hand-outs grant it again.
-    location: Option<PartitionLocation>,
     /// The partition cap of the current grant, or `0` when none is registered.
     kept: u64,
 }
 
 impl SwapPartition
 {
-    /// No partition found yet.
+    /// No grant made yet.
     #[must_use]
     pub const fn new() -> Self
     {
-        Self {
-            location: None,
-            kept: 0,
-        }
+        Self { kept: 0 }
     }
 
     /// The partition cap of the current grant, or `0` when none is registered.
@@ -97,11 +92,11 @@ impl SwapPartition
 
     /// Hand out a cap on the swap partition and return it.
     ///
-    /// The first hand-out looks the partition up; a failed lookup keeps nothing, so a later
-    /// hand-out looks again. A hand-out with a grant registered first cuts it off
-    /// (`grant::cut_off`), ending the previous holder's reach, its block regions included; a
-    /// block driver that is gone took them with it. Then the partition is registered as a new
-    /// grant, which the hand-out keeps, and the caller's cap is derived from it.
+    /// A hand-out with a grant registered first cuts it off (`grant::cut_off`), ending the
+    /// previous holder's reach, its block regions included; a block driver that is gone took
+    /// them with it. Then it looks the partition up, so a disk served since the last hand-out
+    /// is seen, registers it as a new grant, which the hand-out keeps, and derives the caller's
+    /// cap from it. A step that fails keeps nothing but the grant that stays to be cut off.
     ///
     /// # Errors
     /// The [`HandOutError`] of the step that failed.
@@ -112,22 +107,13 @@ impl SwapPartition
             grant::cut_off(ops, self.kept).map_err(|grant::CutOffFailed| HandOutError::CutOff)?;
             self.kept = 0;
         }
-        let location = if let Some(location) = self.location
+        let location = ops.lookup().map_err(|e| match e
         {
-            location
-        }
-        else
-        {
-            let location = ops.lookup().map_err(|e| match e
-            {
-                GptLookupError::NotFound
-                | GptLookupError::WrongType
-                | GptLookupError::Elsewhere { .. } => HandOutError::NoPartition,
-                GptLookupError::DuplicateTie => HandOutError::Ambiguous,
-            })?;
-            self.location = Some(location);
-            location
-        };
+            GptLookupError::NotFound
+            | GptLookupError::WrongType
+            | GptLookupError::Elsewhere { .. } => HandOutError::NoPartition,
+            GptLookupError::DuplicateTie => HandOutError::Ambiguous,
+        })?;
         self.kept = ops.register(&location).ok_or(HandOutError::Register)?;
         ops.derive(self.kept).ok_or(HandOutError::Derive)
     }
@@ -217,6 +203,19 @@ mod tests
             }
         }
 
+        /// The driver's side of `BLK_RETIRE_PARTITION` on `cap`, sent by vfsd or by the holder
+        /// of a derivation, which carries the same badge.
+        fn serve_retire(&mut self, cap: u64) -> u64
+        {
+            if !self.grants.iter().any(|&(_, g)| g == cap)
+            {
+                return ipc::blk_errors::OUT_OF_BOUNDS;
+            }
+            self.grants.retain(|&(_, g)| g != cap);
+            self.regions.retain(|&(k, _)| k != cap);
+            ipc::blk_errors::SUCCESS
+        }
+
         /// The holders that reach the partition: through a derivation of a live grant, or
         /// through a region.
         fn reaching(&self) -> Vec<u64>
@@ -257,11 +256,9 @@ mod tests
             }
             if self.fails.contains(&"retire")
             {
-                return Step::Failed;
+                return Step::of_retire(Ok(ipc::blk_errors::LABEL_VERSION_MISMATCH));
             }
-            self.grants.retain(|&(_, g)| g != cap);
-            self.regions.retain(|&(k, _)| k != cap);
-            Step::Done
+            Step::of_retire(Ok(self.serve_retire(cap)))
         }
 
         fn delete(&mut self, cap: u64)
@@ -376,7 +373,8 @@ mod tests
         assert_eq!(
             ops.calls,
             [
-                "lookup", "register", "derive", "revoke", "retire", "delete", "register", "derive"
+                "lookup", "register", "derive", "revoke", "retire", "delete", "lookup", "register",
+                "derive"
             ]
         );
     }
@@ -406,8 +404,8 @@ mod tests
     #[test]
     fn a_driver_death_at_each_step_of_a_hand_out_leaves_no_holder_but_the_new_one()
     {
-        // The steps of a second hand-out: revoke, retire, delete, register, derive.
-        for die_at in 0..5
+        // The steps of a second hand-out: revoke, retire, delete, lookup, register, derive.
+        for die_at in 0..6
         {
             let mut swap = SwapPartition::new();
             let mut ops = Model::with_partition();
@@ -458,7 +456,41 @@ mod tests
         let cap = swap.hand_out(&mut ops).unwrap();
         assert_eq!(ops.grants.len(), 1);
         assert_eq!(ops.live, [(swap.kept(), cap)]);
-        // The partition is looked up once.
-        assert_eq!(ops.calls, ["lookup", "register", "register", "derive"]);
+        assert_eq!(
+            ops.calls,
+            ["lookup", "register", "lookup", "register", "derive"]
+        );
+    }
+
+    // Defect caught: a partition found once granted from there for good, so a swap partition
+    // whose disk came back under another index is never handed out again.
+    #[test]
+    fn each_hand_out_looks_the_partition_up_again()
+    {
+        let mut swap = SwapPartition::new();
+        let mut ops = Model::with_partition();
+        swap.hand_out(&mut ops).unwrap();
+        let moved = PartitionLocation {
+            disk: 2,
+            ..LOCATION
+        };
+        ops.lookup = Ok(moved);
+        swap.hand_out(&mut ops).unwrap();
+        assert_eq!(ops.grants, [(moved, swap.kept())]);
+    }
+
+    // Defect caught: a grant its holder retired refusing every later hand-out as a failed
+    // cut-off, so a restarted swap service gets no swap partition.
+    #[test]
+    fn a_grant_its_holder_retired_does_not_block_the_next_hand_out()
+    {
+        let mut swap = SwapPartition::new();
+        let mut ops = Model::with_partition();
+        swap.hand_out(&mut ops).unwrap();
+        let kept = swap.kept();
+        assert_eq!(ops.serve_retire(kept), ipc::blk_errors::SUCCESS);
+        let cap = swap.hand_out(&mut ops).unwrap();
+        assert_eq!(ops.reaching(), [cap]);
+        assert_eq!(ops.held, [swap.kept()]);
     }
 }

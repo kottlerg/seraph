@@ -66,7 +66,7 @@ pub fn restart_mount(rt: &'static VfsdRuntime, idx: u32, dead: &Mount, ipc_buf: 
     crate::destroy_driver(dead, ipc_buf);
     if cut.is_err()
     {
-        std::os::seraph::log!(warn: "restart: partition grant not retired; tearing the mount down");
+        std::os::seraph::log!(warn: "restart: partition grant not retired");
         abandon(rt, idx, ipc_buf);
         return;
     }
@@ -139,7 +139,7 @@ fn start_driver(
     })
     else
     {
-        std::os::seraph::log!(warn: "restart: partition not registered; tearing the mount down");
+        std::os::seraph::log!(warn: "restart: partition not registered");
         return None;
     };
     let Ok(partition_ep) = syscall::cap_derive(partition, syscall::RIGHTS_EP_SEND_GRANT)

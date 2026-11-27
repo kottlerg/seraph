@@ -204,7 +204,9 @@ capability a virtio-blk caller supplies or registers), is on the client's memmgr
 hold covers. memmgr pools it only once no other process holds a capability to it
 ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#reclamation)
 § Reclamation), so it stays out of the pool, even after the client releases it or dies, while
-devmgr's reference to it lives, and that one lives until the device can no longer write it.
+devmgr's reference to it lives. That reference lives until the device can no longer write the
+frame, unless the client revokes the capability it lent, which takes devmgr's copy with it
+(the cases below).
 A driver programs its device only with the device address of a DMA mapping of the frame
 (§ DMA Authorisation), and devmgr keeps a capability to the frame for each standing mapping:
 

@@ -55,7 +55,7 @@ use worker_pool::WorkerPool;
 /// storage statement after a runtime root `MOUNT` (the `NS_LOOKUP` walk to
 /// it and procmgr's `READ_VERIFIED`, whose read goes to the root fs
 /// driver) nor the discovery of new
-/// disks a `MOUNT` and the first `GET_SWAP_PARTITION` run before their role
+/// disks a `MOUNT` and each `GET_SWAP_PARTITION` run before their role
 /// lookup: devmgr's `QUERY_DEVICE`, the GPT reads of each new disk, a
 /// scratch page from memmgr when a failed read lost the one held, and the
 /// forced unmount of a mount on a new disk found withdrawn, which blocks as
@@ -481,7 +481,7 @@ pub struct VfsdRuntime
     /// Every block device devmgr served vfsd, each with its whole-disk cap
     /// and its used GPT partition entries, in the order found: at startup,
     /// then by the discovery before each runtime role lookup (`find_partition`
-    /// and the first `GET_SWAP_PARTITION`). A disk devmgr
+    /// and each `GET_SWAP_PARTITION`). A disk devmgr
     /// withdrew stays, marked removed, so a mount record's disk index keeps
     /// naming it. Held only across reads and updates of the table, never
     /// across IPC, and never together with `root_backend`.
@@ -1209,11 +1209,11 @@ impl swap::SwapOps for SwapIo<'_>
 }
 
 /// Handle [`vfsd_labels::GET_SWAP_PARTITION`]: hand the caller a
-/// `SEND_GRANT` on the swap partition, revoking the cap an earlier
-/// hand-out returned ([`swap::SwapPartition::hand_out`]).
+/// `SEND_GRANT` on the swap partition from a grant of its own, cutting off
+/// the grant an earlier hand-out made ([`swap::SwapPartition::hand_out`]).
 ///
-/// The dispatcher admits only a `SWAP_AUTHORITY` badge. The partition is
-/// resolved and registered on the first request, never at startup
+/// The dispatcher admits only a `SWAP_AUTHORITY` badge. Each request
+/// resolves and registers the partition, never startup
 /// ([`resolve_role`], after [`discover_new_disks`]): the one the storage
 /// statement names, else the boot disk's by type and priority. With none,
 /// the request replies [`vfsd_errors::NO_MOUNT`]; so does a tie, and a
@@ -2518,7 +2518,7 @@ pub(crate) fn release_partition(partition: u64, ipc_buf: *mut u64)
 {
     if grant::release(&mut PartitionIo(ipc_buf), partition).is_err()
     {
-        std::os::seraph::log!(warn: "partition grant not retired; a block region may outlive it");
+        std::os::seraph::log!(warn: "partition grant not retired");
     }
 }
 
@@ -2540,7 +2540,8 @@ impl grant::GrantOps for PartitionIo
 
     /// `BLK_RETIRE_PARTITION` on `cap`
     /// (`services/drivers/virtio/blk/README.md` § Label 10:
-    /// `BLK_RETIRE_PARTITION`). Anything but its success is logged.
+    /// `BLK_RETIRE_PARTITION`), classified by [`grant::Step::of_retire`].
+    /// Anything but its success is logged.
     fn retire(&mut self, cap: u64) -> grant::Step
     {
         let msg = IpcMessage::builder(blk_labels::BLK_RETIRE_PARTITION)
@@ -2552,6 +2553,10 @@ impl grant::GrantOps for PartitionIo
         {
             Ok(r) if r.label == ipc::blk_errors::SUCCESS =>
             {}
+            Ok(r) if r.label == ipc::blk_errors::OUT_OF_BOUNDS =>
+            {
+                std::os::seraph::log!(debug: "partition grant already retired");
+            }
             Ok(r) =>
             {
                 std::os::seraph::log!(warn: "BLK_RETIRE_PARTITION refused: code={:#x}", r.label);
@@ -2561,12 +2566,7 @@ impl grant::GrantOps for PartitionIo
                 std::os::seraph::log!(warn: "BLK_RETIRE_PARTITION call failed: code={code:#x}");
             }
         }
-        grant::Step::of(
-            reply
-                .as_ref()
-                .map(|r| r.label == ipc::blk_errors::SUCCESS)
-                .map_err(|&code| code),
-        )
+        grant::Step::of_retire(reply.as_ref().map(|r| r.label).map_err(|&code| code))
     }
 
     fn delete(&mut self, cap: u64)

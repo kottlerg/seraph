@@ -1711,14 +1711,14 @@ fn sweep(queue: u64, sweep_ep: u64)
                 // runtime's thread start registered.
                 if let Err(e) = unsafe { ipc::ipc_call(sweep_ep, &request, ipc_buf) }
                 {
-                    std::os::seraph::log!(warn: "region post {:#x} not delivered (err={e})", entry.tag);
+                    std::os::seraph::log!(warn: "region post {:#x} not delivered: code={e:#x}", entry.tag);
                 }
             }
             Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 =>
             {}
             Err(e) =>
             {
-                std::os::seraph::log!(error: "region sweep queue wait failed (err={e}); sweeper exiting");
+                std::os::seraph::log!(error: "region sweep queue wait failed: code={e:#x}");
                 return;
             }
         }

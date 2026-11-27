@@ -367,11 +367,14 @@ dead driver and revokes its service endpoint, from which every partition and
 region cap derives
 ([docs/device-management.md](../../../../docs/device-management.md#dma-safe-teardown)
 § DMA-Safe Teardown), so the granter's call failing for the driver's death
-leaves nothing to retire. Any other failure leaves the badge registered and the
-cut-off holder's regions reachable through their region caps until it
-unregisters them or its process ends, and the granter then grants the range to
-no new holder. Any holder of a partition cap can retire its badge: the one
-holder the granter allows at a time, who ends its own grant.
+leaves nothing to retire. Any holder of a partition cap can retire its badge:
+the one holder the granter allows at a time, who ends its own grant. A granter
+whose retire on the cap it kept is answered `OUT_OF_BOUNDS` therefore holds a
+retired badge, retired by its holder or by an earlier retire whose reply was
+lost, since the driver minted that badge as a partition badge: its cut-off is
+complete. Any other failure may leave the badge registered and the cut-off
+holder's regions reachable through their region caps until it unregisters them
+or its process ends, and the granter then grants the range to no new holder.
 
 ### Internal label: `SWEEP`
 

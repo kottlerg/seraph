@@ -1344,7 +1344,11 @@ reclaim, below), and the pool is otherwise left to the out-of-memory path (crash
 declined fault, oomd's stop of a job). While the level reads `LOW` or `CRITICAL`, the receive loop
 waits for a message a bounded time and, at most once per sweep interval, runs a slice of the clock:
 a hand walks the eligible regions of each process in turn, a bounded number of steps a slice
-([docs/limits.md](../../../docs/limits.md) § memmgr gives the interval and the bounds). A pass
+([docs/limits.md](../../../docs/limits.md) § memmgr gives the interval and the bounds). It takes
+the processes in the order of their badges, which no lookup of the process index changes, so a pass
+sweeps each process once whatever faults and grants land between its slices, and a hand whose
+process is gone goes on at the next badge; `SWAP_TAKE`'s hand (below) takes them in the same order.
+A pass
 sweeps the records of a budget node only as often as the node's reclaim rate allows ([Distribution
 policy](#distribution-policy), Floors and weights): at its first record in a pass the node's credit
 grows by its rate over the greatest rate of a node the previous pass found an idle chunk of, at most

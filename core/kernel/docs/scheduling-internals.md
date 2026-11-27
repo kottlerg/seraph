@@ -1966,8 +1966,9 @@ take no lock:
 - `outranked` (Relaxed): the owning CPU alone, with interrupts masked, at a return to user mode
   and between two batches of a `SYS_MEMORY_ZERO` (`syscall::mem::sys_memory_zero`, after an
   interrupt window, when `PREEMPT` is set).
-- `has_queued_thread` (Relaxed), through `has_no_work`: the softlockup watchdog's per-tick idle
-  sample (`system_has_no_work`), the SMT core spread, and the idle pull's sibling hold.
+- `has_queued_thread` (Relaxed), through `has_no_work`: the softlockup watchdog's idle
+  sample (`sched::cpu_has_no_work`, a window per BSP tick), the SMT core spread, and the idle
+  pull's sibling hold.
 - `ranks` (Relaxed, with `current_level`): an RT wake's placement on any CPU (§ Wake Protocol
   Invariants, "The RT rule"), and the RT push's choice of a target (§ ThreadState Transitions,
   "The RT push").
@@ -2177,22 +2178,37 @@ RT) finds preemption disabled and must suppress the dispatch — a non-idle `cur
 ticks inside a shootdown ack-wait is live, and without this stamp a map/unmap storm whose ack-waits
 cover every CPU's slice expiries starves all stamps and false-fires the detector (the dump's serial
 output then stalls the acks it misdiagnosed). The BSP `timer_tick` increments a global tick counter
-and, on every tick, samples whether the system is idle (`system_has_no_work`): every CPU's
-`current` is its idle thread and no run queue but the idle queue links a thread
-(`PerCpuScheduler::has_no_work`). A sample that finds it idle records the tick
-(`WATCHDOG_LAST_IDLE_TICK`, printed in the dump's header). The detector fires when the system has
-not been seen idle for `WATCHDOG_THRESHOLD_SECONDS` (3 s, converted to ticks at
-`ticks_per_second()`) and every CPU's last non-idle dispatch is that old (`all_idle_tick`, which
-is host-tested). The sample is taken on every tick, before the decision, so the stall clock
-restarts at the last idle tick: a thread that slept the threshold since the last dispatch, woken
-by the same BSP tick's `sleep_check_wakeups` just before the check, has not waited undispatched
-at all.
+and, on every tick, reads one window of the detector's sweep of the CPUs (`sweep_window`: at most
+`CPU_SCAN_WINDOW`, 128, CPUs from the sweep's cursor, so a sweep of n CPUs takes ceil(n / 128)
+ticks and a boot of up to 128 CPUs reads every CPU at every tick). For each CPU of the window it
+samples whether the CPU has work: whether its `current` is its idle thread and no run queue but
+the idle queue links a thread (`PerCpuScheduler::has_no_work`). A sweep that finds every CPU idle
+records the tick it ends at (`WATCHDOG_LAST_IDLE_TICK`, printed in the dump's header). The
+detector fires at the end of a sweep when the system has not been seen idle for
+`WATCHDOG_THRESHOLD_SECONDS` (3 s, converted to ticks at `ticks_per_second()`) and every CPU's
+last non-idle dispatch, read by that sweep, is that old (`all_idle_tick`, which is host-tested).
+The sample is recorded before the decision, so the stall clock restarts at the last idle sweep: a
+thread that slept the threshold since the last dispatch, woken by the same BSP tick's
+`sleep_check_wakeups` just before the check, has not waited undispatched at all.
+
+The sweep bounds the BSP tick's cost: at most 128 CPUs' samples and 128 dispatch stamps per tick,
+whatever the CPU count. Each window's reads stop at the first CPU that settles the sweep's answer
+(a CPU with work, a recent stamp), and the later windows of that sweep skip them, so a busy system
+reads about one CPU per tick. The stamps are read only while the system has not been seen idle for
+the threshold, so the sweep under way when the stall clock reaches the threshold, some of whose
+windows were read before it did, does not fire. Work left undispatched is
+therefore reported at most 3 * ceil(n / 128) ticks after one walk of every CPU per tick would
+report it: the last idle sweep can end up to a sweep after the CPU's work appeared, the sweep under
+way when the clock reaches the threshold does not fire, and the next sweep fires at its end. In a
+boot of up to 128 CPUs, where every tick is a whole sweep, the detector decides at every tick as
+that walk would; at the 8192-CPU ceiling, with the 1 ms tick, the bound is 192 ms beside the 3 s
+threshold.
 
 The sample takes no lock: it reads each scheduler's `current`, `idle`, and `non_empty` atomics
-Relaxed, dereferences no TCB, and stops at the first CPU with work, so a wedged scheduler-lock
-holder cannot stall the BSP tick and the sample never contends a CPU's lock. It is therefore not
-one snapshot across the CPUs (only every CPU's scheduler lock, taken on every BSP tick, would make
-it one), so its windows are these:
+Relaxed and dereferences no TCB, so a wedged scheduler-lock holder cannot stall the BSP tick and
+the sample never contends a CPU's lock. It is therefore not one snapshot across the CPUs (only every
+CPU's scheduler lock, taken on every BSP tick, would make it one), and above 128 CPUs a sweep reads
+its CPUs over several ticks. Its windows are these:
 
 - *False negatives.* A sample that misses a ready thread in transit (in a window § ThreadState
   Transitions lists between a `Ready` commit and its link; between two run queues during a
@@ -2204,10 +2220,14 @@ it one), so its windows are these:
   below) when one of its rules matches, and is reported by neither otherwise. A thread whose state
   is `Ready` but which no run queue links (a broken enqueue) reads the same way. A CPU wedged on
   its idle thread (inside a deferred reclaim) with nothing queued anywhere is reported only once
-  work becomes ready and waits the threshold undispatched.
+  work becomes ready and waits the threshold undispatched. Above 128 CPUs a sweep reads its windows
+  at different ticks, so work that moves, between them, from a CPU the sweep has not yet read to
+  one it has (an idle pull, a migration) is missed the same way, by that sweep only.
 - *False positives.* A non-idle `current` that takes no stamping tick for the threshold
   (interrupts masked that long) reads as stalled, and so does ready work whose CPU the host does
-  not run for the threshold (an oversubscribed guest's descheduled vCPU).
+  not run for the threshold (an oversubscribed guest's descheduled vCPU). Above 128 CPUs a sweep
+  reads each CPU's stamp at its window's tick, so a stall that ends within the sweep that read it is
+  still reported once that sweep ends; it had lasted the threshold.
 
 **2. Owed-wake detector (BSP, every `DETECTOR_SCAN_INTERVAL_MS`, 0.5 s).** Detects a single
 `Blocked` thread whose wake is provably owed but never arrived — the lost-wakeup wedge signature
@@ -2235,8 +2255,12 @@ derives from a globally consistent counter on both arches — TSC / `time` CSR �
 comparison is sound). Each AP compares the BSP's stamp against its own (`bsp_stall_check`): a BSP
 wedged interrupts-off kills the sleep-list waker and every BSP-hosted detector at once — total
 silence — so the AP-side check is the only detector that can name that state (#375). Symmetrically
-the BSP scans AP stamps (`ap_silence_check`) and fires on an AP silent past the grace window. Both
-defer to an in-flight TLB shootdown, as below.
+the BSP scans AP stamps (`ap_silence_check`) and fires on an AP silent past the grace window. Each
+of its scans, one per `DETECTOR_SCAN_INTERVAL_MS`, reads one window of a sweep of the APs
+(`sweep_window`, at most 128 APs), so in a boot of n CPUs a silent AP is named at most
+ceil((n - 1) / 128) scans, ceil((n - 1) / 128) * 0.5 s, after its grace runs out: one scan up to 129
+CPUs, as a scan of every AP would, and 32 s at the 8192-CPU ceiling, where the grace is 512 s. Both
+checks defer to an in-flight TLB shootdown, as below.
 
 The observer's report would show only its own state, so before it prints, once it holds the latch,
 it has the silent CPU print its own frame (`arch::current::interrupts::dump_remote_frame`). On
@@ -2332,11 +2356,12 @@ thread stranded in a wedged CPU's run queue — were invisible before this enume
 
 **Cost:** per tick per CPU, one `current_tick()` read plus one Relaxed
 heartbeat store (APs add one Relaxed load + compare for the BSP check); one
-Relaxed counter increment per BSP tick and two O(`cpu_count`) early-exit
-loops (the idle sample, which stops at the first CPU with work, and, once the
-system has not been seen idle for the threshold, the dispatch-stamp scan, which
-stops at the first CPU with a recent dispatch); the registry scan and AP-stamp
-sweep run only on the 0.5 s cadence; one plain stamp store per park commit;
+Relaxed counter increment per BSP tick and two early-exit loops over one sweep
+window of at most `CPU_SCAN_WINDOW` (128) CPUs (the idle sample, which stops at
+the first CPU with work, and, once the system has not been seen idle for the
+threshold, the dispatch-stamp scan, which stops at the first CPU with a recent
+dispatch); the registry scan and the AP-stamp sweep, one window of at most 128
+APs per scan, run only on the 0.5 s cadence; one plain stamp store per park commit;
 three Relaxed stores per syscall (the dispatcher's `syscall_nr` stamp on the
 running TCB at entry and exit, which
 feeds the lock-holder line, and its per-CPU `note_cpu_syscall` stamp at

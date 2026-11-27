@@ -33,6 +33,7 @@ use svctest_fixtures::{CRASHD_RECIPE, ENV, Fixture, NONE, PHASES_ENV, Set};
 use crate::error::{Context as _, Result, bail};
 use crate::layers::{self, Layer};
 use crate::signing::body_of;
+use crate::sysroot::ImageHarness;
 use crate::util::step;
 
 crate::argparse::value_enum! {
@@ -95,14 +96,57 @@ const OOMD_RECIPE: &str = "oomd.svc";
 /// a sysroot's image a services-layer image.
 const SERVICES_LAYER_HARNESSES: [&str; 2] = [SVCTEST_RECIPE, UBENCH_RECIPE];
 
+/// How the recipe of `harness`, one svcmgr launches, comes to be staged.
+fn staged_by(harness: ImageHarness) -> &'static str
+{
+    match harness
+    {
+        ImageHarness::Svctest => "staged by `cargo xtask mkdisk --svctest <set>`",
+        ImageHarness::Ubench => "staged by `cargo xtask mkdisk --ubench`",
+        ImageHarness::Usertest =>
+        {
+            "copied from config/svcmgr/tests/ and packed by `cargo xtask mkdisk --repack-only`"
+        }
+        // The ktest bundle's init has no recipe, so no staging holds it.
+        ImageHarness::Ktest => "booted by `cargo xtask mkdisk --harness ktest`, with no recipe",
+    }
+}
+
 /// Whether the sysroot at `sysroot` stages a services-layer harness, whose
 /// image is a services-layer image (`crate::layers::Image::Services`).
-pub fn services_layer(sysroot: &Path) -> bool
+///
+/// # Errors
+///
+/// When its `config/svcmgr/services/` holds the recipes of two harnesses
+/// svcmgr launches ([`ImageHarness::SUPERVISED`]): an image boots one, so the
+/// pack would leave the other's recipe out and the boot would run a harness
+/// it was not staged for. The refusal names each recipe and how it is staged.
+pub fn services_layer(sysroot: &Path) -> Result<bool>
 {
     let services = sysroot.join(SERVICES_DIR);
-    SERVICES_LAYER_HARNESSES
-        .iter()
-        .any(|recipe| services.join(recipe).is_file())
+    let staged: Vec<(String, ImageHarness)> = ImageHarness::SUPERVISED
+        .into_iter()
+        .filter_map(|harness| harness.recipe().map(|recipe| (recipe, harness)))
+        .filter(|(recipe, _)| services.join(recipe).is_file())
+        .collect();
+    if staged.len() > 1
+    {
+        let named: Vec<String> = staged
+            .iter()
+            .map(|(recipe, harness)| format!("{recipe} ({})", staged_by(*harness)))
+            .collect();
+        bail!(
+            "{} holds the recipes of {} harnesses, and an image boots one: {}; remove all \
+             but one, or restore the default staging with `cargo xtask mkdisk` without \
+             --repack-only",
+            services.display(),
+            staged.len(),
+            named.join(", ")
+        );
+    }
+    Ok(staged
+        .first()
+        .is_some_and(|(recipe, _)| SERVICES_LAYER_HARNESSES.contains(&recipe.as_str())))
 }
 
 /// Stage the ubench boot in `sysroot` (see the module documentation).
@@ -539,7 +583,9 @@ mod tests
                 UBENCH_RECIPE
             };
             fs::write(root.join(SERVICES_DIR).join(earlier), "an earlier staging").unwrap();
-            assert!(services_layer(&root));
+            // usertest's recipe and an earlier harness's: the staging below
+            // leaves one.
+            services_layer(&root).unwrap_err();
             if ubench
             {
                 stage_ubench(&root).unwrap();
@@ -559,11 +605,47 @@ mod tests
             assert!(staged(&root, "timed.svc").is_some());
             assert_eq!(staged(&root, SVCTEST_RECIPE).is_some(), !ubench);
             assert_eq!(staged(&root, UBENCH_RECIPE).is_some(), ubench);
-            assert!(services_layer(&root));
+            assert!(services_layer(&root).unwrap());
             fs::remove_dir_all(&root).unwrap();
         }
         let root = sysroot("layer-default");
-        assert!(!services_layer(&root));
+        assert!(!services_layer(&root).unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Defect caught: a hand-staged usertest recipe beside an earlier
+    // staging's svctest recipe packed a services-layer image without it, and
+    // the boot ran svctest in its place.
+    #[test]
+    fn a_staging_of_two_harnesses_recipes_is_refused_naming_both()
+    {
+        for (i, pair) in [
+            [ImageHarness::Svctest, ImageHarness::Usertest],
+            [ImageHarness::Usertest, ImageHarness::Ubench],
+            [ImageHarness::Svctest, ImageHarness::Ubench],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let root = sysroot(&format!("two-harnesses-{i}"));
+            for harness in pair
+            {
+                let recipe = harness.recipe().unwrap();
+                fs::write(root.join(SERVICES_DIR).join(recipe), "a harness").unwrap();
+            }
+            let text = format!("{:#}", services_layer(&root).unwrap_err());
+            for harness in pair
+            {
+                let recipe = harness.recipe().unwrap();
+                let how = staged_by(*harness);
+                assert!(text.contains(&format!("{recipe} ({how})")), "{text}");
+            }
+            fs::remove_dir_all(&root).unwrap();
+        }
+        // usertest's recipe alone makes no services-layer image.
+        let root = sysroot("one-harness");
+        fs::write(root.join(SERVICES_DIR).join("usertest.svc"), "a harness").unwrap();
+        assert!(!services_layer(&root).unwrap());
         fs::remove_dir_all(&root).unwrap();
     }
 

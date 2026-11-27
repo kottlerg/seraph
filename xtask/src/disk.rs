@@ -427,14 +427,15 @@ const STAGED_RECIPES: &str = "config/svcmgr/services";
 /// ([`layers::installed`]); the default image otherwise.
 ///
 /// # Errors
-/// When a staged recipe cannot be read, or its name or text is not UTF-8.
+/// When the staged recipes are two harnesses' (`services_layer`), or a staged
+/// recipe cannot be read, or its name or text is not UTF-8.
 fn image_of(sysroot: &Path, harness: Harness) -> Result<Image>
 {
     if matches!(harness, Harness::Ktest)
     {
         return Ok(Image::Kernel);
     }
-    if crate::svctest_stage::services_layer(sysroot)
+    if crate::svctest_stage::services_layer(sysroot)?
     {
         return Ok(Image::Services);
     }
@@ -2069,8 +2070,12 @@ mod tests
         fs::write(services.join("usertest.svc"), "binary = /tests/usertest\n").unwrap();
         assert_eq!(image_of(&sysroot, Harness::Init).unwrap(), Image::Harness);
         fs::write(services.join("svctest.svc"), "binary = /tests/svctest\n").unwrap();
-        assert_eq!(image_of(&sysroot, Harness::Init).unwrap(), Image::Services);
+        // Two harnesses' recipes: refused, but not under the ktest bundle,
+        // whose image holds no recipe.
+        image_of(&sysroot, Harness::Init).unwrap_err();
         assert_eq!(image_of(&sysroot, Harness::Ktest).unwrap(), Image::Kernel);
+        fs::remove_file(services.join("usertest.svc")).unwrap();
+        assert_eq!(image_of(&sysroot, Harness::Init).unwrap(), Image::Services);
     }
 
     // Defect caught: a record naming a harness the image does not boot (a
@@ -2090,13 +2095,9 @@ mod tests
         fs::write(services.join("usertest.svc"), "binary = /tests/usertest\n").unwrap();
         assert_eq!(of(Harness::Init).unwrap(), [ImageHarness::Usertest]);
         assert_eq!(of(Harness::Ktest).unwrap(), [ImageHarness::Ktest]);
+        fs::remove_file(services.join("usertest.svc")).unwrap();
         fs::write(services.join("svctest.svc"), "binary = /tests/svctest\n").unwrap();
         assert_eq!(of(Harness::Init).unwrap(), [ImageHarness::Svctest]);
-        fs::write(services.join("ubench.svc"), "binary = /tests/ubench\n").unwrap();
-        assert_eq!(
-            of(Harness::Init).unwrap(),
-            [ImageHarness::Svctest, ImageHarness::Ubench]
-        );
     }
 
     #[test]

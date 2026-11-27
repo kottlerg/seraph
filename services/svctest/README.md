@@ -375,9 +375,11 @@ its class with `class =` and carries `verbs = 58`, a verb mask none of the drive
 hwrng driver's endpoint badged with none of the driver's verb bits. That phase requires an
 `UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY`, and
 `INPUT_READ_EVENTS` (at once, without blocking for a key), and `READ` on the `hwrng-deny` SEND, and
-to `FB_WRITE_BYTES` and `FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot, CI's,
-devmgr runs none and the framebuffer case logs a skip, which the framebuffer device cell
-([docs/testing.md](../../docs/testing.md#coverage-tiers) § Coverage tiers) fails on. The
+to `FB_WRITE_BYTES` and `FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot (CI's
+debug svctest cells) devmgr runs none and the framebuffer case logs a skip, which fails CI's release
+svctest cells and the framebuffer device cell
+([docs/testing.md](../../docs/testing.md#coverage-tiers) § Coverage tiers), both of which boot a
+framebuffer. The
 `logd_sinks` phase's framebuffer cases log the same skip on such a boot
 ([`logd_sinks.rs`](src/phases/logd_sinks.rs) states its cases). The drivers hwrng read phase
 waits (bounded by `DEVICE_WAIT_MS`) for a granted SEND from `caps[16]`, then requires two `READ`

@@ -35,9 +35,10 @@
 //!   entry whatever the sinks show. The serial sink must not write it, which
 //!   the svctest cell's boot checks host-side (`--fail-also` on its text,
 //!   [`HIDDEN_LINE`]; `services/logd/docs/sinks.md` § Settings).
-//! - **Framebuffer stopped**, on a boot with a framebuffer driver (the
-//!   framebuffer cell; otherwise the case logs that it skipped). The
-//!   framebuffer sink is `skip` and holds nobody, and shows critical and more
+//! - **Framebuffer stopped**, on a boot with a framebuffer driver (CI's
+//!   release svctest cells and the framebuffer cell; otherwise the case logs
+//!   that it skipped). The framebuffer sink is `skip` and holds nobody, and
+//!   shows critical and more
 //!   severe by default, so the framebuffer cases send their lines at
 //!   critical. While its driver is stopped the phase sends more lines than
 //!   svctest's share of the history holds at its largest, so the history drops svctest's oldest before the sink

@@ -603,6 +603,14 @@ jobs:
           # The svctest boot also fails on the debug line svctest's `logd_sinks`
           # phase logs, which the serial sink, at its default level of info,
           # must not write (services/logd/docs/sinks.md § Settings).
+          # The release svctest boot keeps QEMU std VGA with no window
+          # (`--display framebuffer`), so devmgr spawns the framebuffer driver
+          # and svctest's drivers and `logd_sinks` phases run their framebuffer
+          # cases, and fails when one logs `framebuffer case skipped`; the
+          # debug svctest boot stays headless, the supported configuration with
+          # no display, so each architecture boots both (docs/testing.md
+          # § Coverage tiers). `--fail-also` takes one pattern, so the release
+          # boot's two are one alternation.
           # The usertest boot also checks the log-level configuration its
           # staging packed: a debug line of vfsd and of the fatfs vfsd spawns,
           # and none of devmgr or procmgr. The ktest boot also checks the
@@ -612,9 +620,15 @@ jobs:
           checks=()
           case "${{ matrix.tester }}" in
             svctest)
+              fail_also='logd_sinks: a debug line no default sink shows'
+              display=()
+              if [ "${{ matrix.profile }}" = release ]; then
+                fail_also="$fail_also|framebuffer case skipped"
+                display=(--display framebuffer)
+              fi
               checks=(--whole-lines whole-lines --whole-lines serial-burst
-                      --whole-lines log-flood
-                      --fail-also 'logd_sinks: a debug line no default sink shows') ;;
+                      --whole-lines log-flood "${display[@]}"
+                      --fail-also "$fail_also") ;;
             usertest)
               checks=(--require 'DEBUG  \[vfsd\] ' --require 'DEBUG  \[fatfs\] '
                       --fail-also 'DEBUG  \[(devmgr|procmgr)\] ') ;;

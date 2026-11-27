@@ -11,6 +11,9 @@ boot-protocol = { workspace = true }
 crypto = { path = "../../shared/crypto" }
 elf = { workspace = true }
 init-protocol = { workspace = true }
+# The portable events, the PMU syscalls' register packing and the per-vendor
+# counter decode; without the `client` feature, which is the user API.
+pmu = { path = "../../shared/pmu" }
 process-layout = { workspace = true }
 font = { workspace = true }
 syscall = { workspace = true }

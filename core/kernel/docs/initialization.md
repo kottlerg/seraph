@@ -335,9 +335,11 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 1. Enable SMEP and SMAP in CR4 (fatal if CPUID lacks either; both are required and
    already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear every CR4
    control ring 3 reaches that the kernel does not grant (VME, PVI, TSD, PCE, FSGSBASE, KL,
-   PKE, UINTR) and PKS, so ring 3 reads the timestamp counter and no performance counter,
-   and has no virtual interrupts, Key Locker, protection keys or user interrupts (each AP
-   repeats this step in interrupts::init_ap)
+   PKE, UINTR) and PKS, so ring 3 reads the timestamp counter and no performance counter
+   (a thread `SYS_PMU_BIND` granted reads them while it runs on a CPU with a user configuration;
+   perfmon.md § The grant), and has no
+   virtual interrupts, Key Locker, protection keys or user interrupts (each AP repeats this step in
+   interrupts::init_ap)
 2. Enable XSAVE (x87 | SSE | AVX in XCR0), set CR0.MP and CR0.NE and clear CR0.EM and
    CR0.AM (x87 errors as #MF, no ring-3 alignment checking); CR0.TS stays clear
 3. Construct and install the permanent GDT and the BSP's TSS (the segment descriptors are
@@ -399,7 +401,9 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Set FS and VS Off (a thread's first F/D/V instruction traps and makes its state live)
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Write scounteren whole with CY alone, whatever the firmware left, so U-mode reads the
-   cycle counter and no other (each AP writes the same in interrupts::init_ap)
+   cycle counter and no other (a thread `SYS_PMU_BIND` granted also reads the configured counters
+   while it runs on a CPU with a user configuration; perfmon.md § The grant; each AP writes the
+   same in interrupts::init_ap)
 5. Initialise AIA (`aia::init_bsp`): halt unless every hart advertises Ssaia
    (`HART_CAP_SSAIA`) and the bootloader reported a supervisor-level APLIC domain
    (`BootInfo.kernel_mmio.aplic`) of 1..=1023 sources with a register window of at least
@@ -438,6 +442,10 @@ that left `mstateen0.ENVCFG` clear, or a hart without `senvcfg`) or does not rea
 does the same at bring-up (Phase 8). x86-64 has no state-enable register:
 the XCR0 set of step 2 is the extended state ring 3 reaches, and the XSAVE switch saves all of it
 ([platform-requirements.md](../../../docs/platform-requirements.md) § riscv64 Classification).
+
+Right after, the BSP describes its performance counters (`perfmon::init_this_cpu`) and logs
+`pmu: counters=<n> width=<bits> events=<mask>`, or `pmu: no counters` where it has none
+([perfmon.md](perfmon.md) § Per-CPU state).
 
 Then the BSP initialises its own interrupt-controller state that needs its per-CPU pointer
 (`interrupts::init_bsp_local`; x86-64 has none). RISC-V initialises the BSP's supervisor-level
@@ -602,12 +610,16 @@ Phase 7.
    h. One KernelLog capability carrying Read, authorising the holder to read the kernel log
       through SYS_KERNEL_LOG_READ and to bind a notification to it through SYS_KERNEL_LOG_BIND;
       init finds it by its `CapDescriptor` (`CapType::KernelLog`, `aux0 = aux1 = 0`)
-   i. Memory capabilities for the boot module images, via
+   i. One PmuControl capability carrying Configure, authorising the holder to describe,
+      configure and bind the user performance counters through SYS_PMU_INFO,
+      SYS_PMU_CONFIGURE and SYS_PMU_BIND; init finds it by its `CapDescriptor`
+      (`CapType::PmuControl`, `aux0 = aux1 = 0`)
+   j. Memory capabilities for the boot module images, via
       `cap::mint_module_memory_caps` (one per `BootInfo.modules` entry), which
       also writes each module's name entry into the `InitInfo` module-name
       table, which follows the header at `MODULE_NAMES_OFFSET`, in place in
       the region step 1 reserved, and the entry count into the header
-   j. (Init's AddressSpace, Thread, and CSpace capabilities and the Memory capabilities
+   k. (Init's AddressSpace, Thread, and CSpace capabilities and the Memory capabilities
       for its segments, InitInfo pages, and stack pages are added in Phase 9)
 
    Because step 1 reserves Phase 9's backing before the drain takes the
@@ -707,6 +719,10 @@ The scratch pages and bundle layout are described in
    ("stack guards: N of M guard tables left"; [memory-internals.md](memory-internals.md)
    § Kernel Stack Guards).
 ```
+
+Each AP describes its own performance counters in `kernel_entry_ap` (`perfmon::init_this_cpu`),
+after `cpu::disable_unswitched_user_state` and before its transient-execution controls, and logs
+no line.
 
 The run-queue structure, idle priority, and idle-thread loop are specified in
 [scheduler.md](scheduler.md) § Run Queue Structure and § Idle Thread; the step-5

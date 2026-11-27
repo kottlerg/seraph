@@ -325,10 +325,14 @@ unsafe fn write_u64_at(phys: u64, offset: u64, value: u64)
     unsafe { core::ptr::write_volatile((phys + offset) as *mut u64, value) };
 }
 
-/// Bytes [`FreedClear`] zeroes between two interrupt windows: 16 pages, about
-/// a microsecond of stores on x86-64 under KVM, so a free of any size masks
-/// interrupts for its clear no longer than a 16-page free does.
-const CLEAR_BATCH_BYTES: u64 = 16 * PAGE_BYTES;
+/// Pages the kernel zeroes between two interrupt windows: [`FreedClear`]'s
+/// batch, and `SYS_MEMORY_ZERO`'s (`syscall::mem::sys_memory_zero`). 16
+/// pages, about a microsecond of stores on x86-64 under KVM, so a clear or a
+/// zero of any size masks interrupts no longer than a 16-page one does.
+pub(crate) const CLEAR_BATCH_PAGES: usize = 16;
+
+/// [`CLEAR_BATCH_PAGES`] in bytes.
+const CLEAR_BATCH_BYTES: u64 = CLEAR_BATCH_PAGES as u64 * PAGE_BYTES;
 
 /// Zeroes the bytes a free returns to `memory`'s region, before they rejoin
 /// its allocator (§ Freed bytes in the module documentation). It takes
@@ -1466,7 +1470,8 @@ pub const fn event_queue_dispatch(capacity: u64, observers: u64) -> DispatchEntr
 ///
 /// Returns `None` for object types that cannot be retyped (`Memory` is
 /// retypable; `Mmio`/`Interrupt`/`IoPort`/`SchedControl`/
-/// `SbiControl`/`EntropyControl` are boot-minted only).
+/// `SbiControl`/`EntropyControl`/`KernelLog`/`PmuControl` are boot-minted
+/// only).
 pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEntry>
 {
     match object_type
@@ -1537,6 +1542,7 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
         | ObjectType::SbiControl
         | ObjectType::EntropyControl
         | ObjectType::KernelLog
+        | ObjectType::PmuControl
         | ObjectType::ArenaPage => None,
     }
 }
@@ -1866,6 +1872,8 @@ mod tests
         assert!(dispatch_for(ObjectType::SchedControl, 0).is_none());
         assert!(dispatch_for(ObjectType::SbiControl, 0).is_none());
         assert!(dispatch_for(ObjectType::EntropyControl, 0).is_none());
+        assert!(dispatch_for(ObjectType::KernelLog, 0).is_none());
+        assert!(dispatch_for(ObjectType::PmuControl, 0).is_none());
     }
 
     /// A Memory object over a zeroed host buffer of `pages` pages, every byte

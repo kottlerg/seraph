@@ -46,7 +46,7 @@ core/kernel/src/arch/
 │   ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
 │   ├── gdt.rs      ├── idt.rs      ├── ioapic.rs     ├── fpu.rs
 │   ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs ├── speculation.rs
-│   └── shadow_stack.rs
+│   ├── pmu.rs      └── shadow_stack.rs
 └── riscv64/
     ├── mod.rs      ├── aia.rs      # APLIC (MSI mode) and IMSIC
     ├── aia_encoding.rs # AIA register-map arithmetic; no arch-module deps
@@ -54,7 +54,7 @@ core/kernel/src/arch/
     ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
     ├── gdt.rs      ├── idt.rs      ├── sbi.rs        ├── fpu.rs
     ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs ├── speculation.rs
-    ├── shadow_stack.rs
+    ├── shadow_stack.rs ├── pmu.rs
     └── encoding.rs # SBI mask, F/D/V, page/tick math, PTE permissions; no arch-module deps
 ```
 
@@ -1043,6 +1043,47 @@ pub unsafe fn apply_mitigations_this_cpu();
 /// the view `view` names (`SPECULATION_VIEW_*`), `InvalidArgument` for an
 /// unknown view, and `NotSupported` for every view on RISC-V.
 pub fn mitigation_info(view: u64) -> Result<u64, SyscallError>;
+```
+
+---
+
+## `pmu` — `arch::current::pmu`
+
+The architecture half of the user performance counters
+(`crate::perfmon`; see [`perfmon.md`](perfmon.md)). A CPU without counters, or one whose
+firmware or hypervisor does not offer them, satisfies the contract by reporting none.
+
+```rust
+/// Per-CPU architecture state: which counters the current configuration holds and, on
+/// x86-64, each event's encoding. Owned by the CPU's `PerCpuData::pmu`.
+pub struct ArchPmu;
+
+/// Describe the calling CPU's counters (`pmu::Info`: the user counters, their width, the
+/// events they count) and leave every user counter stopped at zero. Called once per CPU at
+/// its bring-up, by `perfmon::init_this_cpu`.
+pub unsafe fn init(state: &mut ArchPmu) -> Info;
+
+/// Program the calling CPU's user counters for the events and mode of one
+/// `SYS_PMU_CONFIGURE`, replacing the CPU's previous configuration, and write each event's
+/// read handle to `handles`. `NotSupported` when the CPU does not count an event.
+pub unsafe fn configure(
+    state: &mut ArchPmu,
+    info: Info,
+    events: &EventList,
+    mode: PmuMode,
+    handles: &mut [u8],
+) -> Result<(), SyscallError>;
+
+/// Set or clear, on the calling CPU, the control that lets user mode read counters (x86-64
+/// `CR4.PCE`, every counter `RDPMC` names; riscv64 the configured counters' bits in `scounteren`),
+/// for the thread about to run: `reader` is whether it holds the grant of `SYS_PMU_BIND`.
+pub unsafe fn apply_grant(state: &ArchPmu, reader: bool);
+
+impl ArchPmu
+{
+    /// Whether a configuration holds counters on this CPU.
+    pub const fn configured(&self) -> bool;
+}
 ```
 
 ---

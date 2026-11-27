@@ -737,13 +737,13 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 the non-experimental `ssaia` and `smaia` CPU properties. `xtask/src/qemu.rs` passes
 `-machine virt,aia=aplic-imsic` and
 `-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,ssaia=on,smaia=on`
-followed by `,smstateen=on,svadu=off,svade=on`, the `--idle-wait` suffix (default `,zawrs=off`), the
-`--riscv-zkr` suffix (default `,zkr=on`) and the `--riscv-mmu` satp-mode suffix (default
-`,sv57=off`) for RISC-V and `-cpu max,migratable=no` on x86-64 TCG, plus the `--idle-wait`
-`monitor` suffix (default `,monitor=off`, appended to every x86-64 accelerator's `-cpu` model;
-`on` appends `,monitor=on` under TCG and passes `-overcommit cpu-pm=on` under KVM), the
-`--x86-paging` `la57` suffix (default
-`,la57=off`, appended to every x86-64 accelerator's `-cpu` model) and the
+followed by `,smstateen=on,svadu=off,svade=on,sscofpmf=on`, the `--idle-wait` suffix (default
+`,zawrs=off`), the `--riscv-zkr` suffix (default `,zkr=on`) and the `--riscv-mmu` satp-mode
+suffix (default `,sv57=off`) for RISC-V and `-cpu max,migratable=no` on x86-64 TCG, plus the
+`--idle-wait` `monitor` suffix (default `,monitor=off`, appended to every x86-64 accelerator's
+`-cpu` model; `on` appends `,monitor=on` under TCG and passes `-overcommit cpu-pm=on` under
+KVM), the `--x86-paging` `la57` suffix (default `,la57=off`, appended to every x86-64
+accelerator's `-cpu` model) and the
 `--x86-shadow-stack` `cet-ss` suffix (default `,cet-ss=off`, appended likewise when the QEMU's
 `-cpu help` lists the `cet-ss` flag; a QEMU without the flag, the 10.2 of the CI image among
 them, cannot offer CET shadow stacks, so the default appends nothing there and `on` is refused
@@ -763,6 +763,10 @@ The `rv64` model enables Svadu and leaves Svade off, which with the bundled Open
 hardware A/D updating (`menvcfg.ADUE`). `svadu=off,svade=on` boots the Svade baseline instead, so
 an access that finds A clear faults and the kernel's fault path sets the bit
 ([platform-requirements.md](platform-requirements.md); both properties are present from QEMU 9.0).
+`sscofpmf=on` gives the hart Sscofpmf, with which QEMU describes the events of its programmable
+counters to the bundled OpenSBI, so the SBI PMU extension configures them and the kernel offers
+user performance counters ([core/kernel/docs/perfmon.md](../core/kernel/docs/perfmon.md)); without
+it no programmable counter counts an event and the kernel reports none.
 `zkr=on` gives the hart the Zkr entropy source, whose `seed` CSR the bundled OpenSBI grants
 S-mode when the hart implements it, so the kernel's pool seeds from it beside the firmware boot
 seed and the boot log shows

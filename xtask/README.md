@@ -786,8 +786,8 @@ to install, when the emulator, the cross compiler or its C library is missing
 ([docs/build-system.md](../docs/build-system.md) § Toolchain).
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), and takes
-their `--wait-host` and `--host-override` options. The unit-test form refuses `--arch`, `--cpus`,
-`--mem`, `--release`, `--alone`, `--timing` and `--grant`.
+their `--wait-host`, `--host-override` and `--grant` options. The unit-test form refuses `--arch`,
+`--cpus`, `--mem`, `--release`, `--alone` and `--timing`.
 
 #### Cases
 
@@ -1564,7 +1564,7 @@ writes every file under `vectors/reference/` (`ed25519.json`, `sha512.json`, `sh
 regenerates byte-identically. xtask does not depend on the testkit.
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), and takes
-their `--wait-host` and `--host-override` options.
+their `--wait-host`, `--host-override` and `--grant` options.
 
 ---
 
@@ -1622,7 +1622,7 @@ from clean working directories, each from seed 0 within its budget in `src/comma
 at the same execution, with the same minimized input. `--list` and `--all` leave them out.
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--list`
-aside, and takes their `--wait-host` and `--host-override` options.
+aside, and takes their `--wait-host`, `--host-override` and `--grant` options.
 
 ---
 
@@ -1753,7 +1753,7 @@ sized there, under the limit the command sets, before CI runs it
 ([docs/testing.md](../docs/testing.md#bounded-verification) § Bounded verification).
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), `--pin`
-aside, and takes their `--wait-host` and `--host-override` options.
+aside, and takes their `--wait-host`, `--host-override` and `--grant` options.
 
 ---
 
@@ -1903,7 +1903,8 @@ The cells are listed in the order built:
 `x86_64-debug,x86_64-release,riscv64-debug,riscv64-release` for a run of all four. The verdict is
 `DIFFERENT (<count>)` when any part differs, and the command then fails. The command is admitted
 as a build under the [Host launch rules](#host-launch-rules), and passes its `--wait-host` on to
-each build and clean it runs, which are admitted on their own.
+each build and clean it runs, which are admitted on their own, and which a timing grant set after
+the command was admitted does not hold (Host launch rules).
 
 ---
 
@@ -2708,7 +2709,7 @@ cargo xtask orch orchestrator [<agent-id>]
 cargo xtask orch worker <name> [--id <agent-id>] [--model <m>] [--effort <e>] [--scope <s>] \
     [--branch <b>] [--worktree <path>] [--pr <N>] [--phase <phase>] [--status <text>]
 cargo xtask orch worker <name> --remove
-cargo xtask orch grant set <holder> <commands>...
+cargo xtask orch grant set [--timing [--wait <SECS>]] <holder> <commands>...
 cargo xtask orch grant clear
 cargo xtask orch grant queue <holder> <commands>...
 cargo xtask orch grant unqueue <holder>
@@ -2737,7 +2738,7 @@ needs no separate upkeep; `orch log` appends a line for an event that changes no
 | `state` | Prints the state as text: goal, log, orchestrator, grant and queue, each worker, merge order, open questions, rulings. It warns on stderr when the text passes 10,000 bytes, which keeps it within the 10,000 characters a hook may add to a session's context; `worker --remove`, `question close` and `ruling drop` shorten it. `--json` prints the stored file. |
 | `orchestrator` | Records the agent id workers report to. Without an id, prints the recorded one and changes nothing. |
 | `worker` | Sets the named fields of a worker, creating the worker when it is new, and with `--status` the time of that report, which `state` prints beside it; fields it does not name keep their value. A phase is one of `planning`, `coding`, `review`, `gate`, `merged`, `retired`, `dead`. `--remove` drops the worker. |
-| `grant set` | Records the exclusive grant and takes its holder out of the queue, and writes the grant to the host lock, where every boot not under it is refused ([Host launch rules](#host-launch-rules)). Refuses while a grant is outstanding. |
+| `grant set` | Records the exclusive grant and takes its holder out of the queue, and writes the grant to the host lock, where every boot not under it is refused ([Host launch rules](#host-launch-rules)). Refuses while a grant is outstanding. With `--timing` the grant is a timing grant, which holds every build not under it too, and the command returns only once the host is quiet: no live holder record that does not name the grant's holder (`--grant`), and no QEMU no record names. It prints what still holds the host each time that changes, and after `--wait` seconds (default 1800), or on Ctrl+C, fails naming it, the grant left set. Its options come before the holder. |
 | `grant clear` | Ends the grant, in the host lock first, even one the state does not record, and then in the state. |
 | `grant queue`, `grant unqueue` | Add or drop a request for the grant; a holder has at most one. |
 | `order` | Replaces the merge order; no argument clears it. |
@@ -2758,8 +2759,9 @@ cargo xtask host status
 ```
 
 It prints the lock directory, the 1-minute load average beside each limit, the exclusive grant's
-holder, each live holder (its pid, QEMU count and vCPUs, whether it runs alone or measures
-timing, its checkout and command line), and the vCPU count of each QEMU running. It changes
+holder and whether it is a timing grant, each live holder (its pid; a build, or a boot's QEMU
+count and vCPUs and whether it runs alone or measures timing; the grant it passed; its checkout
+and command line), and the vCPU count of each QEMU running. It changes
 nothing and removes no record.
 
 ### `cargo xtask hook`
@@ -2865,7 +2867,7 @@ to itself, and so does a boot started with `--alone` or `--timing`.
 
 | Command | Admitted when | Load limit (1-minute average, below) |
 |---|---|---|
-| Build | No `--timing` boot runs | 32 (`BUILD_LOAD_MAX`) |
+| Build | No `--timing` boot runs, and no timing grant is outstanding that it is not under (below) | 32 (`BUILD_LOAD_MAX`) |
 | Small boot | No boot that needs the host to itself runs, no QEMU of more than 4 vCPUs runs, and the QEMUs running plus its own are at most 3 (`SMALL_BOOTS_MAX`) | 16 (`SMALL_BOOT_LOAD_MAX`) |
 | Small boot, `--alone` | No QEMU runs | 16 (`SMALL_BOOT_LOAD_MAX`) |
 | More than 4 vCPUs (`SMALL_BOOT_VCPUS_MAX`), more than 3 QEMUs, or `--timing` | No QEMU runs | 10 (`LARGE_BOOT_LOAD_MAX`) |
@@ -2881,24 +2883,35 @@ shares (in `target/xtask/host/` outside a git checkout):
 
 - `admission.lock`: held for the length of one admission. Two commands started at the same
   moment decide one after the other, and the second sees the first's record.
-- `holders/<pid>-<nanos>.json`: one record per admitted boot, held under a file lock by the
-  command and by every QEMU it starts, which inherits the descriptor. A record whose lock can be
-  taken belongs to no live process, and the next admission removes it, so a killed command
+- `holders/<pid>-<nanos>.json`: one record per admitted command, held under a file lock: a
+  build's by the command for as long as it runs, a boot's by the command and by every QEMU it
+  starts, which inherits the descriptor. A build's record counts no QEMU. A record whose lock can
+  be taken belongs to no live process, and the next admission removes it, so a killed command
   leaves nothing to clean up, and its QEMUs keep the host held while they run.
 - `grant.json`: the exclusive grant. `cargo xtask orch grant set` writes it, `orch grant clear`
   (whatever the batch state records) and `orch end` remove it. While it exists, a boot is refused
-  unless it passes `--grant <holder>` naming its holder, and the holder's boots still meet the
-  rules above. Builds are not affected.
+  unless it passes `--grant <holder>` naming its holder, and the holder's boots still meet the rules
+  above. A timing grant (`orch grant set --timing`) refuses a build the same way, unless the build
+  was started by a command the host already admitted (one whose process, or an ancestor of it as
+  `/proc` reports them, holds a live record), as `compare-images` starts its nested builds, so a
+  command admitted before the grant finishes. Any other grant leaves builds alone. With
+  `--wait-host` a refused command waits for the grant to end; without it, it fails at once naming
+  the holder. The lock holds only what the host admits: cargo's compile of xtask itself, which any
+  `cargo xtask` command runs first when the checkout's build of xtask is not current (a file it is
+  built from changed: `xtask/`, a crate xtask's build reaches, directly or through another (`cargo
+  tree -p xtask -e normal,build`), the root `Cargo.toml` or `Cargo.lock`, `.cargo/` or the
+  toolchain; or a worktree that has not built it yet), comes before any admission, and an xtask
+  built from a branch without the timing grant neither registers its builds nor refuses them.
 
 The options:
 
 | Option | Commands | Effect |
 |---|---|---|
 | `--wait-host <SECS>` | Builds and boots | On a refusal, ask again every 10 s until admitted, for at most SECS; at the bound, fail with the last refusal. Ctrl+C ends the wait at once, with the same failure. Without it a refusal fails at once. |
-| `--host-override` | Builds and boots | Start even when the rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers its record, so other commands see it. |
+| `--host-override` | Builds and boots | Start even when the rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers its record, so other commands see it. |
 | `--alone` | Boots | Run beside no other QEMU, and keep every other boot off the host: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts (`.claude/agents/worker.md` § Host runs). |
 | `--timing` | Boots | A timing-sensitive measurement: beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, with builds refused while it runs. |
-| `--grant <HOLDER>` | Boots | Boot under the exclusive grant of HOLDER. |
+| `--grant <HOLDER>` | Builds and boots | Run under the exclusive grant of HOLDER. |
 
 The load is the host's `getloadavg` (`/proc/loadavg` on Linux); a host that reports none is not
 refused on it. On a GitHub Actions runner (`GITHUB_ACTIONS=true`) the checks are skipped with one

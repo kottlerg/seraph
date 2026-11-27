@@ -70,6 +70,7 @@ pub enum ObjectType
     ArenaPage = 13,
     EntropyControl = 14,
     KernelLog = 15,
+    PmuControl = 16,
 }
 
 // ── KernelObjectHeader ────────────────────────────────────────────────────────
@@ -740,7 +741,8 @@ impl MemoryObject
 
 /// RAII guard releasing a read lock on a [`MemoryObject`] when dropped.
 ///
-/// Used by `sys_mem_map` and `cap::retype::retype_allocate` to ensure the
+/// Used by `sys_mem_map`, each batch of `sys_memory_zero` and
+/// `cap::retype::retype_allocate` to ensure the
 /// read lock is released on every return path, including `?` short-circuits.
 pub struct MemoryReadGuard<'a>
 {
@@ -903,6 +905,7 @@ unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
         | ObjectType::SbiControl
         | ObjectType::EntropyControl
         | ObjectType::KernelLog
+        | ObjectType::PmuControl
         | ObjectType::ArenaPage => crate::fatal("lineage_of: not a range-capability object"),
     }
 }
@@ -1392,6 +1395,20 @@ pub struct EntropyControlObject
 /// one `klog` ring.
 #[repr(C)]
 pub struct KernelLogObject
+{
+    pub header: KernelObjectHeader,
+}
+
+/// Kernel object for performance-counter authority (`PmuControl`
+/// capability).
+///
+/// There is exactly one `PmuControl` object, created at boot. Grants the
+/// holder authority to read the PMU's description (`SYS_PMU_INFO`), to program
+/// user counters on the CPU it runs on (`SYS_PMU_CONFIGURE`), and to grant a
+/// thread user-mode counter reads (`SYS_PMU_BIND`); it carries no fields, the
+/// counters being per-CPU state.
+#[repr(C)]
+pub struct PmuControlObject
 {
     pub header: KernelObjectHeader,
 }
@@ -2239,6 +2256,7 @@ const _: () = {
     assert!(size_of::<SbiControlObject>() as u64 <= floor);
     assert!(size_of::<EntropyControlObject>() as u64 <= floor);
     assert!(size_of::<KernelLogObject>() as u64 <= floor);
+    assert!(size_of::<PmuControlObject>() as u64 <= floor);
     assert!(size_of::<ThreadObject>() as u64 <= floor);
     assert!(size_of::<AddressSpaceObject>() as u64 <= floor);
     assert!(size_of::<CSpaceKernelObject>() as u64 <= floor);
@@ -3111,6 +3129,7 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
         | ObjectType::SbiControl
         | ObjectType::EntropyControl
         | ObjectType::KernelLog
+        | ObjectType::PmuControl
         | ObjectType::ArenaPage => crate::fatal("deferred reclaim: object type carries no link"),
     }
 }
@@ -3200,6 +3219,7 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
         | ObjectType::SbiControl
         | ObjectType::EntropyControl
         | ObjectType::KernelLog
+        | ObjectType::PmuControl
         | ObjectType::ArenaPage =>
         {
             // SAFETY: refcount 0; no other references exist; no lock held
@@ -4016,7 +4036,8 @@ pub unsafe fn object_for_new_slot(
         | CapTag::SchedControl
         | CapTag::SbiControl
         | CapTag::EntropyControl
-        | CapTag::KernelLog =>
+        | CapTag::KernelLog
+        | CapTag::PmuControl =>
         {
             // A new slot is the reference userspace can multiply, so it is
             // refused at the ceiling (`REF_COUNT_LIMIT`).
@@ -4459,6 +4480,12 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: refcount 0, exclusively owned KernelLogObject
             // (dealloc_object's contract); no lock is held.
             unsafe { free_body::<KernelLogObject>(ptr, stack) };
+        }
+        ObjectType::PmuControl =>
+        {
+            // SAFETY: refcount 0, exclusively owned PmuControlObject
+            // (dealloc_object's contract); no lock is held.
+            unsafe { free_body::<PmuControlObject>(ptr, stack) };
         }
 
         // ── Arena page kept past its CSpace ───────────────────────────────

@@ -159,6 +159,8 @@ pub enum CapTag
     EntropyControl = 14,
     /// Authority to read the kernel log.
     KernelLog = 15,
+    /// Authority to program this CPU's performance counters for user mode.
+    PmuControl = 16,
 }
 
 // ── Rights ────────────────────────────────────────────────────────────────────
@@ -369,7 +371,8 @@ define_typed_rights! {
     {
         /// May map this memory into an address space.
         MAP = syscall::RIGHTS_MEM_MAP;
-        /// Authority to create writable mappings from this memory.
+        /// Authority to create writable mappings from this memory, and, with
+        /// `MAP`, to have the kernel zero its pages (`SYS_MEMORY_ZERO`).
         WRITE = syscall::RIGHTS_MEM_WRITE;
         /// Authority to create executable mappings from this memory.
         EXECUTE = syscall::RIGHTS_MEM_EXECUTE;
@@ -584,6 +587,19 @@ define_typed_rights! {
         /// May read and acknowledge the kernel's log records and bind their
         /// notification.
         READ = syscall::RIGHTS_KLOG_READ;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `PmuControl` capabilities.
+    ///
+    /// One right: `sys_pmu_info`, `sys_pmu_configure` and `sys_pmu_bind`
+    /// require `CONFIGURE` (docs/capability-model.md § `PmuControl`).
+    PmuControlCap, PmuRights, PmuControl
+    {
+        /// May read the PMU's description, program user counters on the
+        /// caller's CPU, and grant a thread user-mode counter reads.
+        CONFIGURE = syscall::RIGHTS_PMU_CONFIGURE;
     }
 }
 
@@ -928,6 +944,7 @@ mod tests
         assert_eq!(CapTag::SbiControl as u8, CapType::SbiControl as u8);
         assert_eq!(CapTag::EntropyControl as u8, CapType::EntropyControl as u8);
         assert_eq!(CapTag::KernelLog as u8, CapType::KernelLog as u8);
+        assert_eq!(CapTag::PmuControl as u8, CapType::PmuControl as u8);
     }
 
     // Cross-boundary ABI contract: `cap_info(CAP_INFO_TAG_RIGHTS)` returns the

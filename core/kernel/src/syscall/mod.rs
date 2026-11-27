@@ -25,6 +25,7 @@ pub mod hw;
 pub mod ipc;
 pub mod klog;
 pub mod mem;
+pub mod pmu;
 pub mod sbi;
 #[cfg(not(test))]
 pub mod scratch;
@@ -51,15 +52,16 @@ use syscall::{
     SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IPC_REPLY_RECV, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC,
     SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_KERNEL_LOG_BIND,
     SYS_KERNEL_LOG_READ, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE,
-    SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND,
-    SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO,
-    SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES,
-    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS,
-    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
-    SYS_THREAD_SET_RUN_LIMIT, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
-    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
+    SYS_MEMORY_SPLIT, SYS_MEMORY_ZERO, SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT,
+    SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PMU_BIND, SYS_PMU_CONFIGURE, SYS_PMU_INFO,
+    SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
+    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
+    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL,
+    SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_RUN_LIMIT,
+    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
+    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
 };
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
@@ -474,7 +476,7 @@ unsafe fn leave_syscall()
 unsafe fn finish_syscall_work(exit: SyscallExit)
 {
     use crate::percpu::return_work::{
-        AT_SYSCALL, RECLAIM, RUN_LIMIT, SOLE_REF, UPCALL_ANY, UPCALL_SYSCALL,
+        AT_SYSCALL, PMU_GRANT, RECLAIM, RUN_LIMIT, SOLE_REF, UPCALL_ANY, UPCALL_SYSCALL,
     };
     let mut deliveries_taken = 0;
     crate::sched::run_return_work(
@@ -512,6 +514,12 @@ unsafe fn finish_syscall_work(exit: SyscallExit)
                 // SAFETY: syscall context on the caller's valid kernel stack.
                 unsafe { crate::sched::schedule(crate::sched::Requeue::IfRunnable) };
                 crate::arch::current::cpu::halt_loop();
+            }
+            if work & PMU_GRANT != 0
+            {
+                // SAFETY: a return to user mode with interrupts disabled and
+                // no lock held.
+                unsafe { crate::perfmon::sync_grant() };
             }
             if exit == SyscallExit::Complete
             {
@@ -672,6 +680,10 @@ syscall_handlers! {
     SYS_KERNEL_LOG_READ => restartable klog::sys_kernel_log_read,
     SYS_KERNEL_LOG_BIND => plain klog::sys_kernel_log_bind,
     SYS_THREAD_SET_RUN_LIMIT => plain thread::sys_thread_set_run_limit,
+    SYS_MEMORY_ZERO => plain mem::sys_memory_zero,
+    SYS_PMU_INFO => plain pmu::sys_pmu_info,
+    SYS_PMU_CONFIGURE => plain pmu::sys_pmu_configure,
+    SYS_PMU_BIND => plain pmu::sys_pmu_bind,
 }
 
 /// Whether entry to syscall `nr` sets the caller's run-limit count to zero:
@@ -1751,6 +1763,7 @@ mod resets_run_count_tests
         assert!(!resets_run_count(syscall::SYS_NOTIFICATION_SEND));
         assert!(!resets_run_count(syscall::SYS_GETRANDOM));
         assert!(!resets_run_count(syscall::SYS_THREAD_SET_RUN_LIMIT));
+        assert!(!resets_run_count(syscall::SYS_MEMORY_ZERO));
         assert!(!resets_run_count(syscall::SYSCALL_NR_BOUND));
     }
 }

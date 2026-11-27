@@ -1139,12 +1139,15 @@ impl PerCpuScheduler
     /// thread while the level is [stale](Self::level_stale).
     ///
     /// Reads `non_empty` and `outranking` Relaxed, holding no lock. The
-    /// caller is this CPU, at a return to user mode with interrupts masked: a
-    /// link it made itself precedes the read in program order, and a link
-    /// another CPU makes is followed by the wake IPI, whose own return to user
-    /// mode reads again, or, when it cleared the idle wake flag, precedes the
-    /// idle loop's dispatch (core/kernel/docs/scheduling-internals.md § Wake
-    /// Protocol Invariants). `schedule()` then decides under `lock`.
+    /// caller is this CPU with interrupts masked, at a return to user mode or
+    /// between two batches of a `SYS_MEMORY_ZERO` (`syscall::mem`): a link it
+    /// made itself precedes the read in program order, and a link another CPU
+    /// makes is followed by the wake IPI, whose own return to user mode, or
+    /// the zero's test after the next batch, reads again, or, when it cleared
+    /// the idle wake flag, precedes the idle loop's dispatch
+    /// (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
+    /// § Lock-free readers of a CPU's run queues). `schedule()` then decides
+    /// under `lock`; the zero only ends its call.
     #[inline]
     pub fn outranked(&self) -> bool
     {

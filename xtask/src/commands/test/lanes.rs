@@ -356,7 +356,7 @@ fn case_command(exe: &Path, name: TestCase, arch: Arch, args: &TestArgs, lane: &
     {
         cmd.arg("--host-override");
     }
-    if let Some(holder) = &args.host.grant
+    if let Some(holder) = &args.host.common.grant
     {
         cmd.args(["--grant", holder]);
     }

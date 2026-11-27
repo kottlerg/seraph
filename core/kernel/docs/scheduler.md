@@ -681,20 +681,23 @@ Victim selection is mode-dependent:
   local CPU id). Skip if the victim is not significantly busier than us
   (`their_load <= my_load + LOAD_BALANCE_IMBALANCE_THRESHOLD`).
 - **Busy CPU, `my_load == 0`** — scan the other CPUs of its window (from
-  `PerCpuScheduler::balance_cursor`) and pull from the heaviest, a tie going to the first read,
-  when its load exceeds `LOAD_BALANCE_IMBALANCE_THRESHOLD`. In a boot above 129 CPUs a scan
-  that finds no such load moves the cursor past its window (`sched::empty_queue_victim`), and a
-  pull from the heaviest that finds nothing it can take there (`PullOutcome::NothingPullable`)
-  moves it to the CPU after the victim (`sched::balance_cursor_after_pull`), so a CPU whose
-  pinned threads keep its load past the threshold does not hold the scan on its window. Scanning
-  is cheap (one Relaxed atomic load per CPU of the window) and finds a pullable load past the
-  threshold, which stays so, within ceil((n - 1) / 128) ticks in a boot of n CPUs, plus a tick
-  for each CPU ahead of it in the cursor's order whose load is past the threshold with nothing
-  pullable on it, and one for each pull a contended try-lock defers or the re-check under the
-  locks refuses, which read the same window again. In a boot of up to 129 CPUs the scan reads
-  every other CPU at each tick, so the heaviest is pulled at the first tick, as before. Pure
-  random victim selection converges only probabilistically and on small topologies sometimes
-  wastes many ticks before picking the busy CPU.
+  `PerCpuScheduler::balance_cursor`) and pull from a CPU whose load exceeds
+  `LOAD_BALANCE_IMBALANCE_THRESHOLD` (`sched::empty_queue_victim`). In a boot of up to 129 CPUs the
+  window holds every other CPU and the scan pulls from the heaviest, a tie going to the first read,
+  at the first tick that sees it past the threshold; a heaviest CPU with nothing pullable on it is
+  chosen again at each tick, so it hides a lighter one there. In a larger boot the scan pulls from
+  the first CPU of its window past the threshold; a scan that finds none moves the cursor past its
+  window, and a pull that finds nothing it can take on its victim (`PullOutcome::NothingPullable`)
+  moves the cursor to the CPU after the victim (`sched::balance_cursor_after_pull`). The CPUs before
+  the victim in the window are below the threshold, so the move skips no CPU past it, and a CPU
+  whose pinned threads keep its load past the threshold does not hold the scan on its window.
+  Scanning is cheap (one Relaxed atomic load per CPU of the window, in a larger boot up to the first
+  past the threshold). A pullable load past the threshold, which stays so and which no heavier CPU
+  hides in a boot of up to 129 CPUs, is found within ceil((n - 1) / 128) ticks in a boot of n CPUs,
+  plus a tick for each CPU ahead of it in the cursor's order whose load is past the threshold with
+  nothing pullable on it, and one for each pull a contended try-lock defers or the re-check under
+  the locks refuses, which reads the same window again. Pure random victim selection converges only
+  probabilistically and on small topologies sometimes wastes many ticks before picking the busy CPU.
 - **Idle CPU** (running its idle thread, its own queue empty) — a scan of the other CPUs of its
   window, from its cursor (`PerCpuScheduler::idle_pull_cursor`), and a pull whatever the victim's
   load; a tick whose scan finds no backlog moves the cursor past its window. The heaviest CPU's load

@@ -56,7 +56,9 @@ once through `cap[6]`, then deletes it.
 |---|---|---|
 | logd's receive workers | `RECV` | each receives on the endpoint with `ipc_recv` (§ Receive pool) |
 | every userspace sender | `SEND` (badged) | `STREAM_BYTES`, `STREAM_RECORD`, `STREAM_REGISTER_NAME` |
-| a service that seeds `logd.query` | `SEND` badged `LOG_QUERY_AUTHORITY` | `QUERY_SLOTS`, `QUERY_HISTORY` (§ Queries) |
+| a service that seeds `logd.query` | `SEND|GRANT` badged `LOG_QUERY_AUTHORITY` | `QUERY_SLOTS`, `QUERY_HISTORY` (§ Queries), `LOG_SUBSCRIBE` from the `SUBSCRIBERS_MAX` pool (§ Subscriptions) |
+| a service that seeds `logd.follow` (an external sink) | `SEND|GRANT` badged `LOG_FOLLOW_AUTHORITY` | `QUERY_SLOTS`, `QUERY_HISTORY`, `LOG_SUBSCRIBE` from the `SINK_SUBSCRIBERS_MAX` pool |
+| a service that seeds `logd.control` | `SEND` badged `LOG_CONTROL_AUTHORITY` | `SINK_LIST`, `SINK_SET` (§ Sink control) |
 | a service that seeds `logd.flush` | `SEND` badged `LOG_FLUSH_AUTHORITY` | `LOG_FLUSH` (§ Flush barrier) |
 | real-logd on its first launch, or on a restart before procmgr reports init reaped | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); repeated after a further drain while init-logd defers it), then deleted via `cap_delete` whether or not it was acked. Absent (`cap[1]` reads as `0`) on a later restart. Each call is bounded by `HANDOVER_CALL_TIMEOUT_MS` (1 s) |
 
@@ -382,32 +384,44 @@ is among logd's most recent evictions (§ Wait-set).
 ## Queries
 
 Two labels read the badge table, the retired slots, and the history. They are
-served only on a badge carrying `log_labels::LOG_QUERY_AUTHORITY` (`1 << 63`,
-a [verb bit](../../../docs/capability-model.md#verb-bit-authority-pattern)):
-svcmgr mints a SEND on the master log endpoint with that badge from its
-master-log source and publishes it seed-only as `logd.query`
+served only on a badge carrying `log_labels::LOG_QUERY_AUTHORITY` (`1 << 63`)
+or `log_labels::LOG_FOLLOW_AUTHORITY` (`1 << 60`), each a
+[verb bit](../../../docs/capability-model.md#verb-bit-authority-pattern):
+svcmgr mints a `SEND|GRANT` on the master log endpoint with each badge from its
+master-log source and publishes them seed-only as `logd.query` and
+`logd.follow`
 ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `seed`),
-so only a recipe that seeds the name holds it. No sender's badge carries a verb
-bit: procmgr redraws a process badge that does
+so only a recipe that seeds a name holds it. The two differ only in the pool a
+subscription on them draws from (§ Subscriptions). No sender's badge carries a
+verb bit: procmgr redraws a process badge that does
 ([`log_badges`](../../../shared/ipc/src/log_badges.rs)), and `LOG_BADGE_INIT` and
 `LOG_BADGE_PROCMGR` carry none. A query on any other badge is refused with
 `QUERY_DENIED`.
 
-A receive worker answers a query from the table and the history logd owns, as it
-serves the stream labels (§ Receive pool), and calls no other service to answer
-it, so a query never waits on another service (§ Death-queue resync gives the
-deadlock a call to procmgr would risk). The wire format is defined in
-`ipc::log_query`. Every request carries `ipc::LOG_LABELS_VERSION` (7) in
-`data[0]`, which logd checks on every query. The reply's label carries the
-status in bits 0-15, the reply's entry count in bits 16-31, and in bit 32 whether
-more entries follow this page:
+A receive worker answers a query, a subscription (§ Subscriptions) and a sink
+control request (§ Sink control) from the table, the history and the sinks' state
+logd owns, as it serves the stream labels (§ Receive pool), and calls no other
+service to answer it, so none of them waits on another service (§ Death-queue
+resync gives the deadlock a call to procmgr would risk). The wire format is
+defined in `ipc::log_query` and `ipc::log_control`. Every request carries
+`ipc::LOG_LABELS_VERSION` (8) in `data[0]`, which logd checks on every request.
+The reply's label carries the status in bits 0-15, the reply's entry count in
+bits 16-31, and in bit 32 whether more entries follow this page:
 
 | Status | Value | Meaning |
 |---|---|---|
 | `QUERY_OK` | 0 | the page follows |
-| `QUERY_DENIED` | 1 | the badge carries no `LOG_QUERY_AUTHORITY` |
+| `QUERY_DENIED` | 1 | the badge carries no authority the label is served on |
 | `QUERY_VERSION_MISMATCH` | 2 | `data[0]` is not logd's `LOG_LABELS_VERSION` |
-| `QUERY_INVALID` | 3 | a request word holds a value the label does not define |
+| `QUERY_INVALID` | 3 | a request word holds a value the label does not define, or a capability the label does not take |
+| `QUERY_STALE` | 4 | an ascending walk names another logd instance's epoch (§ Subscriptions) |
+| `QUERY_FULL` | 5 | the subscription pool the badge draws from is full |
+| `QUERY_NO_SINK` | 6 | `SINK_SET` names no sink logd has |
+
+`logd.query` and `logd.follow` carry `GRANT`, so any holder can move logd any
+capability with any label. A receive worker deletes every capability that
+arrives with a request, whatever its label, but the two a `LOG_SUBSCRIBE` it
+accepts keeps, so no sender can fill logd's capability space.
 
 A refused query's reply carries no entries. A page is a snapshot of the moment
 logd answers it; a caller walks the pages by resuming after the last entry it
@@ -426,9 +440,12 @@ this across its pages:
   created below the walk's cursor, or a retired slot dropped before the walk
   reaches it, is missed.
 - `QUERY_HISTORY` reads each entry at most once, since `seq` is unique and the
-  walk moves to older `seq` only; a retire keeps an entry's `seq`. An entry
-  retained after the walk began is newer than every entry it read and is
-  missed, as is one the history drops before the walk reaches it.
+  walk moves one way only; a retire keeps an entry's `seq`. Newest first, an
+  entry retained after the walk began is newer than every entry it read and is
+  missed, as is one the history drops before the walk reaches it. Oldest first,
+  an entry retained after the walk began is read when the walk reaches it, and
+  one the history drops before the walk reaches it is missed, which an
+  unfiltered walk sees as a gap in `seq`, since `seq` is dense.
 
 A client that needs one consistent view walks again once the state it waits
 for is reached.
@@ -450,27 +467,36 @@ state, so a live slot comes before a retired one with the same badge.
 | `data[2]` | the badge of the last entry read |
 | `data[3]` | the state of the last entry read |
 
-The reply carries up to `SLOTS_PAGE` (7) entries of `SLOT_ENTRY_WORDS` (9) data
+The reply carries up to `SLOTS_PAGE` (5) entries of `SLOT_ENTRY_WORDS` (11) data
 words each, from `data[0]`:
 
 | Word | Content |
 |---|---|
 | 0 | badge |
-| 1 | state in bits 0-7 (`SLOT_LIVE` 0, `SLOT_EVICTED_DEATH` 1, `SLOT_EVICTED_RESYNC` 2), the name's length in bits 8-15 |
+| 1 | state in bits 0-7 (`SLOT_LIVE` 0, `SLOT_EVICTED_DEATH` 1, `SLOT_EVICTED_RESYNC` 2), the name's length in bits 8-15; bits 16-63 0 |
 | 2 | exit reason of the death that evicted the slot; 0 for any other state |
 | 3-8 | the display name, `MAX_NAME_LEN` (48) bytes little-endian, zero-padded; empty for a slot that registered none |
+| 9 | the slot serial: logd numbers each slot it creates from 1, never reusing a number within an instance, and a history entry names its slot by it |
+| 10 | the name generation: the slot's name registrations, a count from 0 that stops at `u32::MAX`, where the slot keeps its last name |
 
 ### `log_labels::QUERY_HISTORY` (17)
 
-History entries, newest first: those of every live and retired slot, or of one
-badge (its live slot and its retired slot).
+History entries, newest first or oldest first: those of every live and retired
+slot, or of one badge (its live slot and its retired slot), at every level or at
+a level and the more severe.
 
 | Request word | Content |
 |---|---|
 | `data[0]` | `LOG_LABELS_VERSION` |
-| `data[1]` | bit 0: one badge's entries only; bit 1: resume before the `seq` in `data[3]`; any other bit set: `QUERY_INVALID` |
+| `data[1]` | bit 0: one badge's entries only; bit 1: newest first, resume before the `seq` in `data[3]`; bit 2: oldest first, from the `seq` in `data[3]`, that entry included; bit 3: only entries at the level in `data[4]` or more severe; bits 1 and 2 both set, or any other bit set: `QUERY_INVALID` |
 | `data[2]` | the badge, with bit 0 of `data[1]` |
-| `data[3]` | the `seq` of the last entry read, with bit 1 of `data[1]` |
+| `data[3]` | with bit 1, the `seq` of the last entry read; with bit 2, the first `seq` to read (0: from the oldest), which a reader sets to the `seq` after the last one it read |
+| `data[4]` | with bit 3, the least severe level returned, an `ipc::stream_labels::LEVEL_*` code; past 7: `QUERY_INVALID` |
+| `data[5]` | with bit 2, the instance epoch the reader follows (§ Subscriptions): another instance's is refused `QUERY_STALE`, and 0 asks no check |
+
+With neither bit 1 nor bit 2 the walk starts at the newest entry. A filtered walk
+serves an interactive reader, which counts no gap; a reader that counts the
+entries it missed walks unfiltered.
 
 The reply carries as many whole entries as fit its 64 data words, from
 `data[0]`, each word-aligned:
@@ -479,13 +505,127 @@ The reply carries as many whole entries as fit its 64 data words, from
 |---|---|
 | 0 | `seq` (§ History) |
 | 1 | `us` |
-| 2 | the sender's badge |
-| 3 | level in bits 0-7 (`ipc::stream_labels::LEVEL_*`), kind in bits 8-15 (`ENTRY_TEXT` 0, `ENTRY_RECORD` 1), the byte length in bits 16-31 |
+| 2 | the slot serial of the sender's slot (§ `log_labels::QUERY_SLOTS` (16)), whose row carries its badge |
+| 3 | level in bits 0-7 (`ipc::stream_labels::LEVEL_*`), kind in bits 8-11 (`ENTRY_TEXT` 0, `ENTRY_RECORD` 1), origin in bits 12-15 (`ORIGIN_LIVE` 0, retained by this logd instance; `ORIGIN_RELAYED` 1, installed from init-logd's handover), the byte length in bits 16-31, the slot's name generation when the entry was retained in bits 32-63 |
 | 4 on | the entry's bytes (§ History), zero-padded to a word |
 
 Every entry fits one reply: the longest, a `RECORD_MAX_BYTES` (480) record,
 takes 4 + 60 words. A record's bytes are its `STREAM_RECORD` payload, which
 `ipc::log_record::Record::decode` reads back to its message and fields.
+
+## Subscriptions
+
+### `log_labels::LOG_SUBSCRIBE` (19)
+
+A subscriber is signalled each time logd retains an entry, and reads the new
+entries itself with an oldest-first `QUERY_HISTORY` walk from the `seq` after
+the last one it read. The request moves two capabilities to logd, in this order:
+
+| Request | Content |
+|---|---|
+| `data[0]` | `LOG_LABELS_VERSION` |
+| capability 0 | the signal: a capability, with the notify right, to a Notification of the subscriber's |
+| capability 1 | the token: a capability to a Notification of the subscriber's that nobody waits on, whose sole reference ends the subscription (below) |
+
+The subscriber moves copies and keeps its own capability to each object. Every
+holder of a name shares its one badge, so a subscriber is not told apart by its
+badge, and the death cascade cannot end its subscription; the token ends it.
+
+logd answers `QUERY_DENIED` on a badge with neither `LOG_QUERY_AUTHORITY` nor
+`LOG_FOLLOW_AUTHORITY`, `QUERY_INVALID` for a request with other than two
+capabilities, a signal that is not a Notification or lacks the notify right, or
+a token that is not a Notification, and `QUERY_FULL` when the badge's pool has
+no free subscription. A refused request leaves logd holding none of its
+capabilities. Subscriptions come from two pools, kept apart by the verb bit of
+the SEND the request arrives on, each a [docs/limits.md](../../../docs/limits.md)
+row:
+
+| Pool | Badge | Subscriptions |
+|---|---|---|
+| interactive followers | `LOG_QUERY_AUTHORITY` (`logd.query`) | `SUBSCRIBERS_MAX` (8), indices 0 to 7 |
+| external sinks | `LOG_FOLLOW_AUTHORITY` (`logd.follow`), which only a recipe seeds | `SINK_SUBSCRIBERS_MAX` (4), indices 8 to 11 |
+
+so interactive followers cannot take an external sink's place. The `QUERY_OK`
+reply carries no entries:
+
+| Reply word | Content |
+|---|---|
+| `data[0]` | the subscription's index |
+| `data[1]` | the instance epoch: the monotonic time, in microseconds since boot, this logd started; never 0, and no other instance shares it |
+| `data[2]` | the `seq` of the oldest entry the history holds, or `data[3]` when it holds none |
+| `data[3]` | the `seq` the next entry retained takes |
+
+logd signals every subscriber's Notification, bit 0, after it retains an entry,
+from the thread that retained it. The signals coalesce: a subscriber reads
+everything after its cursor on each wake. A `STREAM_BYTES` message that
+completes no line retains no entry and signals no one.
+
+**The subscriber's end.** logd binds a sole-reference observer
+(`SYS_CAP_BIND_SOLE_REFERENCE`,
+[core/kernel/docs/capability-internals.md](../../../core/kernel/docs/capability-internals.md)
+§ Sole-Reference Observers) on the token, posting to an event queue of logd's
+that its main thread's wait set holds (§ Wait-set), the correlator naming the
+subscription's index and a generation the index counts. When the subscriber
+deletes its token, or dies and its capabilities go, the token falls to logd's
+one reference: the kernel posts on the deleting CPU's next drain, at the latest
+after its next timer tick, and logd's main thread wakes, ends the subscription,
+deletes both of its capabilities and frees the index. A subscriber ends its
+subscription by deleting its token. A token moved with no capability kept
+ends its subscription as soon as it is made. The token, not the signal's
+Notification, is observed because a wait on the Notification and its wait-set
+membership are references the kernel counts, so the Notification does not fall
+to one reference while its subscriber waits on it.
+
+**logd's end.** The subscriber can bind a sole-reference observer of its own on
+the token: when logd dies, or ends the subscription, the token falls to the
+subscriber's reference, and the post tells the subscriber to subscribe again.
+The epoch then tells it whether the instance changed, and the `seq` numbering
+with it. An oldest-first `QUERY_HISTORY` walk carrying the epoch it subscribed
+on is refused `QUERY_STALE` by another instance, so a reader that follows by
+`seq` cannot read a new instance's entries as the old one's.
+
+A follower thus wakes only for entries and for those two ends: idle, it makes
+no call and takes no wake-up, and neither side polls.
+
+## Sink control
+
+Two labels read and change logd's device sinks (§ Output sinks) and their
+settings ([sinks.md](sinks.md) § Settings). They are served only on a badge
+carrying `log_labels::LOG_CONTROL_AUTHORITY` (`1 << 61`), a verb bit svcmgr
+mints on a SEND, without `GRANT`, from its master-log source and publishes
+seed-only as `logd.control`; any other badge is refused `QUERY_DENIED`. The
+wire format is defined in `ipc::log_control`.
+
+### `log_labels::SINK_LIST` (20)
+
+One sink per request, by its index from 0: `data[0]` `LOG_LABELS_VERSION`,
+`data[1]` the index. The reply carries one entry, with bit 32 of its label set
+when another sink follows, or none past the last sink:
+
+| Reply word | Content |
+|---|---|
+| 0 | the state in bits 0-7 (`SINK_SERVED` 0, its driver resolved and answering; `SINK_UNSERVED` 1, no driver of its class resolved; `SINK_STALLED` 2, its current write older than the stall bound), the name's length in bits 8-15, the settings' length in bits 16-31 |
+| 1 | the cursor: the `seq` of the next entry the sink considers |
+| 2 | the entries the sink owed and dropped since logd started |
+| 3 on | the name (`serial`, `framebuffer`), at most `SINK_NAME_MAX` (16) bytes, zero-padded to a word, then the settings in the recipe's syntax, every key with its value, at most `SETTINGS_TEXT_MAX` (256) bytes |
+
+### `log_labels::SINK_SET` (21)
+
+| Request word | Content |
+|---|---|
+| `data[0]` | `LOG_LABELS_VERSION` |
+| `data[1]` | the name's length in bits 0-15, the settings string's length in bits 16-31; bits 32-63 0 |
+| `data[2]` on | the sink's name, zero-padded to a word, then the settings string |
+
+The string is a list of `key=value` items in the recipe's syntax, applied over
+the sink's current settings by the parser that reads the recipe, so a key it
+does not name keeps its value. A name no sink has is refused `QUERY_NO_SINK`; a
+string that is not UTF-8 or does not parse is refused `QUERY_INVALID` and
+changes nothing. A string that parses becomes the sink's settings at once, under
+the state lock: the writers and the kernel log reader are woken, since the sink
+may now show or hold differently, and logd records the change in its own
+notice line, `<sink>: settings set to <string>`, which the sinks show as any
+other entry.
 
 ## Receive pool
 
@@ -628,7 +768,7 @@ does not wait inside logd: the caller asks again. The wire format is defined in 
 
 | Request word | Content |
 |---|---|
-| `data[0]` | `LOG_LABELS_VERSION` (7), checked on every request |
+| `data[0]` | `LOG_LABELS_VERSION` (8), checked on every request |
 | `data[1]` | 0 for a new flush, 1 to ask again for the token in `data[2]`; any other value: `FLUSH_INVALID` |
 | `data[2]` | the token of an earlier answer, with `data[1]` = 1 |
 
@@ -689,12 +829,17 @@ both are decisions, not defects:
 
 ## Wait-set
 
-logd's main thread waits on a 2-member `WaitSet`:
+logd's main thread waits on a `WaitSet` of up to 5 members:
 
 | Badge | Source | Purpose |
 |---|---|---|
 | `WS_BADGE_DEATH` (1) | RECV on logd's death-notification `EventQueue` | drained on the wake |
 | `WS_BADGE_RESYNC` (2) | logd's resync `Notification` | bit `RESYNC_WALK_DONE` (1): the resync helper thread's walk has ended; bit `RESYNC_REQUESTED` (2): a drain asks for a resync (§ Death-queue resync) |
+| `WS_BADGE_WATCHES` (3, 4) | the serial and the framebuffer class watch `Notification`s, each when devmgr registered it | the class's driver changed; the sink's driver is resolved again (§ Output sinks) |
+| `WS_BADGE_SUBSCRIPTIONS` (5) | RECV on the subscriptions' `EventQueue`, of `SUBSCRIBERS_MAX + SINK_SUBSCRIBERS_MAX` (12) entries and observer nodes, when logd could make it | drained on the wake: each post whose correlator names a subscription's index and current generation ends it (§ Subscriptions) |
+
+logd serves on without the subscriptions' queue, and then refuses every
+`LOG_SUBSCRIBE` `QUERY_FULL`.
 
 Each receive worker drains the death queue before it serves a request. The main thread drains the
 queue when it is ready, so deaths no request follows are drained too. Each take from the queue is

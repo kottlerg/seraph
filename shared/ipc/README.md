@@ -31,6 +31,7 @@ shared/ipc/
 └── src/
     ├── lib.rs                  # IpcMessage, call/recv/reply wrappers, version constants, modules
     ├── bootstrap.rs            # Creator-to-child bootstrap rounds; multi-round slot codec
+    ├── log_control.rs          # Wire format of logd's SINK_LIST and SINK_SET labels
     ├── log_query.rs            # Wire format of logd's QUERY_SLOTS and QUERY_HISTORY labels
     ├── log_record.rs           # Log record codec: RecordWriter, Record, key alphabet
     ├── recv_guard.rs           # RecvGuard backoff and EXIT_RECV_WEDGE policy
@@ -110,9 +111,10 @@ added, removed, or repurposed, or a payload shape changed. The constants fall in
 Handshake-checked namespaces carry the version in their first-contact handshake, and the receiver
 rejects a mismatch; `devmgr_labels` and `devmgr_dma_labels` instead carry it in `data[0]` of every
 request, which devmgr checks each time, and `iommu_labels` does the same, checked by the IOMMU
-driver, as does `log_labels` for its three labels `QUERY_SLOTS`, `QUERY_HISTORY` and `LOG_FLUSH`,
-checked by logd, and `acpid_labels`, checked by acpid. Only `ns_labels` is implicitly covered: its
-caps descend from the `vfsd_labels::GET_SYSTEM_ROOT_CAP` and `fs_labels::FS_MOUNT` handshakes, so
+driver, as does `log_labels` for its labels `QUERY_SLOTS`, `QUERY_HISTORY`, `LOG_FLUSH`,
+`LOG_SUBSCRIBE`, `SINK_LIST` and `SINK_SET`, checked by logd, and `acpid_labels`, checked by acpid.
+Only `ns_labels` is implicitly covered: its caps descend from the `vfsd_labels::GET_SYSTEM_ROOT_CAP`
+and `fs_labels::FS_MOUNT` handshakes, so
 the parent channel stands in for the version check. The remaining constants are markers that exist
 for the bump discipline. `STREAM_LABELS_VERSION` is in practice marker-only: every process that
 holds a stream cap has it pre-installed, in `ProcessInfo.log_send_cap` or, for init, derived by init

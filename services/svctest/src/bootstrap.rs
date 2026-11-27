@@ -38,7 +38,7 @@ pub struct Caps
     /// `DENY_BADGE`-badged SEND on vfsd's service endpoint (`vfsd.deny`),
     /// in slot 5.
     pub vfsd_deny: u64,
-    /// `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint
+    /// `LOG_QUERY_AUTHORITY`-badged `SEND|GRANT` on the master log endpoint
     /// (`logd.query`), in slot 6.
     pub logd_query: u64,
     /// The `serial` class SEND on devmgr's registry endpoint

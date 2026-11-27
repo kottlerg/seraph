@@ -131,7 +131,7 @@ direct console paths remain as fallbacks for the life of the system.
    gives it ([logd handover protocol](../services/logd/docs/handover-protocol.md) § Kernel log): a
    thread of its own waits on a notification the kernel signals and retains each record as the
    kernel's `[kernel]` line in the kernel's slot, which the sinks write as any line and every
-   `logd.query` holder can read. A record is acknowledged on the
+   `logd.query` or `logd.follow` holder can read. A record is acknowledged on the
    reader's next read once its line is written or its sink stalled, so a record a failure report
    flushes is one no sink took.
 

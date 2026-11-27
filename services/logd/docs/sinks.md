@@ -16,9 +16,12 @@ wall offset read from timed (§ Wall time), the rfc5424 format with its timestam
 journal the sinks write from, the serial and framebuffer outputs as two sinks with a cursor and a
 writer thread each, the hold window and its `WINDOW_FULL` refusal, the serial sink's `hold` pace
 (its writes of an entry as plain chunks and then a zero-length `SERIAL_WRITE_SENT` barrier, its
-cursor moving once the entry is sent) and the framebuffer's `skip` pace, the drop lines, and
-`LOG_FLUSH` over the `hold` sinks' cursors, whose token is the next `seq`
-([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks, § Hold window, § Flush barrier).
+cursor moving once the entry is sent) and the framebuffer's `skip` pace, the drop lines,
+`LOG_FLUSH` over the `hold` sinks' cursors, whose token is the next `seq`, the record's slot
+serial, name generation and `live` and `relayed` origins, the reads, subscriptions and sink
+control of § Queries, follow and control, and the `logd.query`, `logd.follow` and `logd.control`
+names ([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks, § Hold window, § Flush
+barrier, § Queries, § Subscriptions, § Sink control).
 
 Everything else this document states is design intent, not yet implemented, unless a sentence names
 it as built. Each section names the Issue that builds it. Until an Issue lands,
@@ -59,8 +62,8 @@ These points of RFC 5424 bind a sink that emits it:
 
 ## The record
 
-*Design intent: the slot serial and the origin are #1492's and #1496's work and #928's; the
-history entry's other fields are built.*
+*Built (#1494), but for the `previous` origin, which is #1498's, and the instance number of
+§ Display names, #1492's.*
 
 logd's history entry is the record. Every sink renders from it, and the query interface returns it
 (§ Queries, follow and control).
@@ -547,9 +550,8 @@ waits on no sink's progress for a sender.
 
 ## Queries, follow and control
 
-*Design intent (#1494), but for `QUERY_SLOTS` and the descending `QUERY_HISTORY` walk, which are
-built ([ipc-interface.md](ipc-interface.md) § Queries). `LOG_LABELS_VERSION` is bumped with the wire
-changes.*
+*Built (#1494; [ipc-interface.md](ipc-interface.md) § Queries, § Subscriptions, § Sink control),
+but for the instance number in `QUERY_SLOTS` rows (#1492) and the previous slots (#1498).*
 
 All of these are answered by a receive worker from logd's state under the state lock, with no call
 out, as the queries are today.
@@ -592,7 +594,7 @@ capability space.
   `logd.follow` (`LOG_FOLLOW_AUTHORITY`), which only a recipe seeds, so interactive followers cannot
   take an external sink's place. A full pool refuses one more with `QUERY_FULL`. The reply carries
   the subscription's index, the instance epoch (the monotonic time logd started, which no other
-  instance shares), and the oldest and newest `seq` held.
+  instance shares), the oldest `seq` held and the `seq` the next entry takes.
 - logd signals every subscriber's Notification when it retains an entry. The signals coalesce: a
   subscriber reads everything after its cursor on each wake.
 - **A subscriber's end.** logd binds a sole-reference observer (`SYS_CAP_BIND_SOLE_REFERENCE`,
@@ -604,7 +606,11 @@ capability space.
   references the kernel counts, so the Notification does not fall to one while the subscriber waits
   on it. Every holder of a name shares that name's one badge (`log_labels::LOG_QUERY_AUTHORITY`,
   `LOG_FOLLOW_AUTHORITY`), so a subscriber cannot be told apart by its badge, and the death cascade
-  cannot end it. `LOG_UNSUBSCRIBE` ends a subscription at once.
+  cannot end it. A subscriber ends its own subscription the same way, by deleting its token; logd
+  ends it on the post, which the kernel makes within a timer tick of the deletion, and its main
+  thread's wake. No label ends a subscription: logd cannot compare a capability a caller presents
+  with the token it holds, so a label could not tie an end to its subscriber, and any holder of the
+  name could end any subscription by its index.
 - **logd's end.** The subscriber binds a sole-reference observer on the same token, posting to its
   own event queue. When logd dies, or ends the subscription, the token falls to the subscriber's
   reference and the post tells the subscriber to subscribe again (§ External sinks). The epoch then
@@ -625,7 +631,7 @@ capability space.
 
 ## Authority to read and steer
 
-*Design intent (#1494, #1495, #1501).*
+*Built (#1494), but for `programs/log` (#1495) and `/svc` (#1501).*
 
 - `logd.query` (reads and subscriptions), `logd.follow` (the same, from the external sinks' pool of
   subscriptions) and `logd.control` (sink control) are seed-only names svcmgr mints. `logd.follow`

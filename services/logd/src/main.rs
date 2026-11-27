@@ -670,7 +670,7 @@ fn create_wait_set(logd: &Logd, watches: [u64; 2]) -> Option<u64>
         && let Err(e) = syscall::wait_set_add(ws, subscriptions_eq, WS_BADGE_SUBSCRIPTIONS)
     {
         let mut buf = SerialFmt::new();
-        let _ = write!(buf, "wait_set_add(subscriptions) err={e}");
+        let _ = write!(buf, "subscriptions: wait set add failed err={e:#x}");
         self_log(buf.as_str());
     }
     Some(ws)

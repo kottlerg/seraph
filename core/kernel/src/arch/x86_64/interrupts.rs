@@ -238,7 +238,9 @@ pub(super) fn apic_read(offset: usize) -> u32
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
-/// Initialise interrupt infrastructure for x86-64.
+/// Initialise interrupt infrastructure for x86-64, allocating the I/O APICs' kept
+/// redirection-entry words from `allocator` once their pins are discovered
+/// (`ioapic::init_entry_storage`).
 ///
 /// Must be called once during Phase 5, after per-CPU storage is allocated (Phase 4)
 /// and before `timer::init()`.
@@ -246,7 +248,7 @@ pub(super) fn apic_read(offset: usize) -> u32
 /// # Safety
 /// Must execute at ring 0 from a single-threaded context.
 #[cfg(not(test))]
-pub unsafe fn init()
+pub unsafe fn init(allocator: &mut crate::mm::BuddyAllocator)
 {
     // 1. Enable SMEP + SMAP — fatal if CPU lacks support.
     // SAFETY: ring-0 single-threaded boot.
@@ -341,17 +343,22 @@ pub unsafe fn init()
         apic_write(APIC_LVT_PERF, LVT_MASK);
     }
 
-    // 7. Initialise the I/O APIC: discover entry count and mask all entries.
+    // 7. Initialise the I/O APIC: discover entry count and mask all entries, then
+    //    allocate the kept low dword of each discovered GSI's entry.
     // SAFETY: direct map is active; per-IOAPIC MMIO bases are mapped via the
     // arch platform layer's contribution to Phase 3 direct-map regions.
     unsafe {
         super::ioapic::init();
     }
+    super::ioapic::init_entry_storage(allocator);
 }
 
 /// No-op test stub: interrupt initialisation cannot run in host unit tests.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub unsafe fn init() {}
+pub unsafe fn init(_allocator: &mut crate::mm::BuddyAllocator) {}
 
 /// Initialise the BSP's own interrupt-controller state that needs its per-CPU
 /// pointer: nothing on x86-64, where [`init`] brings up the BSP's local APIC.

@@ -47,6 +47,12 @@ programmable `events`. The cycle counter is the only one read; the others read `
 | x86-64 | `rdtsc`: reference cycles at a constant rate on a CPU with an invariant TSC | The kernel clears `CR4.TSD` on every CPU |
 | riscv64 | `csrr cycle`: the hart's cycles | The kernel sets `scounteren.CY` on every hart |
 
+A read bounds the region between two reads as
+[docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell) states. Its inline
+assembly declares that it may read and write memory, so the compiler keeps each load and store on
+the side of the read where the program puts it. On x86-64 the read is `mfence; lfence; rdtsc;
+lfence`, so that the CPU orders it too. On riscv64 the hart orders `csrr cycle` only with itself.
+
 ---
 
 ## Samples and summary
@@ -145,7 +151,7 @@ carries no count.
 |---|---|---|
 | [`core/ktest`](../../core/ktest/README.md) | `ktest` | Tier 3, one line per kernel benchmark (§ Tier 3) |
 | [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3` |
-| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring` and `ubench.console_write`, per variant |
+| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.console_write`, per variant, and `ubench.empty_window` |
 
 ---
 

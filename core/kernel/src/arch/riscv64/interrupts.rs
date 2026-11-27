@@ -1341,13 +1341,14 @@ unsafe fn set_user_counters()
 
 /// Initialise supervisor trap infrastructure for the BSP, and the APLIC
 /// domain. The BSP's IMSIC file is initialised by [`init_bsp_local`], once its
-/// per-CPU pointer is installed.
+/// per-CPU pointer is installed. `allocator` is unused: the APLIC keeps no state
+/// the kernel allocates (the x86-64 item allocates its I/O APICs' kept entries).
 ///
 /// # Safety
 /// Must execute in supervisor mode with the direct physical map active, once,
 /// on the BSP.
 #[cfg(not(test))]
-pub unsafe fn init()
+pub unsafe fn init(_allocator: &mut crate::mm::BuddyAllocator)
 {
     // Install trap vector (stvec is a per-hart CSR; also called from init_ap).
     // SAFETY: caller ensures execution in S-mode; trap_entry is valid.

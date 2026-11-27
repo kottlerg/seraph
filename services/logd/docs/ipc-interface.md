@@ -378,7 +378,7 @@ A receive worker answers a query from the table and the history logd owns, as it
 serves the stream labels (§ Receive pool), and calls no other service to answer
 it, so a query never waits on another service (§ Death-queue resync gives the
 deadlock a call to procmgr would risk). The wire format is defined in
-`ipc::log_query`. Every request carries `ipc::LOG_LABELS_VERSION` (5) in
+`ipc::log_query`. Every request carries `ipc::LOG_LABELS_VERSION` (6) in
 `data[0]`, which logd checks on every query. The reply's label carries the
 status in bits 0-15, the reply's entry count in bits 16-31, and in bit 32 whether
 more entries follow this page:
@@ -511,7 +511,9 @@ resolved, the framebuffer driver; each is a sink with its own queue and writer t
 [`codec/src/sink.rs`](../codec/src/sink.rs)). The rule bounds what a driver that is slow,
 stopped by a debugger, or dead costs logd: its own writer waits on it, and no other thread of
 logd's waits on it for longer than `SINK_STALL_MS` (1000 ms,
-[docs/limits.md](../../../docs/limits.md) § init and logd).
+[docs/limits.md](../../../docs/limits.md) § init and logd). [sinks.md](sinks.md) designs the sink
+contract that replaces these queues, the journal read by a cursor per sink (design intent; not yet
+implemented).
 
 - **Queue.** Each sink queues whole lines in a static ring of `SINK_QUEUE_BYTES` (16 KiB), so its
   memory is fixed at startup. A line is queued whole or not at all.

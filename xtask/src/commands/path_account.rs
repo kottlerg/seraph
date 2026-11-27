@@ -38,8 +38,8 @@ use crate::path_account::{
 };
 use crate::path_record::{Record, Row, Window, rows, windows};
 use crate::qemu::{
-    Execution, Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr,
-    X86Paging, X86ShadowStack, build_qemu_argv_for, validate_sysroot_for_launch,
+    Execution, Firmware, GdbMode, InterruptRemapping, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu,
+    RiscvZkr, X86Paging, X86ShadowStack, build_qemu_argv_for, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::function_path;
 use crate::symbolize::store::{Store, build_id};
@@ -869,6 +869,7 @@ impl Boot
             x86_paging: X86Paging::Four,
             x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
+            interrupt_remapping: InterruptRemapping::for_sysroot(ctx),
             debug_port: None,
             test_devices: false,
             hotplug_port: None,

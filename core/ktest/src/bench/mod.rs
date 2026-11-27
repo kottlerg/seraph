@@ -31,6 +31,7 @@
 //!    from [`run_all`] below.
 
 mod cap;
+mod counter;
 mod event;
 mod ipc;
 mod mm;
@@ -378,6 +379,7 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     wait_set::bench_wait_set(ctx, &mut h);
     tlb::bench_tlb_shootdown(ctx, &mut h);
     tlb::bench_tlb_shootdown_concurrent(ctx, &mut h);
+    counter::bench_empty_window(ctx, &mut h);
 
     if syscall::thread_set_affinity(ctx.thread_cap, AFFINITY_ANY).is_err()
     {

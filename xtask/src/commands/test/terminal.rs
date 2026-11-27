@@ -56,8 +56,8 @@ use crate::disk::DiskLayout;
 use crate::guest::{QemuStderr, explain_exit};
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    Firmware, GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
-    X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
+    Firmware, GdbMode, InterruptRemapping, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
+    X86Paging, X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::Stub;
 use crate::qmp;
@@ -216,6 +216,7 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,
+        interrupt_remapping: InterruptRemapping::for_sysroot(ctx),
         debug_port: Some(debug_port),
         test_devices: false,
         hotplug_port: None,

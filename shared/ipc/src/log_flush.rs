@@ -13,8 +13,10 @@
 //! status alone: [`FLUSHED`] or [`FLUSH_PENDING`] with the token in `data[0]`
 //! and, for [`FLUSH_PENDING`], the retry hint in milliseconds in `data[1]`, or
 //! a refusal with no data. The token is logd's: a client hands it back
-//! unread, and it holds only for the logd instance that issued it, which
-//! answers a token it does not know [`FLUSHED`].
+//! unread, and it holds only for the logd instance that issued it. An
+//! instance reads every token as its own number, so one from before a logd
+//! restart is answered [`FLUSHED`] while it is above every number the new
+//! instance has issued, and is otherwise waited on as the new instance's.
 
 // Under `rustc-dep-of-std` the crate root is `no_core`, and a submodule needs
 // its own prelude import (see `recv_guard.rs`).

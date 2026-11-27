@@ -1724,7 +1724,8 @@ impl Sink
     /// number of the last line queued (`services/logd/docs/ipc-interface.md`
     /// § Flush barrier). Flushed once the writer has written or given up
     /// every line up to the token, and at once while the sink is stalled
-    /// (its queue's stall, or a write of the writer's past [`SINK_STALL_MS`]),
+    /// (the writer gave its last write up, or its current write is past
+    /// [`SINK_STALL_MS`]),
     /// unserved, or absent (no class SEND, so no line is ever queued); pending
     /// otherwise, with the lines' expected time as the retry hint.
     fn flush_answer(&self, token: Option<u64>) -> FlushAnswer

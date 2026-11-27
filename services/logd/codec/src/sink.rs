@@ -144,6 +144,11 @@ pub struct SinkQueue<const N: usize>
     /// write up ([`Self::not_written`]); cleared when the writer completes a
     /// write ([`Self::written`]).
     stalled: bool,
+    /// Set when the writer gives a write up ([`Self::not_written`]), and
+    /// cleared when it completes one ([`Self::written`]): the writer's own
+    /// evidence that the driver does not take lines, which a flush reads
+    /// ([`Self::unwritten_through`]), as it does not read a producer's stall.
+    gave_up: bool,
     /// Lines queued since the queue was made: the number of the last one.
     queued: u64,
     /// Lines the writer has taken ([`Self::pop`]).
@@ -167,6 +172,7 @@ impl<const N: usize> SinkQueue<N>
             dropped: 0,
             given_up: 0,
             stalled: false,
+            gave_up: false,
             queued: 0,
             taken: 0,
             done: 0,
@@ -304,6 +310,7 @@ impl<const N: usize> SinkQueue<N>
     {
         self.done = self.taken;
         self.stalled = false;
+        self.gave_up = false;
     }
 
     /// The writer gave up a write: the driver did not take all of it, or took
@@ -320,6 +327,7 @@ impl<const N: usize> SinkQueue<N>
         self.done = self.taken;
         self.given_up = self.given_up.saturating_add(lost);
         self.stalled = true;
+        self.gave_up = true;
     }
 
     /// Whether line number `line` ([`Offer::Queued`]) is written, or given
@@ -342,14 +350,18 @@ impl<const N: usize> SinkQueue<N>
 
     /// The lines numbered up to `token` ([`Self::last_queued`]) that the
     /// writer is still to write: 0 once it has written or given up line
-    /// `token`, while the sink is stalled, and for a token above every number
-    /// this queue has issued, which only another queue can have issued (that
-    /// of a logd instance that has since restarted).
+    /// `token`, while its last write was given up and none has completed
+    /// since (the sink is stalled), and for a token above every number this
+    /// queue has issued, which only another queue can have issued (that of a
+    /// logd instance that has since restarted). A producer's stall
+    /// ([`Self::stall`]) does not count: a producer that waited out the stall
+    /// bound behind a long queue sets it while the writer still works through
+    /// the lines ahead of it.
     #[must_use]
     pub const fn unwritten_through(&self, token: u64) -> u64
     {
         // Numbers wrap after 2^64 lines; the distance stays below 2^63.
-        if self.stalled || self.is_written(token) || self.queued.wrapping_sub(token) >= 1 << 63
+        if self.gave_up || self.is_written(token) || self.queued.wrapping_sub(token) >= 1 << 63
         {
             0
         }
@@ -782,26 +794,44 @@ mod tests
         assert_eq!(q.unwritten_through(3), 1);
     }
 
-    // Defect caught: a flush that waits on a sink whose writer gave up a
-    // line, or that is stalled, until its caller's bound.
+    // Defect caught: a flush answered flushed while the writer still worked
+    // through the lines before its token, because a producer had waited out
+    // the stall bound behind them; or one that waited on a writer that had
+    // given a write up.
     #[test]
-    fn a_flush_does_not_wait_on_a_stalled_sink_or_a_line_given_up()
+    fn a_flush_waits_through_a_producers_stall_and_not_on_a_writer_that_gave_up()
     {
         let mut q: SinkQueue<{ 4 * (HEADER_BYTES + 4) }> = SinkQueue::new();
         let _ = q.offer(b"one", LineKind::Logged, false);
         let _ = q.offer(b"two", LineKind::Logged, false);
         let token = q.last_queued();
         q.stall();
-        assert_eq!(q.unwritten_through(token), 0, "stalled");
+        assert!(q.is_stalled());
+        assert_eq!(
+            q.unwritten_through(token),
+            2,
+            "a producer's stall is not the writer's"
+        );
         let mut buf = [0u8; 8];
         assert!(q.pop(&mut buf).is_some());
         q.written();
-        assert_eq!(q.unwritten_through(token), 1, "the stall ends with a write");
+        assert_eq!(q.unwritten_through(token), 1);
+        // A write given up stalls the sink until the writer next completes
+        // one, so the line after it is not waited for meanwhile.
         assert!(q.pop(&mut buf).is_some());
+        let _ = q.offer(b"six", LineKind::Logged, false);
+        let token = q.last_queued();
         q.not_written(1);
-        assert!(q.is_stalled());
+        assert_eq!(q.unwritten_through(token), 0, "the writer gave a write up");
+        assert!(q.pop(&mut buf).is_some());
         q.written();
-        assert_eq!(q.unwritten_through(token), 0, "given up counts as done");
+        assert_eq!(q.unwritten_through(token), 0);
+        let _ = q.offer(b"ten", LineKind::Logged, false);
+        assert_eq!(
+            q.unwritten_through(q.last_queued()),
+            1,
+            "a completed write ends the stall"
+        );
     }
 
     // Defect caught: a token from a logd instance before its restart, above

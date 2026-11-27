@@ -614,14 +614,18 @@ The reply's label is its status:
 - **Token.** A new flush's token marks the end of the log as logd holds it when it answers. Today
   that is the number of the last line queued to the serial sink (`SinkQueue::last_queued`). A
   client never reads the token. It hands it back unchanged when it asks again. A token holds only
-  for the logd instance that issued it: an instance that does not know a token (one issued before
-  logd restarted) answers `FLUSHED`, since the lines it marked went with the instance that held
-  them. `FLUSHED` is 0, so the empty reply that init-logd gives a label it does not serve reads as
+  for the logd instance that issued it, since the lines it marked went with the instance that held
+  them. An instance reads every token as a number of its own: one above every number it has
+  issued (from before logd restarted, while the new instance has queued fewer lines) answers
+  `FLUSHED`, and a lower one waits on the new instance's lines up to it, within the same bounds.
+  `FLUSHED` is 0, so the empty reply that init-logd gives a label it does not serve reads as
   flushed.
 - **Flushed.** The log is flushed for a token once the serial writer has written, or given up,
   every line up to it (§ Output sinks, Writer). It is also flushed at once in four cases:
-  - the serial sink is stalled: its queue's stall, or a write of the writer's older than
-    `SINK_STALL_MS`;
+  - the serial sink is stalled: the writer gave its last write up and has completed none since,
+    or its current write is older than `SINK_STALL_MS`. A producer that waited out its own bound
+    behind a long queue does not stall the sink for a flush, since the writer may still be working
+    through the lines ahead of it;
   - the sink is unserved;
   - the sink is absent (the bootstrap carried no serial class SEND);
   - there is no hold sink.

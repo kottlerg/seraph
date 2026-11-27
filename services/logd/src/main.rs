@@ -28,17 +28,22 @@
 mod handover;
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use death_set::OverflowWatch;
 use ipc::log_badges::LOG_BADGE_LOGD;
+use ipc::log_control::{SINK_SERVED, SINK_STALLED, SINK_UNSERVED, SetRequest, SinkView};
 use ipc::log_flush::{FLUSH_DENIED, FlushAnswer};
 use ipc::log_labels::{
-    LOG_FLUSH, LOG_FLUSH_AUTHORITY, LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS,
+    LOG_CONTROL_AUTHORITY, LOG_FLUSH, LOG_FLUSH_AUTHORITY, LOG_FOLLOW_AUTHORITY,
+    LOG_QUERY_AUTHORITY, LOG_SUBSCRIBE, QUERY_HISTORY, QUERY_SLOTS, SINK_LIST, SINK_SET,
 };
-use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal};
+use ipc::log_query::{
+    HistoryRequest, QUERY_DENIED, QUERY_FULL, QUERY_INVALID, QUERY_NO_SINK, QUERY_OK, QUERY_STALE,
+    Subscribed, Walk as HistoryWalk, decode_slots_request, decode_subscribe_request, refusal,
+};
 use ipc::log_record::{RECORD_MAX_BYTES, Record};
 use ipc::serve::Reply;
 use ipc::stream_labels::{
@@ -52,7 +57,8 @@ use logd_codec::kernel::{Accept, KERNEL_NAME, KernelLine};
 use logd_codec::reclaim::{Cause, ReclaimLine};
 use logd_codec::record::RENDERED_MAX_BYTES;
 use logd_codec::settings::{
-    BACKLOG_MAX, Colour, Format, HOSTNAME_ENV, HostName, Pace, Relayed, SinkKind, SinkSettings,
+    BACKLOG_MAX, Colour, Format, HOSTNAME_ENV, HostName, Pace, RENDERED_SETTINGS_MAX, Relayed,
+    SinkKind, SinkSettings,
 };
 use logd_codec::sink::SINK_STALL_MS;
 use recv_pool::{IpcBuf, RecvPool, SpawnError};
@@ -72,6 +78,21 @@ const WS_BADGE_RESYNC: u64 = 2;
 /// `WaitSet` badges for the serial and framebuffer class watches
 /// ([`OutputDriver`]), in [`resolve_output_drivers`]'s order.
 const WS_BADGE_WATCHES: [u64; 2] = [3, 4];
+/// `WaitSet` badge for the subscriptions' event queue, which each token's
+/// sole-reference observer posts to ([`end_subscriptions`]).
+const WS_BADGE_SUBSCRIPTIONS: u64 = 5;
+
+/// Subscriptions on `logd.query` (`LOG_QUERY_AUTHORITY`) at once: the
+/// interactive followers' pool (`services/logd/docs/sinks.md`
+/// § Subscriptions). A capacity: one more is refused `QUERY_FULL`.
+const SUBSCRIBERS_MAX: usize = 8;
+/// Subscriptions on `logd.follow` (`LOG_FOLLOW_AUTHORITY`) at once: the
+/// external sinks' pool, which no interactive follower can fill.
+const SINK_SUBSCRIBERS_MAX: usize = 4;
+/// Every subscription, the `logd.query` pool's first.
+const SUBSCRIPTIONS: usize = SUBSCRIBERS_MAX + SINK_SUBSCRIBERS_MAX;
+/// The bit logd signals a subscriber's Notification with.
+const SUBSCRIPTION_BIT: u64 = 1;
 
 /// Resync-notification bit the resync helper thread signals when its walk of
 /// procmgr's live badges ends.
@@ -239,16 +260,16 @@ fn main() -> !
         fatal("FATAL: resync notification create failed; halting");
         syscall::thread_exit();
     };
-    let Some(ws_cap) = create_wait_set(death_eq, resync_note, watches)
-    else
-    {
-        fatal("FATAL: wait_set create failed; halting");
-        syscall::thread_exit();
-    };
     let logd: &'static Logd = Box::leak(Box::new(Logd {
         death_eq,
         resync_note,
+        subscriptions_eq: create_subscriptions_eq(),
+        subscription_tokens: create_subscription_tokens(),
     }));
+    let ws_cap = create_wait_set(logd, watches).unwrap_or_else(|| {
+        fatal("FATAL: wait_set create failed; halting");
+        syscall::thread_exit()
+    });
 
     // Spawn the receive workers now, while init-logd still serves the log
     // endpoint: each one's start in the runtime waits on procmgr, which may
@@ -341,6 +362,16 @@ struct Logd
     death_eq: u64,
     /// The resync notification ([`RESYNC_WALK_DONE`], [`RESYNC_REQUESTED`]).
     resync_note: u64,
+    /// The subscriptions' event queue ([`answer_subscribe`],
+    /// [`end_subscriptions`]); 0 when it could not be made, and every
+    /// `LOG_SUBSCRIBE` is refused `QUERY_FULL`.
+    subscriptions_eq: u64,
+    /// Each subscription index's token, a Notification of logd's that nobody
+    /// signals or waits on: a subscription's reply moves its subscriber a
+    /// copy, and the subscription ends when logd's is the token's one
+    /// reference again ([`answer_subscribe`]). 0 for an index whose token
+    /// could not be made, which no subscription takes.
+    subscription_tokens: [u64; SUBSCRIPTIONS],
 }
 
 /// The badge table with the journal, the death-drain count, and the sinks'
@@ -384,6 +415,10 @@ struct LogdState
     /// Whether the sinks write the journal: set once init-logd writes the
     /// UART no more ([`open_output`]).
     open: bool,
+    /// The instance epoch (`services/logd/docs/ipc-interface.md`
+    /// § Subscriptions): the monotonic time this logd started, in
+    /// microseconds since boot, never 0, which no other instance shares.
+    epoch: u64,
 }
 
 impl LogdState
@@ -400,6 +435,7 @@ impl LogdState
             cursors: [Cursor::default(); MARKS],
             settings: SINKS.map(|sink| sink.kind.defaults()),
             open: false,
+            epoch: elapsed_us().max(1),
         };
         state.sync_marks();
         state
@@ -414,6 +450,20 @@ impl LogdState
         {
             let mark = self.mark_of(sink);
             self.table.history_mut().set_mark(sink.index, mark);
+        }
+    }
+
+    /// Start sink `index`'s cursor after the newest entry, as for a sink
+    /// turned on (`services/logd/docs/sinks.md` § Pace): it passes nothing of
+    /// the time it was `off`, whether or not its writer stepped meanwhile, and
+    /// owes no drop or notice from before. An entry its writer is still
+    /// writing stays taken until the writer settles it ([`Cursor::start_at`]).
+    fn start_at_newest(&mut self, index: usize)
+    {
+        let next = self.table.history().next_seq();
+        if let Some(cursor) = self.cursors.get_mut(index)
+        {
+            cursor.start_at(next);
         }
     }
 
@@ -585,13 +635,21 @@ fn create_resync_note() -> Option<u64>
 }
 
 /// Build the main thread's wait set: the death event queue
-/// (`WS_BADGE_DEATH`), the resync notification (`WS_BADGE_RESYNC`), and each
-/// class watch registered (`WS_BADGE_WATCHES`; 0 for one that is not). The
-/// log endpoint is the receive workers', outside the set.
-fn create_wait_set(death_eq: u64, resync_note: u64, watches: [u64; 2]) -> Option<u64>
+/// (`WS_BADGE_DEATH`), the resync notification (`WS_BADGE_RESYNC`), each
+/// class watch registered (`WS_BADGE_WATCHES`; 0 for one that is not), and
+/// the subscriptions' event queue (`WS_BADGE_SUBSCRIPTIONS`; 0 when there is
+/// none). The log endpoint is the receive workers', outside the set.
+fn create_wait_set(logd: &Logd, watches: [u64; 2]) -> Option<u64>
 {
     // The set's member capacity: the members above.
-    const WS_MEMBERS: u32 = 4;
+    const WS_MEMBERS: u32 = 5;
+    let Logd {
+        death_eq,
+        resync_note,
+        subscriptions_eq,
+        // The tokens are no member: nothing waits on them.
+        ..
+    } = *logd;
     let Some(ws) = std::os::seraph::object_slab_retype(
         std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
         |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
@@ -629,7 +687,60 @@ fn create_wait_set(death_eq: u64, resync_note: u64, watches: [u64; 2]) -> Option
             self_log(buf.as_str());
         }
     }
+    // A queue the set cannot hold is never drained: its subscriptions end only
+    // with logd.
+    if subscriptions_eq != 0
+        && let Err(e) = syscall::wait_set_add(ws, subscriptions_eq, WS_BADGE_SUBSCRIPTIONS)
+    {
+        let mut buf = SerialFmt::new();
+        let _ = write!(buf, "subscriptions: wait set add failed err={e:#x}");
+        self_log(buf.as_str());
+    }
     Some(ws)
+}
+
+/// Create each subscription index's token ([`Logd::subscription_tokens`]),
+/// at start, so a receive worker makes no object and calls no service to
+/// answer `LOG_SUBSCRIBE`. An index whose token cannot be made is logged and
+/// takes no subscription.
+fn create_subscription_tokens() -> [u64; SUBSCRIPTIONS]
+{
+    let tokens = [(); SUBSCRIPTIONS].map(|()| {
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        })
+        .unwrap_or(0)
+    });
+    let missing = tokens.iter().filter(|&&token| token == 0).count();
+    if missing > 0
+    {
+        let mut line = SerialFmt::new();
+        let _ = write!(line, "subscriptions: token create failed count={missing}");
+        retain_own(LEVEL_WARN, line.as_str().as_bytes());
+    }
+    tokens
+}
+
+/// Allocate the slab and create the subscriptions' event queue: one observer
+/// node, and room for one post, per subscription, since each holds one
+/// sole-reference binding on its token until the binding posts and the
+/// subscription ends ([`answer_subscribe`]). 0, logged, when it cannot be
+/// made: logd serves on, and refuses every subscription.
+fn create_subscriptions_eq() -> u64
+{
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`SUBSCRIPTIONS` is 12, which a `u32` holds"
+    )]
+    const NODES: u32 = SUBSCRIPTIONS as u32;
+    let slab_bytes = std::os::seraph::event_queue_retype_bytes(u64::from(NODES), u64::from(NODES));
+    std::os::seraph::object_slab_retype(slab_bytes, |slab| {
+        syscall::event_queue_create_observed(slab, NODES, NODES).ok()
+    })
+    .unwrap_or_else(|| {
+        retain_own(LEVEL_WARN, b"subscriptions: event queue create failed");
+        0
+    })
 }
 
 /// Send `REGISTER_DEATH_EQ` to procmgr.
@@ -707,6 +818,7 @@ fn control_loop(
         match badge
         {
             WS_BADGE_DEATH => drain_deaths(logd),
+            WS_BADGE_SUBSCRIPTIONS => end_subscriptions(logd.subscriptions_eq),
             WS_BADGE_RESYNC =>
             {
                 // Take and clear the signalled bits: the wait set reports the
@@ -881,7 +993,7 @@ fn evict_missing(snapshot: &[u64], live: &[u64], logd: &Logd)
             .lock()
             .table
             .retire(badge, Eviction::Resync)
-            .map(|slot| slot.name.clone());
+            .map(|slot| slot.name().to_vec());
         if let Some(name) = evicted
         {
             log_reclaim(badge, Cause::Resync, &name);
@@ -990,7 +1102,7 @@ fn drain_deaths(logd: &Logd)
             let evicted = state
                 .table
                 .retire(death.correlator, Eviction::Death { exit_reason })
-                .map(|slot| slot.name.clone());
+                .map(|slot| slot.name().to_vec());
             drop(state);
             (death.correlator, exit_reason, evicted, full)
         };
@@ -1035,7 +1147,22 @@ fn serve_request(logd: &Logd, msg: &IpcMessage, reply: &mut Reply)
     }
     else if label_id == QUERY_SLOTS || label_id == QUERY_HISTORY
     {
-        reply.set(answer_query(&logd.lock().table, msg));
+        reply.set(answer_query(&logd.lock(), msg));
+    }
+    else if label_id == LOG_SUBSCRIBE
+    {
+        if answer_subscribe(logd, msg, reply)
+        {
+            return;
+        }
+    }
+    else if label_id == SINK_LIST
+    {
+        reply.set(answer_sink_list(msg));
+    }
+    else if label_id == SINK_SET
+    {
+        reply.set(answer_sink_set(msg));
     }
     else if label_id == LOG_FLUSH
     {
@@ -1046,6 +1173,13 @@ fn serve_request(logd: &Logd, msg: &IpcMessage, reply: &mut Reply)
         // Unknown / legacy label (e.g. GET_LOG_CAP from a hypothetical
         // pre-pivot caller). Reply empty so the sender unblocks.
         reply.set_status(0);
+    }
+    // A SEND with GRANT lets any holder move logd capabilities with any label:
+    // only an accepted `LOG_SUBSCRIBE` keeps them, so no sender fills logd's
+    // capability space.
+    for &cap in msg.caps()
+    {
+        let _ = syscall::cap_delete(cap);
     }
 }
 
@@ -1117,10 +1251,12 @@ fn slowest_entry_us(holding: [bool; MARKS]) -> u64
 /// and history logd owns (`services/logd/docs/ipc-interface.md` § Queries),
 /// under the state lock the caller holds. It reads only that state and calls
 /// no other service, so a query never waits on one. `QUERY_DENIED` for a badge
-/// without `LOG_QUERY_AUTHORITY`.
-fn answer_query(table: &SlotTable, msg: &IpcMessage) -> IpcMessage
+/// with neither `LOG_QUERY_AUTHORITY` nor `LOG_FOLLOW_AUTHORITY`;
+/// `QUERY_STALE` for an ascending walk that names another instance's epoch.
+fn answer_query(st: &LogdState, msg: &IpcMessage) -> IpcMessage
 {
-    if msg.badge & LOG_QUERY_AUTHORITY == 0
+    let table = &st.table;
+    if msg.badge & (LOG_QUERY_AUTHORITY | LOG_FOLLOW_AUTHORITY) == 0
     {
         return refusal(QUERY_DENIED);
     }
@@ -1138,16 +1274,362 @@ fn answer_query(table: &SlotTable, msg: &IpcMessage) -> IpcMessage
     }
     else
     {
-        match HistoryRequest::decode(msg)
+        let req = match HistoryRequest::decode(msg)
         {
-            Ok(req) =>
+            Ok(req) => req,
+            Err(status) => return refusal(status),
+        };
+        let (page, more) = match req.walk
+        {
+            HistoryWalk::Down { before } =>
             {
-                let (page, more) = logd_codec::query::history_page(|| table.history_views(), &req);
-                page.reply(more)
+                logd_codec::query::history_page(table.history_down(before), &req)
             }
-            Err(status) => refusal(status),
+            HistoryWalk::Up { epoch, .. } if epoch != 0 && epoch != st.epoch =>
+            {
+                return refusal(QUERY_STALE);
+            }
+            HistoryWalk::Up { from, .. } =>
+            {
+                logd_codec::query::history_page(table.history_up(from), &req)
+            }
+        };
+        page.reply(more)
+    }
+}
+
+/// One subscription: the subscriber's signal, in logd's capability space.
+/// Its token is its index's ([`Logd::subscription_tokens`]).
+#[derive(Clone, Copy)]
+struct Subscription
+{
+    signal: u64,
+}
+
+/// The subscriptions, by index, the `logd.query` pool's first
+/// (`SUBSCRIBERS_MAX`), then the `logd.follow` pool's
+/// (`SINK_SUBSCRIBERS_MAX`), with each index's generation, which the
+/// correlator of its index's token's binding carries. A leaf lock: no other lock is
+/// taken under it, and the state lock is never held when it is taken but by
+/// [`retain_notice`]'s signal.
+struct Subscriptions
+{
+    slots: [Option<Subscription>; SUBSCRIPTIONS],
+    generations: [u32; SUBSCRIPTIONS],
+}
+
+static SUBSCRIBERS: Mutex<Subscriptions> = Mutex::new(Subscriptions {
+    slots: [None; SUBSCRIPTIONS],
+    generations: [0; SUBSCRIPTIONS],
+});
+
+/// The subscriptions held, so that a retention with none takes no lock
+/// ([`signal_subscribers`]).
+static SUBSCRIBED: AtomicUsize = AtomicUsize::new(0);
+
+/// The subscriptions' lock ([`SUBSCRIBERS`]).
+fn subscribers() -> MutexGuard<'static, Subscriptions>
+{
+    SUBSCRIBERS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The correlator of subscription `index`'s binding in its `generation`.
+const fn correlator(index: usize, generation: u32) -> u64
+{
+    ((index as u64) << 32) | generation as u64
+}
+
+/// The indices of the pool a `LOG_SUBSCRIBE` on `badge` draws from; `None`
+/// for a badge with neither authority.
+fn subscription_pool(badge: u64) -> Option<core::ops::Range<usize>>
+{
+    if badge & LOG_FOLLOW_AUTHORITY != 0
+    {
+        Some(SUBSCRIBERS_MAX..SUBSCRIPTIONS)
+    }
+    else if badge & LOG_QUERY_AUTHORITY != 0
+    {
+        Some(0..SUBSCRIBERS_MAX)
+    }
+    else
+    {
+        None
+    }
+}
+
+/// Whether `cap` names a Notification and carries `rights`.
+fn is_notification(cap: u64, rights: u64) -> bool
+{
+    syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS).is_ok_and(|info| {
+        info >> 32 == u64::from(syscall::CAP_TAG_NOTIFICATION) && info & rights == rights
+    })
+}
+
+impl Subscriptions
+{
+    /// Take the subscription a binding's post with correlator `posted` ends:
+    /// the one at its index, when its generation is the correlator's.
+    fn end(&mut self, posted: u64) -> Option<Subscription>
+    {
+        let index = usize::try_from(posted >> 32).ok()?;
+        let generation = *self.generations.get(index)?;
+        if correlator(index, generation) != posted
+        {
+            return None;
+        }
+        self.slots.get_mut(index)?.take()
+    }
+}
+
+/// Answer a `LOG_SUBSCRIBE` request (`services/logd/docs/ipc-interface.md`
+/// § Subscriptions): take the request's signal into a free index of the pool
+/// its badge draws from ([`take_subscription`]), and answer a copy of the
+/// index's token, the index, the epoch, and the oldest and next `seq`. The
+/// signal must be a Notification with the notify right. Leaves the answer in
+/// `reply`, and returns whether the request's signal is kept; a refusal keeps
+/// none. A reply that does not reach the subscriber deletes the token's copy,
+/// which ends the subscription.
+fn answer_subscribe(logd: &Logd, msg: &IpcMessage, reply: &mut Reply) -> bool
+{
+    let Some(pool) = subscription_pool(msg.badge)
+    else
+    {
+        reply.set(refusal(QUERY_DENIED));
+        return false;
+    };
+    let signal = match decode_subscribe_request(msg)
+    {
+        Ok(signal) => signal,
+        Err(status) =>
+        {
+            reply.set(refusal(status));
+            return false;
+        }
+    };
+    if !is_notification(signal, syscall::RIGHTS_NTF_NOTIFY)
+    {
+        reply.set(refusal(QUERY_INVALID));
+        return false;
+    }
+    let (index, token) = match take_subscription(logd, pool, signal)
+    {
+        Ok(taken) => taken,
+        Err(status) =>
+        {
+            reply.set(refusal(status));
+            return false;
+        }
+    };
+    let answer = {
+        let st = state();
+        let next = st.table.history().next_seq();
+        Subscribed {
+            token,
+            index: index as u64,
+            epoch: st.epoch,
+            oldest: st.table.history_up(0).next().map_or(next, |r| r.entry.seq),
+            next,
+        }
+    };
+    reply.set_or_delete_caps(answer.reply());
+    true
+}
+
+/// Take a free index of `pool` whose token exists for `signal`: derive the
+/// subscriber's copy of the index's token, with no rights, and bind a
+/// sole-reference observer on logd's to the subscriptions' event queue, so
+/// the subscription ends when no copy is left. Returns the index and the
+/// copy; `QUERY_FULL` when no index is free or the bind fails.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the lock is held across the bind, so a post of the binding finds the subscription"
+)]
+fn take_subscription(
+    logd: &Logd,
+    pool: core::ops::Range<usize>,
+    signal: u64,
+) -> Result<(usize, u64), u64>
+{
+    let eq = logd.subscriptions_eq;
+    if eq == 0
+    {
+        return Err(QUERY_FULL);
+    }
+    let mut subs = subscribers();
+    let Subscriptions { slots, generations } = &mut *subs;
+    let free = pool.clone().find(|&i| {
+        slots.get(i).is_some_and(Option::is_none)
+            && logd
+                .subscription_tokens
+                .get(i)
+                .is_some_and(|&token| token != 0)
+    });
+    let (Some(index), Some(&token)) = (free, free.and_then(|i| logd.subscription_tokens.get(i)))
+    else
+    {
+        return Err(QUERY_FULL);
+    };
+    let (Some(slot), Some(generation)) = (slots.get_mut(index), generations.get_mut(index))
+    else
+    {
+        return Err(QUERY_FULL);
+    };
+    // The copy is made before the bind, so the bind finds the token at two
+    // references: a free index's token is at logd's one, since its last
+    // subscription ended only when no copy was left.
+    let copy = syscall::cap_derive(token, 0).map_err(|_| QUERY_FULL)?;
+    *generation = generation.wrapping_add(1);
+    // Under the lock, so the post of a copy deleted at once finds the
+    // subscription ([`end_subscriptions`]). The pool's observer nodes match
+    // its indices, and each returns with its binding's post, before the index
+    // is free again.
+    if syscall::cap_bind_sole_reference(token, eq, correlator(index, *generation)).is_err()
+    {
+        let _ = syscall::cap_delete(copy);
+        return Err(QUERY_FULL);
+    }
+    *slot = Some(Subscription { signal });
+    SUBSCRIBED.fetch_add(1, Ordering::Relaxed);
+    Ok((index, copy))
+}
+
+/// Signal every subscriber's Notification: an entry was retained. Taken
+/// after each retention, with the state lock released but by
+/// [`retain_notice`]; no lock when there is no subscription.
+fn signal_subscribers()
+{
+    if SUBSCRIBED.load(Ordering::Relaxed) == 0
+    {
+        return;
+    }
+    // Held across the sends: an ended subscription's signal is deleted only
+    // after it leaves the table, so no send names a deleted capability.
+    let subs = subscribers();
+    for sub in subs.slots.iter().flatten()
+    {
+        // A signal the subscriber revoked fails; its subscription ends with
+        // its token.
+        let _ = syscall::notification_send(sub.signal, SUBSCRIPTION_BIT);
+    }
+}
+
+/// End each subscription whose token's binding posted to `eq`, the
+/// subscriptions' event queue: the subscriber deleted its copy of the token,
+/// or died, and the token fell to logd's one reference. Deletes its signal;
+/// the token stays its index's, for the next subscription there.
+/// A post for an index since reused, by its generation, is dropped. The main
+/// thread's, on its wait set's `WS_BADGE_SUBSCRIPTIONS`.
+fn end_subscriptions(eq: u64)
+{
+    while let Ok(post) = syscall::event_recv_entry(eq, u64::MAX)
+    {
+        let ended = subscribers().end(post.tag);
+        if let Some(sub) = ended
+        {
+            SUBSCRIBED.fetch_sub(1, Ordering::Relaxed);
+            let _ = syscall::cap_delete(sub.signal);
         }
     }
+}
+
+/// Answer a `SINK_LIST` request (`services/logd/docs/ipc-interface.md`
+/// § Sink control) from the sink's settings and cursor under the state lock.
+/// `QUERY_DENIED` for a badge without `LOG_CONTROL_AUTHORITY`.
+fn answer_sink_list(msg: &IpcMessage) -> IpcMessage
+{
+    if msg.badge & LOG_CONTROL_AUTHORITY == 0
+    {
+        return refusal(QUERY_DENIED);
+    }
+    let index = match ipc::log_control::decode_list_request(msg)
+    {
+        Ok(index) => index,
+        Err(status) => return refusal(status),
+    };
+    let Some(sink) = usize::try_from(index).ok().and_then(|i| SINKS.get(i))
+    else
+    {
+        return ipc::log_control::list_end();
+    };
+    let (settings, cursor) = {
+        let st = state();
+        (
+            st.settings.get(sink.index).copied(),
+            st.cursors.get(sink.index).copied(),
+        )
+    };
+    let (Some(settings), Some(cursor)) = (settings, cursor)
+    else
+    {
+        return ipc::log_control::list_end();
+    };
+    let mut text = logd_codec::BoundedStr::<RENDERED_SETTINGS_MAX>::new();
+    let _ = write!(text, "{settings}");
+    let view = SinkView {
+        state: sink.state(),
+        cursor: cursor.next,
+        drops: cursor.drops,
+        name: sink.what.as_bytes(),
+        settings: text.as_str().as_bytes(),
+    };
+    let more = sink.index.saturating_add(1) < SINKS.len();
+    view.reply(more).unwrap_or_else(|| refusal(QUERY_INVALID))
+}
+
+/// Answer a `SINK_SET` request (`services/logd/docs/ipc-interface.md`
+/// § Sink control): parse its settings string over the named sink's settings
+/// and, when it parses, make them the sink's, under the state lock, and wake
+/// the writers and the kernel reader, whose sinks may hold differently now.
+/// `QUERY_DENIED` for a badge without `LOG_CONTROL_AUTHORITY`,
+/// `QUERY_NO_SINK` for a name no sink has, `QUERY_INVALID` for a string that
+/// does not parse, which changes nothing.
+fn answer_sink_set(msg: &IpcMessage) -> IpcMessage
+{
+    if msg.badge & LOG_CONTROL_AUTHORITY == 0
+    {
+        return refusal(QUERY_DENIED);
+    }
+    let req = match SetRequest::decode(msg)
+    {
+        Ok(req) => req,
+        Err(status) => return refusal(status),
+    };
+    let Some(sink) = SINKS.iter().find(|s| s.what.as_bytes() == req.name)
+    else
+    {
+        return refusal(QUERY_NO_SINK);
+    };
+    let Ok(text) = core::str::from_utf8(req.settings)
+    else
+    {
+        return refusal(QUERY_INVALID);
+    };
+    {
+        let mut st = state();
+        let Some(current) = st.settings.get_mut(sink.index)
+        else
+        {
+            return refusal(QUERY_NO_SINK);
+        };
+        let Ok(settings) = current.parse_over(sink.kind, text)
+        else
+        {
+            return refusal(QUERY_INVALID);
+        };
+        let turned_on = current.level.is_none() && settings.level.is_some();
+        *current = settings;
+        if turned_on
+        {
+            st.start_at_newest(sink.index);
+        }
+        st.sync_marks();
+    }
+    RETAINED.notify_all();
+    PROGRESS.notify_all();
+    let mut line = SerialFmt::new();
+    let _ = write!(line, "{}: settings set to {text}", sink.what);
+    retain_own(LEVEL_NOTICE, line.as_str().as_bytes());
+    IpcMessage::new(ipc::log_query::reply_label(QUERY_OK, 0, false))
 }
 
 /// Answer a `LOG_FLUSH` request (`services/logd/docs/ipc-interface.md`
@@ -1236,7 +1718,7 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> 
     let n = byte_len.min(bytes.len()).min(STREAM_CHUNK_SIZE);
     let level = level_of(msg.label);
     let text = bytes.get(..n).unwrap_or_default();
-    {
+    let lines = {
         let mut st = logd.lock();
         if sender_named(msg.label) && st.table.name_lost(badge)
         {
@@ -1270,8 +1752,15 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> 
                 }
             }
         }
+        lines
+    };
+    // A message that completes no line retains no entry: no subscriber has
+    // anything new to read.
+    wake_writers();
+    if lines > 0
+    {
+        signal_subscribers();
     }
-    retained();
     Consumed::Status(0)
 }
 
@@ -1539,7 +2028,8 @@ fn keep_kernel_record(
 }
 
 /// Record / update the display name for `badge`. History entries carry
-/// no name, only the badge (`QUERY_HISTORY`), so a rename changes the
+/// no name, only their slot's serial and name generation (`QUERY_HISTORY`),
+/// so a rename changes the
 /// slot's one current name (`QUERY_SLOTS`), which every line of the
 /// sender then renders under, earlier ones included.
 /// Long names truncated. No collision-suffix policy (procmgr's
@@ -1562,8 +2052,7 @@ fn register_name(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
         // An evicted sender's name (`SlotTable::sender_slot`).
         return;
     };
-    slot.name.clear();
-    slot.name.extend_from_slice(name);
+    slot.set_name(name);
 }
 
 // ── Serial output (driver-mediated) ────────────────────────────────────────
@@ -1814,10 +2303,35 @@ struct Cursor
     walk_end: Option<u64>,
     /// Entries the sink has dropped and not yet reported.
     dropped: u64,
+    /// Entries the sink has dropped since logd started, which `SINK_LIST`
+    /// reports ([`Self::drop_entries`]).
+    drops: u64,
     /// A `skip` sink's drop notice the journal holds and the sink has not
     /// reached: its `seq` and the count it names, which later drops are added
     /// to, so the notices do not multiply.
     notice: Option<(u64, u64)>,
+}
+
+impl Cursor
+{
+    /// Start at `next`, owing nothing before it: no drop to report, and no
+    /// notice to add to. An entry the writer has taken, and its walk, stay
+    /// the writer's to settle ([`Sink::advance`], [`Sink::release_taken`]),
+    /// so a walk written meanwhile still moves `walked`.
+    const fn start_at(&mut self, next: u64)
+    {
+        self.next = next;
+        self.dropped = 0;
+        self.notice = None;
+    }
+
+    /// Count `count` more entries the sink dropped, to report and in its
+    /// total.
+    const fn drop_entries(&mut self, count: u64)
+    {
+        self.dropped = self.dropped.saturating_add(count);
+        self.drops = self.drops.saturating_add(count);
+    }
 }
 
 /// What a sink's writer does next ([`Sink::next`]).
@@ -2104,6 +2618,29 @@ impl Sink
         !logd_codec::sink::write_overdue((started != NOT_WRITING).then_some(started), elapsed_us())
     }
 
+    /// The sink's state as `SINK_LIST` reports it: unserved while no driver
+    /// of its class is resolved, or its class is absent; stalled while its
+    /// current write is older than [`SINK_STALL_MS`]; served otherwise.
+    fn state(&self) -> u8
+    {
+        if self.driver.class() == 0 || self.driver.cap() == 0
+        {
+            return SINK_UNSERVED;
+        }
+        let started = self.write_started_us.load(Ordering::Relaxed);
+        if logd_codec::sink::write_overdue(
+            (started != NOT_WRITING).then_some(started),
+            elapsed_us(),
+        )
+        {
+            SINK_STALLED
+        }
+        else
+        {
+            SINK_SERVED
+        }
+    }
+
     /// The writer's next step from its cursor, under the state lock `st`
     /// ([`Self::step`]), then the sink's mark moved with the cursor, and the
     /// kernel reader woken when the cursor passed entries.
@@ -2143,15 +2680,12 @@ impl Sink
         };
         if settings.level.is_none()
         {
-            cursor.next = table.history().next_seq();
+            cursor.start_at(table.history().next_seq());
             cursor.taken = None;
             cursor.walk_end = None;
-            cursor.dropped = 0;
             return Step::Idle;
         }
-        cursor.dropped = cursor
-            .dropped
-            .saturating_add(table.history_mut().take_evicted(self.index));
+        cursor.drop_entries(table.history_mut().take_evicted(self.index));
         let mut found = None;
         while let Some((seq, entry)) = table.history().entry_from(cursor.next)
         {
@@ -2208,9 +2742,7 @@ impl Sink
                 {
                     cursor.walked = cursor.walked.max(end);
                 }
-                cursor.dropped = cursor
-                    .dropped
-                    .saturating_add(u64::from(wrote != Wrote::All));
+                cursor.drop_entries(u64::from(wrote != Wrote::All));
             }
             st.sync_marks();
         }
@@ -2390,7 +2922,7 @@ impl Sink
                 .between(cursor.next, start)
                 .filter(|(_, entry)| settings.shows(entry.level, entry.origin == Origin::Relayed))
                 .count();
-            cursor.dropped = cursor.dropped.saturating_add(passed as u64);
+            cursor.drop_entries(passed as u64);
             cursor.next = cursor.next.max(start);
         }
         st.sync_marks();
@@ -2621,13 +3153,16 @@ fn retain_notice(what: &str, cursor: &mut Cursor, table: &mut SlotTable)
         {
             return;
         };
-        history.push_text(
+        let seq = history.push_text(
             slot,
             LOG_BADGE_LOGD,
             elapsed_us(),
             LEVEL_NOTICE,
             text.as_str().as_bytes(),
-        )
+        );
+        // Under the state lock, which the subscriptions' lock nests in.
+        signal_subscribers();
+        seq
     };
     cursor.notice = Some((seq, total));
 }
@@ -2746,9 +3281,17 @@ fn open_output()
     write_inline_sinks();
 }
 
-/// After an entry is retained: wake the writers, and write the sinks that
-/// have none inline. Called with the state lock released.
+/// After an entry is retained: wake the writers, write the sinks that have
+/// none inline, and signal the subscribers. Called with the state lock
+/// released.
 fn retained()
+{
+    wake_writers();
+    signal_subscribers();
+}
+
+/// Wake the writers, and write the sinks that have none inline.
+fn wake_writers()
 {
     RETAINED.notify_all();
     write_inline_sinks();

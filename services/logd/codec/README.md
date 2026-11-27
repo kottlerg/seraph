@@ -18,7 +18,10 @@ and the `WalkGate` that runs one walk at a time; see
 logs when it evicts a slot (`ReclaimLine`, built as a log record; see the same document
 § Death-notification cascade, where the line is a test contract), and which entries a page of
 real-logd's `QUERY_SLOTS` and `QUERY_HISTORY` replies carries (`query::slot_page`,
-`query::history_page`; see the same document § Queries). It also holds the level tag both
+`query::history_page`, which takes the entries already in walk order and filters them by badge and
+least level; see the same document § Queries). `settings.rs`'s `SinkSettings` has a `Display` in the
+recipe syntax (`RENDERED_SETTINGS_MAX`, 160) that `parse_over` reads back, which `SINK_LIST`
+reports. It also holds the level tag both
 log receivers render between a line's stamp and its `[name]` prefix (`level::tag`; see the same
 document § Levels), how both render a log record and the parser that reads its fields back from
 the rendered text (`record::render`, `record::fields`, `RENDERED_MAX_BYTES`; see the same document

@@ -3929,7 +3929,7 @@ Forward a sanctioned SBI firmware call to M-mode on RISC-V, gated by a per-exten
 **Return:** `rax`/`a0`: the SBI call's return value on success; `SyscallError` on
 failure. A nonzero SBI firmware error collapses to `NotSupported`.
 
-Only a fixed set of six extensions is forwardable (SRST, SUSP, CPPC, BASE, DBCN, PMU);
+Only a fixed set of five extensions is forwardable (SRST, SUSP, CPPC, BASE, DBCN);
 each maps to a distinct `SbiControl` right. Extensions outside that set are rejected
 (see [capability-model.md](../../../docs/capability-model.md) § SbiControl (RISC-V only)).
 

@@ -473,17 +473,20 @@ own right:
 - **Cppc** — forward processor performance control (CPPC).
 - **Base** — forward the read-only Base extension (version / extension probe).
 - **Dbcn** — forward the Debug Console extension.
-- **Pmu** — forward the Performance Monitoring Unit extension.
 
 `SYS_SBI_CALL` maps the requested extension ID to the right it requires and
 rejects the call with `InsufficientRights` unless the cap carries that right.
 
-**Kernel floor.** The kernel forwards only the six sanctioned extensions above and
+**Kernel floor.** The kernel forwards only the five sanctioned extensions above and
 rejects every other extension ID regardless of cap (`InvalidArgument`). The rejected
 set includes the extensions it manages internally — TIME (scheduler timer), IPI (TLB
 shootdown / wakeups), RFENCE (remote fences), HSM (hart lifecycle) — whose forwarding
-would break a kernel invariant. Sanctioning a further extension adds one entry to the
-kernel's extension-to-right map and one `SbiControl` right.
+would break a kernel invariant, and PMU (the Performance Monitoring Unit): a counter counts
+everything that runs on its hart, so programming one is an authority over every process there,
+not a firmware call an `SbiControl` right carries. Capability-mediated counter access is design
+intent, not yet implemented ([#265](https://github.com/kottlerg/seraph/issues/265)). Bit 5 of
+the `SbiControl` rights space is reserved, and no right takes it. Sanctioning a further extension
+adds one entry to the kernel's extension-to-right map and one `SbiControl` right.
 
 **Distribution is policy, not kernel enforcement.** Each sanctioned extension has a
 right, but a holder can only forward an extension whose
@@ -501,7 +504,7 @@ devmgr, the steady-state holder of platform firmware authority (it sits alongsid
 IRQ resources devmgr already brokers). The remaining sanctioned rights are carried into no surviving
 cap and are unreachable after init's reap: **Dbcn** is thrown away by design (the userspace serial
 driver owns the console; forwarding the firmware console would bypass the console-ownership model),
-and **Cppc** / **Base** / **Pmu** are simply not needed by any current service. devmgr serves pwrmgr
+and **Cppc** / **Base** are simply not needed by any current service. devmgr serves pwrmgr
 a derivation further narrowed to **Reset** only (system reset / reboot), gated on the
 `SHUTDOWN_DEVICE_AUTHORITY` badge bit that only pwrmgr's seed-only `devmgr.shutdown` cap
 carries; **Suspend** is retained against a future power-management path but delegated to no one

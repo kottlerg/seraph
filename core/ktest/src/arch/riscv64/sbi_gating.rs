@@ -10,7 +10,7 @@
 //! (RISC-V only), without triggering an actual firmware action (SRST would
 //! reset the machine):
 //!
-//! 1. **Kernel floor** — TIME and HSM are rejected even when the cap holds
+//! 1. **Kernel floor** — TIME, HSM and PMU are rejected even when the cap holds
 //!    every sanctioned right.
 //! 2. **Per-extension rights** — SRST through a cap derived without `SBI_RESET`
 //!    is rejected, so no reset occurs.
@@ -28,6 +28,10 @@ const SBI_EXT_TIME: u64 = 0x5449_4D45;
 
 /// SBI Hart State Management extension ID (kernel-reserved: hart lifecycle).
 const SBI_EXT_HSM: u64 = 0x0048_534D;
+
+/// SBI Performance Monitoring Unit extension ID (kernel-reserved: performance
+/// counters).
+const SBI_EXT_PMU: u64 = 0x0050_4D55;
 
 /// SBI System Reset extension ID (sanctioned, requires `SBI_RESET`).
 const SBI_EXT_SRST: u64 = 0x5352_5354;
@@ -53,6 +57,15 @@ pub fn run(ctx: &TestContext) -> TestResult
         != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("sbi_gating: HSM (reserved) should be rejected with InvalidArgument");
+    }
+
+    // ── Kernel floor: PMU, whose counters count every thread on the hart ──────
+    // Function 0 is `sbi_pmu_num_counters`, which changes no counter state if
+    // the floor lets it through.
+    if sbi_call(ctx.sbi_control_cap, SBI_EXT_PMU, 0, 0, 0, 0)
+        != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("sbi_gating: PMU (reserved) should be rejected with InvalidArgument");
     }
 
     // ── Per-extension rights: SRST without SBI_RESET is denied, no reset ──────

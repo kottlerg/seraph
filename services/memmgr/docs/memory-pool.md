@@ -538,6 +538,65 @@ code; how the threads share the ledgers is the sharding above.
 
 ---
 
+## Receive loop
+
+memmgr serves with `SYS_IPC_REPLY_RECV`: a handler leaves its reply in an `ipc::serve::Reply` slot
+and does not send it, and the reply goes out with the loop's next receive, so the receive that
+follows a reply is the one the kernel's prediction of a serving receiver reads, and a fair or
+lower-RT caller that is not pinned can be placed on memmgr's CPU (core/kernel/docs/scheduler.md §
+Thread Assignment). A turn runs from one receive's return to the next receive, in this order:
+
+1. **The request.** The handler applies the request and sets the reply, or a request that took no
+   effect sets its refusal.
+2. **Retire objects.** The objects the request queued are freed (§ Memory objects, Release).
+3. **Limit signals.** The limit event of each node the request's charge marked is sent
+   (§ Distribution policy).
+4. **Eviction.** The compression jobs the worker marked done are drained, and a slice of the clock
+   runs when one is due (§ Eviction).
+5. **`CSpace` top-up** (§ CSpace headroom).
+6. **Pressure signal.** The level and the draw room are recomputed, and every registrant signalled
+   on a change (§ Memory pressure).
+7. **The receive**, which sends the reply still set, waiting a bounded time while the clock runs or
+   a job is in flight (§ Eviction).
+
+A turn that received no message (the bounded wait ended, or the receive failed) runs steps 4 to 7,
+and one whose receive failed skips step 4, so that the top-up before the retry is what refills a
+spent receive reserve (§ Reclamation).
+
+**Work in front of a reply.** Each of steps 2, 4, 5 and 6 first checks whether it has work to do,
+and a step that has sends the reply alone (`SYS_IPC_REPLY`) before doing it, so no caller's reply
+waits for a freed object's teardown, a drain, a clock slice, a donation or a broadcast. The checks
+are: an object queued for retirement; a job slot marked done, or a clock slice due (the clock runs
+and `SWEEP_INTERVAL_US` has passed since the last); the headroom or the growth budget low enough to
+call for a top-up; a change of the level or an opening of the draw room. A reply that rides the
+receive therefore waits behind the request's own handling and, past it, only these checks (an atomic
+load per job slot, a clock read while the clock runs, the three `cap_info` reads of the headroom,
+and the pressure computation) and step 3's sends, one Notification send per node of the charged
+chain that is at its limit or refused the charge, which never block. A job the worker finishes after
+step 4 looked is drained by the next turn: the receive waits a bounded time while a job is in
+flight. A turn that sent its reply alone ends in a plain receive, after which the kernel predicts no
+serving receiver for the next caller; such turns are those that do memmgr's background work.
+
+**A reply not delivered.** The kernel wakes a caller that is gone, or whose `CSpace` cannot take a
+reply's caps, with a transfer failure instead of the reply, and moves none of the reply's caps. Each
+request whose effect would stay charged, or stranded in memmgr's `CSpace`, when its caller does not
+learn of it leaves beside its reply the undo of that effect, which runs as soon as the send that
+carried the reply returns, before memmgr reads the ledger for anything else: a grant's frames and
+runs and inner derivations (`REQUEST_MEMORY_CAPS`), a registration and its caps
+(`REGISTER_PROCESS`), a committed region (`REGISTER_REGION`), a region's growth (`EXTEND_REGION`),
+an attachment and the zero frame it took (`ATTACH_OBJECT`), a node handle (`NODE_CREATE`,
+`CREATE_SUB_NODE`), and a sealed object and its handle (`SEAL_OBJECT`). A reply whose caps memmgr
+keeps no use for, a charge-only handle (`NODE_CHARGE_HANDLE`) or the buffer a disk-tier request
+hands back (`SWAP_TAKE`, `SWAP_RESTORE`), deletes them when it is not delivered. Nothing faults in,
+maps or names what the undo takes back first: memmgr serves one message at a time, and between a
+handler and the send of its reply run only step 3's sends and the other steps' checks, since a step
+with work sends the reply first. They can count the effect: a limit event sent in that span can
+count a charge that the undo then takes back, at worst one signal more than the ledger then shows.
+The pressure step, whose broadcast reaches every registrant, reads the level and the draw room again
+after a send it made, so it signals the ledger past the undo.
+
+---
+
 ## CSpace headroom
 
 memmgr's own `CSpace` takes a slot for every frame split and inner derivation a grant makes, and
@@ -620,8 +679,9 @@ quiescent joins the free pool (and the failed selection runs once more), and eac
 to the back of the list, so successive rechecks visit every run. Only the first of these in a turn
 of the receive loop rechecks; later ones in the same turn find the recheck done. A turn starts when
 a receive returns, with a message or with an error: it is the message's handling, if any, then the
-`CSpace` top-up before the next receive. A handler's recheck at entry therefore always runs, and so
-does the top-up's before a failed receive's retry, which is what refills a spent receive reserve.
+rest of the turn up to the next receive, the `CSpace` top-up among it (§ Receive loop). A handler's
+recheck at entry therefore always runs, and so does the top-up's before a failed receive's retry,
+which is what refills a spent receive reserve.
 One recheck checks at most `DEFERRED_RECHECK_BATCH` (64) runs and spends at most
 `DEFERRED_RECHECK_WINDOWS` (256) mapping-count queries of up to 512 pages each, plus the rest of the
 run that crosses that budget, after which it stops and leaves the runs behind at the head for the
@@ -1276,7 +1336,8 @@ registration replaces the first and memmgr deletes the cap the first carried. `P
 deletes the cap before it takes the process's frames back, since the cap keeps the Notification,
 and the frame it was retyped from, alive ([Reclamation](#reclamation)).
 
-At the top of each turn of its receive loop, after the `CSpace` top-up, memmgr recomputes the
+Near the end of each turn of its receive loop, after the `CSpace` top-up and before the receive
+(§ Receive loop), memmgr recomputes the
 level and the draw room ([Commit](#commit), Overcommit), and sends each registrant, in one send,
 its level bits on a change of the level and its draw-room bits on an opening of the draw room. The
 send ORs the bits into the Notification and never blocks, so no client can hold memmgr, and bits not

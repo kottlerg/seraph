@@ -22,9 +22,9 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, PAGE_SIZE};
 
 use crate::capture::Dest;
 use crate::{
-    FaultDecline, MemLedger, SCRUB_VA, SCRUB_WINDOW_PAGES, back_span_with, cap_badge, delete_caps,
-    ensure_committed_slots, fault_target, ledger_mut, map_self, release_unmapped_chunk,
-    reply_label, self_aspace,
+    Answer, FaultDecline, MemLedger, SCRUB_VA, SCRUB_WINDOW_PAGES, back_span_with, cap_badge,
+    delete_caps, ensure_committed_slots, fault_target, ledger_mut, map_self,
+    release_unmapped_chunk, self_aspace,
 };
 
 const _: () = assert!(FILL_CHUNKS as u64 == memmgr_labels::FILL_CHUNKS);
@@ -42,7 +42,12 @@ const READ_WORDS: usize = 2;
 /// the Memory caps after it, at most `memmgr_labels::OBJECT_READ_PAGES`, and
 /// report the object's pages and whether it carries the checkpoint mark.
 /// Deletes every cap before the reply, whatever it is.
-pub(crate) fn handle_object_read(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep: u64)
+pub(crate) fn handle_object_read(
+    req: &IpcMessage,
+    caps: &[u64],
+    answer: &mut Answer,
+    service_ep: u64,
+)
 {
     let (handle, dest) = match caps.split_first()
     {
@@ -55,10 +60,9 @@ pub(crate) fn handle_object_read(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u
     {
         Ok(reply) =>
         {
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            answer.set(reply);
         }
-        Err(label) => reply_label(ipc_buf, label),
+        Err(label) => answer.set_status(label),
     }
 }
 
@@ -145,7 +149,12 @@ fn copy_pages(l: &MemLedger, obj: NodeIdx, first: u64, dst: &mut [u8])
 /// caller's own regions with copies of the pages of the object whose handle
 /// is `caps[0]`, a SEND on `service_ep` read and deleted first, and reply
 /// the pages backed.
-pub(crate) fn handle_fill_region(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep: u64)
+pub(crate) fn handle_fill_region(
+    req: &IpcMessage,
+    caps: &[u64],
+    answer: &mut Answer,
+    service_ep: u64,
+)
 {
     let handle = caps.first().and_then(|&cap| cap_badge(service_ep, cap));
     match fill_region(req, handle)
@@ -155,10 +164,9 @@ pub(crate) fn handle_fill_region(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u
             let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
                 .word(0, pages)
                 .build();
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            answer.set(reply);
         }
-        Err(label) => reply_label(ipc_buf, label),
+        Err(label) => answer.set_status(label),
     }
 }
 
@@ -391,7 +399,7 @@ fn decline_label((reason, _): (FaultDecline, u64)) -> u64
 pub(crate) fn handle_mark_checkpoint(
     req: &IpcMessage,
     caps: &[u64],
-    ipc_buf: *mut u64,
+    answer: &mut Answer,
     procmgr_badge: u64,
     service_ep: u64,
 )
@@ -400,7 +408,7 @@ pub(crate) fn handle_mark_checkpoint(
     let account = caps.get(1).and_then(|&cap| cap_badge(service_ep, cap));
     if req.badge != procmgr_badge
     {
-        reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
+        answer.set_status(memmgr_errors::UNAUTHORIZED);
         return;
     }
     let l = ledger_mut();
@@ -420,5 +428,5 @@ pub(crate) fn handle_mark_checkpoint(
     {
         memmgr_errors::INVALID_ARGUMENT
     };
-    reply_label(ipc_buf, label);
+    answer.set_status(label);
 }

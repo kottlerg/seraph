@@ -569,6 +569,37 @@ impl<K> RegionTable<K>
         }
     }
 
+    /// What was kept with the live region `id` names, or `None` for an
+    /// unregistered region or an earlier generation of its slot.
+    #[must_use]
+    pub fn kept(&self, id: RegionId) -> Option<&K>
+    {
+        let slot = self.slots.get(id.slot)?;
+        match &slot.state
+        {
+            SlotState::Live { kept, .. } if slot.generation == id.generation => Some(kept),
+            SlotState::Live { .. } | SlotState::Free | SlotState::Retiring => None,
+        }
+    }
+
+    /// Unregister one live region registered for `partition`, as
+    /// [`RegionTable::remove`] does: its slot retires until its
+    /// sole-reference post. Returns the region and what was kept with it, or
+    /// `None` once `partition` holds no live region; `BLK_END_REGIONS`
+    /// calls it until `None`.
+    pub fn remove_one_of(&mut self, partition: u64) -> Option<(Region, K)>
+    {
+        let slot = self.slots.iter_mut().find(
+            |s| matches!(&s.state, SlotState::Live { region, .. } if region.partition == partition),
+        )?;
+        match core::mem::replace(&mut slot.state, SlotState::Retiring)
+        {
+            SlotState::Live { region, kept } => Some((region, kept)),
+            // Found Live just above, with `&mut` held throughout.
+            SlotState::Free | SlotState::Retiring => None,
+        }
+    }
+
     /// Unregister the live region `id` names, returning it and what was kept
     /// with it; its slot retires until its sole-reference post. `None` when
     /// `id` names no live region.
@@ -1240,5 +1271,62 @@ mod tests
         t.slots[0].generation = GENERATION_MASK;
         let id = t.admit(1).unwrap();
         assert_eq!((id.slot, id.generation), (0, 1));
+    }
+
+    #[test]
+    fn kept_names_only_the_live_registration()
+    {
+        let mut t: RegionTable<u8> = RegionTable::new();
+        let id = t.admit(3).unwrap();
+        assert_eq!(t.kept(id), None);
+        t.insert(id, region(3), 7).unwrap();
+        assert_eq!(t.kept(id), Some(&7));
+        assert_eq!(
+            t.kept(RegionId {
+                generation: id.generation + 1,
+                ..id
+            }),
+            None
+        );
+        t.remove(id).unwrap();
+        assert_eq!(t.kept(id), None);
+    }
+
+    // Defect caught: a partition cap revoked by its granter leaving the
+    // revoked holder's regions live (BLK_END_REGIONS ending too few, or
+    // another partition's).
+    #[test]
+    fn ending_a_partitions_regions_takes_each_of_its_own_and_retires_their_slots()
+    {
+        let mut t: RegionTable<u8> = RegionTable::new();
+        let mut ids = Vec::new();
+        for (kept, partition) in [(1, 5), (2, 6), (3, 5), (4, 5)]
+        {
+            let id = t.admit(partition).unwrap();
+            t.insert(id, region(partition), kept).unwrap();
+            ids.push(id);
+        }
+        let mut ended = Vec::new();
+        while let Some((r, kept)) = t.remove_one_of(5)
+        {
+            assert_eq!(r.partition, 5);
+            ended.push(kept);
+        }
+        ended.sort_unstable();
+        assert_eq!(ended, [1, 3, 4]);
+        assert_eq!(t.get(ids[1]), Some(&region(6)));
+        for &i in &[ids[0], ids[2], ids[3]]
+        {
+            assert_eq!(t.get(i), None);
+            // Retiring until the binding's post, which then frees the slot.
+            assert_eq!(t.post(i.correlator()), Post::Retired);
+        }
+        // The partition registers again up to its bound.
+        for _ in 0..MAX_REGIONS_PER_PARTITION
+        {
+            let id = t.admit(5).unwrap();
+            t.insert(id, region(5), 0).unwrap();
+        }
+        assert_eq!(t.admit(5), None);
     }
 }

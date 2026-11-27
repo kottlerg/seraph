@@ -14,7 +14,8 @@
 //! (`BLK_READ_INTO_MEMORY`), block writes (`BLK_WRITE_FROM_MEMORY`),
 //! partition registration (`REGISTER_PARTITION`), the device geometry
 //! (`BLK_GET_GEOMETRY`), and registered regions (`BLK_REGISTER_REGION`,
-//! `BLK_READ_REGION`, `BLK_WRITE_REGION`, `BLK_UNREGISTER_REGION`) over IPC.
+//! `BLK_READ_REGION`, `BLK_WRITE_REGION`, `BLK_UNREGISTER_REGION`,
+//! `BLK_END_REGIONS`) over IPC.
 //! A sweeper thread unregisters the region of a client that holds no
 //! liveness cap any more ([`start_sweeper`]).
 
@@ -722,15 +723,19 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
             }
             blk_labels::BLK_READ_REGION =>
             {
-                handle_region_transfer(&msg, rt, io::IoDirection::Read, &mut reply);
+                handle_region_transfer(&msg, ipc_buf, rt, io::IoDirection::Read, &mut reply);
             }
             blk_labels::BLK_WRITE_REGION =>
             {
-                handle_region_transfer(&msg, rt, io::IoDirection::Write, &mut reply);
+                handle_region_transfer(&msg, ipc_buf, rt, io::IoDirection::Write, &mut reply);
             }
             blk_labels::BLK_UNREGISTER_REGION =>
             {
                 handle_unregister_region(&msg, ipc_buf, rt, &mut reply);
+            }
+            blk_labels::BLK_END_REGIONS =>
+            {
+                handle_end_regions(&msg, ipc_buf, rt, &mut reply);
             }
             virtio_blk::SWEEP if Caller::of(msg.badge) == Caller::Sweeper =>
             {
@@ -1308,7 +1313,10 @@ fn register_region(
         match unsafe { virtio_core::dma::map(rt.dma_ep, mem_cap, dma_access, ipc_buf) }
         {
             Ok(addr) => addr,
-            Err(ipc::DmaError::Refused(ipc::devmgr_dma_errors::TOO_MANY_MAPPINGS)) =>
+            Err(ipc::DmaError::Refused(
+                ipc::devmgr_dma_errors::TOO_MANY_MAPPINGS
+                | ipc::devmgr_dma_errors::OUT_OF_RESOURCES,
+            )) =>
             {
                 return Err(ipc::blk_errors::REGION_LIMIT);
             }
@@ -1432,13 +1440,14 @@ fn release_region(dma_ep: u64, region: &Region, kept: &RegionCaps, ipc_buf: *mut
 /// cap; one the request carries is deleted.
 fn handle_region_transfer(
     msg: &IpcMessage,
+    ipc_buf: *mut u64,
     rt: &mut BlkRuntime,
     dir: io::IoDirection,
     out: &mut Reply,
 )
 {
     drop_caps(msg.caps());
-    out.set_status(region_transfer(msg, rt, dir));
+    out.set_status(region_transfer(msg, ipc_buf, rt, dir));
 }
 
 /// Run the transfer a region request names, and return the reply label.
@@ -1451,7 +1460,21 @@ fn handle_region_transfer(
 /// loses quiesces it as for any transfer ([`quiesce_device`]); the region
 /// stays registered. A slow request's line reports its device time, its map
 /// and unmap being 0.
-fn region_transfer(msg: &IpcMessage, rt: &mut BlkRuntime, dir: io::IoDirection) -> u64
+///
+/// A region whose kept Memory cap no longer answers `cap_info` is
+/// unregistered ([`release_region`]) and the request answered
+/// `OUT_OF_BOUNDS`, before the device is programmed: its client revoked the
+/// cap it registered, devmgr's copy with it, and memmgr may pool the frames
+/// once the client releases them. The window left is the one request in
+/// flight, as on the per-transfer path; the check goes once devmgr holds a
+/// mapped frame against its lender's revoke
+/// (docs/device-management.md § DMA-Safe Teardown).
+fn region_transfer(
+    msg: &IpcMessage,
+    ipc_buf: *mut u64,
+    rt: &mut BlkRuntime,
+    dir: io::IoDirection,
+) -> u64
 {
     if msg.word(0) != u64::from(ipc::BLK_LABELS_VERSION)
     {
@@ -1462,11 +1485,23 @@ fn region_transfer(msg: &IpcMessage, rt: &mut BlkRuntime, dir: io::IoDirection) 
     {
         return ipc::blk_errors::OUT_OF_BOUNDS;
     };
-    let Some(region) = rt.regions.get(id).copied()
+    let (Some(region), Some(memory)) = (
+        rt.regions.get(id).copied(),
+        rt.regions.kept(id).map(|kept| kept.memory),
+    )
     else
     {
         return ipc::blk_errors::OUT_OF_BOUNDS;
     };
+    if syscall::cap_info(memory, syscall::CAP_INFO_MEMORY_SIZE).is_err()
+    {
+        if let Some((region, kept)) = rt.regions.remove(id)
+        {
+            std::os::seraph::log!(warn: "region ended: registered Memory cap revoked");
+            release_region(rt.dma_ep, &region, &kept, ipc_buf);
+        }
+        return ipc::blk_errors::OUT_OF_BOUNDS;
+    }
     if rt.device_faulted
     {
         return ipc::blk_errors::DEVICE_FAULT;
@@ -1559,6 +1594,41 @@ fn handle_unregister_region(
         else
         {
             ipc::blk_errors::OUT_OF_BOUNDS
+        }
+    }
+    else
+    {
+        ipc::blk_errors::LABEL_VERSION_MISMATCH
+    };
+    out.set_status(code);
+}
+
+/// Handle a `BLK_END_REGIONS` request on a partition or whole-disk cap
+/// (README § Label 10: `BLK_END_REGIONS`): unregister every live region
+/// registered through the caller's badge ([`RegionTable::remove_one_of`]),
+/// each as `BLK_UNREGISTER_REGION` would ([`release_region`]), before the
+/// reply. A partition cap's granter sends it after revoking the caps derived
+/// from its own, so no holder it cut off keeps a region. Served after a lost
+/// request too, since the reset device reaches nothing.
+fn handle_end_regions(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, out: &mut Reply)
+{
+    drop_caps(msg.caps());
+    let code = if msg.word(0) == u64::from(ipc::BLK_LABELS_VERSION)
+    {
+        match Caller::of(msg.badge)
+        {
+            Caller::WholeDisk(badge) | Caller::Partition(badge) =>
+            {
+                while let Some((region, kept)) = rt.regions.remove_one_of(badge)
+                {
+                    release_region(rt.dma_ep, &region, &kept, ipc_buf);
+                }
+                ipc::blk_errors::SUCCESS
+            }
+            Caller::Unbadged | Caller::Region(_) | Caller::Sweeper | Caller::Unknown =>
+            {
+                ipc::blk_errors::OUT_OF_BOUNDS
+            }
         }
     }
     else

@@ -47,19 +47,29 @@ pub fn now_ns() -> u64
 /// thread began, `dead` being the dead driver's record.
 ///
 /// On the watch thread: revoke what the dead driver held of the partition,
-/// keeping the partition cap for the new driver; revoke and delete its
-/// service endpoint, which invalidates every cap derived from it, the caps
-/// clients hold through the mount among them; destroy what is left of its
-/// process; then start [`respawn`] on a thread of its own. A thread that
-/// cannot be started abandons the restart here.
+/// keeping the partition cap for the new driver, and end the block regions
+/// registered through the partition (`crate::end_partition_regions`); revoke
+/// and delete its service endpoint, which invalidates every cap derived from
+/// it, the caps clients hold through the mount among them; destroy what is
+/// left of its process; then start [`respawn`] on a thread of its own. An
+/// end that fails for a reason other than the block driver's death, and a
+/// thread that cannot be started, abandon the restart here, so no new driver
+/// takes the partition while an earlier holder's region may be live.
 pub fn restart_mount(rt: &'static VfsdRuntime, idx: u32, dead: &Mount, ipc_buf: *mut u64)
 {
     if let Err(code) = syscall::cap_revoke_all(dead.partition)
     {
         std::os::seraph::log!(warn: "restart: partition cap_revoke_all failed: code={code}");
     }
+    let ended = crate::end_partition_regions(dead.partition, ipc_buf);
     driver::teardown_driver(dead.endpoint);
     crate::destroy_driver(dead, ipc_buf);
+    if ended == swap::RegionsEnd::Failed
+    {
+        std::os::seraph::log!(warn: "restart: block regions not ended, tearing the mount down");
+        abandon(rt, idx, ipc_buf);
+        return;
+    }
 
     let kept = *dead;
     let spawned = std::thread::Builder::new()
@@ -215,7 +225,7 @@ fn land(
 /// filesystem. The dead driver was torn down when the restart began.
 fn abandon(rt: &VfsdRuntime, idx: u32, ipc_buf: *mut u64)
 {
-    if take_abandoned(rt, idx)
+    if take_abandoned(rt, idx, ipc_buf)
     {
         crate::finish_unmount(rt, idx, ipc_buf);
     }
@@ -227,7 +237,7 @@ fn abandon(rt: &VfsdRuntime, idx: u32, ipc_buf: *mut u64)
 /// lookups `NotFound`.
 fn abandon_without_walk(rt: &VfsdRuntime, idx: u32)
 {
-    if take_abandoned(rt, idx)
+    if take_abandoned(rt, idx, core::ptr::null_mut())
         && rt
             .root_backend
             .lock()
@@ -240,9 +250,10 @@ fn abandon_without_walk(rt: &VfsdRuntime, idx: u32)
 }
 
 /// Move the restart of the mount at node `idx` to a removal and revoke and
-/// delete its partition cap. `false`, logged, when no restart was under
-/// way, which only the restart's own thread ends.
-fn take_abandoned(rt: &VfsdRuntime, idx: u32) -> bool
+/// delete its partition cap (`crate::revoke_partition`, which ends its block
+/// regions when `ipc_buf` is not null). `false`, logged, when no restart
+/// was under way, which only the restart's own thread ends.
+fn take_abandoned(rt: &VfsdRuntime, idx: u32, ipc_buf: *mut u64) -> bool
 {
     let abandoned = rt
         .root_backend
@@ -255,6 +266,6 @@ fn take_abandoned(rt: &VfsdRuntime, idx: u32) -> bool
         std::os::seraph::log!(error: "restart: the abandoned restart was not under way");
         return false;
     };
-    crate::revoke_partition(dead.partition);
+    crate::revoke_partition(dead.partition, ipc_buf);
     true
 }

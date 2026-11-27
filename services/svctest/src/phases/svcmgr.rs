@@ -1111,6 +1111,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         (caps.hwrng_deny_class, "devmgr.class.hwrng-deny"),
         (caps.memmgr_swap, "memmgr.swap"),
         (caps.rtc_class, "devmgr.class.rtc"),
+        (caps.block_class, "devmgr.class.block"),
         (caps.svcmgr_grant, "svcmgr.grant"),
     ]
     {

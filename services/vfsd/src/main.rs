@@ -1199,6 +1199,11 @@ impl swap::SwapOps for SwapIo<'_>
         }
     }
 
+    fn end_regions(&mut self, cap: u64) -> swap::RegionsEnd
+    {
+        end_partition_regions(cap, self.ipc_buf)
+    }
+
     fn derive(&mut self, cap: u64) -> Option<u64>
     {
         syscall::cap_derive(cap, syscall::RIGHTS_EP_SEND_GRANT).ok()
@@ -1215,8 +1220,8 @@ impl swap::SwapOps for SwapIo<'_>
 /// statement names, else the boot disk's by type and priority. With none,
 /// the request replies [`vfsd_errors::NO_MOUNT`]; so does a tie, and a
 /// named partition that is no swap partition.
-/// A failed registration, revoke or derivation replies
-/// [`vfsd_errors::IO_ERROR`].
+/// A failed registration, revoke, end of the previous holder's block
+/// regions or derivation replies [`vfsd_errors::IO_ERROR`].
 fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime, reply: &mut Reply)
 {
     let handed = rt
@@ -1240,6 +1245,7 @@ fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime, reply: &mut Re
                 }
                 swap::HandOutError::Register
                 | swap::HandOutError::Revoke
+                | swap::HandOutError::EndRegions
                 | swap::HandOutError::Derive => ipc::vfsd_errors::IO_ERROR,
             };
             IpcMessage::new(label)
@@ -2026,7 +2032,7 @@ fn driver_unmount(endpoint: u64, force: Force, ipc_buf: *mut u64) -> DriverUnmou
 /// exit needs and one that did takes as a no-op.
 fn teardown_mount(mount: &Mount, ipc_buf: *mut u64)
 {
-    revoke_partition(mount.partition);
+    revoke_partition(mount.partition, ipc_buf);
     driver::teardown_driver(mount.endpoint);
     match syscall::event_recv_timeout(mount.death_queue, DRIVER_DEATH_TIMEOUT_MS)
     {
@@ -2045,7 +2051,7 @@ fn teardown_mount(mount: &Mount, ipc_buf: *mut u64)
 /// death has posted, so nothing is waited for.
 fn teardown_dead_mount(mount: &Mount, ipc_buf: *mut u64)
 {
-    revoke_partition(mount.partition);
+    revoke_partition(mount.partition, ipc_buf);
     driver::teardown_driver(mount.endpoint);
     destroy_driver(mount, ipc_buf);
 }
@@ -2314,7 +2320,7 @@ fn do_mount_internal(
     else
     {
         std::os::seraph::log!(warn: "MOUNT: partition cap derive failed");
-        revoke_partition(partition);
+        revoke_partition(partition, ipc_buf);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
 
@@ -2348,7 +2354,7 @@ fn do_mount_internal(
     {
         std::os::seraph::log!(warn: "MOUNT: failed to spawn fatfs");
         log_cap_delete("module_cap (spawn-fail)", module_cap_for_spawn);
-        revoke_partition(partition);
+        revoke_partition(partition, ipc_buf);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
     let driver_ep = fatfs.send;
@@ -2396,7 +2402,7 @@ fn do_mount_internal(
             std::os::seraph::log!(warn: "MOUNT: root fall-through cap derive failed");
             // Revoking the endpoint also invalidates `caller_root_cap` and
             // stops the driver, which nothing would reach otherwise.
-            release_failed_mount(&fatfs, partition);
+            release_failed_mount(&fatfs, partition, ipc_buf);
             return Err(ipc::vfsd_errors::IO_ERROR);
         };
         c
@@ -2462,7 +2468,7 @@ fn do_mount_internal(
             warn: "MOUNT: synthetic-root install failed (mount point or partition taken, \
              mount limit, no memory, or driver not observed)"
         );
-        release_failed_mount(&fatfs, partition);
+        release_failed_mount(&fatfs, partition, ipc_buf);
         return Err(ipc::vfsd_errors::TABLE_FULL);
     };
 
@@ -2496,23 +2502,66 @@ fn do_mount_internal(
 /// ([`driver::teardown_driver`]), invalidating every cap minted from it
 /// and stopping the driver; and the process handle and death queue are
 /// deleted.
-fn release_failed_mount(fatfs: &driver::FatfsDriver, partition: u64)
+fn release_failed_mount(fatfs: &driver::FatfsDriver, partition: u64, ipc_buf: *mut u64)
 {
-    revoke_partition(partition);
+    revoke_partition(partition, ipc_buf);
     driver::teardown_driver(fatfs.endpoint);
     log_cap_delete("driver process handle", fatfs.process);
     log_cap_delete("driver death queue", fatfs.death_queue);
 }
 
 /// Revoke and delete a partition cap vfsd registered: the driver's
-/// derivation of it stops reaching the block driver.
-fn revoke_partition(partition: u64)
+/// derivation of it stops reaching the block driver. Between the two, the
+/// block regions registered through the partition's badge are ended
+/// ([`end_partition_regions`]), so the cut-off holder keeps none. A null
+/// `ipc_buf` skips the end: only a restart's thread with no IPC buffer
+/// passes one, whose holder died before the restart began and took its
+/// regions with it, and which granted no new holder.
+pub(crate) fn revoke_partition(partition: u64, ipc_buf: *mut u64)
 {
     if let Err(code) = syscall::cap_revoke_all(partition)
     {
         std::os::seraph::log!(warn: "partition revoke: cap_revoke_all failed: code={code}");
     }
+    if !ipc_buf.is_null()
+    {
+        end_partition_regions(partition, ipc_buf);
+    }
     log_cap_delete("partition cap", partition);
+}
+
+/// End every block region registered through `partition`'s badge
+/// (`blk_labels::BLK_END_REGIONS` on `partition`), after a revoke of the
+/// caps derived from it: a region cap is minted from the block driver's
+/// endpoint, so the revoke does not reach it
+/// (`services/drivers/virtio/blk/README.md` § Label 10: `BLK_END_REGIONS`).
+/// The revoke comes first, so the cut-off holder registers nothing after the
+/// end, and a registration it queued before the revoke is served before the
+/// end. Anything but [`swap::RegionsEnd::Ended`] is logged.
+pub(crate) fn end_partition_regions(partition: u64, ipc_buf: *mut u64) -> swap::RegionsEnd
+{
+    let msg = IpcMessage::builder(blk_labels::BLK_END_REGIONS)
+        .word(0, u64::from(ipc::BLK_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(partition, &msg, ipc_buf) };
+    let end = swap::RegionsEnd::of(
+        reply
+            .as_ref()
+            .map(|r| r.label == ipc::blk_errors::SUCCESS)
+            .map_err(|&code| code),
+    );
+    match (end, &reply)
+    {
+        (swap::RegionsEnd::Ended, _) =>
+        {}
+        (_, Err(code)) =>
+        {
+            std::os::seraph::log!(warn: "BLK_END_REGIONS call failed: code={code:#x}");
+        }
+        (_, Ok(r)) => std::os::seraph::log!(warn: "BLK_END_REGIONS refused: code={:#x}", r.label),
+    }
+    end
 }
 
 /// For each synthetic intermediate the install made visible, walk the

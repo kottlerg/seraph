@@ -1055,6 +1055,7 @@ dependencies = [
 name = "vfsd-swap"
 version = "0.1.5"
 dependencies = [
+ "syscall-abi",
  "vfsd-gpt",
 ]
 

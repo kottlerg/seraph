@@ -99,6 +99,14 @@ pub const BLK_WRITE_REGION: u64 = 8;
 /// revoked. Specified in `services/drivers/virtio/blk/README.md` § Label 9:
 /// `BLK_UNREGISTER_REGION`.
 pub const BLK_UNREGISTER_REGION: u64 = 9;
+/// End every region registered through the badge of the partition or
+/// whole-disk cap it is sent on: `data[0]` = caller's `BLK_LABELS_VERSION`.
+/// Each region is unregistered as [`BLK_UNREGISTER_REGION`] would, before
+/// the reply. Whoever grants derivations of a partition cap and revokes them
+/// sends it on its own kept cap after the revoke, so a holder it cut off
+/// keeps no region. Specified in `services/drivers/virtio/blk/README.md`
+/// § Label 10: `BLK_END_REGIONS`.
+pub const BLK_END_REGIONS: u64 = 10;
 /// [`BLK_REGISTER_REGION`] access: the device only reads the region, so
 /// the region serves [`BLK_WRITE_REGION`] alone.
 pub const REGION_DEVICE_READS: u64 = 1;

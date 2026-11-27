@@ -222,9 +222,11 @@ is fixed for the device's life.
 Register a staging buffer. Sent on a partition or whole-disk cap. The driver
 checks the Memory cap, maps it for the device once with the access the
 request names (`DMA_MAP`), and keeps it, and the mapping, until the region is
-unregistered: by `BLK_UNREGISTER_REGION`, by the end of the client's lease
-(the last copy of the liveness cap outside the driver is gone, its process
-having died or deleted it), or by devmgr's withdrawal of the driver. The
+unregistered: by `BLK_UNREGISTER_REGION`, by `BLK_END_REGIONS` on the
+registering badge, by the end of the client's lease (the last copy of the
+liveness cap outside the driver is gone, its process having died or deleted
+it), by the next transfer after the client revoked the Memory cap it
+registered, or by devmgr's withdrawal of the driver. The
 client keeps its own copy of the Memory cap, and keeps only the partition's
 own data in the region: the device may write it for the whole registration,
 so the client copies data out once before it parses or checks it.
@@ -253,8 +255,8 @@ so the client copies data out once before it parses or checks it.
 | 3 | `OUT_OF_BOUNDS` | The badge is neither a whole-disk badge nor a registered partition's |
 | 5 | `INVALID_MEMORY_CAP` | The cap is absent, not a Memory cap, empty, or missing the rights the access needs; or `data[1]` names no access |
 | 6 | `LABEL_VERSION_MISMATCH` | `data[0]` is not the driver's `BLK_LABELS_VERSION` |
-| 7 | `DEVICE_FAULT` | The driver has failed stop after a lost request, or devmgr refused the mapping for a reason other than its bound |
-| 8 | `REGION_LIMIT` | The partition already holds `MAX_REGIONS_PER_PARTITION` (4) regions, the driver's `MAX_REGIONS` (32) slots are taken, devmgr's `MAX_MAPPINGS_PER_DEVICE` is reached, or the driver could not fund the region's capabilities |
+| 7 | `DEVICE_FAULT` | The driver has failed stop after a lost request, or devmgr refused the mapping for a reason other than its bounds |
+| 8 | `REGION_LIMIT` | The partition already holds `MAX_REGIONS_PER_PARTITION` (4) regions, the driver's `MAX_REGIONS` (32) slots are taken, devmgr refused the mapping at its `MAX_MAPPINGS_PER_DEVICE` or for want of device address space or memory (`OUT_OF_RESOURCES`), or the driver could not fund the region's capabilities |
 
 A refused request deletes the Memory cap it carried.
 
@@ -283,7 +285,7 @@ cap. A cap the request carries is deleted.
 |---|---|---|
 | 1 | `DEVICE_STATUS_IOERR` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
 | 2 | `DEVICE_STATUS_UNSUPP` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
-| 3 | `OUT_OF_BOUNDS` | The cap names no live region, or the run leaves the partition |
+| 3 | `OUT_OF_BOUNDS` | The cap names no live region, or the run leaves the partition; or the Memory cap the driver kept for the region no longer answers `cap_info`, its client having revoked the cap it registered, and the driver has unregistered the region as label 9 does, before programming the device |
 | 5 | `INVALID_MEMORY_CAP` | The offset is not a block multiple, the run passes the region's end, the count is 0 or past the u32 descriptor length, or the region is one the device only reads |
 | 6 | `LABEL_VERSION_MISMATCH` | `data[0]` is not the driver's `BLK_LABELS_VERSION` |
 | 7 | `DEVICE_FAULT` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request; after a lost request, every later request (see DMA Discipline). The region stays registered |
@@ -303,6 +305,39 @@ frames), deletes the Memory cap it kept, and revokes every copy of the
 region cap and of the liveness cap. Served after the driver has failed stop
 too. Reply: label 0 (success), `OUT_OF_BOUNDS` (3) for a cap naming no live
 region (a second unregistration included), or `LABEL_VERSION_MISMATCH` (6).
+
+### Label 10: `BLK_END_REGIONS`
+
+End every region registered through the badge of the partition or
+whole-disk cap the request is sent on, `data[0]` the caller's
+`BLK_LABELS_VERSION`. The driver unregisters each as `BLK_UNREGISTER_REGION`
+does, all before the reply, so once the reply arrives the device reaches no
+frame of them and no copy of their region or liveness caps is left. Served
+after the driver has failed stop too. Reply: label 0 (success), whether or
+not the badge held a region; `OUT_OF_BOUNDS` (3) on a region cap or an
+unbadged cap; or `LABEL_VERSION_MISMATCH` (6).
+
+A region outlives the partition cap it was registered on: its region cap is
+minted from this endpoint, so a revoke of the partition cap does not reach
+it. Whoever grants derivations of a partition or whole-disk cap and revokes
+them therefore MUST send `BLK_END_REGIONS` on the cap it kept after each
+revoke, before it deletes that cap or grants a new derivation; vfsd does so
+at each revoke
+([namespace-composition.md](../../../vfsd/docs/namespace-composition.md#revocation)
+§ Revocation). The order makes the end complete: after the revoke the cut-off
+holder can send no registration, and one it sent before the revoke is ahead
+of the end on this endpoint's queue, which the driver serves in order, so the
+end unregisters it too. A driver that died between the revoke and the end
+took its regions with it: devmgr withdraws a dead driver and revokes its
+service endpoint, from which every region cap derives
+([docs/device-management.md](../../../../docs/device-management.md#dma-safe-teardown)
+§ DMA-Safe Teardown), so the granter's call failing for the driver's death
+leaves no region; any other failure leaves the cut-off
+holder's regions reachable through their region caps until it unregisters
+them or its process ends, and the granter then grants the partition to no
+new holder. Any holder of a badge can end that badge's regions: on a
+partition, the one holder the granter allows at a time; on the whole-disk
+badge, the `MOUNT_AUTHORITY` holders.
 
 ### Internal label: `SWEEP`
 
@@ -366,7 +401,14 @@ is retiring until that post, which frees it, so each slot has at most one
 binding awaiting its post and the queue's `MAX_REGIONS` observer nodes
 cover every binding. Until the region is unregistered, its frames stay out of
 memmgr's pool through the driver's Memory cap and devmgr's
-([memory-pool.md](../../../memmgr/docs/memory-pool.md) § Reclamation).
+([memory-pool.md](../../../memmgr/docs/memory-pool.md) § Reclamation), unless
+the client revokes the cap it registered, which takes both copies with it:
+before each region transfer the driver checks that its kept cap still
+answers `cap_info`, and unregisters a region whose cap does not, so the
+frames of a revoked region reach the device during at most the one request
+in flight, the window the per-transfer path has
+([docs/device-management.md](../../../../docs/device-management.md#dma-safe-teardown)
+§ DMA-Safe Teardown).
 Unregistration relies on the depth of 1 below: no request on the region is
 in flight while the service loop unregisters it. A deeper queue would count
 each region's requests and unmap once none is left.

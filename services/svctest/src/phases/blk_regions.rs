@@ -4,7 +4,7 @@
 // services/svctest/src/phases/blk_regions.rs
 
 //! virtio-blk's registered DMA regions, against the driver of the first live
-//! block device (`services/drivers/virtio/blk/README.md` § Label 6 to § Label 9).
+//! block device (`services/drivers/virtio/blk/README.md` § Label 6 to § Label 10).
 //!
 //! svctest holds that device's whole-disk cap through its `devmgr.class.block`
 //! seed and registers a scratch partition in the gap between the GPT's entry
@@ -26,9 +26,18 @@
 //! - a child that registers a region of its own grant and is killed ends the
 //!   registration with no request of anyone's: svctest's copy of the child's
 //!   region cap is revoked, and the child's pages leave memmgr's deferred
-//!   list.
+//!   list;
+//! - a transfer on a region whose registered Memory cap its client revoked is
+//!   refused `OUT_OF_BOUNDS` and ends the region;
+//! - `BLK_END_REGIONS` on the partition cap after a revoke of a derivation
+//!   of it ends every region registered through the derivation, a
+//!   registration a thread sends in a loop on the derivation while the revoke
+//!   and the end run included; the partition then registers a region again,
+//!   and `BLK_END_REGIONS` on a region cap is refused `OUT_OF_BOUNDS`.
 
 use std::os::seraph::{current_ipc_buf, startup_info};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ipc::{IpcMessage, blk_errors, blk_labels};
@@ -374,6 +383,8 @@ fn blk_regions_phase(caps: &Caps)
     a.unregister("region a");
 
     dead_childs_region(partition);
+    revoked_memory(partition);
+    end_after_revoke(partition);
 
     let _ = syscall::cap_delete(partition);
     let _ = syscall::cap_delete(disk);
@@ -661,6 +672,189 @@ fn dead_childs_region(partition: u64)
         baseline,
         "blk_regions: the dead child's region pages after its registration ended",
     );
+}
+
+/// A region whose registered Memory cap svctest revokes (the revoke of every
+/// cap derived from its grant, the one it lent among them, which the driver
+/// kept): the next transfer on it is refused `OUT_OF_BOUNDS`, and the driver
+/// has unregistered it, svctest's region and liveness caps revoked.
+fn revoked_memory(partition: u64)
+{
+    let region = Region::register(
+        partition,
+        blk_labels::REGION_DEVICE_READS_WRITES,
+        "region of a revoked cap",
+    )
+    .unwrap_or_else(|label| panic!("blk_regions: a region to revoke refused ({label:#x})"));
+    syscall::cap_revoke_all(region.grant)
+        .unwrap_or_else(|e| panic!("blk_regions: revoking the lent Memory cap failed ({e})"));
+    assert_eq!(
+        region.transfer(
+            blk_labels::BLK_READ_REGION,
+            0,
+            1,
+            0,
+            "a read after the revoke"
+        ),
+        blk_errors::OUT_OF_BOUNDS,
+        "blk_regions: a transfer on a region whose Memory cap was revoked"
+    );
+    assert!(
+        gone(region.cap) && gone(region.liveness),
+        "blk_regions: a region whose Memory cap was revoked outlived its next transfer"
+    );
+    region.release("region of a revoked cap");
+}
+
+/// `BLK_END_REGIONS` on `partition` after a revoke of the derivation of it
+/// a holder registered through, as vfsd sends it: a region the holder
+/// registered, and every region a thread registered on the derivation in a
+/// loop that runs until the revoke cuts it off, are ended, their caps
+/// revoked. The thread races the revoke, so a registration of it may be
+/// queued on the driver's endpoint when the revoke runs; the driver serves
+/// that ahead of the end, which ends it too. Then the partition registers a
+/// region again, and the end on a region cap is refused.
+fn end_after_revoke(partition: u64)
+{
+    let holder = syscall::cap_derive(partition, syscall::RIGHTS_EP_SEND_GRANT)
+        .expect("blk_regions: holder's partition cap");
+    let first = Region::register(
+        holder,
+        blk_labels::REGION_DEVICE_READS_WRITES,
+        "holder's region",
+    )
+    .unwrap_or_else(|label| panic!("blk_regions: the holder's region refused ({label:#x})"));
+    let made = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&made);
+    let racer = std::thread::Builder::new()
+        .name("blk_regions_racer".into())
+        .spawn(move || register_until_cut_off(holder, &seen))
+        .expect("blk_regions: racer thread spawn failed");
+    let start = Instant::now();
+    while made.load(Ordering::Acquire) == 0
+    {
+        assert!(
+            start.elapsed() < REVOKE_WAIT && !racer.is_finished(),
+            "blk_regions: the racer registered no region"
+        );
+        let _ = syscall::thread_yield();
+    }
+    syscall::cap_revoke_all(partition)
+        .unwrap_or_else(|e| panic!("blk_regions: revoking the holder's cap failed ({e})"));
+    end_regions(partition, blk_errors::SUCCESS, "the end after the revoke");
+    let registrations = racer.join().expect("blk_regions: racer thread panicked");
+    assert!(
+        gone(first.cap) && gone(first.liveness),
+        "blk_regions: the holder's region outlived the end after the revoke"
+    );
+    first.release("holder's region");
+    for registered in registrations
+    {
+        assert!(
+            gone(registered.cap) && gone(registered.liveness),
+            "blk_regions: a region the racer registered outlived the end after the revoke"
+        );
+        super::memmgr::release_grant(registered.grant, registered.grant_id);
+    }
+
+    let again = Region::register(
+        partition,
+        blk_labels::REGION_DEVICE_READS_WRITES,
+        "region after the end",
+    )
+    .unwrap_or_else(|label| panic!("blk_regions: a region after the end refused ({label:#x})"));
+    end_regions(
+        again.cap,
+        blk_errors::OUT_OF_BOUNDS,
+        "the end on a region cap",
+    );
+    again.unregister("region after the end");
+}
+
+/// `BLK_END_REGIONS` on `cap`, whose reply label must be `want`.
+fn end_regions(cap: u64, want: u64, what: &str)
+{
+    let msg = IpcMessage::builder(blk_labels::BLK_END_REGIONS)
+        .word(0, version())
+        .build();
+    assert_eq!(call(cap, &msg, what).label, want, "blk_regions: {what}");
+}
+
+/// A region the racer registered: its region and liveness caps and the
+/// one-page grant it covers.
+struct Registered
+{
+    cap: u64,
+    liveness: u64,
+    grant: u64,
+    grant_id: u64,
+}
+
+/// Register one-page regions on `holder` in a loop, counting each in
+/// `made`, until a call on `holder` fails, the revoke having taken it.
+/// At most two of its regions stay registered: past that it unregisters
+/// the oldest, so the partition's bound is never reached. Returns every
+/// region it registered.
+fn register_until_cut_off(holder: u64, made: &AtomicUsize) -> Vec<Registered>
+{
+    let ipc_buf = current_ipc_buf();
+    let mut all: Vec<Registered> = Vec::new();
+    let mut live = 0usize;
+    loop
+    {
+        let (grant, grant_id) = super::memmgr::try_request_contiguous(1)
+            .unwrap_or_else(|label| panic!("blk_regions: racer grant refused ({label:#x})"));
+        let lent = syscall::cap_derive(grant, syscall::RIGHTS_MEM_MAP_RW)
+            .unwrap_or_else(|e| panic!("blk_regions: racer lent cap failed ({e})"));
+        let msg = IpcMessage::builder(blk_labels::BLK_REGISTER_REGION)
+            .word(0, version())
+            .word(1, blk_labels::REGION_DEVICE_READS_WRITES)
+            .cap(lent)
+            .build();
+        // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(holder, &msg, ipc_buf) };
+        let Ok(reply) = reply
+        else
+        {
+            let _ = syscall::cap_delete(lent);
+            super::memmgr::release_grant(grant, grant_id);
+            return all;
+        };
+        let &[cap, liveness] = reply.caps()
+        else
+        {
+            panic!(
+                "blk_regions: a racer registration replied {:#x} with {} caps",
+                reply.label,
+                reply.caps().len()
+            )
+        };
+        all.push(Registered {
+            cap,
+            liveness,
+            grant,
+            grant_id,
+        });
+        made.fetch_add(1, Ordering::Release);
+        live = live
+            .checked_add(1)
+            .expect("blk_regions: racer count overflowed");
+        if live > 2
+        {
+            let oldest = all
+                .len()
+                .checked_sub(live)
+                .and_then(|i| all.get(i))
+                .expect("blk_regions: the racer's oldest live region");
+            let end = IpcMessage::builder(blk_labels::BLK_UNREGISTER_REGION)
+                .word(0, version())
+                .build();
+            // SAFETY: as above. The end may already have taken the region, so
+            // the call's outcome is not checked; its caps are, after the end.
+            let _ = unsafe { ipc::ipc_call(oldest.cap, &end, ipc_buf) };
+            live = live.checked_sub(1).expect("live counted above two");
+        }
+    }
 }
 
 /// A `blk-region-child`: fetch a partition cap and a hand-off SEND from the

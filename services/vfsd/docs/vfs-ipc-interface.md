@@ -278,11 +278,15 @@ nothing, and the next request tries again.
 
 Every request derives the caller's cap from the kept one. One holder at a time reaches the
 partition: a request after the first revokes every cap derived from the kept one, and so the
-previous holder's, before it derives the new one. One lock covers the whole hand-out, so the
-first request's registration and a later request's revoke never interleave, and two concurrent
-requests leave exactly one live cap. A revoke that fails derives nothing, leaving the previous
-holder the only one; a derivation that fails after the revoke leaves no holder, never a stale
-one, until a later request succeeds. The pure decisions are
+previous holder's, then ends the block regions registered through the partition
+(`BLK_END_REGIONS`,
+[virtio-blk README](../../drivers/virtio/blk/README.md#label-10-blk_end_regions) § Label 10),
+so the previous holder keeps none, before it derives the new one. One lock covers the whole
+hand-out, so the first request's registration and a later request's revoke never interleave, and
+two concurrent requests leave exactly one live cap. A revoke that fails derives nothing, leaving
+the previous holder the only one; an end that fails other than for the block driver's death
+derives nothing, leaving no holder; a derivation that fails after the revoke leaves no holder,
+never a stale one, until a later request succeeds. The pure decisions are
 [`vfsd-swap`](../swap/src/lib.rs), host-tested.
 
 **Request**

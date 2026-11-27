@@ -9,8 +9,9 @@
 //!
 //! [`SwapPartition`] keeps the partition cap vfsd registered for the swap partition, and each
 //! hand-out derives the caller's cap from it. One holder at a time reaches the partition: a
-//! hand-out after the first revokes every cap derived from the kept one before it derives the
-//! new one, and refuses when that revoke fails. vfsd calls [`SwapPartition::hand_out`] under one
+//! hand-out after the first revokes every cap derived from the kept one, then ends the regions
+//! the block driver holds for the partition's badge (`blk_labels::BLK_END_REGIONS`), before it
+//! derives the new one, and refuses when that revoke or that end fails. vfsd calls [`SwapPartition::hand_out`] under one
 //! lock, so the first request's registration and a later request's revoke never interleave.
 //!
 //! The crate performs no I/O; vfsd supplies the operations through [`SwapOps`], so the hand-out
@@ -41,8 +42,50 @@ pub trait SwapOps
     /// Revoke every cap derived from `cap`, keeping `cap`; `false` when the revoke fails.
     fn revoke_descendants(&mut self, cap: u64) -> bool;
 
+    /// End every region the block driver holds for `cap`'s badge (`BLK_END_REGIONS` on
+    /// `cap`), so a holder the revoke cut off keeps none.
+    fn end_regions(&mut self, cap: u64) -> RegionsEnd;
+
     /// Derive the caller's cap from `cap`, or `None` when the derivation fails.
     fn derive(&mut self, cap: u64) -> Option<u64>;
+}
+
+/// How a `BLK_END_REGIONS` sent after a revoke ended
+/// (`services/drivers/virtio/blk/README.md` § Label 10: `BLK_END_REGIONS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionsEnd
+{
+    /// The driver ended every region of the badge.
+    Ended,
+    /// The block driver is gone: it took its regions with it, since devmgr revokes a dead
+    /// driver's service endpoint, from which every region cap derives.
+    DriverGone,
+    /// Any other outcome: the cut-off holder's regions may still be live.
+    Failed,
+}
+
+impl RegionsEnd
+{
+    /// Classify the call: `Ok(true)` for a `SUCCESS` reply, `Ok(false)` for any other reply
+    /// label, `Err` the IPC call's error code. `NoReceiver` (the driver's receive right died
+    /// with it) and `InvalidCapability` (devmgr's withdrawal revoked the cap the call was sent
+    /// on) are the driver's death.
+    #[must_use]
+    pub fn of(reply: Result<bool, i64>) -> Self
+    {
+        use syscall_abi::SyscallError;
+        match reply
+        {
+            Ok(true) => Self::Ended,
+            Err(code)
+                if code == SyscallError::NoReceiver as i64
+                    || code == SyscallError::InvalidCapability as i64 =>
+            {
+                Self::DriverGone
+            }
+            Ok(false) | Err(_) => Self::Failed,
+        }
+    }
 }
 
 /// Why a hand-out returned no cap.
@@ -60,6 +103,10 @@ pub enum HandOutError
     /// The revoke of the previous holder's cap failed; no new cap is derived, so the previous
     /// holder stays the only one.
     Revoke,
+    /// The end of the cut-off holder's regions failed for a reason other than the driver's
+    /// death; no new cap is derived, and no holder reaches the partition until a later hand-out
+    /// succeeds.
+    EndRegions,
     /// The derivation failed. No holder reaches the partition until a later hand-out succeeds.
     Derive,
 }
@@ -93,7 +140,9 @@ impl SwapPartition
     /// The first hand-out looks the partition up and registers it, and keeps the cap; a failed
     /// lookup or registration keeps nothing, so a later hand-out tries again. Every later
     /// hand-out first revokes the caps derived from the kept one, cutting off the previous
-    /// holder. Then the caller's cap is derived from the kept one.
+    /// holder, and then ends the regions the block driver holds for the partition, so the
+    /// previous holder keeps none; a driver that is gone took them with it. Then the caller's
+    /// cap is derived from the kept one.
     ///
     /// # Errors
     /// The [`HandOutError`] of the step that failed.
@@ -113,6 +162,10 @@ impl SwapPartition
         else if !ops.revoke_descendants(self.kept)
         {
             return Err(HandOutError::Revoke);
+        }
+        else if ops.end_regions(self.kept) == RegionsEnd::Failed
+        {
+            return Err(HandOutError::EndRegions);
         }
         ops.derive(self.kept).ok_or(HandOutError::Derive)
     }
@@ -136,6 +189,9 @@ mod tests
         lookup: Result<PartitionLocation, GptLookupError>,
         register_ok: bool,
         revoke_ok: bool,
+        end: RegionsEnd,
+        /// Holders the driver still serves a region of: each revoke-cut holder until an end.
+        regions: Vec<u64>,
         derive_ok: bool,
         registered: Vec<(PartitionLocation, u64)>,
         /// `(parent, cap)` of each live derivation.
@@ -157,6 +213,8 @@ mod tests
                 lookup,
                 register_ok: true,
                 revoke_ok: true,
+                end: RegionsEnd::Ended,
+                regions: Vec::new(),
                 derive_ok: true,
                 registered: Vec::new(),
                 live: Vec::new(),
@@ -197,9 +255,21 @@ mod tests
             self.calls.push("revoke");
             if self.revoke_ok
             {
+                // A revoke cuts the holder off the partition but not off the regions it
+                // registered.
                 self.live.retain(|&(parent, _)| parent != cap);
             }
             self.revoke_ok
+        }
+
+        fn end_regions(&mut self, _cap: u64) -> RegionsEnd
+        {
+            self.calls.push("end");
+            if self.end != RegionsEnd::Failed
+            {
+                self.regions.clear();
+            }
+            self.end
         }
 
         fn derive(&mut self, cap: u64) -> Option<u64>
@@ -211,6 +281,8 @@ mod tests
             }
             let child = self.mint();
             self.live.push((cap, child));
+            // Each holder registers a region.
+            self.regions.push(child);
             Some(child)
         }
     }
@@ -284,7 +356,47 @@ mod tests
         assert_eq!(ops.live, [(swap.kept(), second)]);
         assert_eq!(
             ops.calls,
-            ["lookup", "register", "derive", "revoke", "derive"]
+            ["lookup", "register", "derive", "revoke", "end", "derive"]
+        );
+        // Defect caught: a revoked holder keeping the block regions it registered.
+        assert_eq!(ops.regions, [second]);
+    }
+
+    // Defect caught: vfsd handing the swap partition to a new holder while the previous one
+    // still reaches it through its regions.
+    #[test]
+    fn a_failed_end_derives_nothing_and_a_gone_driver_counts_as_ended()
+    {
+        let mut swap = SwapPartition::new();
+        let mut ops = Model::with_partition();
+        let first = swap.hand_out(&mut ops).unwrap();
+        ops.end = RegionsEnd::Failed;
+        assert_eq!(swap.hand_out(&mut ops), Err(HandOutError::EndRegions));
+        assert_eq!(ops.live, Vec::new());
+        assert_eq!(ops.regions, [first]);
+        assert_eq!(ops.calls.last(), Some(&"end"));
+        ops.end = RegionsEnd::DriverGone;
+        let cap = swap.hand_out(&mut ops).unwrap();
+        assert_eq!(ops.live, [(swap.kept(), cap)]);
+    }
+
+    #[test]
+    fn an_end_reply_classifies_the_drivers_death_apart_from_other_failures()
+    {
+        use syscall_abi::SyscallError;
+        assert_eq!(RegionsEnd::of(Ok(true)), RegionsEnd::Ended);
+        assert_eq!(RegionsEnd::of(Ok(false)), RegionsEnd::Failed);
+        assert_eq!(
+            RegionsEnd::of(Err(SyscallError::NoReceiver as i64)),
+            RegionsEnd::DriverGone
+        );
+        assert_eq!(
+            RegionsEnd::of(Err(SyscallError::InvalidCapability as i64)),
+            RegionsEnd::DriverGone
+        );
+        assert_eq!(
+            RegionsEnd::of(Err(SyscallError::Interrupted as i64)),
+            RegionsEnd::Failed
         );
     }
 

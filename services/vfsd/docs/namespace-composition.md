@@ -84,7 +84,7 @@ the mount's driver and to tear it down:
 | `endpoint` | The driver's service endpoint as vfsd created it, from which every cap on it derives (§ Revocation) |
 | `process` | procmgr's process handle for the driver, from the create reply |
 | `death_queue` | `RECV` on the driver's death queue (below) |
-| `partition` | The partition cap virtio-blk returned on `REGISTER_PARTITION`; the driver holds a `cap_derive` (`SEND_GRANT`) of it, so `cap_revoke_all` on this cap cuts the driver off the partition |
+| `partition` | The partition cap virtio-blk returned on `REGISTER_PARTITION`; the driver holds a `cap_derive` (`SEND_GRANT`) of it, so `cap_revoke_all` on this cap cuts the driver off the partition, and `BLK_END_REGIONS` on it after the revoke ends the block regions the driver registered (§ Revocation) |
 | `disk` | The index, in vfsd's disk list, of the disk that holds the partition |
 | `first_lba` | The partition's first LBA on that disk; with `disk`, it names the partition, so a `MOUNT` of a partition a record holds, mounted or being removed, is refused before its driver is spawned and one driver serves a partition |
 
@@ -136,7 +136,8 @@ death and device loss) are the callers of `begin_unmount`; a restart that
 cannot start its driver ends as a removal too (§ Driver restart).
 
 A `MOUNT` that fails after its driver started releases what its record
-would have held: it revokes and deletes the partition cap, revokes the
+would have held: it revokes the partition cap, ends its block regions
+(§ Revocation) and deletes it, revokes the
 driver's service endpoint (which stops the driver), and deletes the
 process handle and the death queue.
 
@@ -155,7 +156,8 @@ the mount at a path in this order:
    unmounts the mount as the loss does (§ Driver death and device loss) and replies `NO_MOUNT`.
 3. Otherwise, whether the driver answered `SUCCESS` (it has released every open and exits),
    anything else, or nothing in time, tear the driver down without relying on it: revoke and
-   delete the record's `partition`, so the driver reaches the disk no more; revoke and delete
+   delete the record's `partition`, ending its block regions between the two (§ Revocation),
+   so the driver reaches the disk no more; revoke and delete
    its `endpoint`, which invalidates every cap derived from it (§ Revocation) and stops a driver
    still receiving; wait, bounded, for the death on the record's `death_queue`; then send
    `DESTROY_PROCESS` on the record's `process`, which a driver that exited takes as a no-op, and
@@ -247,7 +249,8 @@ restarted: its driver's death ends vfsd (§ Driver death and device loss).
   would cross it is answered `IoError`, never resolved through the root filesystem, an `UNMOUNT`
   of it is answered `NO_MOUNT` and a `MOUNT` at its path `TABLE_FULL`, as during a removal, and
   a disk's loss passes it. The watch thread then tears the dead instance down: it revokes what the
-  driver held of the partition, keeping the record's `partition` for the next driver; revokes and
+  driver held of the partition, keeping the record's `partition` for the next driver, and ends the
+  block regions registered through it (§ Revocation); revokes and
   deletes the driver's service endpoint, which invalidates every cap derived from it, every cap a
   client holds through the mount among them, so each fails closed; and destroys what is left of the
   process and deletes its handle and death queue. It starts the new driver on a thread of its own,
@@ -265,7 +268,8 @@ restarted: its driver's death ends vfsd (§ Driver death and device loss).
   resolves the mount's path again and reaches the new driver. The thread then checks the disk again,
   as a `MOUNT` does after its install, and tears the mount down as a forced `UNMOUNT` when the
   disk was lost meanwhile.
-- **Failure.** A removed disk, a driver that does not start, or a death queue the set refuses ends
+- **Failure.** An end of the block regions that fails other than for the block driver's death, a
+  removed disk, a driver that does not start, or a death queue the set refuses ends
   the restart as a removal (`VfsdRootBackend::abandon_restart`): the partition cap is revoked and
   the record removed as at the end of an unmount, and the path falls through to the root
   filesystem.
@@ -399,6 +403,15 @@ badged fall-through cap, and the driver's own receive copy all derive
 from it. The driver's block-device authority is revoked the same way,
 through the record's `partition`, from which the driver's partition cap
 derives.
+That revoke does not reach the block regions the driver registered
+through the partition, whose caps virtio-blk mints from its own endpoint,
+so vfsd sends `BLK_END_REGIONS` on `partition` after each revoke of it,
+before it deletes the cap or derives a new one from it
+([virtio-blk README](../../drivers/virtio/blk/README.md#label-10-blk_end_regions)
+§ Label 10: `BLK_END_REGIONS`). The block driver's death makes the end
+fail with the regions already gone; any other failure is logged, and vfsd
+then gives the partition to no new holder, so a restart becomes a removal
+(§ Driver restart).
 Revoking a cap the backend retains reaches only that cap's descendants,
 not the driver's receive copy, so it does not stop the server.
 Per-cap revocation — invalidating one issued node cap without affecting

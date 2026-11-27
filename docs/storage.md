@@ -301,7 +301,7 @@ by structure. See
 
 ## fs ↔ block IPC Contract
 
-The contract between fs drivers and the block driver has three
+The contract between fs drivers and the block driver has four
 elements:
 
 - **Two-tier endpoint.** Whole-disk `blk_labels::MOUNT_AUTHORITY`-badged (vfsd;
@@ -321,10 +321,17 @@ elements:
   replies and then fails every later read or write with `DeviceFault`;
   if the device does not acknowledge the reset, the driver exits without
   replying and the cap is destroyed with it.
+- **Registered DMA regions.** A partition holder may instead register a
+  Memory cap as a region (`BLK_REGISTER_REGION`), which the driver keeps,
+  mapped for the device, and transfer through the region cap it gets back
+  (`BLK_READ_REGION`, `BLK_WRITE_REGION`) with no cap on each request,
+  until the region is unregistered (`BLK_UNREGISTER_REGION`, the end of
+  the holder's lease, or `BLK_END_REGIONS`, which whoever revokes a
+  partition cap sends on the cap it kept).
 
 Authoritative wire shapes for `REGISTER_PARTITION`,
-`BLK_READ_INTO_MEMORY`, `BLK_WRITE_FROM_MEMORY`, and `BLK_GET_GEOMETRY`
-live in
+`BLK_READ_INTO_MEMORY`, `BLK_WRITE_FROM_MEMORY`, `BLK_GET_GEOMETRY`, and
+the region labels 6 to 10 live in
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
 The fs-driver side — `FS_MOUNT`, `FS_UNMOUNT`, `FS_SESSION`, `FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`,
 `FS_RELEASE_MEMORY`, `FS_RELEASE_ACK`, `FS_WRITE`, `FS_WRITE_MEMORY`,

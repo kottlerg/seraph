@@ -212,8 +212,17 @@ A driver programs its device only with the device address of a DMA mapping of th
   the transfer completed or the device acknowledged its reset, and it holds the lent capability
   until then too. It moves the capability back in its reply; a reply that fails (the client is
   gone) has it delete the capability, the transfer being over. A registered region's frame stays
-  mapped, and the driver keeps its capability, until the region is unregistered: by its client,
-  or by the driver once the client holds no liveness capability for it, its process gone.
+  mapped, and the driver keeps its capability, until the region is unregistered: by its client;
+  by the driver once the client holds no liveness capability for it, its process gone; by the
+  holder of the partition the client registered it on, after revoking the client's partition
+  capability
+  ([virtio-blk README](../services/drivers/virtio/blk/README.md#label-10-blk_end_regions)
+  § Label 10: `BLK_END_REGIONS`); or by the driver at the next transfer after the client revoked
+  the capability it registered, which takes the driver's and devmgr's copies with it, since
+  both derive from the client's. Until that transfer, the frames of a region so revoked, like
+  those of a transfer in flight whose lent capability is revoked, are held by no copy devmgr
+  keeps; the region check bounds that window to one request, and devmgr holding the frames of
+  a standing mapping by a reference no lender can revoke is the remaining step.
 - **When the driver is gone.** A driver that dies mid-transfer, or exits after an unacknowledged
   reset, leaves the mapping standing, and its own capability goes with its `CSpace`. When devmgr
   withdraws the device it deletes its mapping capabilities only once the IOMMU blocks the device,

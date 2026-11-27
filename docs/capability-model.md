@@ -518,16 +518,19 @@ sanctioning further extensions does not compete with any other type's rights.
 
 ### SchedControl
 
-A capability granting authority to assign thread priorities within a bounded
-band. Like `Interrupt`/`Mmio`/`IoPort`, it is a **range authority**: the object
-carries a `[min, max]` priority band, and holding the cap authorises setting any
-priority in that band via `SYS_THREAD_SET_PRIORITY`, or placing a new thread at
-it via `SYS_CAP_CREATE_THREAD`'s priority arguments (creation at the floor,
-`PRIORITY_MIN`, needs no `SchedControl` at all). It carries **no rights bit** —
-presence of the cap plus its band *is* the authority (a band-less or right-less
-`SchedControl` would be inert, so there is nothing to gate). Narrow a band into
-two disjoint children with `SYS_SCHED_SPLIT`; `cap_derive` cannot shrink a band
-(it attenuates rights only).
+A capability granting authority to assign thread priorities within a bounded band. Like
+`Interrupt`/`Mmio`/`IoPort`, it is a **range authority**: the object carries a `[min, max]` priority
+band, and holding the cap authorises setting any priority in that band via
+`SYS_THREAD_SET_PRIORITY`, or placing a new thread at it via `SYS_CAP_CREATE_THREAD`'s priority
+arguments (creation at the floor, `PRIORITY_MIN`, needs no `SchedControl` at all). It carries **no
+rights bit** — presence of the cap plus its band *is* the priority authority, and presence alone the
+run-limit authority below, so no rights bit has anything to gate. Narrow a band into two disjoint
+children with `SYS_SCHED_SPLIT`; `cap_derive` cannot shrink a band (it attenuates rights only).
+
+Holding a `SchedControl` cap, whatever its band, also authorises setting the run limit of a thread
+the holder has Control on (`SYS_THREAD_SET_RUN_LIMIT`,
+[core/kernel/docs/scheduler.md § Run Limit](../core/kernel/docs/scheduler.md#run-limit)): the
+limit bounds a thread's running and grants it nothing, so no band applies to it.
 
 There is no ambient priority authority: a process holding no `SchedControl`
 cannot set *any* thread priority. The kernel does not define a normal/elevated
@@ -1124,16 +1127,16 @@ terminal when:
 
 On the first terminal end of the address space, a terminal fault or a `SYS_ASPACE_EXIT` by any
 thread in it, the kernel posts the end's reason (`EXIT_FAULT_BASE + vector` on x86-64,
-`EXIT_FAULT_BASE + cause` on riscv64, for a fault; the encoded exit code for an exit) to each bound
-observer. The address space dies once: a later terminal fault or exit of another of its threads
-posts nothing to them. Every terminal fault and every `SYS_ASPACE_EXIT` exits its calling thread,
-and the kernel stops no other thread. `SYS_THREAD_EXIT` ends only the caller and posts only its
-thread's observers. A stopped faulting thread is the exception in timing
-only: whether the stop cancelled the episode or a `KILL` reply had already claimed it, the
-terminal fault takes effect, and is posted, only if the thread is started again (see
-[Fault Handling](fault-handling.md#delivery-resume-and-kill)). The fault of a restartable syscall's
-copy of a user buffer is never terminal: in each of the cases above it fails that syscall with
-`InvalidAddress`, the thread runs on, and nothing is posted (see
+`EXIT_FAULT_BASE + cause` on riscv64, for a fault; `EXIT_RUN_LIMIT` for a run-limit fault; the
+encoded exit code for an exit) to each bound observer. The address space dies once: a later
+terminal fault or exit of another of its threads posts nothing to them. Every terminal fault and
+every `SYS_ASPACE_EXIT` exits its calling thread, and the kernel stops no other thread.
+`SYS_THREAD_EXIT` ends only the caller and posts only its thread's observers. A stopped faulting
+thread is the exception in timing only: whether the stop cancelled the episode or a `KILL` reply had
+already claimed it, the terminal fault takes effect, and is posted, only if the thread is started
+again (see [Fault Handling](fault-handling.md#delivery-resume-and-kill)). The fault of a restartable
+syscall's copy of a user buffer is never terminal: in each of the cases above it fails that syscall
+with `InvalidAddress`, the thread runs on, and nothing is posted (see
 [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)).
 
 procmgr binds such an observer at process creation, so a fatal fault or an exit on any thread — a

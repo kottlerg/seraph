@@ -20,6 +20,7 @@ pub mod deadline_heap;
 pub mod fpu_switch;
 pub mod hold;
 pub mod registry_list;
+pub mod run_limit;
 pub mod run_queue;
 pub mod thread;
 #[cfg(not(test))]
@@ -2898,6 +2899,9 @@ fn idle_tcb(cpu: usize, stack_top: u64) -> ThreadControlBlock
         upcall_cookie: core::sync::atomic::AtomicU64::new(0),
         upcall_any_instruction: core::sync::atomic::AtomicBool::new(false),
         upcall_masked: core::sync::atomic::AtomicBool::new(false),
+        run_limit: core::sync::atomic::AtomicU32::new(0),
+        run_count: core::sync::atomic::AtomicU32::new(0),
+        run_limit_pending: core::sync::atomic::AtomicBool::new(false),
         is_user: false,
         saved_state: idle_saved_state(cpu, stack_top),
         kernel_stack_top: stack_top,
@@ -7877,6 +7881,8 @@ unsafe fn mark_dispatched(
         (*tcb).wake_pending = false;
         (was_pending, (*tcb).thread_id)
     };
+    // A pending upcall follows the thread to this CPU; a pending run-limit
+    // fault follows it in `schedule()`, after its `context_saved` Acquire.
     // SAFETY: tcb is a valid TCB whose sched_lock is held (contract).
     let upcall = unsafe { crate::ipc::upcall::return_work_of(tcb) };
     if upcall != 0
@@ -8687,6 +8693,16 @@ pub unsafe fn schedule(requeue: Requeue)
         spin_site_exit();
     }
 
+    // A run-limit fault pending on `next` follows it to this CPU. Read after
+    // the Acquire of its `context_saved` above (the check or the spin), which
+    // follows every tick its previous CPU took while it was current there: a
+    // tick in its block window, after this CPU's claim, posts the bit on that
+    // CPU, and this read sees the fault it marked
+    // (core/kernel/docs/scheduler.md § Run Limit). Idle has none.
+    // SAFETY: next is null or a valid TCB; this CPU's per-CPU pointer is
+    // installed and interrupts are disabled.
+    unsafe { run_limit::follow_to_cpu(next) };
+
     // Extended-state switch-in: make `next`'s state live unless this CPU's
     // registers still hold it (`fpu_owner` and `next`'s `fpu_cpu` naming each
     // other). It runs after the Acquire load of `next`'s `context_saved` above
@@ -9100,6 +9116,14 @@ pub unsafe fn timer_tick()
         saved = unsafe { sched.lock.lock_raw() };
     }
 
+    // Count the tick toward the run limit of a non-idle current thread, under
+    // this CPU's scheduler lock and before the slice decision, so a tick that
+    // skips a switch still counts (core/kernel/docs/scheduler.md § Run Limit).
+    // The idle thread has no limit.
+    // SAFETY: current validated non-null above and is this CPU's current
+    // thread; interrupt context with this CPU's scheduler lock held.
+    unsafe { run_limit::tick(current) };
+
     // SAFETY: current validated non-null above; slice_remaining is always valid.
     let remaining = unsafe { (*current).slice_remaining };
     let Some((slice, reschedule)) = sched.tick_outcome(remaining).slice_and_reschedule()
@@ -9250,8 +9274,9 @@ unsafe fn preempt_outranked(sched: &PerCpuScheduler) -> bool
 /// this CPU's return-work word ([`crate::percpu::return_work_pending`]) for
 /// the bits this return handles (`percpu::return_work::AT_INTERRUPT`), and,
 /// only when one is set, [`interrupt_return_slow`] with `deliver`, the
-/// interrupt delivery point of an upcall (docs/fault-handling.md § Delivery
-/// points; core/kernel/docs/scheduling-internals.md § Return Work).
+/// delivery of a pending run-limit fault ([`run_limit::deliver_at_interrupt`])
+/// and the interrupt delivery point of an upcall (docs/fault-handling.md
+/// § Delivery points; core/kernel/docs/scheduling-internals.md § Return Work).
 ///
 /// # Safety
 /// As for [`preempt_if_outranked`], at the end of an interrupt taken from user

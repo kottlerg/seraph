@@ -32,7 +32,7 @@ Unknown mode: with no first argument or one that names no mode above, it prints
 ## capexhaust
 
 Exhausts the process's own `CSpace` general slots, spends its IPC receive reserve on memmgr grants,
-checks memmgr's failed-grant rollback, and then runs a guarded blocking receive loop. The
+checks memmgr's undo of a grant and a sub-node whose replies fail, and then runs a guarded blocking receive loop. The
 `recv_wedge` phase of [`svctest`](../../svctest/README.md)
 (`services/svctest/src/phases/recv_guard.rs`) spawns `program-modes capexhaust`, waits for it to
 exit, and checks that it died with `EXIT_RECV_WEDGE`. It is not a general-purpose program. Source:
@@ -56,16 +56,22 @@ The fixture runs these steps in order:
    grant lands and no more than `CSPACE_IPC_RECV_RESERVE` do; the fixture panics otherwise.
    Nothing between the derive loop and this one allocates, so no heap growth takes reserved
    slots first.
-4. **Failed-grant rollback.** It reads memmgr's pool `free_bytes` with `QUERY_POOL_STATUS`,
-   sends eight one-page `REQUEST_MEMORY_CAPS` calls, and reads `free_bytes` again. With its
-   reserve spent, the `CSpace` cannot take a cap-bearing reply, so every reply MUST carry
-   the `IPC_REPLY_TRANSFER_FAILED` label (see
-   [docs/ipc-design.md](../../../docs/ipc-design.md#message-format)), and the two readings MUST
-   match. `free_bytes` is system-wide, so another process that allocates or dies in the
-   window (`crasher` shares the `svctest` boot, per
-   [docs/testing.md](../../../docs/testing.md#gating)) can move it. The fixture therefore
-   retries the window up to `ROLLBACK_WINDOW_TRIES` (8) times and panics if no window
-   matches. If a `QUERY_POOL_STATUS` call fails, it exits with code 1.
+4. **Failed-reply undo.** It reads its own charge (`QUERY_MEMORY_USAGE` `data[0]`), and
+   memmgr's pool `free_bytes` and the used slots of memmgr's own `CSpace`
+   (`QUERY_POOL_STATUS` `data[3]` and `data[19]`), sends eight one-page
+   `REQUEST_MEMORY_CAPS` calls and eight `CREATE_SUB_NODE` calls, and reads all three again.
+   With its reserve spent, the `CSpace` cannot take a cap-bearing reply, so every reply MUST
+   carry the `IPC_REPLY_TRANSFER_FAILED` label (see
+   [docs/ipc-design.md](../../../docs/ipc-design.md#message-format)), and memmgr MUST undo each
+   request ([memory-pool.md](../../memmgr/docs/memory-pool.md#receive-loop) § Receive loop):
+   the grant's frames go back to the pool uncharged and its caps are deleted, and the
+   sub-node's handle state is dropped and its handle cap deleted, so the two readings MUST
+   match. `free_bytes` and memmgr's slots are system-wide, so another process that allocates
+   or dies in the window (`crasher` shares the `svctest` boot, per
+   [docs/testing.md](../../../docs/testing.md#gating)) can move them, and a first touch of a
+   stack page can move the charge. The fixture therefore retries the window up to
+   `ROLLBACK_WINDOW_TRIES` (8) times and panics if no window matches. If a query fails, it
+   exits with code 1.
 5. **Wedged receive.** It enters a blocking `ipc_recv` loop on the endpoint, routing every
    outcome through `ipc::recv_guard::RecvGuard` as services do. With its reserve spent and no
    headroom for the kernel's `MSG_CAP_SLOTS_MAX` pre-allocate, every receive fails before
@@ -86,10 +92,12 @@ The fixture registers the log name `capexhaust` and logs these lines:
 | `<n> grants landed in the IPC receive reserve; reserve spent` | The reserve loop has ended |
 | `REQUEST_MEMORY_CAPS unexpected reply label <l>` | memmgr answered a grant with neither a grant nor a failed transfer, before the exit with code 1 |
 | `REQUEST_MEMORY_CAPS call failed (err=<e>)` | A grant call failed, before the exit with code 1 |
-| `QUERY_POOL_STATUS failed before grant attempts` | The first pool query of a window failed, before the exit with code 1 |
-| `QUERY_POOL_STATUS failed after grant attempts` | The second pool query of a window failed, before the exit with code 1 |
-| `pool churned during rollback window (attempt <i>: <before> -> <after>); retrying` | The `free_bytes` readings of one window differ |
-| `failed-grant rollback verified (free_bytes unchanged); entering recv loop` | A window's readings match |
+| `CREATE_SUB_NODE unexpected reply label <l>` | memmgr answered a sub-node request with other than a failed transfer, before the exit with code 1 |
+| `CREATE_SUB_NODE call failed (err=<e>)` | A sub-node call failed, before the exit with code 1 |
+| `QUERY_MEMORY_USAGE failed` | A query of the fixture's charge failed, before the exit with code 1 |
+| `QUERY_POOL_STATUS failed` | A pool query failed, before the exit with code 1 |
+| `undo window moved, retrying: attempt=<i> charge=<a>-><b> free_bytes=<a>-><b> memmgr_slots=<a>-><b>` | The fixture's charge, the pool's `free_bytes` or memmgr's used `CSpace` slots differ across one window |
+| `failed-reply undo verified` | A window's readings match |
 | `ipc_recv failing (err=<e>); backing off` | `RecvGuard` reports the first failure of a streak |
 | `ipc_recv wedged (err=<e>); exiting` | `RecvGuard` reports the fatal failure, before the exit |
 
@@ -97,7 +105,7 @@ The `ipc_recv failing` line also shows that logging still works from a fully exh
 `CSpace`: log messages and their replies carry no caps.
 
 `svctest`'s `recv_wedge` phase asserts only the exit code. The `OutOfMemory`, reserve, and
-rollback checks above are the fixture's own panics, which exit with a fault code instead of
+undo checks above are the fixture's own panics, which exit with a fault code instead of
 `EXIT_RECV_WEDGE` and so fail the phase.
 
 ---

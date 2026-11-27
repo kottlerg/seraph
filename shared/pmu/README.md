@@ -33,10 +33,10 @@ which adds the dependency on [`shared/syscall`](../syscall/README.md).
 
 ## Events and packing
 
-`PmuEvent` names the portable events by their ABI ids: `Cycles` and `Instructions`, counted
-wherever a CPU has counters, and `LlcReferences`, `LlcMisses`, `BranchInstructions`,
-`BranchMisses`, `DtlbMisses` and `ItlbMisses`, counted only where the CPU counts them, as
-`Info::supports` reports. `PmuMode` is `User`, `Kernel` or `All`.
+`PmuEvent` names the portable events by their ABI ids: `Cycles`, `Instructions`,
+`LlcReferences`, `LlcMisses`, `BranchInstructions`, `BranchMisses`, `DtlbMisses` and
+`ItlbMisses`. Each, `Cycles` and `Instructions` included, is counted only where the CPU's user
+counters count it, as `Info::supports` reports. `PmuMode` is `User`, `Kernel` or `All`.
 
 `Info::pack` and `Info::unpack` carry `SYS_PMU_INFO`'s result; `EventList::encode` and
 `EventList::decode` carry `SYS_PMU_CONFIGURE`'s event word and count, refusing more than
@@ -55,7 +55,8 @@ most one wrap.
 | `riscv` | `sbi_pmu_counter_get_info` results | The programmable counter of the highest CSR (`Layout::of`) | The SBI hardware and cache event indices; which a hart counts is probed at bring-up; offered only where every hart has Sscofpmf |
 
 Each module also encodes an event select (x86-64: event, unit mask, `USR`, `OS`, `EN`) or the SBI
-configuration flags (riscv64: `CLEAR_VALUE`, `AUTO_START` and the mode's inhibit bits) for a
+configuration flags (riscv64: the mode's inhibit bits alone, since the firmware may apply them to
+a fixed counter it answers with; `claimed_index` and `fixed_counter` name that answer) for a
 mode.
 
 ---

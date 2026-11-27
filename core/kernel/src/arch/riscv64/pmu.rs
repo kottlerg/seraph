@@ -15,9 +15,9 @@
 
 #[cfg(not(test))]
 use pmu::riscv::{
-    CFG_CLEAR_VALUE, Counter, CounterInfo, EXT_PMU, FID_COUNTER_CONFIG_MATCHING,
-    FID_COUNTER_GET_INFO, FID_COUNTER_STOP, FID_NUM_COUNTERS, Layout, STOP_RESET, claimed_index,
-    config_flags, event_index,
+    Counter, CounterInfo, EXT_PMU, FID_COUNTER_CONFIG_MATCHING, FID_COUNTER_GET_INFO,
+    FID_COUNTER_START, FID_COUNTER_STOP, FID_NUM_COUNTERS, Layout, START_SET_INIT_VALUE,
+    STOP_RESET, claimed_index, config_flags, event_index, fixed_counter,
 };
 #[cfg(not(test))]
 use pmu::{EventList, Info, PmuEvent, PmuMode};
@@ -80,23 +80,61 @@ fn counter_info(index: u64) -> Option<CounterInfo>
     (ret.error == 0).then(|| CounterInfo::decode(ret.value))
 }
 
-/// Claim a counter among `mask` for SBI event `event` with `flags`: its SBI
-/// index, or `None` where no counter of `mask` counts it. A counter outside
-/// `mask` that the firmware answers with (`OpenSBI`'s fixed `cycle` or
-/// `instret`) is no claim, and is left as it is (`claimed_index`).
+/// Claim a counter among `mask` for `event` with `flags`, which neither
+/// clear nor start it (`config_flags`): its SBI index, or `None` where no
+/// counter of `mask` counts it. The fixed `cycle` or `instret` counter the
+/// firmware answers with on a hart with Smcntrpmf (`claimed_index`) is no
+/// claim: its value is untouched, and the filter the request wrote into its
+/// `mcyclecfg` or `minstretcfg` is written back at once (`reset_fixed`).
 #[cfg(not(test))]
-fn config_matching(mask: u64, flags: u64, event: u64) -> Option<u64>
+fn config_matching(mask: u64, flags: u64, event: PmuEvent) -> Option<u64>
 {
     let ret = sbi_call5(
         EXT_PMU,
         FID_COUNTER_CONFIG_MATCHING,
-        [0, mask, flags, event, 0],
+        [0, mask, flags, event_index(event), 0],
     );
     if ret.error != 0
     {
         return None;
     }
-    claimed_index(mask, ret.value)
+    let claimed = claimed_index(mask, ret.value);
+    if claimed.is_none() && fixed_counter(event) == Some(ret.value)
+    {
+        reset_fixed(event);
+    }
+    claimed
+}
+
+/// Write the filter of `event`'s fixed counter (`pmu::riscv::fixed_counter`)
+/// to the one a request with no inhibit flag gives it, counting every mode
+/// but M-mode. Offered that counter alone, the firmware answers with it only
+/// on a hart with Smcntrpmf, where it writes the counter's `mcyclecfg` or
+/// `minstretcfg` and leaves its value; elsewhere it refuses and nothing
+/// changes.
+#[cfg(not(test))]
+fn reset_fixed(event: PmuEvent)
+{
+    if let Some(index) = fixed_counter(event)
+    {
+        let _ = sbi_call5(
+            EXT_PMU,
+            FID_COUNTER_CONFIG_MATCHING,
+            [0, 1 << index, 0, event_index(event), 0],
+        );
+    }
+}
+
+/// Start the claimed counter `index` at zero; whether the firmware did.
+#[cfg(not(test))]
+fn start(index: u64) -> bool
+{
+    let ret = sbi_call5(
+        EXT_PMU,
+        FID_COUNTER_START,
+        [index, 1, START_SET_INIT_VALUE, 0, 0],
+    );
+    ret.error == 0
 }
 
 /// Stop and release every counter of `mask` (SBI indices).
@@ -119,7 +157,9 @@ fn release(mask: u64)
 /// hart lacks Sscofpmf (`boot_protocol::HART_CAP_SSCOFPMF`), without which
 /// the firmware cannot filter a counter by privilege mode and a user reader's
 /// counts would include the kernel's execution, or where the firmware has no
-/// PMU extension or leaves no user counter.
+/// PMU extension or leaves no user counter. On a hart with Smcntrpmf it sets
+/// the filter of `cycle` and `instret` first (`reset_fixed`), the one a
+/// refused claim's write is undone to.
 ///
 /// # Safety
 /// S-mode on the hart being initialised, with interrupts disabled.
@@ -157,10 +197,12 @@ pub unsafe fn init(state: &mut ArchPmu) -> Info
     {
         return Info::NONE;
     }
+    reset_fixed(PmuEvent::Cycles);
+    reset_fixed(PmuEvent::Instructions);
     let mut events = 0;
     for event in PmuEvent::ALL
     {
-        if let Some(index) = config_matching(layout.user, CFG_CLEAR_VALUE, event_index(event))
+        if let Some(index) = config_matching(layout.user, 0, event)
         {
             release(1 << index);
             events |= event.bit();
@@ -206,8 +248,12 @@ pub unsafe fn configure(
     for (event, handle) in events.as_slice().iter().zip(handles.iter_mut())
     {
         let free = state.user & !state.configured;
-        let claimed = config_matching(free, flags, event_index(*event)).and_then(|index| {
+        let claimed = config_matching(free, flags, *event).and_then(|index| {
             state.configured |= 1 << index;
+            if !start(index)
+            {
+                return None;
+            }
             counter_info(index)
                 .and_then(|c| c.programmable())
                 .and_then(|offset| u8::try_from(offset).ok())

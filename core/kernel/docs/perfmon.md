@@ -44,20 +44,23 @@ The layouts are `pmu::intel::Layout`, `pmu::amd::Perfmon::user` and `reserved`, 
 `pmu::riscv::Layout`. The kernel's counter is the one a kernel-owned use (the NMI watchdog of
 #1088) programs; this document's mechanism never touches it.
 
-On x86-64 an event select names the event, its unit mask, the mode's `USR` and `OS` bits and
-`EN`, never `INT`, `ANY`, `INV`, `EDGE` or a counter mask; the user counters' enables in the
-global control (`IA32_PERF_GLOBAL_CTRL` on Intel version 2 and later, `PerfCntrGlobalCtl` on AMD
-with PerfMonV2) are set at bring-up and left set. On riscv64 the firmware owns the selectors
+On x86-64 an event select names the event, its unit mask, the mode's `USR` and `OS` bits and `EN`,
+never `INT`, `ANY`, `INV`, `EDGE` or a counter mask; the user counters' enables in the global
+control (`IA32_PERF_GLOBAL_CTRL` on Intel version 2 and later, `PerfCntrGlobalCtl` on AMD with
+PerfMonV2) are set at bring-up and left set. On riscv64 the firmware owns the selectors
 (`mhpmevent`): a counter is claimed with `sbi_pmu_counter_config_matching`, over the free user
-counters with `CLEAR_VALUE`, `AUTO_START` and the mode's inhibit flags, and released with
-`sbi_pmu_counter_stop` and its reset flag. The events a hart counts are probed once at bring-up,
-by claiming and releasing a counter for each. Counters are offered only when every hart has
-Sscofpmf: without it the SBI PMU extension cannot filter a counter by privilege mode (OpenSBI
+counters with the mode's inhibit flags alone, started at zero with `sbi_pmu_counter_start`, and
+released with `sbi_pmu_counter_stop` and its reset flag. The events a hart counts are probed once at
+bring-up, by claiming and releasing a counter for each. Counters are offered only when every hart
+has Sscofpmf: without it the SBI PMU extension cannot filter a counter by privilege mode (OpenSBI
 accepts and ignores the inhibit flags), so a user reader's counts would include the kernel's
 execution, a disclosure channel, and the kernel reports no counters. Sscofpmf also gives the
-overflow interrupt the kernel's reserved counter needs. A counter the firmware answers outside the
-offered set (OpenSBI returns the fixed cycle or instret counter for those events) is no claim
-(`pmu::riscv::claimed_index`).
+overflow interrupt the kernel's reserved counter needs. On a hart with Smcntrpmf, OpenSBI answers
+`Cycles` or `Instructions` with the fixed `cycle` or `instret` counter when no offered counter
+counts it, after writing the request's inhibit flags into that counter's `mcyclecfg` or
+`minstretcfg`. Such an answer is no claim (`pmu::riscv::claimed_index`): the claim flags never clear
+or start a counter, so the fixed counter's value is untouched, and its filter is written back at
+once to the one bring-up gives it, counting every mode but M-mode (`reset_fixed`).
 
 A configuration replaces the CPU's previous one, whoever made it: its counters are stopped at
 zero (released, on riscv64) before the new events are programmed. A configuration of no events

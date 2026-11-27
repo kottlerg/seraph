@@ -31,9 +31,9 @@ use syscall_abi::{
 };
 
 /// A portable event: what a counter counts, which the kernel maps to each
-/// CPU's own encoding. [`Cycles`](Self::Cycles) and
-/// [`Instructions`](Self::Instructions) are counted wherever a PMU exists; the
-/// others only where the CPU counts them, which [`Info::supports`] reports.
+/// CPU's own encoding. Every event, [`Cycles`](Self::Cycles) and
+/// [`Instructions`](Self::Instructions) included, is counted only where the
+/// CPU's user counters count it, which [`Info::supports`] reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PmuEvent

@@ -30,10 +30,6 @@ pub const FID_COUNTER_START: u64 = 3;
 /// `sbi_pmu_counter_stop`.
 pub const FID_COUNTER_STOP: u64 = 4;
 
-/// Config flag: clear the counter's value.
-pub const CFG_CLEAR_VALUE: u64 = 1 << 1;
-/// Config flag: start the counter.
-pub const CFG_AUTO_START: u64 = 1 << 2;
 /// Config flag: do not count in VU-mode.
 pub const CFG_SET_VUINH: u64 = 1 << 3;
 /// Config flag: do not count in VS-mode.
@@ -46,6 +42,8 @@ pub const CFG_SET_SINH: u64 = 1 << 6;
 pub const CFG_SET_MINH: u64 = 1 << 7;
 /// Stop flag: stop the counter and release it.
 pub const STOP_RESET: u64 = 1 << 0;
+/// Start flag: set the counter's value to the call's initial value.
+pub const START_SET_INIT_VALUE: u64 = 1 << 0;
 
 /// The CSR number of `cycle`; counter CSR `n` is `CSR_CYCLE + n`.
 pub const CSR_CYCLE: u16 = 0xC00;
@@ -204,12 +202,15 @@ const fn cache_event(cache: u64, result: u64) -> u64
 }
 
 /// `sbi_pmu_counter_config_matching`'s flags for a configuration counting in
-/// `mode`: clear the value, start the counter, and inhibit every mode the
-/// configuration does not count (M-mode and the virtualised modes always).
+/// `mode`: inhibit every mode the configuration does not count (M-mode and
+/// the virtualised modes always). They neither clear nor start the counter,
+/// since the firmware applies them to the fixed counter it may answer with
+/// ([`claimed_index`]); a claimed counter is started with
+/// `sbi_pmu_counter_start` and [`START_SET_INIT_VALUE`].
 #[must_use]
 pub const fn config_flags(mode: PmuMode) -> u64
 {
-    let mut flags = CFG_CLEAR_VALUE | CFG_AUTO_START | CFG_SET_MINH | CFG_SET_VUINH | CFG_SET_VSINH;
+    let mut flags = CFG_SET_MINH | CFG_SET_VUINH | CFG_SET_VSINH;
     if !mode.counts_user()
     {
         flags |= CFG_SET_UINH;
@@ -224,9 +225,10 @@ pub const fn config_flags(mode: PmuMode) -> u64
 /// The counter `sbi_pmu_counter_config_matching` claimed, from its returned
 /// `index`, when that index is one of `mask`, the counters the call offered:
 /// `None` for any other. The SBI specification has the firmware pick from
-/// the offered set, but `OpenSBI` hands back the fixed `cycle` or `instret`
-/// counter for those events whatever the set, which a configuration must
-/// never take or release.
+/// the offered set, but on a hart with Smcntrpmf `OpenSBI` answers
+/// `Cycles` or `Instructions` with the fixed `cycle` or `instret`
+/// counter ([`fixed_counter`]) when no offered counter counts it, which a
+/// configuration must never take or release.
 #[must_use]
 pub const fn claimed_index(mask: u64, index: u64) -> Option<u64>
 {
@@ -237,6 +239,25 @@ pub const fn claimed_index(mask: u64, index: u64) -> Option<u64>
     else
     {
         None
+    }
+}
+
+/// The SBI index of the fixed counter `OpenSBI` answers `event` with when no
+/// offered counter counts it: `cycle` (0) for `Cycles`, `instret` (2) for
+/// `Instructions`, none for any other event.
+#[must_use]
+pub const fn fixed_counter(event: PmuEvent) -> Option<u64>
+{
+    match event
+    {
+        PmuEvent::Cycles => Some(0),
+        PmuEvent::Instructions => Some(2),
+        PmuEvent::LlcReferences
+        | PmuEvent::LlcMisses
+        | PmuEvent::BranchInstructions
+        | PmuEvent::BranchMisses
+        | PmuEvent::DtlbMisses
+        | PmuEvent::ItlbMisses => None,
     }
 }
 
@@ -260,6 +281,23 @@ mod tests
         assert_eq!(claimed_index(u64::MAX, 63), Some(63));
         assert_eq!(claimed_index(u64::MAX, 64), None);
         assert_eq!(claimed_index(u64::MAX, u64::MAX), None);
+    }
+
+    // Defect guarded: a fixed-counter answer left with the filter a refused
+    // request wrote, or a counter other than `cycle` or `instret` taken
+    // for one.
+    #[test]
+    fn fixed_counter_names_cycle_and_instret_only()
+    {
+        assert_eq!(fixed_counter(PmuEvent::Cycles), Some(0));
+        assert_eq!(fixed_counter(PmuEvent::Instructions), Some(2));
+        for event in PmuEvent::ALL
+        {
+            if !matches!(event, PmuEvent::Cycles | PmuEvent::Instructions)
+            {
+                assert_eq!(fixed_counter(event), None);
+            }
+        }
     }
 
     fn hw(index: u8, offset: u16, width: u8) -> Counter
@@ -352,7 +390,7 @@ mod tests
     #[test]
     fn config_flags_inhibit_the_modes_not_counted()
     {
-        let base = CFG_CLEAR_VALUE | CFG_AUTO_START | CFG_SET_MINH | CFG_SET_VUINH | CFG_SET_VSINH;
+        let base = CFG_SET_MINH | CFG_SET_VUINH | CFG_SET_VSINH;
         assert_eq!(config_flags(PmuMode::User), base | CFG_SET_SINH);
         assert_eq!(config_flags(PmuMode::Kernel), base | CFG_SET_UINH);
         assert_eq!(config_flags(PmuMode::All), base);

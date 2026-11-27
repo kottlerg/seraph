@@ -78,7 +78,7 @@ pub const HANDOVER_RELEASE: u64 = 14;
 /// Badge bit on a SEND on the master log endpoint that authorises
 /// [`QUERY_SLOTS`], [`QUERY_HISTORY`] and [`LOG_SUBSCRIBE`], the last from
 /// the pool of `SUBSCRIBERS_MAX` subscriptions. svcmgr mints it, with
-/// `GRANT` for [`LOG_SUBSCRIBE`]'s capabilities, from its master-log source
+/// `GRANT` for [`LOG_SUBSCRIBE`]'s signal, from its master-log source
 /// and publishes it seed-only as [`crate::published_names::LOGD_QUERY`]. No
 /// sender's badge carries it:
 /// procmgr redraws a process badge carrying a
@@ -131,10 +131,10 @@ pub const LOG_FLUSH: u64 = 18;
 pub const LOG_FOLLOW_AUTHORITY: u64 = 1u64 << 60;
 
 /// Follow the history: the request moves logd a signal, a capability to a
-/// Notification logd signals each time it retains an entry, and a token, a
-/// capability to an object of the subscriber's whose sole reference ends the
-/// subscription. The reply carries the subscription's index, the instance
-/// epoch, and the oldest and the next `seq`. A full pool is refused. Served
+/// Notification logd signals each time it retains an entry. The reply carries
+/// the subscription's token, a capability to an object of logd's whose
+/// deletion ends the subscription, its index, the instance epoch, and the
+/// oldest and the next `seq`. A full pool is refused. Served
 /// only on a badge carrying [`LOG_QUERY_AUTHORITY`] or
 /// [`LOG_FOLLOW_AUTHORITY`], each its own pool. Wire format:
 /// [`crate::log_query`]; specified in `services/logd/docs/ipc-interface.md`

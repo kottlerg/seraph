@@ -397,7 +397,7 @@ fn publish_logd_names(registry: &mut registry::Registry, source: u64)
     // `LOG_FOLLOW_AUTHORITY` (the external sinks' reads and subscriptions)
     // and `LOG_CONTROL_AUTHORITY` (`SINK_LIST` and `SINK_SET`). Seed-only,
     // as every name whose badge carries a verb bit; the two that subscribe keep `GRANT` for
-    // their seeds, since `LOG_SUBSCRIBE` moves a signal and a token to logd.
+    // their seeds, since `LOG_SUBSCRIBE` moves a signal to logd.
     for (name, badge, visibility) in [
         (
             ipc::published_names::LOGD_QUERY,

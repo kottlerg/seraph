@@ -525,29 +525,23 @@ pub fn slot_entry(reply: &IpcMessage, index: usize) -> Option<SlotEntry>
 
 /// A [`LOG_SUBSCRIBE`] request: the signal, a capability to a Notification of
 /// the subscriber's with the notify right, which logd signals when it retains
-/// an entry, and the token, a capability to an object of the subscriber's that
-/// nobody waits on, whose sole reference ends the subscription
-/// (`services/logd/docs/ipc-interface.md` § Subscriptions).
+/// an entry (`services/logd/docs/ipc-interface.md` § Subscriptions).
 #[must_use]
-pub fn subscribe_request(signal: u64, token: u64) -> IpcMessage
+pub fn subscribe_request(signal: u64) -> IpcMessage
 {
     IpcMessage::builder(LOG_SUBSCRIBE)
         .word(0, u64::from(LOG_LABELS_VERSION))
         .cap(signal)
-        .cap(token)
         .build()
 }
 
-/// The capabilities a [`LOG_SUBSCRIBE`] request carries.
-pub const SUBSCRIBE_CAPS: usize = 2;
-
-/// Read a [`LOG_SUBSCRIBE`] request: its signal and token capabilities, in
-/// the receiver's capability space.
+/// Read a [`LOG_SUBSCRIBE`] request: its signal capability, in the receiver's
+/// capability space.
 ///
 /// # Errors
 /// [`QUERY_VERSION_MISMATCH`] for another version, [`QUERY_INVALID`] for a
-/// request with other than [`SUBSCRIBE_CAPS`] capabilities.
-pub fn decode_subscribe_request(msg: &IpcMessage) -> Result<(u64, u64), u64>
+/// request with other than one capability.
+pub fn decode_subscribe_request(msg: &IpcMessage) -> Result<u64, u64>
 {
     if msg.word(0) != u64::from(LOG_LABELS_VERSION)
     {
@@ -555,7 +549,7 @@ pub fn decode_subscribe_request(msg: &IpcMessage) -> Result<(u64, u64), u64>
     }
     match *msg.caps()
     {
-        [signal, token] => Ok((signal, token)),
+        [signal] => Ok(signal),
         _ => Err(QUERY_INVALID),
     }
 }
@@ -564,6 +558,11 @@ pub fn decode_subscribe_request(msg: &IpcMessage) -> Result<(u64, u64), u64>
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Subscribed
 {
+    /// The token, the reply's one capability, in the capability space of
+    /// whoever holds the message: a capability, with no rights, to a
+    /// Notification of logd's. Its deletion, or its holder's death, ends the
+    /// subscription, when no copy of it is left.
+    pub token: u64,
     /// The subscription's place in its pool.
     pub index: u64,
     /// The instance epoch: the monotonic time, in microseconds since boot,
@@ -586,24 +585,28 @@ impl Subscribed
             .word(1, self.epoch)
             .word(2, self.oldest)
             .word(3, self.next)
+            .cap(self.token)
             .build()
     }
 
     /// Read a reply.
     ///
     /// # Errors
-    /// The reply's status, when it is not [`QUERY_OK`].
+    /// The reply's status, when it is not [`QUERY_OK`]; [`QUERY_INVALID`] for
+    /// a [`QUERY_OK`] reply without exactly one capability.
     pub fn decode(reply: &IpcMessage) -> Result<Self, u64>
     {
-        match reply_status(reply.label)
+        match (reply_status(reply.label), reply.caps())
         {
-            QUERY_OK => Ok(Self {
+            (QUERY_OK, &[token]) => Ok(Self {
+                token,
                 index: reply.word(0),
                 epoch: reply.word(1),
                 oldest: reply.word(2),
                 next: reply.word(3),
             }),
-            status => Err(status),
+            (QUERY_OK, _) => Err(QUERY_INVALID),
+            (status, _) => Err(status),
         }
     }
 }
@@ -1097,15 +1100,21 @@ mod tests
     #[test]
     fn subscribe_request_round_trips()
     {
-        let msg = subscribe_request(41, 42);
+        let msg = subscribe_request(41);
         assert_eq!(msg.label, LOG_SUBSCRIBE);
-        assert_eq!(decode_subscribe_request(&msg), Ok((41, 42)));
-        let one = IpcMessage::builder(LOG_SUBSCRIBE)
+        assert_eq!(decode_subscribe_request(&msg), Ok(41));
+        // A request with a capability more, or none, is refused.
+        let two = IpcMessage::builder(LOG_SUBSCRIBE)
             .word(0, u64::from(LOG_LABELS_VERSION))
             .cap(41)
+            .cap(42)
             .build();
-        assert_eq!(decode_subscribe_request(&one), Err(QUERY_INVALID));
-        let old = IpcMessage::builder(LOG_SUBSCRIBE).cap(1).cap(2).build();
+        assert_eq!(decode_subscribe_request(&two), Err(QUERY_INVALID));
+        let none = IpcMessage::builder(LOG_SUBSCRIBE)
+            .word(0, u64::from(LOG_LABELS_VERSION))
+            .build();
+        assert_eq!(decode_subscribe_request(&none), Err(QUERY_INVALID));
+        let old = IpcMessage::builder(LOG_SUBSCRIBE).cap(1).build();
         assert_eq!(decode_subscribe_request(&old), Err(QUERY_VERSION_MISMATCH));
     }
 
@@ -1113,6 +1122,7 @@ mod tests
     fn subscribed_reply_round_trips()
     {
         let s = Subscribed {
+            token: 77,
             index: 3,
             epoch: 1_234_567,
             oldest: 10,
@@ -1120,6 +1130,10 @@ mod tests
         };
         assert_eq!(Subscribed::decode(&s.reply()), Ok(s));
         assert_eq!(Subscribed::decode(&refusal(QUERY_FULL)), Err(QUERY_FULL));
+        let tokenless = IpcMessage::builder(reply_label(QUERY_OK, 0, false))
+            .word(0, 3)
+            .build();
+        assert_eq!(Subscribed::decode(&tokenless), Err(QUERY_INVALID));
     }
 
     // Defect caught: the origin or the name generation of an entry lost, or

@@ -519,26 +519,25 @@ takes 4 + 60 words. A record's bytes are its `STREAM_RECORD` payload, which
 
 A subscriber is signalled each time logd retains an entry, and reads the new
 entries itself with an oldest-first `QUERY_HISTORY` walk from the `seq` after
-the last one it read. The request moves two capabilities to logd, in this order:
+the last one it read. The request moves one capability to logd:
 
 | Request | Content |
 |---|---|
 | `data[0]` | `LOG_LABELS_VERSION` |
 | capability 0 | the signal: a capability, with the notify right, to a Notification of the subscriber's |
-| capability 1 | the token: a capability to a Notification of the subscriber's that nobody waits on, whose sole reference ends the subscription (below) |
 
-The subscriber moves copies and keeps its own capability to each object. Every
-holder of a name shares its one badge, so a subscriber is not told apart by its
-badge, and the death cascade cannot end its subscription; the token ends it.
+The subscriber moves a copy and keeps its own capability to the Notification.
+Every holder of a name shares its one badge, so a subscriber is not told apart
+by its badge, and the death cascade cannot end its subscription; the token the
+reply carries ends it (below).
 
 logd answers `QUERY_DENIED` on a badge with neither `LOG_QUERY_AUTHORITY` nor
-`LOG_FOLLOW_AUTHORITY`, `QUERY_INVALID` for a request with other than two
-capabilities, a signal that is not a Notification or lacks the notify right, or
-a token that is not a Notification, and `QUERY_FULL` when the badge's pool has
-no free subscription. A refused request leaves logd holding none of its
-capabilities. Subscriptions come from two pools, kept apart by the verb bit of
-the SEND the request arrives on, each a [docs/limits.md](../../../docs/limits.md)
-row:
+`LOG_FOLLOW_AUTHORITY`, `QUERY_INVALID` for a request with other than one
+capability or a signal that is not a Notification or lacks the notify right, and
+`QUERY_FULL` when the badge's pool has no free subscription. A refused request
+leaves logd holding none of its capabilities. Subscriptions come from two
+pools, kept apart by the verb bit of the SEND the request arrives on, each a
+[docs/limits.md](../../../docs/limits.md) row:
 
 | Pool | Badge | Subscriptions |
 |---|---|---|
@@ -546,10 +545,11 @@ row:
 | external sinks | `LOG_FOLLOW_AUTHORITY` (`logd.follow`), which only a recipe seeds | `SINK_SUBSCRIBERS_MAX` (4), indices 8 to 11 |
 
 so interactive followers cannot take an external sink's place. The `QUERY_OK`
-reply carries no entries:
+reply carries no entries, and one capability:
 
-| Reply word | Content |
+| Reply | Content |
 |---|---|
+| capability 0 | the token: a capability, with no rights, to the subscription index's Notification, which logd made at start and nobody signals or waits on; deleting it ends the subscription (below) |
 | `data[0]` | the subscription's index |
 | `data[1]` | the instance epoch: the monotonic time, in microseconds since boot, this logd started; never 0, and no other instance shares it |
 | `data[2]` | the `seq` of the oldest entry the history holds, or `data[3]` when it holds none |
@@ -560,24 +560,31 @@ from the thread that retained it. The signals coalesce: a subscriber reads
 everything after its cursor on each wake. A `STREAM_BYTES` message that
 completes no line retains no entry and signals no one.
 
-**The subscriber's end.** logd binds a sole-reference observer
+**The subscriber's end.** logd makes one token Notification per subscription
+index at start, so a receive worker makes no object to answer, and keeps its own
+capability to each. For a subscription it derives the subscriber's copy, then
+binds a sole-reference observer
 (`SYS_CAP_BIND_SOLE_REFERENCE`,
 [core/kernel/docs/capability-internals.md](../../../core/kernel/docs/capability-internals.md)
-§ Sole-Reference Observers) on the token, posting to an event queue of logd's
+§ Sole-Reference Observers) on its own, posting to an event queue of logd's
 that its main thread's wait set holds (§ Wait-set), the correlator naming the
 subscription's index and a generation the index counts. When the subscriber
 deletes its token, or dies and its capabilities go, the token falls to logd's
 one reference: the kernel posts on the deleting CPU's next drain, at the latest
 after its next timer tick, and logd's main thread wakes, ends the subscription,
-deletes both of its capabilities and frees the index. A subscriber ends its
-subscription by deleting its token. A token moved with no capability kept
-ends its subscription as soon as it is made. The token, not the signal's
-Notification, is observed because a wait on the Notification and its wait-set
-membership are references the kernel counts, so the Notification does not fall
-to one reference while its subscriber waits on it.
+deletes its signal and frees the index, whose token the next subscription there
+takes. A subscriber ends its subscription by deleting its token, and a reply
+that does not reach it deletes the copy and ends the subscription the same way.
+logd makes the token, rather than taking one from the subscriber, so no other
+reference to it exists: a capability a subscriber moved could share its object
+with the signal or with another subscription's token, which would hold logd at
+two references and the subscription past its subscriber. The token, not the
+signal's Notification, is observed because a wait on the Notification and its
+wait-set membership are references the kernel counts, so the Notification does
+not fall to one reference while its subscriber waits on it.
 
 **logd's end.** The subscriber can bind a sole-reference observer of its own on
-the token: when logd dies, or ends the subscription, the token falls to the
+its token: when logd dies, or ends the subscription, the token falls to the
 subscriber's reference, and the post tells the subscriber to subscribe again.
 The epoch then tells it whether the instance changed, and the `seq` numbering
 with it. An oldest-first `QUERY_HISTORY` walk carrying the epoch it subscribed

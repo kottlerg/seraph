@@ -36,7 +36,7 @@
 //! to devmgr, [`published_names::MEMMGR_SWAP`](crate::published_names::MEMMGR_SWAP), whose seeds move caps to memmgr,
 //! [`published_names::LOGD_QUERY`](crate::published_names::LOGD_QUERY) and
 //! [`published_names::LOGD_FOLLOW`](crate::published_names::LOGD_FOLLOW), whose seeds move
-//! a subscription's signal and token to logd,
+//! a subscription's signal to logd,
 //! and `sessiond.operator` and `crashd.core` (`:grant` entries), whose seeds move
 //! caps to sessiond and crashd;
 //! `QUERY_ENDPOINT` never yields `GRANT`.
@@ -162,8 +162,8 @@ pub const MEMMGR_SWAP: &[u8] = b"memmgr.swap";
 /// `QUERY_HISTORY` surface, and `LOG_SUBSCRIBE` in the interactive
 /// followers' pool (`services/logd/docs/ipc-interface.md` § Queries,
 /// § Subscriptions). svcmgr mints it from its master-log source. Seed-only,
-/// its seeds keeping `GRANT`, since a subscription moves its signal and token
-/// to logd; seeded only by svctest, whose logd phases read slots and history
+/// its seeds keeping `GRANT`, since a subscription moves its signal to logd;
+/// seeded only by svctest, whose logd phases read slots and history
 /// and follow the journal through it.
 pub const LOGD_QUERY: &[u8] = b"logd.query";
 

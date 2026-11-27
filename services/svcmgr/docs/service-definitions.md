@@ -231,8 +231,8 @@ svcmgr-launched services.
 Space-separated discovery-registry names. svcmgr resolves each name to a freshly-derived
 `RIGHTS_EP_SEND` cap on the published endpoint (`RIGHTS_EP_SEND_GRANT` for `devmgr.bind`, whose
 `BIND_DRIVERS` moves a directory cap and so needs `GRANT`, for `memmgr.swap`, whose swap labels
-move caps to memmgr, for `logd.query` and `logd.follow`, whose `LOG_SUBSCRIBE` moves a signal and a
-token to logd, for `svcmgr.grant`, whose requests carry caps, and for each
+move caps to memmgr, for `logd.query` and `logd.follow`, whose `LOG_SUBSCRIBE` moves a signal to
+logd, for `svcmgr.grant`, whose requests carry caps, and for each
 [`:grant`](#provides) name) and injects them positionally into the child's bootstrap rounds:
 
 ```
@@ -286,7 +286,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `memmgr.swap` | svcmgr (endowed `SWAP_AUTHORITY` `SEND\|GRANT`) | `SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint, the swap labels of memmgr's disk tier; its seeds keep `GRANT` (seeded by swapd's recipe; by svctest's too, as a second swap client that registers nothing) | no |
 | `sessiond.operator` | svcmgr (`sessiond.svc` provider) | `:grant`-badged `SEND\|GRANT` on sessiond's service endpoint, the operator authority, which carries no stop bit (seeded by terminal and svctest) | no |
 | `crashd.core` | svcmgr (`crashd.svc` provider) | `:grant`-badged (`LIVE_CORE_AUTHORITY`) `SEND\|GRANT` on crashd's live-core endpoint, the authority to ask for a live core, whose request moves the account the capture is charged to (seeded by usertest only) | no |
-| `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged `SEND\|GRANT` on the master log endpoint: logd's `QUERY_SLOTS`, `QUERY_HISTORY` and `LOG_SUBSCRIBE` from the `SUBSCRIBERS_MAX` pool ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries, § Subscriptions); its seeds keep `GRANT`, since `LOG_SUBSCRIBE` moves a signal and a token to logd (seeded by svctest only) | no |
+| `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged `SEND\|GRANT` on the master log endpoint: logd's `QUERY_SLOTS`, `QUERY_HISTORY` and `LOG_SUBSCRIBE` from the `SUBSCRIBERS_MAX` pool ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries, § Subscriptions); its seeds keep `GRANT`, since `LOG_SUBSCRIBE` moves a signal to logd (seeded by svctest only) | no |
 | `logd.follow` | svcmgr (minted from the reserved master-log source) | `LOG_FOLLOW_AUTHORITY`-badged (bit 60) `SEND\|GRANT` on the master log endpoint, for external sinks: the same reads and `LOG_SUBSCRIBE` from the `SINK_SUBSCRIBERS_MAX` pool ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries, § Subscriptions); its seeds keep `GRANT` (seeded by svctest only) | no |
 | `logd.control` | svcmgr (minted from the reserved master-log source) | `LOG_CONTROL_AUTHORITY`-badged (bit 61) SEND on the master log endpoint: logd's `SINK_LIST` and `SINK_SET` ([logd IPC interface](../../logd/docs/ipc-interface.md) § Sink control; seeded by svctest only) | no |
 | `logd.flush` | svcmgr (minted from the reserved master-log source) | `LOG_FLUSH_AUTHORITY`-badged SEND on the master log endpoint: logd's `LOG_FLUSH` barrier ([logd IPC interface](../../logd/docs/ipc-interface.md) § Flush barrier; seeded by pwrmgr, which waits on it before a power-off or reset, acpid, which waits on it before the register write of one, crashd, which waits on it before it declines a fault, and svctest) | no |

@@ -245,7 +245,7 @@ it ([service-definitions.md § `seed`](service-definitions.md#seed)). A seed is 
 `devmgr.bind`, `memmgr.swap`, `logd.query`, `logd.follow`, `svcmgr.grant` and each `:grant` entry
 (`sessiond.operator`, `crashd.core`), which are `SEND|GRANT`: `BIND_DRIVERS` moves a directory cap
 and the kernel requires `GRANT` for that, the swap labels move caps to memmgr, `LOG_SUBSCRIBE` moves
-a signal and a token to logd, and a `:grant` name's seeds move caps to its provider. The public
+a signal to logd, and a `:grant` name's seeds move caps to its provider. The public
 names are `svcmgr`, `pwrmgr.deny`, `acpid.deny`, `timed`, and any name published through
 [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
 

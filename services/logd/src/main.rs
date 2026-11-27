@@ -264,6 +264,7 @@ fn main() -> !
         death_eq,
         resync_note,
         subscriptions_eq: create_subscriptions_eq(),
+        subscription_tokens: create_subscription_tokens(),
     }));
     let ws_cap = create_wait_set(logd, watches).unwrap_or_else(|| {
         fatal("FATAL: wait_set create failed; halting");
@@ -365,6 +366,12 @@ struct Logd
     /// [`end_subscriptions`]); 0 when it could not be made, and every
     /// `LOG_SUBSCRIBE` is refused `QUERY_FULL`.
     subscriptions_eq: u64,
+    /// Each subscription index's token, a Notification of logd's that nobody
+    /// signals or waits on: a subscription's reply moves its subscriber a
+    /// copy, and the subscription ends when logd's is the token's one
+    /// reference again ([`answer_subscribe`]). 0 for an index whose token
+    /// could not be made, which no subscription takes.
+    subscription_tokens: [u64; SUBSCRIPTIONS],
 }
 
 /// The badge table with the journal, the death-drain count, and the sinks'
@@ -443,6 +450,19 @@ impl LogdState
         {
             let mark = self.mark_of(sink);
             self.table.history_mut().set_mark(sink.index, mark);
+        }
+    }
+
+    /// Start sink `index`'s cursor after the newest entry, as for a sink
+    /// turned on (`services/logd/docs/sinks.md` § Pace): it passes nothing of
+    /// the time it was `off`, whether or not its writer stepped meanwhile, and
+    /// owes no drop or notice from before.
+    fn start_at_newest(&mut self, index: usize)
+    {
+        let next = self.table.history().next_seq();
+        if let Some(cursor) = self.cursors.get_mut(index)
+        {
+            cursor.start_at(next);
         }
     }
 
@@ -626,6 +646,8 @@ fn create_wait_set(logd: &Logd, watches: [u64; 2]) -> Option<u64>
         death_eq,
         resync_note,
         subscriptions_eq,
+        // The tokens are no member: nothing waits on them.
+        ..
     } = *logd;
     let Some(ws) = std::os::seraph::object_slab_retype(
         std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
@@ -674,6 +696,28 @@ fn create_wait_set(logd: &Logd, watches: [u64; 2]) -> Option<u64>
         self_log(buf.as_str());
     }
     Some(ws)
+}
+
+/// Create each subscription index's token ([`Logd::subscription_tokens`]),
+/// at start, so a receive worker makes no object and calls no service to
+/// answer `LOG_SUBSCRIBE`. An index whose token cannot be made is logged and
+/// takes no subscription.
+fn create_subscription_tokens() -> [u64; SUBSCRIPTIONS]
+{
+    let tokens = [(); SUBSCRIPTIONS].map(|()| {
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        })
+        .unwrap_or(0)
+    });
+    let missing = tokens.iter().filter(|&&token| token == 0).count();
+    if missing > 0
+    {
+        let mut line = SerialFmt::new();
+        let _ = write!(line, "subscriptions: token create failed count={missing}");
+        retain_own(LEVEL_WARN, line.as_str().as_bytes());
+    }
+    tokens
 }
 
 /// Allocate the slab and create the subscriptions' event queue: one observer
@@ -1106,9 +1150,7 @@ fn serve_request(logd: &Logd, msg: &IpcMessage, reply: &mut Reply)
     }
     else if label_id == LOG_SUBSCRIBE
     {
-        let (answer, kept) = answer_subscribe(logd, msg);
-        reply.set(answer);
-        if kept
+        if answer_subscribe(logd, msg, reply)
         {
             return;
         }
@@ -1255,19 +1297,18 @@ fn answer_query(st: &LogdState, msg: &IpcMessage) -> IpcMessage
     }
 }
 
-/// One subscription: the subscriber's signal and token, in logd's
-/// capability space.
+/// One subscription: the subscriber's signal, in logd's capability space.
+/// Its token is its index's ([`Logd::subscription_tokens`]).
 #[derive(Clone, Copy)]
 struct Subscription
 {
     signal: u64,
-    token: u64,
 }
 
 /// The subscriptions, by index, the `logd.query` pool's first
 /// (`SUBSCRIBERS_MAX`), then the `logd.follow` pool's
 /// (`SINK_SUBSCRIBERS_MAX`), with each index's generation, which the
-/// correlator of its token's binding carries. A leaf lock: no other lock is
+/// correlator of its index's token's binding carries. A leaf lock: no other lock is
 /// taken under it, and the state lock is never held when it is taken but by
 /// [`retain_notice`]'s signal.
 struct Subscriptions
@@ -1340,73 +1381,115 @@ impl Subscriptions
 }
 
 /// Answer a `LOG_SUBSCRIBE` request (`services/logd/docs/ipc-interface.md`
-/// § Subscriptions): take the request's signal and token into a free index of
-/// the pool its badge draws from, bind a sole-reference observer on the token
-/// to the subscriptions' event queue, and answer the index, the epoch, and the
-/// oldest and next `seq`. The signal must be a Notification with the notify
-/// right, the token a Notification. Returns the answer, and whether the
-/// request's capabilities are kept; a refusal keeps none.
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "the lock is held across the bind, so a post of the binding finds the subscription"
-)]
-fn answer_subscribe(logd: &Logd, msg: &IpcMessage) -> (IpcMessage, bool)
+/// § Subscriptions): take the request's signal into a free index of the pool
+/// its badge draws from ([`take_subscription`]), and answer a copy of the
+/// index's token, the index, the epoch, and the oldest and next `seq`. The
+/// signal must be a Notification with the notify right. Leaves the answer in
+/// `reply`, and returns whether the request's signal is kept; a refusal keeps
+/// none. A reply that does not reach the subscriber deletes the token's copy,
+/// which ends the subscription.
+fn answer_subscribe(logd: &Logd, msg: &IpcMessage, reply: &mut Reply) -> bool
 {
     let Some(pool) = subscription_pool(msg.badge)
     else
     {
-        return (refusal(QUERY_DENIED), false);
+        reply.set(refusal(QUERY_DENIED));
+        return false;
     };
-    let (signal, token) = match decode_subscribe_request(msg)
+    let signal = match decode_subscribe_request(msg)
     {
-        Ok(caps) => caps,
-        Err(status) => return (refusal(status), false),
-    };
-    if !is_notification(signal, syscall::RIGHTS_NTF_NOTIFY) || !is_notification(token, 0)
-    {
-        return (refusal(QUERY_INVALID), false);
-    }
-    let eq = logd.subscriptions_eq;
-    let index = {
-        let mut subs = subscribers();
-        let Subscriptions { slots, generations } = &mut *subs;
-        let free = pool
-            .clone()
-            .find(|&i| slots.get(i).is_some_and(Option::is_none));
-        let (Some(index), true) = (free, eq != 0)
-        else
+        Ok(signal) => signal,
+        Err(status) =>
         {
-            return (refusal(QUERY_FULL), false);
-        };
-        let (Some(slot), Some(generation)) = (slots.get_mut(index), generations.get_mut(index))
-        else
-        {
-            return (refusal(QUERY_FULL), false);
-        };
-        *generation = generation.wrapping_add(1);
-        // Under the lock, so the post of a token already at one reference
-        // finds the subscription ([`end_subscriptions`]). The pool's
-        // observer nodes match its indices, and each returns with its
-        // binding's post, before the index is free again.
-        if syscall::cap_bind_sole_reference(token, eq, correlator(index, *generation)).is_err()
-        {
-            return (refusal(QUERY_FULL), false);
+            reply.set(refusal(status));
+            return false;
         }
-        *slot = Some(Subscription { signal, token });
-        SUBSCRIBED.fetch_add(1, Ordering::Relaxed);
-        index
+    };
+    if !is_notification(signal, syscall::RIGHTS_NTF_NOTIFY)
+    {
+        reply.set(refusal(QUERY_INVALID));
+        return false;
+    }
+    let (index, token) = match take_subscription(logd, pool, signal)
+    {
+        Ok(taken) => taken,
+        Err(status) =>
+        {
+            reply.set(refusal(status));
+            return false;
+        }
     };
     let answer = {
         let st = state();
         let next = st.table.history().next_seq();
         Subscribed {
+            token,
             index: index as u64,
             epoch: st.epoch,
             oldest: st.table.history_up(0).next().map_or(next, |r| r.entry.seq),
             next,
         }
     };
-    (answer.reply(), true)
+    reply.set_or_delete_caps(answer.reply());
+    true
+}
+
+/// Take a free index of `pool` whose token exists for `signal`: derive the
+/// subscriber's copy of the index's token, with no rights, and bind a
+/// sole-reference observer on logd's to the subscriptions' event queue, so
+/// the subscription ends when no copy is left. Returns the index and the
+/// copy; `QUERY_FULL` when no index is free or the bind fails.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the lock is held across the bind, so a post of the binding finds the subscription"
+)]
+fn take_subscription(
+    logd: &Logd,
+    pool: core::ops::Range<usize>,
+    signal: u64,
+) -> Result<(usize, u64), u64>
+{
+    let eq = logd.subscriptions_eq;
+    if eq == 0
+    {
+        return Err(QUERY_FULL);
+    }
+    let mut subs = subscribers();
+    let Subscriptions { slots, generations } = &mut *subs;
+    let free = pool.clone().find(|&i| {
+        slots.get(i).is_some_and(Option::is_none)
+            && logd
+                .subscription_tokens
+                .get(i)
+                .is_some_and(|&token| token != 0)
+    });
+    let (Some(index), Some(&token)) = (free, free.and_then(|i| logd.subscription_tokens.get(i)))
+    else
+    {
+        return Err(QUERY_FULL);
+    };
+    let (Some(slot), Some(generation)) = (slots.get_mut(index), generations.get_mut(index))
+    else
+    {
+        return Err(QUERY_FULL);
+    };
+    // The copy is made before the bind, so the bind finds the token at two
+    // references: a free index's token is at logd's one, since its last
+    // subscription ended only when no copy was left.
+    let copy = syscall::cap_derive(token, 0).map_err(|_| QUERY_FULL)?;
+    *generation = generation.wrapping_add(1);
+    // Under the lock, so the post of a copy deleted at once finds the
+    // subscription ([`end_subscriptions`]). The pool's observer nodes match
+    // its indices, and each returns with its binding's post, before the index
+    // is free again.
+    if syscall::cap_bind_sole_reference(token, eq, correlator(index, *generation)).is_err()
+    {
+        let _ = syscall::cap_delete(copy);
+        return Err(QUERY_FULL);
+    }
+    *slot = Some(Subscription { signal });
+    SUBSCRIBED.fetch_add(1, Ordering::Relaxed);
+    Ok((index, copy))
 }
 
 /// Signal every subscriber's Notification: an entry was retained. Taken
@@ -1430,8 +1513,9 @@ fn signal_subscribers()
 }
 
 /// End each subscription whose token's binding posted to `eq`, the
-/// subscriptions' event queue: the subscriber deleted its token, or died,
-/// and the token fell to logd's one reference. Deletes its signal and token.
+/// subscriptions' event queue: the subscriber deleted its copy of the token,
+/// or died, and the token fell to logd's one reference. Deletes its signal;
+/// the token stays its index's, for the next subscription there.
 /// A post for an index since reused, by its generation, is dropped. The main
 /// thread's, on its wait set's `WS_BADGE_SUBSCRIPTIONS`.
 fn end_subscriptions(eq: u64)
@@ -1443,7 +1527,6 @@ fn end_subscriptions(eq: u64)
         {
             SUBSCRIBED.fetch_sub(1, Ordering::Relaxed);
             let _ = syscall::cap_delete(sub.signal);
-            let _ = syscall::cap_delete(sub.token);
         }
     }
 }
@@ -1532,7 +1615,12 @@ fn answer_sink_set(msg: &IpcMessage) -> IpcMessage
         {
             return refusal(QUERY_INVALID);
         };
+        let turned_on = current.level.is_none() && settings.level.is_some();
         *current = settings;
+        if turned_on
+        {
+            st.start_at_newest(sink.index);
+        }
         st.sync_marks();
     }
     RETAINED.notify_all();
@@ -1939,7 +2027,8 @@ fn keep_kernel_record(
 }
 
 /// Record / update the display name for `badge`. History entries carry
-/// no name, only the badge (`QUERY_HISTORY`), so a rename changes the
+/// no name, only their slot's serial and name generation (`QUERY_HISTORY`),
+/// so a rename changes the
 /// slot's one current name (`QUERY_SLOTS`), which every line of the
 /// sender then renders under, earlier ones included.
 /// Long names truncated. No collision-suffix policy (procmgr's
@@ -2224,6 +2313,17 @@ struct Cursor
 
 impl Cursor
 {
+    /// Start at `next`, owing nothing before it: no entry taken or walked
+    /// to, no drop to report, and no notice to add to.
+    const fn start_at(&mut self, next: u64)
+    {
+        self.next = next;
+        self.taken = None;
+        self.walk_end = None;
+        self.dropped = 0;
+        self.notice = None;
+    }
+
     /// Count `count` more entries the sink dropped, to report and in its
     /// total.
     const fn drop_entries(&mut self, count: u64)
@@ -2579,10 +2679,7 @@ impl Sink
         };
         if settings.level.is_none()
         {
-            cursor.next = table.history().next_seq();
-            cursor.taken = None;
-            cursor.walk_end = None;
-            cursor.dropped = 0;
+            cursor.start_at(table.history().next_seq());
             return Step::Idle;
         }
         cursor.drop_entries(table.history_mut().take_evicted(self.index));

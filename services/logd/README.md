@@ -127,12 +127,12 @@ under its sender's name, the first after the restart included
   history of every slot or of one badge, newest first, or oldest first from a
   given `seq`, filtered by badge and least level, a reply's worth per call.
   `LOG_SUBSCRIBE` signals a subscriber's Notification on each retained entry
-  until it deletes its token. Those three are served on a SEND badged `LOG_QUERY_AUTHORITY` or
-  `LOG_FOLLOW_AUTHORITY` (`QUERY_SLOTS` and `QUERY_HISTORY` on either), which svcmgr mints from its
-  master-log source and publishes seed-only as `logd.query` and `logd.follow`. `SINK_LIST` and
-  `SINK_SET` read and set the sinks' settings, and are served only on a SEND badged
-  `LOG_CONTROL_AUTHORITY`, published seed-only as `logd.control`. A receive worker answers them from
-  the state logd owns and calls no other service to do so (see
+  until it deletes the token the reply moved it. Those three are served on a SEND badged
+  `LOG_QUERY_AUTHORITY` or `LOG_FOLLOW_AUTHORITY` (`QUERY_SLOTS` and `QUERY_HISTORY` on either),
+  which svcmgr mints from its master-log source and publishes seed-only as `logd.query` and
+  `logd.follow`. `SINK_LIST` and `SINK_SET` read and set the sinks' settings, and are served only
+  on a SEND badged `LOG_CONTROL_AUTHORITY`, published seed-only as `logd.control`. A receive worker
+  answers them from the state logd owns and calls no other service to do so (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Queries, § Subscriptions and § Sink control).
 * **Flush barrier.** `LOG_FLUSH` answers whether the sink that holds the log (serial) has written
   the lines logd had taken when the barrier was first asked, `FLUSHED` at once when no sink holds it
@@ -204,7 +204,8 @@ under its sender's name, the first after the restart included
 Disk persistence with rotation and a network syslog sink are external sinks, processes that follow
 logd's history; logd itself holds no file system and no network stack. Their interface, with
 the per-sink settings and the record's RFC 5424 mapping, is designed in
-[`docs/sinks.md`](docs/sinks.md) (design intent; not yet implemented).
+[`docs/sinks.md`](docs/sinks.md): logd's side of it, the query, follow and control interface, is
+built (#1494), and the external sinks themselves are design intent (#1496, #1499).
 
 ## Source Layout
 
@@ -275,7 +276,7 @@ its lifetime, and deletes the `timed` SEND once it has read the wall clock (see
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler and the per-teardown death forward, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
-| [services/logd/docs/sinks.md](docs/sinks.md) | The sink contract (device and external sinks), the record and its RFC 5424 mapping, the per-sink settings, the console format, and the query, follow and control interface (design intent) |
+| [services/logd/docs/sinks.md](docs/sinks.md) | The sink contract (device and external sinks), the record and its RFC 5424 mapping, the per-sink settings, the console format, and the query, follow and control interface; the external sinks are design intent |
 | [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts, the query API (`QUERY_SLOTS`, `QUERY_HISTORY`, `LOG_SUBSCRIBE`) and its `LOG_QUERY_AUTHORITY` and `LOG_FOLLOW_AUTHORITY`, the sink control (`SINK_LIST`, `SINK_SET`) and its `LOG_CONTROL_AUTHORITY`, the history's stored form and the retired slots, and the `reclaim:` line logd logs when it evicts a slot |
 | [services/crashd/docs/operation.md](../crashd/docs/operation.md) | The core dump, whose outcome line waits on logd, and so writes no core of logd, which declares itself on the core path |
 | [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with, the `reclaim:` line, log record rendering, and the `BoundedStr` diagnostic formatter |

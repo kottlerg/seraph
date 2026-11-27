@@ -143,8 +143,8 @@ emergency for a fault or panic print (#1491; today every record is informational
 serial and framebuffer device sinks' writers, serial's answers to `STALLED` and to a failed call,
 `LOG_FLUSH` ([ipc-interface.md](ipc-interface.md) § Output sinks, § Hold window, § Flush
 barrier), and each device sink's settings, the `off` level, the framebuffer's level and its
-emergency walk (#1493). Design intent: `SINK_SET` and external sinks (#1494), and pstore
-(#1498).*
+emergency walk (#1493), and `SINK_LIST`, `SINK_SET`, the severity filter and subscriptions
+(#1494). Design intent: external sinks (#1496, #1499), and pstore (#1498).*
 
 A sink is one output of the log. Every sink, inside logd or outside it, follows one contract: it
 reads the history in `seq` order through a cursor, shows the entries at or above its level, renders
@@ -318,7 +318,7 @@ an unknown gap, and starts from the new instance's oldest entry.
 ## Settings
 
 *Built (#1493): the `SERIAL` and `FRAMEBUFFER` entries with every key, and `LOGD_HOSTNAME`.
-Design intent: the `PSTORE` entry (#1498), and `SINK_SET` (#1494).*
+Built (#1494): `SINK_SET`. Design intent: the `PSTORE` entry (#1498).*
 
 Each device sink's settings come from one `env` entry of logd's recipe
 (`rootfs/config/svcmgr/services/logd.svc`), so they are set per distribution, signed as
@@ -583,11 +583,14 @@ capability space.
 
 ### Subscriptions
 
-- `LOG_SUBSCRIBE` moves two capabilities to logd over a `logd.query` or `logd.follow` SEND, which
-  svcmgr mints with `GRANT` for it: a signal capability of a Notification the subscriber made, and a
-  token, a capability to a second object of the subscriber's that nobody waits on. logd checks each
-  capability's type and rights and deletes what it does not keep, since any holder of the name can
-  move it any capability.
+- `LOG_SUBSCRIBE` moves one capability to logd over a `logd.query` or `logd.follow` SEND, which
+  svcmgr mints with `GRANT` for it: a signal capability of a Notification the subscriber made. logd
+  checks its type and rights and deletes what it does not keep, since any holder of the name can
+  move it any capability. The reply moves the subscriber a token, a capability with no rights to a
+  Notification logd made at start for the subscription's index, which nobody signals or waits on.
+  logd makes the token so that no other reference to it exists: one the subscriber chose could
+  share its object with the signal or another subscription's token, and hold the subscription past
+  its subscriber.
 - Subscriptions come from two pools, each a [docs/limits.md](../../../docs/limits.md) row, kept
   apart by the verb bit of the SEND they arrive on: `SUBSCRIBERS_MAX` (8) for `logd.query`, which
   every session program may hold (§ Authority to read and steer), and `SINK_SUBSCRIBERS_MAX` (4) for
@@ -598,23 +601,25 @@ capability space.
 - logd signals every subscriber's Notification when it retains an entry. The signals coalesce: a
   subscriber reads everything after its cursor on each wake.
 - **A subscriber's end.** logd binds a sole-reference observer (`SYS_CAP_BIND_SOLE_REFERENCE`,
-  [docs/capability-model.md](../../../docs/capability-model.md)) on the token, posting to an event
-  queue of logd's that its wait-set holds, the correlator naming the subscription's index and a
-  generation. When the subscriber dies its slots go, the token falls to logd's one reference, and
-  logd ends the subscription and deletes both capabilities. The token, not the Notification, is
-  observed because the subscriber's wait on the Notification, and its wait-set membership, are
-  references the kernel counts, so the Notification does not fall to one while the subscriber waits
-  on it. Every holder of a name shares that name's one badge (`log_labels::LOG_QUERY_AUTHORITY`,
-  `LOG_FOLLOW_AUTHORITY`), so a subscriber cannot be told apart by its badge, and the death cascade
-  cannot end it. A subscriber ends its own subscription the same way, by deleting its token; logd
-  ends it on the post, which the kernel makes within a timer tick of the deletion, and its main
-  thread's wake. No label ends a subscription: logd cannot compare a capability a caller presents
-  with the token it holds, so a label could not tie an end to its subscriber, and any holder of the
-  name could end any subscription by its index.
-- **logd's end.** The subscriber binds a sole-reference observer on the same token, posting to its
-  own event queue. When logd dies, or ends the subscription, the token falls to the subscriber's
-  reference and the post tells the subscriber to subscribe again (§ External sinks). The epoch then
-  tells it whether the instance changed and its cursor's `seq` numbering with it.
+  [docs/capability-model.md](../../../docs/capability-model.md)) on its own capability to the token,
+  posting to an event queue of logd's that its wait-set holds, the correlator naming the
+  subscription's index and a generation. When the subscriber dies its slots go, the token falls to
+  logd's one reference, and logd ends the subscription and deletes the signal, keeping the token for
+  the index's next subscription. The token, not the Notification, is observed because the
+  subscriber's wait on the Notification, and its wait-set membership, are references the kernel
+  counts, so the Notification does not fall to one while the subscriber waits on it. Every holder of
+  a name shares that name's one badge (`log_labels::LOG_QUERY_AUTHORITY`, `LOG_FOLLOW_AUTHORITY`),
+  so a subscriber cannot be told apart by its badge, and the death cascade cannot end it. A
+  subscriber ends its own subscription the same way, by deleting its token; logd ends it on the
+  post, which the kernel makes within a timer tick of the deletion, and its main thread's wake. A
+  reply that does not reach the subscriber deletes its copy and ends the subscription the same way.
+  No label ends a subscription: logd cannot compare a capability a caller presents with the token
+  it holds, so a label could not tie an end to its subscriber, and any holder of the name could end
+  any subscription by its index.
+- **logd's end.** The subscriber binds a sole-reference observer on its copy of the token, posting
+  to its own event queue. When logd dies, or ends the subscription, the token falls to the
+  subscriber's reference and the post tells the subscriber to subscribe again (§ External sinks).
+  The epoch then tells it whether the instance changed and its cursor's `seq` numbering with it.
 - A follower therefore wakes only for entries and for those two ends: idle, it makes no call and
   takes no wake-up, 0 a minute, and neither side polls.
 

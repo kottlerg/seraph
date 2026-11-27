@@ -285,7 +285,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   - `logd.query` — `LOG_QUERY_AUTHORITY`-badged `SEND|GRANT` minted from the
     endowed master-log source, gating logd's `QUERY_SLOTS`, `QUERY_HISTORY` and `LOG_SUBSCRIBE` from
     the `SUBSCRIBERS_MAX` pool ([logd IPC interface](../../logd/docs/ipc-interface.md#queries));
-    seeded with `GRANT`, since `LOG_SUBSCRIBE` moves a signal and a token to logd; svctest is the
+    seeded with `GRANT`, since `LOG_SUBSCRIBE` moves a signal to logd; svctest is the
     only recipe seeding it.
   - `logd.follow` — `LOG_FOLLOW_AUTHORITY`-badged (bit 60) `SEND|GRANT` minted from the endowed
     master-log source, for external sinks: the same reads and `LOG_SUBSCRIBE` from the

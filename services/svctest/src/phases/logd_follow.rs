@@ -7,20 +7,24 @@
 //! (`services/logd/docs/ipc-interface.md` § Queries, § Subscriptions and
 //! § Sink control).
 //!
-//! `logd_follow` subscribes on `logd.query` with a signal and a token, logs
+//! `logd_follow` subscribes on `logd.query` with a signal, takes the token the
+//! reply carries, logs
 //! an informational and a warning line, waits for the signal, and reads both
 //! lines oldest first from the subscription's next `seq`, then only the
 //! warning through the severity filter. A walk on another instance's epoch is
 //! refused `QUERY_STALE`. It fills the `logd.follow` pool beside the
 //! `logd.query` subscription, requires the next subscription refused
 //! `QUERY_FULL`, and requires one freed once its token is deleted. A refused
-//! subscription leaves logd holding none of the capabilities it moved, and a
-//! badge with neither authority is refused `QUERY_DENIED`.
+//! subscription, a signal without the notify right or a request with a
+//! capability more among them, leaves logd holding none of the capabilities
+//! it moved, and a badge with neither authority is refused `QUERY_DENIED`.
 //!
 //! `logd_control` requires `SINK_LIST` and `SINK_SET` refused on
 //! `logd.query`, lists the serial and framebuffer sinks through
 //! `logd.control`, sets the framebuffer sink's level, which logd's own
-//! notice line records, and sets its settings back. It steers the framebuffer
+//! notice line records, and sets its settings back. It turns the framebuffer
+//! sink `off`, logs a line, and turns it on again, which starts its cursor
+//! past that line whether or not a driver serves the sink. It steers the framebuffer
 //! sink, whose output no boot check reads, so the serial lines the boot is
 //! judged on keep their level.
 
@@ -70,8 +74,8 @@ const LOGD_WAIT: Duration = Duration::from_secs(30);
 /// The pause between polls for an ended subscription.
 const POLL: Duration = Duration::from_millis(10);
 
-/// A subscriber's end: its Notification, which logd signals, and its token,
-/// whose sole reference ends the subscription.
+/// A subscriber's end: its Notification, which logd signals, and the token
+/// an accepted subscription's reply carries, whose deletion ends it; 0 before.
 struct Subscriber
 {
     signal: u64,
@@ -80,42 +84,56 @@ struct Subscriber
 
 impl Subscriber
 {
-    /// Two new Notifications.
+    /// A new Notification, and no token.
     fn new() -> Self
     {
         Self {
             signal: notification(),
-            token: notification(),
+            token: 0,
         }
     }
 
-    /// `LOG_SUBSCRIBE` on `cap`, moving a copy of the signal with only the
-    /// notify right (`signal_rights`) and a copy of the token.
-    fn subscribe_with(&self, cap: u64, signal_rights: u64) -> Result<Subscribed, u64>
+    /// A copy of the signal with `rights`, to move to logd.
+    fn signal_copy(&self, rights: u64) -> u64
     {
-        let signal = syscall::cap_derive(self.signal, signal_rights)
-            .unwrap_or_else(|e| panic!("logd_follow: signal derive failed ({e})"));
-        let token = syscall::cap_derive(self.token, syscall::RIGHTS_NTF_NOTIFY)
-            .unwrap_or_else(|e| panic!("logd_follow: token derive failed ({e})"));
-        Subscribed::decode(&logd_query_call(cap, &subscribe_request(signal, token)))
+        syscall::cap_derive(self.signal, rights)
+            .unwrap_or_else(|e| panic!("logd_follow: signal derive failed ({e})"))
+    }
+
+    /// `LOG_SUBSCRIBE` on `cap`, moving a copy of the signal with only the
+    /// notify right (`signal_rights`), and keeping the reply's token.
+    fn subscribe_with(&mut self, cap: u64, signal_rights: u64) -> Result<Subscribed, u64>
+    {
+        let request = subscribe_request(self.signal_copy(signal_rights));
+        let sub = Subscribed::decode(&logd_query_call(cap, &request))?;
+        assert!(
+            sub.token != 0 && self.token == 0,
+            "logd_follow: subscription reply {sub:?} for a subscriber with token {}",
+            self.token
+        );
+        self.token = sub.token;
+        Ok(sub)
     }
 
     /// `LOG_SUBSCRIBE` on `cap`.
-    fn subscribe(&self, cap: u64) -> Result<Subscribed, u64>
+    fn subscribe(&mut self, cap: u64) -> Result<Subscribed, u64>
     {
         self.subscribe_with(cap, syscall::RIGHTS_NTF_NOTIFY)
     }
 
-    /// Whether the token is at this one reference: logd holds no copy of it.
-    fn token_sole(&self) -> bool
+    /// Whether the signal is at this one reference: logd holds no copy of it.
+    fn signal_sole(&self) -> bool
     {
-        syscall::cap_info(self.token, syscall::CAP_INFO_SOLE_REFERENCE) == Ok(1)
+        syscall::cap_info(self.signal, syscall::CAP_INFO_SOLE_REFERENCE) == Ok(1)
     }
 
-    /// Delete both capabilities, which ends a subscription on them.
+    /// Delete the token, which ends the subscription, and the signal.
     fn end(self)
     {
-        let _ = syscall::cap_delete(self.token);
+        if self.token != 0
+        {
+            let _ = syscall::cap_delete(self.token);
+        }
         let _ = syscall::cap_delete(self.signal);
     }
 }
@@ -216,8 +234,8 @@ fn logd_follow_phase(caps: &Caps)
         denied.label
     );
 
-    // A signal without the notify right: refused, and logd keeps neither cap.
-    let invalid = Subscriber::new();
+    // A signal without the notify right: refused, and logd keeps no copy.
+    let mut invalid = Subscriber::new();
     assert_eq!(
         invalid
             .subscribe_with(caps.logd_query, syscall::RIGHTS_NTF_WAIT)
@@ -226,12 +244,34 @@ fn logd_follow_phase(caps: &Caps)
         "logd_follow: a signal without the notify right not refused"
     );
     assert!(
-        invalid.token_sole(),
-        "logd_follow: logd kept the token of a refused subscription"
+        invalid.signal_sole(),
+        "logd_follow: logd kept the signal of a refused subscription"
     );
+    // A request with a capability more than the signal: refused, and logd
+    // keeps neither.
+    let other = notification();
+    let two = IpcMessage::builder(ipc::log_labels::LOG_SUBSCRIBE)
+        .word(0, u64::from(ipc::LOG_LABELS_VERSION))
+        .cap(invalid.signal_copy(syscall::RIGHTS_NTF_NOTIFY))
+        .cap(
+            syscall::cap_derive(other, syscall::RIGHTS_NTF_NOTIFY)
+                .unwrap_or_else(|e| panic!("logd_follow: derive failed ({e})")),
+        )
+        .build();
+    assert_eq!(
+        Subscribed::decode(&logd_query_call(caps.logd_query, &two)).err(),
+        Some(QUERY_INVALID),
+        "logd_follow: a request with two capabilities not refused"
+    );
+    assert!(
+        invalid.signal_sole()
+            && syscall::cap_info(other, syscall::CAP_INFO_SOLE_REFERENCE) == Ok(1),
+        "logd_follow: logd kept a capability of a refused subscription"
+    );
+    let _ = syscall::cap_delete(other);
     invalid.end();
 
-    let follower = Subscriber::new();
+    let mut follower = Subscriber::new();
     let sub = follower
         .subscribe(caps.logd_query)
         .unwrap_or_else(|s| panic!("logd_follow: LOG_SUBSCRIBE on logd.query refused ({s})"));
@@ -311,7 +351,7 @@ fn check_pools(caps: &Caps)
 {
     let mut sinks: Vec<Subscriber> = (0..SINK_SUBSCRIBERS_MAX)
         .map(|_| {
-            let sink = Subscriber::new();
+            let mut sink = Subscriber::new();
             let sub = sink.subscribe(caps.logd_follow).unwrap_or_else(|s| {
                 panic!("logd_follow: LOG_SUBSCRIBE on logd.follow refused ({s})")
             });
@@ -323,15 +363,15 @@ fn check_pools(caps: &Caps)
             sink
         })
         .collect();
-    let extra = Subscriber::new();
+    let mut extra = Subscriber::new();
     assert_eq!(
         extra.subscribe(caps.logd_follow).err(),
         Some(QUERY_FULL),
         "logd_follow: a subscription past the logd.follow pool not refused"
     );
     assert!(
-        extra.token_sole(),
-        "logd_follow: logd kept the token of a refused subscription"
+        extra.signal_sole(),
+        "logd_follow: logd kept the signal of a refused subscription"
     );
 
     sinks
@@ -360,8 +400,8 @@ fn check_pools(caps: &Caps)
     }
 }
 
-/// One `SINK_LIST` walk on `cap`: each sink's (name, settings, state).
-fn sink_list(cap: u64) -> Result<Vec<(String, String, u8)>, u64>
+/// One `SINK_LIST` walk on `cap`: each sink's (name, settings, state, cursor).
+fn sink_list(cap: u64) -> Result<Vec<(String, String, u8, u64)>, u64>
 {
     let mut sinks = Vec::new();
     for index in 0u64..
@@ -376,6 +416,7 @@ fn sink_list(cap: u64) -> Result<Vec<(String, String, u8)>, u64>
             String::from_utf8_lossy(view.name).into_owned(),
             String::from_utf8_lossy(view.settings).into_owned(),
             view.state,
+            view.cursor,
         ));
         if !more
         {
@@ -385,17 +426,62 @@ fn sink_list(cap: u64) -> Result<Vec<(String, String, u8)>, u64>
     Ok(sinks)
 }
 
-/// The settings `SINK_LIST` reports for the sink `name`.
-fn settings_of(cap: u64, name: &str) -> String
+/// The settings and the cursor `SINK_LIST` reports for the sink `name`.
+fn listed(cap: u64, name: &str) -> (String, u64)
 {
     sink_list(cap)
         .unwrap_or_else(|s| panic!("logd_control: SINK_LIST refused ({s})"))
         .into_iter()
-        .find(|(n, _, _)| n == name)
+        .find(|(n, _, _, _)| n == name)
         .map_or_else(
             || panic!("logd_control: no {name} sink listed"),
-            |(_, settings, _)| settings,
+            |(_, settings, _, cursor)| (settings, cursor),
         )
+}
+
+/// The settings `SINK_LIST` reports for the sink `name`.
+fn settings_of(cap: u64, name: &str) -> String
+{
+    listed(cap, name).0
+}
+
+/// The line the phase logs while the framebuffer sink is `off`.
+const OFF_LINE: &str = "logd_control: a line while the framebuffer sink is off";
+
+/// Turn `sink` `off`, log [`OFF_LINE`], and set it back to `on`, its
+/// settings before: the cursor `SINK_LIST` reports must be past the line.
+fn check_turned_on(caps: &Caps, sink: &str, on: &str)
+{
+    assert!(
+        !on.starts_with("level=off"),
+        "logd_control: {sink} is off before the phase: {on}"
+    );
+    assert_eq!(
+        sink_set(caps.logd_control, sink, "level=off"),
+        QUERY_OK,
+        "logd_control: SINK_SET {sink} level=off refused"
+    );
+    std::os::seraph::log!("{OFF_LINE}");
+    let mut off_seq = None;
+    super::procmgr::logd_history_each(caps.logd_query, None, |entry| {
+        if entry.bytes == OFF_LINE.as_bytes()
+        {
+            off_seq = Some(entry.seq);
+        }
+        off_seq.is_none()
+    });
+    let off_seq = off_seq.expect("logd_control: the line logged while off not read");
+    assert_eq!(
+        sink_set(caps.logd_control, sink, on),
+        QUERY_OK,
+        "logd_control: SINK_SET {sink} back to {on} refused"
+    );
+    let (settings, cursor) = listed(caps.logd_control, sink);
+    assert!(
+        settings == on && cursor > off_seq,
+        "logd_control: {sink} turned on at {settings} with its cursor at {cursor}, not past the \
+         line logged while off at {off_seq}"
+    );
 }
 
 /// `SINK_SET` on `cap`: its status.
@@ -432,16 +518,16 @@ fn logd_control_phase(caps: &Caps)
 
     let sinks = sink_list(caps.logd_control)
         .unwrap_or_else(|s| panic!("logd_control: SINK_LIST refused ({s})"));
-    let names: Vec<&str> = sinks.iter().map(|(name, _, _)| name.as_str()).collect();
+    let names: Vec<&str> = sinks.iter().map(|(name, _, _, _)| name.as_str()).collect();
     assert_eq!(names, ["serial", SINK], "logd_control: sinks listed");
     assert!(
         sinks
             .iter()
-            .all(|(_, settings, _)| settings.starts_with("level=")),
+            .all(|(_, settings, _, _)| settings.starts_with("level=")),
         "logd_control: settings not in the recipe's syntax: {sinks:?}"
     );
     assert!(
-        matches!(sinks.first(), Some((_, _, SINK_SERVED | SINK_STALLED))),
+        matches!(sinks.first(), Some((_, _, SINK_SERVED | SINK_STALLED, _))),
         "logd_control: the serial sink is not served: {sinks:?}"
     );
 
@@ -493,5 +579,6 @@ fn logd_control_phase(caps: &Caps)
         before,
         "logd_control: {SINK} settings not set back"
     );
+    check_turned_on(caps, SINK, &before);
     std::os::seraph::log!("logd_control: sinks listed, steered and set back");
 }

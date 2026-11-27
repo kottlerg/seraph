@@ -565,11 +565,16 @@ lines and fsbench's.
 
 CI's `bench` cell, one per architecture, takes both in the release profile from its architecture's
 release build job (`cargo xtask build --release --ktest-bench-only`) and boots them under QEMU's
-icount (`cargo xtask run --icount`): one guest clock tick per retired instruction while a vCPU runs,
-so the count of a window that does not idle is the same in every run of one build, whatever the
-runner's load. While every vCPU idles, the guest's clock follows the host's time up to its next
-timer deadline (QEMU's `sleep=on`), so a device completion ends the idle as it would on hardware,
-and a window that idles counts host time. It boots each three times
+icount (`cargo xtask run --icount`): one guest clock tick per retired instruction while a vCPU runs.
+At one CPU the count of a window that does not idle, and that no interrupt or other thread enters,
+is therefore the same in every run of one build, whatever the runner's load, unless the path's cost
+depends on the order in which earlier host-timed events (a device completion, the end of an idle)
+left the system's state, such as the order of a page cache's slots. The timer tick's phase follows
+the end of each earlier idle, which is at host time, so the ticks a long window takes, and any
+switch they cause, can differ from run to run. At more than one CPU the vCPUs share the clock, so a
+window also counts the other vCPUs' instructions. While every vCPU idles, the guest's clock follows
+the host's time up to its next timer deadline (QEMU's `sleep=on`), so a device completion ends the
+idle as it would on hardware, and a window that idles counts host time. It boots each three times
 at one CPU and once at four, the ubench boots with a framebuffer (`--display framebuffer`) and their
 logs saved in `ubench/` beside the ktest boots', and one `cargo xtask bench-check --mode icount`
 over both sets compares each measurement's lowest p50 over the runs that reported its suite with its
@@ -624,10 +629,13 @@ the region between two reads, the benchmark's measured operation, as follows:
   result observable after the closing read, as `ubench.shmem_ring` does by comparing the bytes it
   read with those it wrote.
 - **Under icount.** QEMU retires a vCPU's instructions one at a time in program order, and the
-  counter advances one per instruction. A sample is therefore exactly the instructions retired
-  between the two reads: the region as compiled, and the reads' own instructions on the region's
-  side (on x86-64 the `lfence` after the opening `rdtsc`, and the `mfence; lfence` before the
-  closing one).
+  counter advances one per instruction, an x86-64 `rep` string instruction counting once per
+  iteration. In a window on one CPU that does not idle, a sample is therefore every instruction
+  the CPU retires between the two reads: the region as compiled, the reads' own instructions on
+  the region's side (on x86-64 the `lfence` after the opening `rdtsc`, and the `mfence; lfence`
+  before the closing one), and any interrupt handler or other thread the CPU runs inside the
+  window, such as the kernel's periodic timer tick in a long window. A window at more than one
+  CPU, and one that idles, count as the paragraphs above say.
 - **On hardware, x86-64.** The read is `mfence; lfence; rdtsc; lfence`. `mfence; lfence` holds
   `rdtsc` until every earlier instruction has completed and every earlier load and store is
   globally visible. The last `lfence` holds every later instruction until `rdtsc` has read the
@@ -647,7 +655,9 @@ region's side under icount, and on hardware the cycles of those instructions and
 The `empty_window` benchmark of each suite, `ktest.empty_window` and `ubench.empty_window`,
 measures that offset as two reads with nothing between them, in both modes. A line's p50 includes
 the offset its suite's `empty_window` line reports in the same mode. No tool subtracts it: a
-reader who wants the region's cost alone subtracts it.
+reader who wants the region's cost alone subtracts it, which under icount leaves exactly the
+region's instructions only for a window on one CPU that does not idle and that no interrupt or
+other thread enters.
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host

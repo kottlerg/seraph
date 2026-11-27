@@ -456,7 +456,8 @@ impl LogdState
     /// Start sink `index`'s cursor after the newest entry, as for a sink
     /// turned on (`services/logd/docs/sinks.md` § Pace): it passes nothing of
     /// the time it was `off`, whether or not its writer stepped meanwhile, and
-    /// owes no drop or notice from before.
+    /// owes no drop or notice from before. An entry its writer is still
+    /// writing stays taken until the writer settles it ([`Cursor::start_at`]).
     fn start_at_newest(&mut self, index: usize)
     {
         let next = self.table.history().next_seq();
@@ -2313,13 +2314,13 @@ struct Cursor
 
 impl Cursor
 {
-    /// Start at `next`, owing nothing before it: no entry taken or walked
-    /// to, no drop to report, and no notice to add to.
+    /// Start at `next`, owing nothing before it: no drop to report, and no
+    /// notice to add to. An entry the writer has taken, and its walk, stay
+    /// the writer's to settle ([`Sink::advance`], [`Sink::release_taken`]),
+    /// so a walk written meanwhile still moves `walked`.
     const fn start_at(&mut self, next: u64)
     {
         self.next = next;
-        self.taken = None;
-        self.walk_end = None;
         self.dropped = 0;
         self.notice = None;
     }
@@ -2680,6 +2681,8 @@ impl Sink
         if settings.level.is_none()
         {
             cursor.start_at(table.history().next_seq());
+            cursor.taken = None;
+            cursor.walk_end = None;
             return Step::Idle;
         }
         cursor.drop_entries(table.history_mut().take_evicted(self.index));

@@ -723,9 +723,15 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    step 1. One release PR bumps `[workspace.package] version` in the root
    `Cargo.toml` to `<X>.<Y>.<Z>` and adds the notes file from the draft,
    every section filled and the Known Issues as the maintainer decided
-   them, through the normal PR workflow, and merges once the maintainer
-   approves its merge (§ Pre-merge review). The tag MUST point at a commit
-   that contains both.
+   them. It also regenerates both hot-path accounts, every configuration
+   of each
+   ([core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md#regenerating-it)
+   § Regenerating It), at a head of the PR from which the change to its
+   merge is documentation or comments only, so that each block names a
+   head whose code is the merge's. It goes through the normal PR
+   workflow, and merges once the maintainer approves its merge
+   (§ Pre-merge review). The tag MUST point at a commit that contains the
+   bump and the notes file.
 4. Run the release host runs ([testing.md](testing.md#coverage-tiers)
    § Coverage tiers) on the commit to be tagged, a `master` commit that
    contains the bump and the notes file and whose own CI run is green (a
@@ -745,11 +751,7 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    manual dispatch of `fuzz.yml` on `master` while the commit to be
    tagged is its head (`gh workflow run fuzz.yml --ref master`), at the
    default time per target, whose run's head commit is that commit and
-   whose conclusion is `success`. Both hot-path accounts are regenerated
-   at the same commit, every configuration of each
-   ([core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md#regenerating-it)
-   § Regenerating It), and land through one Markdown-only PR, whose merge
-   is then the commit to be tagged. A run at an earlier `master` commit that
+   whose conclusion is `success`. A run at an earlier `master` commit that
    contains the bump stands for the commit to be tagged when the change between the two is
    documentation or comments only, as [testing.md](testing.md#coverage-tiers)
    § Coverage tiers defines it.

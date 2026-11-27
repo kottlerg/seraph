@@ -43,8 +43,8 @@ This section states when both hot-path accounts are regenerated, this one and
 it uses it: when it claims a cut measured on the account, or adds a gated row to the harness the
 account covers (ktest's rows here, ubench's and fsbench's in the userspace account). Such a PR
 regenerates every configuration of that account, rewrites its block, and revises the prose where
-its numbers moved. Both accounts are also regenerated once per release, on the release candidate
-([docs/conventions.md](../../../docs/conventions.md) § Release Production). No other PR
+its numbers moved. Both accounts are also regenerated once per release, in the release PR
+([docs/conventions.md](../../../docs/conventions.md) § Release Production, step 3). No other PR
 regenerates them, a change to a path their rows run included: the benchmark cell's icount
 baselines catch a moved row in that PR's CI run
 ([docs/testing.md](../../../docs/testing.md) § Benchmarks). Between regenerations the
@@ -180,14 +180,15 @@ the host-mode bands are taken on the release build
 
 ## Ranked Cuts
 
-Ranked on the release account by the instructions each removes from the one gated row it
-shortens most, on the architecture where that saving is larger, as measured when the cut was
-taken or declined; a new cut is ranked on an account regenerated for it (§ Regenerating It).
-Each cut is its own Issue, under #1531. A design change goes to the maintainer as a pick:
-#1548, #1549 and #1550 were approved before their Issues were filed, and #1695 before it was
-built; a local cut needs no pick. Each reports the
-host-mode figure under KVM beside its counts, and a cut that saves instructions but costs time
-is not taken.
+Ranked on the release account by the instructions each removes from the one ktest row it
+shortens most, the rows this account covers, on the architecture where that saving is larger,
+as measured when the cut was taken or declined. A cut's saving on the ubench and fsbench rows,
+which repeat a kernel path many times per sample, does not enter the rank. A new cut is ranked
+on an account regenerated for it (§ Regenerating It). Each cut is its own Issue, under #1531. A
+design change goes to the maintainer as a pick: #1548, #1549 and #1550 were approved before
+their Issues were filed, and #1695 before it was built; a local cut needs no pick. Each reports
+the host-mode figure under KVM beside its counts, and a cut that saves instructions but costs
+time is not taken.
 
 | Rank | Cut | Kind | Expected saving (release, x86_64 / riscv64) |
 |---:|---|---|---|

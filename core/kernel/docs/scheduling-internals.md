@@ -489,7 +489,8 @@ windows between two teardowns, a dying `CSpace`'s windows in its release pass, i
 and its kept-page sort and release, the windows of a death-observer chain's release, of an address
 space's frame release and of an Mmio object's mapping withdrawal, the windows of an exiting
 thread's death posts, the windows between a registry walk's batches (`thread_registry::for_each`)
-and between a multi-waiter drain's batches (`ipc::drain_in_batches`), and the windows between the
+and between a multi-waiter drain's batches (`ipc::drain_in_batches`), the windows between a
+`SYS_MEMORY_ZERO`'s batches (`sys_memory_zero`), and the windows between the
 derivation-lock holds of
 revocation, deletion, the range splits, a move, and the teardown drain
 (`interrupt_window` in `cap/object.rs`, through

@@ -1852,9 +1852,17 @@ return work holds a thread that may outrank the caller, a stop, an upcall, or a 
 ([scheduling-internals.md](scheduling-internals.md) § Return Work), returns the pages zeroed so
 far; the return to user mode that follows switches, stops or delivers. The return work is read
 only between batches, so every call zeroes at least one batch, and a caller that is always
-outranked still advances. A batch after the first whose checks fail (a split shrank the region,
-a retype reached the range, the handle was revoked or deleted) also ends the call with the count
-so far, and the next call, starting at that batch, returns the error.
+outranked still advances. A slice expiry does not end the call: a tick that lands in a window
+between batches refills the slice without rescheduling, as in every preemption-disabled window
+(§ `SYS_THREAD_STOP`, Latency contract), so a thread at the caller's own level runs once the call
+returns. A batch after the first whose checks fail (a split shrank the region, a retype reached
+the range, the handle was revoked or deleted) also ends the call with the count so far, and the
+next call, starting at that batch, returns the error.
+
+The call issues no instruction-fetch synchronisation. A page it zeroes that a mapping shows
+executable holds code written through a writable alias, which the holder synchronises with
+`SYS_MEM_PROTECT` to executable ([memory-internals.md](memory-internals.md)
+§ Instruction-Fetch Synchronisation).
 
 **Errors:** returned only when no page was zeroed. `InvalidArgument` (`page_count` zero, the
 range overflows or lies past the region's end, or its first batch lies below the retype
@@ -2057,7 +2065,8 @@ target's remaining time slice (at most the longest slice, 20 timer ticks, that o
 [scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)), except when the
 slice expires while the target runs a preemption-disabled kernel section with interrupts enabled (a
 TLB-shootdown or drain spin, or a page-pool seeding, teardown, explicit-placement pre-grow,
-registry-walk, waiter-drain, or derivation-lock window between batches, `interrupt_window`):
+registry-walk, waiter-drain, memory-zero, or derivation-lock window between batches,
+`interrupt_window`):
 `timer_tick` then refills the slice without rescheduling, and `preempt_enable` does not reschedule,
 so the stop completes at the first later slice-expiry tick with preemption enabled, a further slice
 later at the least, or at the target's next return to user mode when a thread queued on its CPU

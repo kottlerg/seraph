@@ -660,15 +660,17 @@ hart has run one; on x86-64 nothing. The call sites are:
 The fence is placed per call that makes a mapping executable or writes through a debugger, not at
 every store, for these reasons:
 
-- **Every kernel route to executing written bytes passes a call site.** Bytes stored through a
-  data path become executable through a new executable mapping or a protect to executable, and
-  both synchronise. The kernel's own stores to a user frame through the direct map are the zeroing
-  and filling of frames before they are mapped (the same case), the Phase-9 relocation, and
-  `sys_thread_write_mem`. That call synchronises after every write, not only one that reaches an
-  executable leaf of the target, since a writable page's frame may be mapped executable in
-  another mapping no leaf of the target shows. A frame freed with stale instruction lines and
-  reused for new code is reached only through a new executable mapping, so frame reuse needs no
-  call of its own.
+- **Every kernel route to executing written bytes passes a call site, `SYS_MEMORY_ZERO` aside.**
+  Bytes stored through a data path become executable through a new executable mapping or a
+  protect to executable, and both synchronise. The kernel's own stores to a user frame through the
+  direct map are the zeroing and filling of frames before they are mapped (the same case), the
+  Phase-9 relocation, `sys_thread_write_mem`, and `SYS_MEMORY_ZERO`. `sys_thread_write_mem`
+  synchronises after every write, not only one that reaches an executable leaf of the target,
+  since a writable page's frame may be mapped executable in another mapping no leaf of the target
+  shows. `SYS_MEMORY_ZERO` needs the Write right a writable mapping needs and synchronises
+  nothing: zeroing a frame a mapping shows executable is a store through a writable alias, the
+  next point's case. A frame freed with stale instruction lines and reused for new code is reached
+  only through a new executable mapping, so frame reuse needs no call of its own.
 - **Code written through a writable alias is the process's to synchronise.** W^X holds per mapping,
   not per frame: a Memory capability may carry both `Write` and `Execute`, so one frame can be
   mapped writable at one address and executable at another, in one space or two. A store through the

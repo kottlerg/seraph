@@ -35,7 +35,7 @@ use crate::{TestContext, TestResult};
 const ZERO_VA: u64 = 0x1_7000_0000;
 /// Pages of the piece the functional cases zero.
 const PIECE_PAGES: u64 = 48;
-/// Pages of the piece the latency case zeroes: 32 MiB, 2,048 batches.
+/// Pages of the piece the latency case zeroes: 32 MiB, 512 batches.
 const LATENCY_PIECE_PAGES: u64 = 8192;
 /// The word every byte of a piece holds before a zero.
 const PATTERN: u64 = 0xA5A5_5A5A_C3C3_3C3C;

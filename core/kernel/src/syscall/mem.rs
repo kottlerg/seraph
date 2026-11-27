@@ -1346,12 +1346,15 @@ const ZERO_BATCH_PAGES: usize = crate::cap::retype::CLEAR_BATCH_PAGES;
 
 /// The return-work bits on which `SYS_MEMORY_ZERO` stops between two batches
 /// and returns the pages zeroed so far: a thread queued on this CPU may
-/// outrank the caller (`PREEMPT`, posted by a local or a remote enqueue, a
-/// wake, or the tick at a slice's end), the caller is stopped (`STOPPED`), it
-/// has an upcall to take (`UPCALL_SYSCALL`, `UPCALL_ANY`), or a run-limit
-/// fault (`RUN_LIMIT`). The return to user mode that follows handles each.
+/// outrank the caller (`PREEMPT`, posted by a local or a remote link, a stale
+/// level, or the wake IPI), the caller is stopped (`STOPPED`), it has an
+/// upcall to take (`UPCALL_SYSCALL`, `UPCALL_ANY`), or a run-limit fault
+/// (`RUN_LIMIT`). The return to user mode that follows handles each.
 /// `RECLAIM` and `SOLE_REF` are housekeeping that the return makes whenever
-/// the call ends, and do not stop it.
+/// the call ends, and do not stop it. A slice expiry posts no bit: a tick that
+/// lands in a window between batches, where preemption is disabled, refills
+/// the slice and does not reschedule (core/kernel/docs/scheduler.md
+/// § Kernel-Mode Preemption Points), so it does not end the call.
 const ZERO_STOP_WORK: u32 = {
     use crate::percpu::return_work::{PREEMPT, RUN_LIMIT, STOPPED, UPCALL_ANY, UPCALL_SYSCALL};
     PREEMPT | STOPPED | UPCALL_SYSCALL | UPCALL_ANY | RUN_LIMIT

@@ -95,8 +95,10 @@ struct Shared<H>
 /// copied out of the page (`IpcMessage`), so the handler may make nested calls
 /// on that page. The handler ends its turn with its reply left in the
 /// [`Reply`] ([`Reply::set`]), which the worker sends with its next receive
-/// in one `SYS_IPC_REPLY_RECV`; or it replies at once ([`ipc::ipc_reply`])
-/// when it has work after the reply; or it deliberately leaves the caller
+/// in one `SYS_IPC_REPLY_RECV`; or, when it has work after the reply, it
+/// sets the reply and sends it first with [`Reply::flush`] on the endpoint
+/// the pool receives on, the worker's next receive returning any call that
+/// send took up; or it deliberately leaves the caller
 /// unanswered, which the worker's next receive then releases
 /// (`docs/ipc-design.md` § The Call/Reply Model).
 ///

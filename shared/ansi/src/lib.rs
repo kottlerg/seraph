@@ -22,8 +22,8 @@
 /// Windows 10 console (Campbell) 16-colour palette: ANSI colour index →
 /// 24-bit RGB. Indices `0..=7` are the normal set, `8..=15` the bright set.
 /// Index 0 (Campbell `0C0C0C`) and index 15 (Campbell `F2F2F2`) are pinned
-/// to pure black / pure white so the unstyled default — and logd's always-on
-/// framebuffer mirror — stays the pre-colour monochrome output. Sixteen
+/// to pure black / pure white so the unstyled default, the framebuffer
+/// driver's own, stays the pre-colour monochrome output. Sixteen
 /// entries is the SGR colour set the parser maps (`30..=37`, `90..=97` and
 /// their background twins); the size bounds no capacity.
 const ANSI_RGB: [[u8; 3]; 16] = [
@@ -46,15 +46,17 @@ const ANSI_RGB: [[u8; 3]; 16] = [
 ];
 
 /// Default foreground: full white (index 15), so unstyled text matches the
-/// pre-colour output and the always-on logd framebuffer mirror stays bright.
-const DEFAULT_FG: u8 = 15;
+/// pre-colour output, the framebuffer driver's default.
+pub const DEFAULT_FG: u8 = 15;
 /// Default background: black (index 0).
-const DEFAULT_BG: u8 = 0;
+pub const DEFAULT_BG: u8 = 0;
 
-/// RGB of palette index `idx`. Every index the parser holds is below 16
-/// (`fg_base` and `bg_idx` are set only from a colour digit and bit 3), so
-/// the black fallback is never taken.
-fn ansi_rgb(idx: u8) -> [u8; 3]
+/// RGB of palette index `idx`; black for an index past the palette. Every
+/// index the parser holds is below 16 (`fg_base` and `bg_idx` are set only
+/// from a colour digit and bit 3), and logd's framebuffer sink colours a
+/// level tag from it.
+#[must_use]
+pub fn ansi_rgb(idx: u8) -> [u8; 3]
 {
     ANSI_RGB.get(usize::from(idx)).copied().unwrap_or([0; 3])
 }

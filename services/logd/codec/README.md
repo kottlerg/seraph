@@ -25,14 +25,19 @@ the rendered text (`record::render`, `record::fields`, `RENDERED_MAX_BYTES`; see
 § `stream_labels::STREAM_RECORD`), the line and name widths both log
 receivers keep per sender (`LINE_BUF_SIZE`, `MAX_NAME_LEN`), `BoundedStr`, the
 fixed-capacity, UTF-8-safe formatter logd uses for its own diagnostics. It holds the rules of
-real-logd's output sinks that need no clock or lock of their own (`SINK_STALL_MS`, `SKIP_BACKLOG`,
-`write_overdue`, `hint_ms`, `attach_cursor`, `drop_text`: when a sink's write is overdue, the retry
-hint of a refused message, where a `skip` sink's cursor starts, and the text of a drop line; see
-[`docs/ipc-interface.md`](../docs/ipc-interface.md) § Output sinks, § Hold window). It issues no
-syscall and no IPC, so both ends keep the IPC calls and the logic stays host-reachable, per
-[coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
+real-logd's output sinks that need no clock or lock of their own (`SINK_STALL_MS`, `write_overdue`,
+`hint_ms`, `attach_cursor`, `drop_text`: when a sink's write is overdue, the retry hint of a refused
+message, where a `skip` sink's cursor starts, and the text of a drop line; see
+[`docs/ipc-interface.md`](../docs/ipc-interface.md) § Output sinks, § Hold window), a device sink's
+settings and the parser of the recipe syntax that sets them (`settings::SinkSettings`,
+`SinkKind::defaults`), and the two formats a sink renders an entry in, the console format with its
+field list (`console::write`) and the rfc5424 format (`rfc5424::write`; see
+[`docs/sinks.md`](../docs/sinks.md) § Settings, § The console format, § The rfc5424 format). It
+issues no syscall and no IPC, so both ends keep the IPC calls and the logic stays host-reachable,
+per [coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
 
-`no_std`; depends on `shared/ipc` (`IpcMessage`, `log_record`, `log_query`) and `abi/syscall`
+`no_std`; depends on `shared/ipc` (`IpcMessage`, `log_record`, `log_query`), `shared/log`
+(`parse_level`, the level keywords a sink's `level` takes) and `abi/syscall`
 (`MSG_DATA_WORDS_MAX`).
 
 ---
@@ -46,12 +51,17 @@ services/logd/codec/
 ├── README.md
 └── src/
     ├── lib.rs                  # Crate root
+    ├── console.rs              # The console format: a line of the fields
+    │                           # a sink's settings name
     ├── handover.rs             # Handover wire contract: codes, encoders,
     │                           # decoder, NameResend, release retry
     ├── history.rs              # HistoryRing: init-logd's captured history
     ├── kernel.rs               # Kernel log lines: the record cursor, the
     │                           # [kernel] line parts, the reserved name
     ├── level.rs                # The level tag a rendered line carries
+    │                           # and its colour
+    ├── prefix.rs               # The default console prefix and its
+    │                           # fields' writers
     ├── query.rs                # Query pages: which slots and history
     │                           # entries a reply carries
     ├── reclaim.rs              # ReclaimLine: the slot-eviction log line
@@ -59,6 +69,8 @@ services/logd/codec/
     │                           # parser
     ├── resync.rs               # Death-queue resync: candidates, live-page
     │                           # decoder, eviction set, WalkGate
+    ├── rfc5424.rs              # The rfc5424 format and its UTF-8 escape
+    ├── settings.rs             # A device sink's settings and their parser
     ├── sink.rs                 # Sink rules: stall bound, retry hint,
     │                           # attach cursor, drop-line text
     └── bounded_str.rs          # BoundedStr: UTF-8-safe bounded formatter

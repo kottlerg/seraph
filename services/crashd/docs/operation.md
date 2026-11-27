@@ -416,7 +416,7 @@ core of crashme's `worker` mode took 8 s to 12 s on debug builds of both archite
   virtio-console driver, which the GDB stub waits on, and crashd declare themselves undebuggable at
   startup, as svctest and the GDB stub, debug-authority holders, do in a boot that stages them;
   before the declaration, a fault of one of them reaches crashd and is declined once the bound
-  passes. The serial and framebuffer drivers, through which logd writes every line, are covered:
+  passes. The serial and framebuffer drivers, through which logd writes the log lines, are covered:
   crashd's log lines reach them through logd's sink writers, so no thread crashd waits on waits on
   either driver for longer than logd's `SINK_STALL_MS`. A fault of any of these takes the outcome it
   has with no handler bound; the kernel's `fault unhandled` and `USERSPACE FAULT` lines are its only

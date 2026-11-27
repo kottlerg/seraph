@@ -12,7 +12,8 @@
 //! byte ring ([`history`]); logd's death-queue resync decisions
 //! ([`resync`]); the line logd logs when it evicts a slot ([`reclaim`]);
 //! which entries a query page carries ([`query`]); logd's sinks' stall
-//! bound, retry hint, backlog and drop line ([`sink`]);
+//! bound, retry hint, backlog and drop line ([`sink`]); a device sink's
+//! settings and the recipe syntax that sets them ([`settings`]);
 //! the level tag both log receivers render ([`level`]) and the console-line
 //! prefix both write ([`prefix`]); how both write and
 //! keep the kernel's log records ([`kernel`]); and the line and
@@ -27,6 +28,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod console;
 pub mod handover;
 pub mod history;
 pub mod kernel;
@@ -36,6 +38,8 @@ pub mod query;
 pub mod reclaim;
 pub mod record;
 pub mod resync;
+pub mod rfc5424;
+pub mod settings;
 pub mod sink;
 
 mod bounded_str;

@@ -1360,7 +1360,8 @@ const ZERO_BATCH_PAGES: usize = crate::cap::retype::CLEAR_BATCH_PAGES;
 /// shootdown IPI posts it too, and a set bit without such a thread would end
 /// the call for a return that switches nothing. `RECLAIM` and `SOLE_REF` are
 /// housekeeping that the return makes whenever the call ends, and do not stop
-/// it. A slice expiry posts no bit: a tick that lands in a window between
+/// it; nor does `PMU_GRANT`, since the caller reads no counter while in the
+/// kernel and the return applies its grant before it runs in user mode again. A slice expiry posts no bit: a tick that lands in a window between
 /// batches, where preemption is disabled, refills the slice and does not
 /// reschedule (core/kernel/docs/scheduler.md § Kernel-Mode Preemption Points),
 /// so it does not end the call.
@@ -1703,14 +1704,20 @@ mod tests
         assert!(!zero_stops(0, not_consulted));
         assert!(!zero_stops(return_work::RECLAIM, not_consulted));
         assert!(!zero_stops(return_work::SOLE_REF, not_consulted));
+        assert!(!zero_stops(return_work::PMU_GRANT, not_consulted));
         assert!(!zero_stops(
-            return_work::RECLAIM | return_work::SOLE_REF,
+            return_work::RECLAIM | return_work::SOLE_REF | return_work::PMU_GRANT,
             not_consulted
         ));
         // Every kind a syscall's return handles is a stop, the preemption
-        // the scheduler's test decides, or one of the two housekeeping kinds.
+        // the scheduler's test decides, or one of the kinds the return makes
+        // whenever the call ends.
         assert_eq!(
-            ZERO_STOP_WORK | return_work::PREEMPT | return_work::RECLAIM | return_work::SOLE_REF,
+            ZERO_STOP_WORK
+                | return_work::PREEMPT
+                | return_work::RECLAIM
+                | return_work::SOLE_REF
+                | return_work::PMU_GRANT,
             return_work::AT_SYSCALL
         );
     }

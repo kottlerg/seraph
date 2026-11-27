@@ -45,7 +45,7 @@ pub fn spcr_uart_base(acpi: &Acpi<'_, '_>) -> Option<u64>
 ///   carries no size.
 /// - The RHCT ([`rhct_hart_caps`]) → `km.timebase_freq` and the
 ///   `HART_CAP_*` bits every hart's ISA string names (Sstc, Svpbmt, Svinval,
-///   Svnapot, Ssaia, Zawrs).
+///   Svnapot, Ssaia, Zawrs, Sscofpmf).
 ///
 /// Fields the caller left non-zero are preserved; fields left zero are
 /// populated when the corresponding table is present.

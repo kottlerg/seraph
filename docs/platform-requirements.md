@@ -312,10 +312,13 @@ Each feature is classified per architecture as one of:
   boot seed; used where the hart implements `Zkr` and the M-mode firmware grants S-mode the CSR
   (`mseccfg.SSEED`, which OpenSBI sets on such a hart), which the kernel learns by probing the
   CSR (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
-- **SBI PMU extension, with Sscofpmf under emulation** — the user performance counters of a
+- **SBI PMU extension and Sscofpmf** — the user performance counters of a
   `PmuControl` holder ([core/kernel/docs/perfmon.md](../core/kernel/docs/perfmon.md)): the SBI PMU
-  extension with at least one programmable hardware counter. Without it `SYS_PMU_INFO` answers
-  `NotSupported` and the kernel logs `pmu: no counters`; nothing else depends on it. Under
+  extension with at least one programmable hardware counter, and Sscofpmf on every hart
+  (`HART_CAP_SSCOFPMF`). Without Sscofpmf the SBI PMU extension cannot filter a counter by
+  privilege mode, so a user reader's counts would include the kernel's execution; the platform
+  then has no user counters. Without either, `SYS_PMU_INFO` answers `NotSupported` and the kernel
+  logs `pmu: no counters`; nothing else depends on it. Under
   emulation the CPU model must enable Sscofpmf (`sscofpmf=on`,
   [build-system.md](build-system.md) § QEMU and Firmware), with which QEMU describes the events
   of its programmable counters.

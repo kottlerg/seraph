@@ -180,7 +180,12 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 /// v25: `hart_caps` gained bit 5 ([`HART_CAP_ZAWRS`]). No layout change. The
 ///     kernel's idle loop waits with `WRS.NTO` on its idle wake word when it is
 ///     confirmed, and with `WFI` otherwise.
-pub const BOOT_PROTOCOL_VERSION: u32 = 25;
+/// v26: `hart_caps` gained bit 6 ([`HART_CAP_SSCOFPMF`]). No layout change.
+///     The kernel offers user performance counters only when it is confirmed:
+///     without Sscofpmf the SBI PMU extension cannot filter a counter by
+///     privilege mode, so a user reader's counts would include the kernel's
+///     execution.
+pub const BOOT_PROTOCOL_VERSION: u32 = 26;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -658,7 +663,8 @@ pub struct KernelMmio
     /// ISA-capability bits the bootloader positively confirmed on every
     /// enabled hart (bit 0 = [`HART_CAP_SSTC`], bit 1 = [`HART_CAP_SVPBMT`],
     /// bit 2 = [`HART_CAP_SVINVAL`], bit 3 = [`HART_CAP_SVNAPOT`], bit 4 =
-    /// [`HART_CAP_SSAIA`], bit 5 = [`HART_CAP_ZAWRS`]). Each firmware source
+    /// [`HART_CAP_SSAIA`], bit 5 = [`HART_CAP_ZAWRS`], bit 6 =
+    /// [`HART_CAP_SSCOFPMF`]). Each firmware source
     /// ORs in the bits it can confirm; zero means undiscovered or absent.
     pub hart_caps: u64,
     /// The supervisor-level APLIC domain, from the first ACPI MADT APLIC
@@ -706,6 +712,11 @@ pub const HART_CAP_SSAIA: u64 = 1 << 4;
 /// riscv64 `hart_caps` bit 5: every enabled hart implements Zawrs (the
 /// wait-on-reservation-set instructions `WRS.NTO` and `WRS.STO`).
 pub const HART_CAP_ZAWRS: u64 = 1 << 5;
+
+/// riscv64 `hart_caps` bit 6: every enabled hart implements Sscofpmf (the
+/// counter overflow and privilege-mode filtering extension: `scountovf`, and
+/// the mode-inhibit and overflow bits of `mhpmevent`).
+pub const HART_CAP_SSCOFPMF: u64 = 1 << 6;
 
 // `AplicDomain` and `ImsicLayout` are not gated on `target_arch = "riscv64"`
 // for the reason the `HART_CAP_*` constants are not: the arch-neutral firmware

@@ -16,8 +16,8 @@
 #[cfg(not(test))]
 use pmu::riscv::{
     CFG_CLEAR_VALUE, Counter, CounterInfo, EXT_PMU, FID_COUNTER_CONFIG_MATCHING,
-    FID_COUNTER_GET_INFO, FID_COUNTER_STOP, FID_NUM_COUNTERS, Layout, STOP_RESET, config_flags,
-    event_index,
+    FID_COUNTER_GET_INFO, FID_COUNTER_STOP, FID_NUM_COUNTERS, Layout, STOP_RESET, claimed_index,
+    config_flags, event_index,
 };
 #[cfg(not(test))]
 use pmu::{EventList, Info, PmuEvent, PmuMode};
@@ -81,7 +81,9 @@ fn counter_info(index: u64) -> Option<CounterInfo>
 }
 
 /// Claim a counter among `mask` for SBI event `event` with `flags`: its SBI
-/// index, or `None` where no counter of `mask` counts it.
+/// index, or `None` where no counter of `mask` counts it. A counter outside
+/// `mask` that the firmware answers with (`OpenSBI`'s fixed `cycle` or
+/// `instret`) is no claim, and is left as it is (`claimed_index`).
 #[cfg(not(test))]
 fn config_matching(mask: u64, flags: u64, event: u64) -> Option<u64>
 {
@@ -90,7 +92,11 @@ fn config_matching(mask: u64, flags: u64, event: u64) -> Option<u64>
         FID_COUNTER_CONFIG_MATCHING,
         [0, mask, flags, event, 0],
     );
-    (ret.error == 0 && ret.value < MAX_INDICES as u64).then_some(ret.value)
+    if ret.error != 0
+    {
+        return None;
+    }
+    claimed_index(mask, ret.value)
 }
 
 /// Stop and release every counter of `mask` (SBI indices).
@@ -109,14 +115,21 @@ fn release(mask: u64)
 }
 
 /// Describe this hart's counters into `state`: the user counters, their
-/// width and the events they count, probed one by one. `Info::NONE` where the
-/// firmware has no PMU extension or leaves no user counter.
+/// width and the events they count, probed one by one. `Info::NONE` where a
+/// hart lacks Sscofpmf (`boot_protocol::HART_CAP_SSCOFPMF`), without which
+/// the firmware cannot filter a counter by privilege mode and a user reader's
+/// counts would include the kernel's execution, or where the firmware has no
+/// PMU extension or leaves no user counter.
 ///
 /// # Safety
 /// S-mode on the hart being initialised, with interrupts disabled.
 #[cfg(not(test))]
 pub unsafe fn init(state: &mut ArchPmu) -> Info
 {
+    if crate::platform::kernel_mmio().hart_caps & boot_protocol::HART_CAP_SSCOFPMF == 0
+    {
+        return Info::NONE;
+    }
     let probe = sbi_call(SBI_EXT_BASE, SBI_PROBE_EXTENSION, EXT_PMU, 0, 0);
     if probe.error != 0 || probe.value == 0
     {

@@ -1074,9 +1074,9 @@ pub unsafe fn configure(
     handles: &mut [u8],
 ) -> Result<(), SyscallError>;
 
-/// Set or clear, on the calling CPU, the control that lets user mode read the configured
-/// counters (x86-64 `CR4.PCE`; riscv64 the counters' bits in `scounteren`), for the thread
-/// about to run: `reader` is whether it holds the grant of `SYS_PMU_BIND`.
+/// Set or clear, on the calling CPU, the control that lets user mode read counters (x86-64
+/// `CR4.PCE`, every counter `RDPMC` names; riscv64 the configured counters' bits in `scounteren`),
+/// for the thread about to run: `reader` is whether it holds the grant of `SYS_PMU_BIND`.
 pub unsafe fn apply_grant(state: &ArchPmu, reader: bool);
 
 impl ArchPmu

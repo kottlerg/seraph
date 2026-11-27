@@ -23,7 +23,8 @@ in `SYS_PMU_CONFIGURE`. No lock guards it.
 The description is taken on each CPU, by that CPU, at its bring-up (`perfmon::init_this_cpu`:
 the boot CPU in Phase 5, each AP in its entry; [initialization.md](initialization.md)), because a
 hybrid part's core types differ in what they count. Bring-up leaves every user counter stopped
-at zero and no grant in effect. The boot CPU logs the description,
+at zero and no grant in effect. A riscv64 hart whose `hart_caps` lacks `HART_CAP_SSCOFPMF`
+describes no counters. The boot CPU logs the description,
 `pmu: counters=<n> width=<bits> events=<mask>`, or `pmu: no counters`.
 
 ---
@@ -50,7 +51,13 @@ with PerfMonV2) are set at bring-up and left set. On riscv64 the firmware owns t
 (`mhpmevent`): a counter is claimed with `sbi_pmu_counter_config_matching`, over the free user
 counters with `CLEAR_VALUE`, `AUTO_START` and the mode's inhibit flags, and released with
 `sbi_pmu_counter_stop` and its reset flag. The events a hart counts are probed once at bring-up,
-by claiming and releasing a counter for each.
+by claiming and releasing a counter for each. Counters are offered only when every hart has
+Sscofpmf: without it the SBI PMU extension cannot filter a counter by privilege mode (OpenSBI
+accepts and ignores the inhibit flags), so a user reader's counts would include the kernel's
+execution, a disclosure channel, and the kernel reports no counters. Sscofpmf also gives the
+overflow interrupt the kernel's reserved counter needs. A counter the firmware answers outside the
+offered set (OpenSBI returns the fixed cycle or instret counter for those events) is no claim
+(`pmu::riscv::claimed_index`).
 
 A configuration replaces the CPU's previous one, whoever made it: its counters are stopped at
 zero (released, on riscv64) before the new events are programmed. A configuration of no events
@@ -68,7 +75,8 @@ thread reads them only while it holds the grant, its `ThreadControlBlock::pmu_re
 grants no thread, so there a bound thread's read faults as an unbound one's. The grant is written
 to the CPU as:
 
-- x86-64: `CR4.PCE`, set for a reader and clear otherwise. `cpu::enable_smep_smap` clears it
+- x86-64: `CR4.PCE`, all-or-nothing, set for a reader and clear otherwise; a reader can `RDPMC`
+  every counter `RDPMC` names, not only the configured ones. `cpu::enable_smep_smap` clears it
   with the other denied user controls on every CPU, so each starts from no grant.
 - riscv64: `scounteren`, `interrupts::USER_COUNTERS` (`cycle` alone) for every thread, with the
   bits of the CPU's configured counters added for a reader.

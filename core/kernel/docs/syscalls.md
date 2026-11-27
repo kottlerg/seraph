@@ -4162,8 +4162,11 @@ no counter for an event the CPU reports, which leaves the CPU with none ([perfmo
 
 ### `SYS_PMU_BIND` (81)
 
-Grant or revoke a thread's direct user-mode reads of the configured counters of the CPU it runs
-on.
+Grant or revoke a thread's direct user-mode reads of the counters of the CPU it runs on. On
+x86-64 the grant is `CR4.PCE`, all-or-nothing: a bound thread can `RDPMC` every counter `RDPMC`
+names, the fixed counters, the kernel's reserved counter and, on AMD, the Data Fabric and L3
+counters included, not only the configured ones; riscv64 grants the configured counters'
+`scounteren` bits alone.
 
 **Arguments:**
 
@@ -4303,7 +4306,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `KLOG_READ_MAX` | 16384 | Most bytes one `SYS_KERNEL_LOG_READ` writes |
 | `KLOG_STALL_MS` | 1000 | Milliseconds an attached kernel log reader may leave a record unread, measured from its append or from the reader's last read of a new record when that came later, before the kernel writes its lines directly |
 | `PMU_CONFIGURE_MAX` | 8 | Most events one `SYS_PMU_CONFIGURE` takes |
-| `BOOT_PROTOCOL_VERSION` | 25 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 26 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
 [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs) crates, which are the

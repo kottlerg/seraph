@@ -221,10 +221,46 @@ pub const fn config_flags(mode: PmuMode) -> u64
     flags
 }
 
+/// The counter `sbi_pmu_counter_config_matching` claimed, from its returned
+/// `index`, when that index is one of `mask`, the counters the call offered:
+/// `None` for any other. The SBI specification has the firmware pick from
+/// the offered set, but `OpenSBI` hands back the fixed `cycle` or `instret`
+/// counter for those events whatever the set, which a configuration must
+/// never take or release.
+#[must_use]
+pub const fn claimed_index(mask: u64, index: u64) -> Option<u64>
+{
+    if index < 64 && mask & (1 << index) != 0
+    {
+        Some(index)
+    }
+    else
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    // Defect guarded: a claim of a counter outside the offered set (`OpenSBI`'s
+    // fixed `cycle` or `instret`) taken as a user counter, whose release
+    // would stop it under every thread.
+    #[test]
+    fn claimed_index_accepts_only_an_offered_counter()
+    {
+        let mask = 0b1111_1000;
+        assert_eq!(claimed_index(mask, 3), Some(3));
+        assert_eq!(claimed_index(mask, 7), Some(7));
+        assert_eq!(claimed_index(mask, 0), None);
+        assert_eq!(claimed_index(mask, 2), None);
+        assert_eq!(claimed_index(mask, 8), None);
+        assert_eq!(claimed_index(u64::MAX, 63), Some(63));
+        assert_eq!(claimed_index(u64::MAX, 64), None);
+        assert_eq!(claimed_index(u64::MAX, u64::MAX), None);
+    }
 
     fn hw(index: u8, offset: u16, width: u8) -> Counter
     {

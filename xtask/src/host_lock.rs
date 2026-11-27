@@ -9,8 +9,9 @@
 //! and before a build compiles, the command takes the host lock, reads the
 //! host's state (the live holders, the QEMUs running, the exclusive grant,
 //! the 1-minute load average), and decides with [`decide`] whether the rules
-//! admit it. An admitted boot registers a holder record that stays locked
-//! for as long as the command, and every QEMU it starts, runs.
+//! admit it. An admitted command registers a holder record that stays locked
+//! for as long as it runs: a build's for the command's life, a boot's for as
+//! long as the command and every QEMU it starts run.
 //!
 //! The lock directory is `seraph-host/` in the checkout's git common
 //! directory, so every worktree of the checkout reads the same holders
@@ -19,12 +20,15 @@
 //! - `admission.lock`: held exclusively for the length of one admission, so
 //!   two commands started at the same moment decide one after the other and
 //!   the second sees the first's record.
-//! - `holders/<pid>-<nanos>.json`: one record per admitted boot, held under an
-//!   exclusive file lock by the command and, through an inherited descriptor,
-//!   by its QEMUs. A record whose lock can be taken belongs to no live
-//!   process; an admission removes it.
+//! - `holders/<pid>-<nanos>.json`: one record per admitted command, held
+//!   under an exclusive file lock by the command and, through an inherited
+//!   descriptor, by a boot's QEMUs. A record whose lock can be taken belongs
+//!   to no live process; an admission removes it.
 //! - `grant.json`: the exclusive grant, written by `cargo xtask orch grant
-//!   set` and removed by `orch grant clear` and `orch end`.
+//!   set` and removed by `orch grant clear` and `orch end`. Any grant holds
+//!   every boot not under it; a timing grant holds every build not under it
+//!   too, and `orch grant set --timing` waits for the host to be quiet
+//!   ([`wait_quiet`]).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -55,8 +59,13 @@ pub const SMALL_BOOT_VCPUS_MAX: u32 = 4;
 /// The most QEMUs of small boots that run side by side.
 pub const SMALL_BOOTS_MAX: u32 = 3;
 
-/// How often a command started with `--wait-host` asks again.
-const WAIT_POLL: Duration = Duration::from_secs(10);
+/// How often a command started with `--wait-host` asks again, and
+/// `orch grant set --timing` reads whether the host is quiet.
+pub const WAIT_POLL: Duration = Duration::from_secs(10);
+
+/// The most ancestors [`process_lineage`] walks: a bound on a parent chain
+/// `/proc` reports in a loop, far above any real nesting.
+const LINEAGE_MAX: usize = 64;
 
 /// How often a host-lock wait reads whether Ctrl+C ended it: short enough
 /// that the wait ends at once to the user.
@@ -92,8 +101,16 @@ pub enum BootMode
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request
 {
-    /// A build: compiles, starts no QEMU.
-    Build,
+    /// A build: compiles, starts no QEMU. `grant` names the timing grant it
+    /// runs under; `lineage` is the asking process and its ancestors
+    /// ([`process_lineage`]), so a build that a command already admitted
+    /// starts (`compare-images`'s nested builds) is not held by a timing
+    /// grant set after that command was admitted.
+    Build
+    {
+        grant: Option<String>,
+        lineage: Vec<u32>,
+    },
     /// A boot of `qemus` QEMUs side by side, each with `vcpus` vCPUs, under
     /// the grant of `grant` when it names one.
     Boot
@@ -118,6 +135,29 @@ pub struct Holder
     pub exclusive: bool,
     /// A timing-sensitive measurement.
     pub timing: bool,
+    /// A build, which starts no QEMU.
+    pub build: bool,
+    /// The grant the command passed (`--grant`), if any.
+    pub grant: Option<String>,
+}
+
+/// What an exclusive grant holds off the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantKind
+{
+    /// Every boot not under it.
+    Boots,
+    /// A timing grant: every boot and every build not under it.
+    Timing,
+}
+
+/// The exclusive grant, as `grant.json` states it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Grant
+{
+    /// The worker that holds it.
+    pub holder: String,
+    pub kind: GrantKind,
 }
 
 /// What the host's probes read at one moment.
@@ -176,8 +216,19 @@ fn check_load(load: Option<f64>, max: f64, name: &str, what: &str) -> Result<(),
 /// One line naming a holder.
 fn describe(holder: &Holder) -> String
 {
+    let under = holder
+        .grant
+        .as_deref()
+        .map_or_default(|grant| format!(", grant {grant}"));
+    if holder.build
+    {
+        return format!(
+            "pid {} (build{under}) in {}: {}",
+            holder.pid, holder.checkout, holder.command
+        );
+    }
     format!(
-        "pid {} ({} QEMU x {} vCPUs{}{}) in {}: {}",
+        "pid {} ({} QEMU x {} vCPUs{}{}{under}) in {}: {}",
         holder.pid,
         holder.qemus,
         holder.vcpus,
@@ -189,20 +240,35 @@ fn describe(holder: &Holder) -> String
 }
 
 /// Decide whether the rules admit `request`, given the live `holders`, the
-/// `probe`'s reading, and the holder of the exclusive grant, if any. The
-/// refusal names what is in the way: the holder, the count, or the load read
-/// and its limit.
+/// `probe`'s reading, and the exclusive grant, if any. The refusal names
+/// what is in the way: the holder, the count, or the load read and its limit.
 pub fn decide(
     request: &Request,
     holders: &[Holder],
     probe: &Probe,
-    grant: Option<&str>,
+    grant: Option<&Grant>,
 ) -> Result<(), String>
 {
     match request
     {
-        Request::Build =>
+        Request::Build {
+            grant: ours,
+            lineage,
+        } =>
         {
+            let admitted_ancestor = holders.iter().any(|h| lineage.contains(&h.pid));
+            if let Some(grant) = grant.filter(|g| {
+                g.kind == GrantKind::Timing
+                    && ours.as_deref() != Some(g.holder.as_str())
+                    && !admitted_ancestor
+            })
+            {
+                let holder = &grant.holder;
+                return Err(format!(
+                    "the timing grant is held by {holder}; a command under it passes --grant \
+                     {holder}"
+                ));
+            }
             if let Some(timing) = holders.iter().find(|h| h.timing)
             {
                 return Err(format!(
@@ -224,7 +290,7 @@ pub fn decide(
             ours.as_deref(),
             holders,
             probe,
-            grant,
+            grant.map(|g| g.holder.as_str()),
         ),
     }
 }
@@ -361,6 +427,41 @@ fn load_average() -> Option<f64>
     None
 }
 
+/// The parent's pid in the text of `/proc/<pid>/stat`: the second field after
+/// the command name, which is in parentheses and may itself hold spaces and
+/// parentheses, so the fields are read after the last `)`.
+fn parent_pid(stat: &str) -> Option<u32>
+{
+    let (_, fields) = stat.rsplit_once(')')?;
+    fields.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// This process and its ancestors, nearest first, as `/proc` reports them;
+/// this process alone where the host has no `/proc`.
+pub fn process_lineage() -> Vec<u32>
+{
+    let mut lineage = vec![std::process::id()];
+    while lineage.len() < LINEAGE_MAX
+    {
+        let Some(&pid) = lineage.last()
+        else
+        {
+            break;
+        };
+        let Some(parent) = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .as_deref()
+            .and_then(parent_pid)
+            .filter(|&parent| parent > 1 && !lineage.contains(&parent))
+        else
+        {
+            break;
+        };
+        lineage.push(parent);
+    }
+    lineage
+}
+
 /// Read the host's state now.
 pub fn probe_host() -> Probe
 {
@@ -410,8 +511,9 @@ pub fn git_common_dir(root: &Path) -> Option<PathBuf>
         .map(PathBuf::from)
 }
 
-/// The holder of the exclusive grant recorded in `dir`, if any.
-pub fn read_grant(dir: &Path) -> Result<Option<String>>
+/// The exclusive grant recorded in `dir`, if any. A grant written without
+/// the `timing` key is not a timing grant.
+pub fn read_grant(dir: &Path) -> Result<Option<Grant>>
 {
     let path = dir.join(GRANT_FILE);
     let raw = match fs::read_to_string(&path)
@@ -426,16 +528,32 @@ pub fn read_grant(dir: &Path) -> Result<Option<String>>
         .and_then(Value::as_str)
         .filter(|h| !h.is_empty())
         .with_context(|| format!("{} names no holder", path.display()))?;
-    Ok(Some(holder.to_owned()))
+    let kind = if value.get("timing").and_then(Value::as_bool) == Some(true)
+    {
+        GrantKind::Timing
+    }
+    else
+    {
+        GrantKind::Boots
+    };
+    Ok(Some(Grant {
+        holder: holder.to_owned(),
+        kind,
+    }))
 }
 
-/// Record the exclusive grant to `holder` for `commands` in `dir`.
-pub fn write_grant(dir: &Path, holder: &str, commands: &str) -> Result<()>
+/// Record the exclusive grant `grant` for `commands` in `dir`.
+pub fn write_grant(dir: &Path, grant: &Grant, commands: &str) -> Result<()>
 {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(GRANT_FILE);
     let temporary = dir.join(format!("{GRANT_FILE}.tmp"));
-    let body = json!({ "holder": holder, "commands": commands, "set": unix_secs() });
+    let body = json!({
+        "holder": grant.holder,
+        "timing": grant.kind == GrantKind::Timing,
+        "commands": commands,
+        "set": unix_secs(),
+    });
     fs::write(&temporary, format!("{body}\n"))
         .with_context(|| format!("writing {}", temporary.display()))?;
     fs::rename(&temporary, &path).with_context(|| format!("replacing {}", path.display()))
@@ -463,7 +581,9 @@ fn unix_secs() -> u64
 }
 
 /// A holder record's contents, from its JSON; `None` when it does not parse
-/// (a record being written, seen by a reader outside the admission lock).
+/// (a record being written, seen by a reader outside the admission lock). A
+/// record without the `build` and `grant` keys (an older xtask's) is a
+/// boot's under no grant.
 fn parse_holder(raw: &str) -> Option<Holder>
 {
     let value: Value = json::parse(raw).ok()?;
@@ -483,6 +603,8 @@ fn parse_holder(raw: &str) -> Option<Holder>
         qemus: number("qemus")?,
         exclusive: flag("exclusive")?,
         timing: flag("timing")?,
+        build: flag("build").unwrap_or(false),
+        grant: text("grant"),
     })
 }
 
@@ -561,6 +683,8 @@ fn live_holders(dir: &Path, dead: DeadRecords) -> Vec<Holder>
             qemus: 0,
             exclusive: true,
             timing: false,
+            build: false,
+            grant: None,
         }));
     }
     holders
@@ -600,7 +724,7 @@ pub struct Admission
 
 impl Admission
 {
-    /// An admission that holds nothing: a build, or a host check skipped.
+    /// An admission that holds nothing: a host check skipped.
     fn none() -> Self
     {
         Self { record: None }
@@ -676,14 +800,19 @@ impl From<crate::error::Error> for Attempt
 
 /// Write `request`'s holder record into `dir` and lock it: called under the
 /// admission lock, so no reader that removes dead records sees it unlocked.
+/// A build's record states no QEMU, so the boot rules count it as none; an
+/// older xtask reads it as a boot of no QEMU, which refuses nothing.
 fn register(dir: &Path, request: &Request, claim: &Claim) -> Result<Admission>
 {
-    let Request::Boot {
-        vcpus, qemus, mode, ..
-    } = request
-    else
+    let (vcpus, qemus, mode, grant, build) = match request
     {
-        return Ok(Admission::none());
+        Request::Build { grant, .. } => (0, 0, BootMode::Shared, grant, true),
+        Request::Boot {
+            vcpus,
+            qemus,
+            mode,
+            grant,
+        } => (*vcpus, *qemus, *mode, grant, false),
     };
     let holders = dir.join(HOLDERS_DIR);
     fs::create_dir_all(&holders).with_context(|| format!("creating {}", holders.display()))?;
@@ -705,8 +834,10 @@ fn register(dir: &Path, request: &Request, claim: &Claim) -> Result<Admission>
         "checkout": claim.checkout,
         "vcpus": vcpus,
         "qemus": qemus,
-        "exclusive": needs_host_alone(*vcpus, *qemus, *mode),
-        "timing": *mode == BootMode::Timing,
+        "exclusive": !build && needs_host_alone(vcpus, qemus, mode),
+        "timing": mode == BootMode::Timing,
+        "build": build,
+        "grant": grant,
         "override": claim.overridden == Override::Yes,
         "started": unix_secs(),
     });
@@ -714,6 +845,25 @@ fn register(dir: &Path, request: &Request, claim: &Claim) -> Result<Admission>
     Ok(Admission {
         record: Some((path, file)),
     })
+}
+
+/// Take the admission lock of `dir`, held until the returned file drops: an
+/// admission holds it from its read of the host to its record's lock, so a
+/// reader that holds it sees every admission either finished, its record
+/// locked, or not yet begun.
+fn admission_gate(dir: &Path) -> Result<File>
+{
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let gate_path = dir.join(ADMISSION_LOCK);
+    let gate = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&gate_path)
+        .with_context(|| format!("opening {}", gate_path.display()))?;
+    gate.lock()
+        .with_context(|| format!("locking {}", gate_path.display()))?;
+    Ok(gate)
 }
 
 /// One admission attempt in `dir`: under the admission lock, read the live
@@ -726,19 +876,10 @@ pub fn try_admit(
     probe: &dyn Fn() -> Probe,
 ) -> Result<Admission, Attempt>
 {
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let gate_path = dir.join(ADMISSION_LOCK);
-    let gate = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&gate_path)
-        .with_context(|| format!("opening {}", gate_path.display()))?;
-    gate.lock()
-        .with_context(|| format!("locking {}", gate_path.display()))?;
+    let _gate = admission_gate(dir)?;
     let holders = live_holders(dir, DeadRecords::Remove);
     let grant = read_grant(dir)?;
-    match decide(request, &holders, &probe(), grant.as_deref())
+    match decide(request, &holders, &probe(), grant.as_ref())
     {
         Ok(()) => Ok(register(dir, request, claim)?),
         Err(refusal) if claim.overridden == Override::Yes =>
@@ -864,11 +1005,18 @@ fn admit_command(ctx: &Context, host: &HostArgs, request: &Request) -> Result<Ad
     )
 }
 
-/// Admit a build (a command `CliCommand::build_host` names) on the host's load
-/// and its timing holders. Holds nothing once admitted.
-pub fn admit_build(ctx: &Context, host: &HostArgs) -> Result<()>
+/// Admit a build (a command `CliCommand::build_host` names, or a compile a
+/// booting command makes) on the host's load, its timing holders and a
+/// timing grant. The returned admission is held until the build ends; it is
+/// not shared with the processes the build starts, any of which may outlive
+/// it (a compiler cache's server).
+pub fn admit_build(ctx: &Context, host: &HostArgs) -> Result<Admission>
 {
-    admit_command(ctx, host, &Request::Build).map(drop)
+    let request = Request::Build {
+        grant: host.grant.clone(),
+        lineage: process_lineage(),
+    };
+    admit_command(ctx, host, &request)
 }
 
 /// Admit a boot of `qemus` QEMUs side by side, each of `vcpus` vCPUs, and
@@ -886,7 +1034,7 @@ pub fn admit_boot(ctx: &Context, host: &BootHostArgs, vcpus: u32, qemus: u32) ->
         vcpus,
         qemus,
         mode,
-        grant: host.grant.clone(),
+        grant: host.common.grant.clone(),
     };
     let admission = admit_command(ctx, &host.common, &request)?;
     admission.share_with_children()?;
@@ -910,7 +1058,11 @@ pub fn print_status(ctx: &Context) -> Result<()>
     }
     match read_grant(&dir)?
     {
-        Some(holder) => println!("exclusive grant: {holder}"),
+        Some(Grant {
+            holder,
+            kind: GrantKind::Timing,
+        }) => println!("exclusive grant: {holder} (timing: builds held too)"),
+        Some(Grant { holder, .. }) => println!("exclusive grant: {holder}"),
         None => println!("exclusive grant: none"),
     }
     let holders = live_holders(&dir, DeadRecords::Keep);
@@ -925,6 +1077,91 @@ pub fn print_status(ctx: &Context) -> Result<()>
         probe.qemus
     );
     Ok(())
+}
+
+/// What still holds the host for the grant of `holder`: every live holder in
+/// `dir` that does not run under that grant, and the QEMUs `probe` reads
+/// that no record names. Empty when the host is quiet.
+fn not_quiet(dir: &Path, holder: &str, probe: &Probe) -> Vec<String>
+{
+    let holders = live_holders(dir, DeadRecords::Keep);
+    let others = holders
+        .iter()
+        .filter(|h| h.grant.as_deref() != Some(holder));
+    let mut left: Vec<String> = others.into_iter().map(describe).collect();
+    let observed = u32::try_from(probe.qemus.len()).unwrap_or(u32::MAX);
+    let registered: u32 = holders.iter().map(|h| h.qemus).sum();
+    let unregistered = observed.saturating_sub(registered);
+    if unregistered > 0
+    {
+        left.push(format!("{unregistered} QEMU(s) that no record names"));
+    }
+    left
+}
+
+/// Wait until the host in `dir` is quiet for the grant of `holder`: no live
+/// holder that does not run under it, and no QEMU that no record names
+/// (`cargo xtask orch grant set --timing`). Reads every `poll`, `report`ing
+/// what still holds the host each time that changes, for at most `wait`; at
+/// the bound, or when `interrupted` reports Ctrl+C, it fails naming what still
+/// holds the host. Each read is made under the admission lock, so an admission
+/// that read the host before the grant was written is seen with its record,
+/// and every later one sees the grant.
+pub fn wait_quiet(
+    dir: &Path,
+    holder: &str,
+    wait: Duration,
+    poll: Duration,
+    probe: &dyn Fn() -> Probe,
+    interrupted: &dyn Fn() -> bool,
+    report: &mut dyn FnMut(&[String]),
+) -> Result<()>
+{
+    let started = Instant::now();
+    let mut last: Option<Vec<String>> = None;
+    loop
+    {
+        let left = {
+            let _gate = admission_gate(dir)?;
+            not_quiet(dir, holder, &probe())
+        };
+        if left.is_empty()
+        {
+            return Ok(());
+        }
+        if last.as_ref() != Some(&left)
+        {
+            report(&left);
+            last = Some(left.clone());
+        }
+        let waited = started.elapsed();
+        if waited >= wait
+        {
+            bail!(
+                "the host was not quiet within {} s; still holding it: {}",
+                wait.as_secs(),
+                left.join("; ")
+            );
+        }
+        let pause = poll.min(wait.saturating_sub(waited));
+        let paused = Instant::now();
+        loop
+        {
+            if interrupted()
+            {
+                bail!(
+                    "interrupted while waiting for the host to be quiet; still holding it: {}",
+                    left.join("; ")
+                );
+            }
+            let rest = pause.saturating_sub(paused.elapsed());
+            if rest.is_zero()
+            {
+                break;
+            }
+            std::thread::sleep(rest.min(INTERRUPT_SLICE));
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -955,6 +1192,24 @@ mod tests
             qemus,
             exclusive: needs_host_alone(vcpus, qemus, mode),
             timing: mode == BootMode::Timing,
+            build: false,
+            grant: None,
+        }
+    }
+
+    fn build() -> Request
+    {
+        Request::Build {
+            grant: None,
+            lineage: Vec::new(),
+        }
+    }
+
+    fn grant(holder: &str, kind: GrantKind) -> Grant
+    {
+        Grant {
+            holder: holder.into(),
+            kind,
         }
     }
 
@@ -1119,13 +1374,13 @@ mod tests
             "{refusal}"
         );
 
-        let refusal = decide(&Request::Build, &[], &loaded(32.5), None).unwrap_err();
+        let refusal = decide(&build(), &[], &loaded(32.5), None).unwrap_err();
         assert!(refusal.contains("32.50"), "{refusal}");
         assert!(
             refusal.contains("not under 32 (BUILD_LOAD_MAX)"),
             "{refusal}"
         );
-        decide(&Request::Build, &[], &loaded(31.0), None).unwrap();
+        decide(&build(), &[], &loaded(31.0), None).unwrap();
 
         // A host that reports no load is not refused on it.
         let unknown = Probe::default();
@@ -1139,30 +1394,37 @@ mod tests
             holder(4, 1, BootMode::Shared),
             holder(16, 1, BootMode::Shared),
         ];
-        decide(&Request::Build, &shared, &quiet(), None).unwrap();
-        decide(&Request::Build, &[], &quiet(), Some("W3")).unwrap();
+        decide(&build(), &shared, &quiet(), None).unwrap();
+        decide(
+            &build(),
+            &[],
+            &quiet(),
+            Some(&grant("W3", GrantKind::Boots)),
+        )
+        .unwrap();
         let timing = [holder(4, 1, BootMode::Timing)];
-        assert!(decide(&Request::Build, &timing, &quiet(), None).is_err());
+        assert!(decide(&build(), &timing, &quiet(), None).is_err());
     }
 
     #[test]
     fn under_a_grant_only_its_holders_boots_are_admitted()
     {
         let mut ours = boot(8, 1, BootMode::Shared);
-        let refusal = decide(&ours, &[], &quiet(), Some("W3")).unwrap_err();
+        let refusal =
+            decide(&ours, &[], &quiet(), Some(&grant("W3", GrantKind::Boots))).unwrap_err();
         assert!(refusal.contains("--grant W3"), "{refusal}");
         if let Request::Boot { grant, .. } = &mut ours
         {
             *grant = Some("W3".into());
         }
-        decide(&ours, &[], &quiet(), Some("W3")).unwrap();
+        decide(&ours, &[], &quiet(), Some(&grant("W3", GrantKind::Boots))).unwrap();
         // The holder's boots still meet the rules.
         assert!(
             decide(
                 &ours,
                 &[holder(1, 1, BootMode::Shared)],
                 &quiet(),
-                Some("W3")
+                Some(&grant("W3", GrantKind::Boots))
             )
             .is_err()
         );
@@ -1367,11 +1629,35 @@ mod tests
     {
         let dir = scratch("grant");
         assert_eq!(read_grant(&dir).unwrap(), None);
-        write_grant(&dir, "W3", "run --runs 1 --cpus 16").unwrap();
-        assert_eq!(read_grant(&dir).unwrap().as_deref(), Some("W3"));
+        write_grant(
+            &dir,
+            &grant("W3", GrantKind::Boots),
+            "run --runs 1 --cpus 16",
+        )
+        .unwrap();
+        assert_eq!(
+            read_grant(&dir).unwrap(),
+            Some(grant("W3", GrantKind::Boots))
+        );
+        write_grant(&dir, &grant("W4", GrantKind::Timing), "run --timing").unwrap();
+        assert_eq!(
+            read_grant(&dir).unwrap(),
+            Some(grant("W4", GrantKind::Timing))
+        );
         clear_grant(&dir).unwrap();
         assert_eq!(read_grant(&dir).unwrap(), None);
         clear_grant(&dir).unwrap();
+        // A grant an older xtask wrote, with no `timing` key, holds no build.
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(GRANT_FILE),
+            "{\"holder\":\"W5\",\"commands\":\"run\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_grant(&dir).unwrap(),
+            Some(grant("W5", GrantKind::Boots))
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1388,5 +1674,285 @@ mod tests
         assert!(holders[0].exclusive && holders[0].timing);
         drop(admitted);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn under_a_timing_grant_a_build_not_under_it_is_refused_naming_the_holder()
+    {
+        let timing = grant("W3", GrantKind::Timing);
+        let refusal = decide(&build(), &[], &quiet(), Some(&timing)).unwrap_err();
+        assert!(refusal.contains("timing grant is held by W3"), "{refusal}");
+        assert!(refusal.contains("--grant W3"), "{refusal}");
+        let other = Request::Build {
+            grant: Some("W4".into()),
+            lineage: Vec::new(),
+        };
+        assert!(decide(&other, &[], &quiet(), Some(&timing)).is_err());
+        // A grant that is not a timing grant leaves builds alone.
+        decide(
+            &build(),
+            &[],
+            &quiet(),
+            Some(&grant("W3", GrantKind::Boots)),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn under_a_timing_grant_the_holders_builds_and_boots_are_admitted()
+    {
+        let timing = grant("W3", GrantKind::Timing);
+        let ours = Request::Build {
+            grant: Some("W3".into()),
+            lineage: Vec::new(),
+        };
+        decide(&ours, &[], &quiet(), Some(&timing)).unwrap();
+        let boot_ours = Request::Boot {
+            vcpus: 16,
+            qemus: 1,
+            mode: BootMode::Timing,
+            grant: Some("W3".into()),
+        };
+        decide(&boot_ours, &[], &quiet(), Some(&timing)).unwrap();
+        assert!(decide(&boot(4, 1, BootMode::Shared), &[], &quiet(), Some(&timing)).is_err());
+    }
+
+    // Defect it catches: `compare-images`, admitted before a timing grant,
+    // runs nested builds; held by the grant, they would wait while the grant's
+    // quiet wait waits for `compare-images`, until one of them gave up.
+    #[test]
+    fn a_build_an_admitted_command_starts_is_not_held_by_a_timing_grant()
+    {
+        let timing = grant("W3", GrantKind::Timing);
+        let admitted = Holder {
+            pid: 4242,
+            build: true,
+            ..holder(0, 0, BootMode::Shared)
+        };
+        let nested = Request::Build {
+            grant: None,
+            lineage: vec![5151, 4300, 4242, 1000],
+        };
+        decide(
+            &nested,
+            std::slice::from_ref(&admitted),
+            &quiet(),
+            Some(&timing),
+        )
+        .unwrap();
+        let unrelated = Request::Build {
+            grant: None,
+            lineage: vec![5151, 1000],
+        };
+        assert!(decide(&unrelated, &[admitted], &quiet(), Some(&timing)).is_err());
+    }
+
+    #[test]
+    fn a_build_waits_for_a_timing_grant_to_end()
+    {
+        let dir = scratch("timing-build");
+        write_grant(&dir, &grant("W3", GrantKind::Timing), "run --timing").unwrap();
+        let err = admit(
+            &dir,
+            &build(),
+            &claim(),
+            None,
+            Duration::ZERO,
+            &|| quiet(),
+            &|| false,
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("timing grant is held by W3"), "{text}");
+        let clearer = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                clear_grant(&dir).unwrap();
+            })
+        };
+        let admitted = admit(
+            &dir,
+            &build(),
+            &claim(),
+            Some(Duration::from_secs(10)),
+            Duration::from_millis(20),
+            &|| quiet(),
+            &|| false,
+        );
+        clearer.join().unwrap();
+        assert!(admitted.unwrap().record_path().is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_boot_waits_for_a_timing_grant_to_end()
+    {
+        let dir = scratch("timing-boot");
+        write_grant(&dir, &grant("W3", GrantKind::Timing), "run --timing").unwrap();
+        let small = boot(4, 1, BootMode::Shared);
+        assert!(matches!(
+            try_admit(&dir, &small, &claim(), &|| quiet()),
+            Err(Attempt::Refused(_))
+        ));
+        let clearer = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                clear_grant(&dir).unwrap();
+            })
+        };
+        let admitted = admit(
+            &dir,
+            &small,
+            &claim(),
+            Some(Duration::from_secs(10)),
+            Duration::from_millis(20),
+            &|| quiet(),
+            &|| false,
+        );
+        clearer.join().unwrap();
+        assert!(admitted.is_ok());
+        drop(admitted);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_timing_grant_set_while_a_command_runs_waits_until_it_ends()
+    {
+        let dir = scratch("quiet");
+        let running = try_admit(&dir, &build(), &claim(), &|| quiet()).unwrap();
+        write_grant(&dir, &grant("W3", GrantKind::Timing), "run --timing").unwrap();
+        // The holder's own boot, under the grant, does not keep the host busy.
+        let own = Request::Boot {
+            vcpus: 4,
+            qemus: 1,
+            mode: BootMode::Shared,
+            grant: Some("W3".into()),
+        };
+        let own = try_admit(&dir, &own, &claim(), &|| quiet()).unwrap();
+        let mut reported = Vec::new();
+        let err = wait_quiet(
+            &dir,
+            "W3",
+            Duration::from_millis(200),
+            Duration::from_millis(20),
+            &|| quiet(),
+            &|| false,
+            &mut |left| reported.push(left.to_vec()),
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("(build) in /w: test"), "{text}");
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(reported[0].len(), 1, "{reported:?}");
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(running);
+        });
+        wait_quiet(
+            &dir,
+            "W3",
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+            &|| quiet(),
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        releaser.join().unwrap();
+        // A QEMU no record names keeps the host busy too.
+        let unregistered = Probe {
+            load: Some(1.0),
+            qemus: vec![4, 2],
+        };
+        let err = wait_quiet(
+            &dir,
+            "W3",
+            Duration::ZERO,
+            Duration::ZERO,
+            &|| unregistered.clone(),
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("1 QEMU(s) that no record names"));
+        drop(own);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Defect caught: the quiet wait read the holders outside the admission
+    // lock, so an admission that had read no grant but not yet registered was
+    // missed, and the wait reported a quiet host the admission then loaded.
+    #[test]
+    fn the_quiet_wait_sees_an_admission_in_progress_when_the_grant_is_set()
+    {
+        let dir = scratch("quiet-race");
+        let deciding = Arc::new(Barrier::new(2));
+        let admitting = {
+            let dir = dir.clone();
+            let deciding = Arc::clone(&deciding);
+            std::thread::spawn(move || {
+                // An admission between its decision and its record's lock.
+                let gate = admission_gate(&dir).unwrap();
+                deciding.wait();
+                std::thread::sleep(Duration::from_millis(100));
+                let admitted = register(&dir, &build(), &claim()).unwrap();
+                drop(gate);
+                std::thread::sleep(Duration::from_millis(300));
+                drop(admitted);
+            })
+        };
+        deciding.wait();
+        write_grant(&dir, &grant("W3", GrantKind::Timing), "run --timing").unwrap();
+        let err = wait_quiet(
+            &dir,
+            "W3",
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            &|| quiet(),
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("(build)"), "{err:#}");
+        admitting.join().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_build_record_round_trips_and_an_older_record_reads_as_a_boot()
+    {
+        let dir = scratch("build-record");
+        let ours = Request::Build {
+            grant: Some("W3".into()),
+            lineage: Vec::new(),
+        };
+        let admitted = try_admit(&dir, &ours, &claim(), &|| quiet()).unwrap();
+        let holders = live_holders(&dir, DeadRecords::Keep);
+        assert_eq!(holders.len(), 1);
+        assert!(holders[0].build && !holders[0].exclusive);
+        assert_eq!((holders[0].vcpus, holders[0].qemus), (0, 0));
+        assert_eq!(holders[0].grant.as_deref(), Some("W3"));
+        drop(admitted);
+        fs::remove_dir_all(&dir).unwrap();
+
+        let older = r#"{"pid":7,"command":"run","checkout":"/w","vcpus":4,"qemus":1,"exclusive":false,"timing":false}"#;
+        let parsed = parse_holder(older).unwrap();
+        assert!(!parsed.build);
+        assert_eq!(parsed.grant, None);
+    }
+
+    #[test]
+    fn the_parent_pid_is_read_after_the_last_parenthesis_of_the_name()
+    {
+        assert_eq!(parent_pid("1234 (cargo) S 77 1234 1234 0"), Some(77));
+        assert_eq!(parent_pid("1234 (a) b (c)) R 88 1 1 0"), Some(88));
+        assert_eq!(parent_pid("1234 (truncated"), None);
+        let lineage = process_lineage();
+        assert_eq!(lineage.first(), Some(&std::process::id()));
+        #[cfg(target_os = "linux")]
+        assert_eq!(lineage.get(1), Some(&std::os::unix::process::parent_id()));
     }
 }

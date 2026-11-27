@@ -403,7 +403,8 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
             | CapType::SchedControl
             | CapType::SbiControl
             | CapType::EntropyControl
-            | CapType::KernelLog =>
+            | CapType::KernelLog
+            | CapType::PmuControl =>
             {}
         }
     }

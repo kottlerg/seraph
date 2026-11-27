@@ -170,6 +170,11 @@ Each feature is classified per architecture as one of:
   decision, its reason and its cost against Intel's advice are in
   [core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md)
   § Data-operand-independent timing.
+- **Performance counters** — the user performance counters of a `PmuControl` holder
+  ([core/kernel/docs/perfmon.md](../core/kernel/docs/perfmon.md)): Intel architectural performance
+  monitoring (CPUID leaf 0AH, version 1 or later) and AMD core counters (family 17h and later,
+  CPUID `80000001H` ECX[23]). Without them `SYS_PMU_INFO` answers `NotSupported` and the kernel
+  logs `pmu: no counters`; nothing else depends on them.
 - **EFI_RNG_PROTOCOL** — an additional boot entropy seed.
 - **TPM 2.0** — a hardware random number generator independent of RDSEED and RDRAND: when the
   firmware reports a TPM 2.0 in the ACPI `TPM2` table on the FIFO interface or on the CRB
@@ -307,6 +312,17 @@ Each feature is classified per architecture as one of:
   boot seed; used where the hart implements `Zkr` and the M-mode firmware grants S-mode the CSR
   (`mseccfg.SSEED`, which OpenSBI sets on such a hart), which the kernel learns by probing the
   CSR (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
+- **SBI PMU extension and Sscofpmf** — the user performance counters of a
+  `PmuControl` holder ([core/kernel/docs/perfmon.md](../core/kernel/docs/perfmon.md)): the SBI PMU
+  extension with at least one programmable hardware counter, and Sscofpmf with its overflow
+  interrupt (`LCOFI`) delegated to S-mode, which each hart probes for itself by writing
+  `sie.LCOFIE` and reading it back. Without Sscofpmf the SBI PMU extension cannot filter a
+  counter by privilege mode, so a user reader's counts would include the kernel's execution. A
+  hart that lacks the extension, Sscofpmf or the delegation has no user counters: `SYS_PMU_INFO`
+  answers `NotSupported` on that CPU (each CPU reports its own description), and where it is
+  the boot CPU the kernel logs `pmu: no counters`; nothing else depends on it. Under emulation
+  the CPU model must enable Sscofpmf (`sscofpmf=on`, [build-system.md](build-system.md) § QEMU
+  and Firmware), with which QEMU describes the events of its programmable counters.
 - **Goldfish RTC** — the wall clock: when the platform describes one, the `goldfish-rtc` driver
   answers `timed`'s wall-time reads ([services/drivers/README.md](../services/drivers/README.md)
   § Existing Drivers). It is not a boot dependency: without one, wall-time reads fail and the

@@ -2969,6 +2969,7 @@ fn idle_tcb(cpu: usize, stack_top: u64) -> ThreadControlBlock
         run_limit: core::sync::atomic::AtomicU32::new(0),
         run_count: core::sync::atomic::AtomicU32::new(0),
         run_limit_pending: core::sync::atomic::AtomicBool::new(false),
+        pmu_reader: core::sync::atomic::AtomicBool::new(false),
         is_user: false,
         saved_state: idle_saved_state(cpu, stack_top),
         kernel_stack_top: stack_top,
@@ -8097,7 +8098,9 @@ unsafe fn set_running(sched: &PerCpuScheduler, tcb: *mut ThreadControlBlock)
 /// the CPU it ran on before, so every dispatch reads the pending upcall here,
 /// under the `sched_lock` the post writes under: the post either sees
 /// `Running` and this CPU in `preferred_cpu`, or is seen here
-/// (core/kernel/docs/scheduling-internals.md § Return Work).
+/// (core/kernel/docs/scheduling-internals.md § Return Work). A user thread's
+/// counter-read grant is applied here for the same reason
+/// (`perfmon::switch_in`).
 ///
 /// Clearing `wake_pending` is defensive: the `Running` coalesce that sets it
 /// is reached by the dying-server reply-bound wake in `dealloc_object(Thread)`,
@@ -8144,6 +8147,18 @@ unsafe fn mark_dispatched(
         // SAFETY: this CPU's per-CPU pointer is installed and interrupts are
         // disabled (contract).
         unsafe { crate::percpu::post_return_work(upcall) };
+    }
+    // A user thread's counter-read grant takes effect on this CPU, read under
+    // the held sched_lock that `perfmon::bind` stores it under. A CPU with no
+    // user configuration grants none, so its test is one per-CPU load.
+    // SAFETY: this CPU's per-CPU pointer is installed and interrupts are
+    // disabled (contract).
+    if unsafe { crate::perfmon::armed() }
+    {
+        // SAFETY: tcb is a valid TCB whose sched_lock this CPU holds; this
+        // CPU's per-CPU pointer is installed and interrupts are disabled
+        // (contract).
+        unsafe { crate::perfmon::switch_in(tcb) };
     }
     marked
 }
@@ -9594,7 +9609,8 @@ pub unsafe fn interrupt_return_work(deliver: impl FnMut())
 }
 
 /// [`interrupt_return_work`]'s out-of-line path: take this CPU's
-/// `AT_INTERRUPT` bits, then a sole-reference pass, `deliver` and the
+/// `AT_INTERRUPT` bits, then the counter-read grant when its bit was set
+/// (`perfmon::sync_grant`), a sole-reference pass, `deliver` and the
 /// preemption decision, each deciding from its own state; again on the CPU the
 /// thread returns on after a reschedule, while its bits are set
 /// ([`run_return_work`]).
@@ -9611,7 +9627,13 @@ unsafe fn interrupt_return_slow(mut deliver: impl FnMut())
         // SAFETY: a return to user mode with interrupts disabled (contract),
         // on the CPU the thread runs on at each take.
         || unsafe { crate::percpu::take_return_work(AT_INTERRUPT) },
-        |_| {
+        |work| {
+            if work & crate::percpu::return_work::PMU_GRANT != 0
+            {
+                // SAFETY: a return to user mode with interrupts disabled and
+                // no lock held (contract).
+                unsafe { crate::perfmon::sync_grant() };
+            }
             // A pass of the sole-reference posts this CPU marked, an earlier
             // pass on it left, or a tick found pending on any CPU, so a CPU
             // that runs only user code still makes a pass of at most
@@ -9632,7 +9654,8 @@ unsafe fn interrupt_return_slow(mut deliver: impl FnMut())
 
 /// The end of an exception taken from user mode, which is no upcall delivery
 /// point: the one-load test of `percpu::return_work::AT_EXCEPTION`, the
-/// preemption decision when it is set, and, only for a thread that decision
+/// counter-read grant when its bit is set (`perfmon::sync_grant`), the
+/// preemption decision when either is, and, only for a thread that decision
 /// rescheduled, [`interrupt_return_work`] with `deliver`, the interrupt
 /// delivery point, as for a thread an interrupt preempted
 /// (docs/fault-handling.md § Delivery points).
@@ -9667,9 +9690,15 @@ pub unsafe fn exception_return_work(deliver: impl FnMut())
 #[inline(never)]
 unsafe fn exception_return_slow(deliver: impl FnMut())
 {
-    use crate::percpu::return_work::AT_EXCEPTION;
+    use crate::percpu::return_work::{AT_EXCEPTION, PMU_GRANT};
     // SAFETY: a return to user mode with interrupts disabled (contract).
-    let _ = unsafe { crate::percpu::take_return_work(AT_EXCEPTION) };
+    let work = unsafe { crate::percpu::take_return_work(AT_EXCEPTION) };
+    if work & PMU_GRANT != 0
+    {
+        // SAFETY: a return to user mode with interrupts disabled and no lock
+        // held (contract).
+        unsafe { crate::perfmon::sync_grant() };
+    }
     // SAFETY: the caller's contract is preempt_if_outranked's.
     if unsafe { preempt_if_outranked() }
     {

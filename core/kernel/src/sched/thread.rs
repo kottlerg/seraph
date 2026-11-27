@@ -1177,6 +1177,16 @@ pub struct ThreadControlBlock
     /// under [`sched_lock`](Self::sched_lock) while the thread is `Running`.
     pub run_limit_pending: core::sync::atomic::AtomicBool,
 
+    // === Performance counters ===
+    /// User mode reads its CPU's performance counters directly while the
+    /// thread runs (`SYS_PMU_BIND`; core/kernel/docs/perfmon.md). Written by
+    /// `perfmon::bind` under [`sched_lock`](Self::sched_lock); read by the
+    /// dispatch under that lock (`perfmon::switch_in`) and by the return to
+    /// user mode that takes the `PMU_GRANT` bit the bind posts
+    /// (`perfmon::sync_grant`). False from construction; a binding ends only
+    /// with a bind that clears it or with the thread.
+    pub pmu_reader: core::sync::atomic::AtomicBool,
+
     // === Context ===
     /// Whether this thread executes in user mode (ring 3 / U-mode). Immutable
     /// after construction (the Identity row).

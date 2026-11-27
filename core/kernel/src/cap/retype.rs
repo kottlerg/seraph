@@ -1470,7 +1470,8 @@ pub const fn event_queue_dispatch(capacity: u64, observers: u64) -> DispatchEntr
 ///
 /// Returns `None` for object types that cannot be retyped (`Memory` is
 /// retypable; `Mmio`/`Interrupt`/`IoPort`/`SchedControl`/
-/// `SbiControl`/`EntropyControl` are boot-minted only).
+/// `SbiControl`/`EntropyControl`/`KernelLog`/`PmuControl` are boot-minted
+/// only).
 pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEntry>
 {
     match object_type
@@ -1541,6 +1542,7 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
         | ObjectType::SbiControl
         | ObjectType::EntropyControl
         | ObjectType::KernelLog
+        | ObjectType::PmuControl
         | ObjectType::ArenaPage => None,
     }
 }
@@ -1870,6 +1872,8 @@ mod tests
         assert!(dispatch_for(ObjectType::SchedControl, 0).is_none());
         assert!(dispatch_for(ObjectType::SbiControl, 0).is_none());
         assert!(dispatch_for(ObjectType::EntropyControl, 0).is_none());
+        assert!(dispatch_for(ObjectType::KernelLog, 0).is_none());
+        assert!(dispatch_for(ObjectType::PmuControl, 0).is_none());
     }
 
     /// A Memory object over a zeroed host buffer of `pages` pages, every byte

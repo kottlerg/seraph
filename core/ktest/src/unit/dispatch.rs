@@ -13,7 +13,7 @@
 
 use syscall::raw_syscall3;
 use syscall_abi::{
-    KERNEL_VERSION, SYS_IPC_CALL, SYS_MEMORY_ZERO, SYS_SYSTEM_INFO, SYS_THREAD_YIELD,
+    KERNEL_VERSION, SYS_IPC_CALL, SYS_PMU_BIND, SYS_SYSTEM_INFO, SYS_THREAD_YIELD,
     SYSCALL_NR_BOUND, SyscallError, SystemInfoType,
 };
 
@@ -42,15 +42,13 @@ pub fn table_edges_reach_their_handlers(_ctx: &TestContext) -> TestResult
     {
         return Err("SYS_IPC_CALL on a slot no CSpace holds did not return InvalidCapability");
     }
-    if SYS_MEMORY_ZERO + 1 != SYSCALL_NR_BOUND
+    if SYS_PMU_BIND + 1 != SYSCALL_NR_BOUND
     {
-        return Err("SYS_MEMORY_ZERO is no longer the last syscall: update this test");
+        return Err("SYS_PMU_BIND is no longer the last syscall: update this test");
     }
-    // One page from page 0: past the zero-count refusal, so the lookup's
-    // refusal is the one returned.
-    if call(SYS_MEMORY_ZERO, NO_SLOT, 0, 1) != invalid
+    if call(SYS_PMU_BIND, NO_SLOT, NO_SLOT, 0) != invalid
     {
-        return Err("SYS_MEMORY_ZERO on a slot no CSpace holds did not return InvalidCapability");
+        return Err("SYS_PMU_BIND on slots no CSpace holds did not return InvalidCapability");
     }
     if call(SYS_THREAD_YIELD, 0, 0, 0) != 0
     {

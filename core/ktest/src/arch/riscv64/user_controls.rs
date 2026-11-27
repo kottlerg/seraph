@@ -6,7 +6,9 @@
 //! The riscv64 half of `integration::user_mode_controls`: the instructions
 //! U-mode is denied, and the fault each raises.
 //!
-//! The kernel writes `scounteren` whole with `CY` alone on every hart, so a
+//! The kernel writes `scounteren` whole with `CY` alone on every hart, for a
+//! thread `SYS_PMU_BIND` has not granted counter reads (ktest's children are
+//! never bound), so a
 //! U-mode read of `time`, `instret` or `hpmcounter3` raises an
 //! illegal-instruction exception, and `senvcfg` whole with no field set, so
 //! does a U-mode cache-block operation or read of `ssp`. A hart without

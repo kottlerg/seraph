@@ -6478,6 +6478,30 @@ fn empty_queue_victim(
     }
 }
 
+/// Where a busy CPU's `balance_cursor` moves after its empty-queue pull from
+/// `victim`, which `window` chose ([`empty_queue_victim`]), ended in
+/// `outcome`: past `victim` when the pull found nothing it could take there
+/// and the window is narrower than the other CPUs, so a CPU whose load stays
+/// past the threshold with only pinned or mid-handoff threads queued does not
+/// hold the scan on its window, and a heavier CPU after it in the window is
+/// read again at the next tick. `None` otherwise: the next tick reads the same
+/// window, which a boot the window does not narrow always does.
+fn balance_cursor_after_pull(
+    window: ScanWindow,
+    victim: usize,
+    outcome: PullOutcome,
+) -> Option<usize>
+{
+    if outcome == PullOutcome::NothingPullable && !window.covers_all()
+    {
+        Some(cpu_after(victim, window.cpu_count))
+    }
+    else
+    {
+        None
+    }
+}
+
 /// The most-loaded CPU of `window` by `load` and its load, or `None` when
 /// every CPU the window holds has a load of zero: one `load` per CPU of the
 /// window. Ties go to the first read.
@@ -6572,8 +6596,9 @@ impl IdlePullView for KernelCpus
 /// [`try_pull_idle`] instead. It clears this CPU's idle-pull candidate, then
 /// picks a victim by its own load (a pseudo-random one when its load is
 /// non-zero, otherwise the most-loaded one of the window from its
-/// `balance_cursor`, which a miss moves past the window) and pulls from it
-/// only past the imbalance threshold, through the try-lock-only
+/// `balance_cursor`, which a miss moves past the window and a pull that finds
+/// nothing pullable past the victim) and pulls from it only past the imbalance
+/// threshold, through the try-lock-only
 /// `pull_unpinned_ready` (#375). The modes, their rationale, and their hot-path cost are
 /// core/kernel/docs/scheduler.md § Load Balancing's.
 ///
@@ -6600,10 +6625,12 @@ unsafe fn try_pull_balance(this_cpu: usize)
     sched.forget_idle_pull_candidate();
     let my_load = sched.current_load();
 
+    let mut empty_queue_window = None;
     let victim = if my_load == 0
     {
         // Empty-queue scan: pick the heaviest CPU of this CPU's window.
         let window = ScanWindow::new(cpu_count, sched.balance_cursor(), Some(this_cpu));
+        empty_queue_window = Some(window);
         let load = |cpu: usize| {
             // SAFETY: the window holds only CPUs below cpu_count, which is
             // CPU_COUNT; slab initialised.
@@ -6650,7 +6677,12 @@ unsafe fn try_pull_balance(this_cpu: usize)
     };
 
     // SAFETY: victim, this_cpu are valid and distinct.
-    unsafe { pull_unpinned_ready(victim, this_cpu, PullRule::Imbalance) };
+    let outcome = unsafe { pull_unpinned_ready(victim, this_cpu, PullRule::Imbalance) };
+    if let Some(next) =
+        empty_queue_window.and_then(|window| balance_cursor_after_pull(window, victim, outcome))
+    {
+        sched.set_balance_cursor(next);
+    }
 }
 
 /// Test stub.
@@ -10355,8 +10387,9 @@ mod idle_pull_tests
 {
     use super::{
         Backlog, CPU_SCAN_WINDOW, IdlePullMemory, IdlePullStep, IdlePullView, IdleScan,
-        LOAD_BALANCE_IMBALANCE_THRESHOLD, MAX_CPUS, PullOutcome, PullRule, ScanWindow, cpu_after,
-        empty_queue_victim, exceeds_imbalance, idle_pull_step, idle_pull_tick, idle_scan,
+        LOAD_BALANCE_IMBALANCE_THRESHOLD, MAX_CPUS, PullOutcome, PullRule, ScanWindow,
+        balance_cursor_after_pull, cpu_after, empty_queue_victim, exceeds_imbalance,
+        idle_pull_step, idle_pull_tick, idle_scan, initial_scan_cursor,
     };
 
     /// A scan whose most-loaded CPU is `heaviest` and whose first CPU with a
@@ -11357,6 +11390,69 @@ mod idle_pull_tests
                     assert_eq!(found, Some(heavy), "n={count} cpu={this_cpu} from={start}");
                 }
             }
+        }
+    }
+    // The defect caught: a busy CPU whose empty-queue scan picks, at every
+    // tick, a CPU past the threshold with nothing pullable on it, its cursor
+    // kept on that window, so a pullable imbalance elsewhere is never found
+    // (balance_cursor_after_pull moves the cursor past such a victim); or a
+    // boot the window does not narrow storing a cursor it never stored.
+    #[test]
+    fn a_pinned_heavy_cpu_does_not_hide_a_pullable_imbalance_from_an_empty_busy_cpu()
+    {
+        let count = 3 * CPU_SCAN_WINDOW + 7;
+        let this_cpu = 0;
+        let pinned_load = LOAD_BALANCE_IMBALANCE_THRESHOLD + 2;
+        let pullable_load = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
+        // One tick per window, and one for the pinned CPU.
+        let bound = (count - 1).div_ceil(CPU_SCAN_WINDOW) + 1;
+        // The pullable CPU in a later window, after the pinned one in its
+        // window, and before it.
+        for (pinned, pullable) in [(5, 2 * CPU_SCAN_WINDOW), (5, 60), (60, 5)]
+        {
+            let mut cursor = initial_scan_cursor(this_cpu, count, Some(this_cpu));
+            let mut found = None;
+            for _ in 0..bound
+            {
+                let window = ScanWindow::new(count, cursor, Some(this_cpu));
+                let load = |cpu: usize| match cpu
+                {
+                    cpu if cpu == pinned => pinned_load,
+                    cpu if cpu == pullable => pullable_load,
+                    _ => 0,
+                };
+                match empty_queue_victim(window, load)
+                {
+                    Ok(cpu) if cpu == pullable =>
+                    {
+                        found = Some(cpu);
+                        break;
+                    }
+                    Ok(cpu) =>
+                    {
+                        let next =
+                            balance_cursor_after_pull(window, cpu, PullOutcome::NothingPullable);
+                        cursor = next.unwrap_or(cursor);
+                    }
+                    Err(moved) => cursor = moved.unwrap_or(cursor),
+                }
+            }
+            assert_eq!(found, Some(pullable), "pinned={pinned} pullable={pullable}");
+        }
+
+        let whole = ScanWindow::new(CPU_SCAN_WINDOW + 1, 0, Some(this_cpu));
+        assert_eq!(
+            balance_cursor_after_pull(whole, 5, PullOutcome::NothingPullable),
+            None
+        );
+        let narrow = ScanWindow::new(count, 0, Some(this_cpu));
+        for outcome in [
+            PullOutcome::Moved,
+            PullOutcome::RuleFailed,
+            PullOutcome::Deferred,
+        ]
+        {
+            assert_eq!(balance_cursor_after_pull(narrow, 5, outcome), None);
         }
     }
 }

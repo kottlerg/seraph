@@ -16,12 +16,13 @@
 //!   logd takes their lines, the log client waiting out each `WINDOW_FULL`
 //!   refusal's hint;
 //! - a resender, which sends each line again at once when logd refuses it
-//!   `WINDOW_FULL`, and must have been refused. Its lines are at critical,
-//!   which the framebuffer sink shows at its default level.
+//!   `WINDOW_FULL`, and must have been refused.
 //!
 //! On a boot with a framebuffer driver the phase also stops that driver for
-//! the flooded calls, so logd's `skip` framebuffer sink drops the
-//! resender's lines.
+//! the flooded calls: logd's `skip` framebuffer sink holds nobody, so the
+//! probe's times hold with it stopped. Its default level, critical, shows
+//! none of the flood's lines, so it drops none of them; the `logd_sinks`
+//! phase's framebuffer-stopped case checks its drops.
 //!
 //! The phase requires:
 //!
@@ -32,9 +33,7 @@
 //!   the resender's refusals at logd's state lock, whose waiter parks in
 //!   steps of a millisecond (`runtime/ruststd/spin-wait`);
 //! - no probe call refused: only the flooders' own lines are refused;
-//! - both children still flooding when the probe's last call returns;
-//! - on the framebuffer cell, logd's notice counting the lines its
-//!   framebuffer sink dropped once the driver runs again.
+//! - both children still flooding when the probe's last call returns.
 //!
 //! Each probe line is numbered, `log-flood t=0 n=<n> len=<len> <payload>`, and
 //! the end line names them all, so the boot's `cargo xtask run --whole-lines
@@ -45,7 +44,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ipc::IpcMessage;
-use ipc::stream_labels::{LEVEL_CRITICAL, LEVEL_INFO, STREAM_BYTES, WINDOW_FULL, level_bits};
+use ipc::stream_labels::{LEVEL_INFO, STREAM_BYTES, WINDOW_FULL, level_bits};
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -133,9 +132,7 @@ fn logd_flood_phase(caps: &Caps)
         .spawn()
         .expect("logd_flood: spawning the resender failed");
     std::thread::sleep(FLOOD_SETTLE);
-    let before = super::logd_sinks::newest_seq(caps.logd_query);
     let fb = stop_framebuffer(caps.debug_authority);
-    let fb_stopped = fb.is_some();
     let flooded = probe(PROBE_CALLS, FLOODED_GAP);
     let flooding =
         matches!(flood_child.try_wait(), Ok(None)) && matches!(resend_child.try_wait(), Ok(None));
@@ -203,13 +200,6 @@ fn logd_flood_phase(caps: &Caps)
         flooded_median.as_micros(),
         median.as_micros()
     );
-    if fb_stopped
-    {
-        let dropped = super::logd_sinks::await_fb_notice(caps.logd_query, before, "the flood");
-        std::os::seraph::log!(
-            "logd_flood: logd counted {dropped} lines its framebuffer sink dropped"
-        );
-    }
 }
 
 /// Stop every thread of the framebuffer driver, when the boot has one: its
@@ -317,8 +307,7 @@ fn flooder_main() -> !
 }
 
 /// The resender: for [`FLOOD_FOR`], raw `STREAM_BYTES` calls of numbered
-/// lines at critical, so the framebuffer sink owes them, each sent again at
-/// once while logd refuses it `WINDOW_FULL`. Exits
+/// lines, each sent again at once while logd refuses it `WINDOW_FULL`. Exits
 /// 0 once refused at least once, [`RESENDER_NEVER_REFUSED`] if never, 1 on a
 /// failed call.
 fn resender_main() -> !
@@ -333,7 +322,7 @@ fn resender_main() -> !
     while start_at.elapsed() < FLOOD_FOR
     {
         let line = format!("resend {sent}\n");
-        let label = STREAM_BYTES | ((line.len() as u64) << 16) | level_bits(LEVEL_CRITICAL);
+        let label = STREAM_BYTES | ((line.len() as u64) << 16) | level_bits(LEVEL_INFO);
         let msg = IpcMessage::builder(label).bytes(0, line.as_bytes()).build();
         loop
         {

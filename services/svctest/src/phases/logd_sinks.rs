@@ -400,22 +400,11 @@ fn retained_seq(query: u64, lines: &[Vec<u8>], case: &str) -> u64
     })
 }
 
-/// The `seq` of the newest entry of logd's history, read through `query`.
-pub(super) fn newest_seq(query: u64) -> u64
-{
-    let mut newest = 0;
-    super::procmgr::logd_history_each(query, None, |entry| {
-        newest = entry.seq;
-        false
-    });
-    newest
-}
-
 /// Wait until logd's history holds its notice counting lines its
 /// framebuffer sink dropped, retained after the entry `after`, within
 /// [`DEATH_TIMEOUT`]; `what` names the event that lets the sink's writer go
 /// on. The count it names.
-pub(super) fn await_fb_notice(query: u64, after: u64, what: &str) -> u64
+fn await_fb_notice(query: u64, after: u64, what: &str) -> u64
 {
     let start_at = Instant::now();
     loop

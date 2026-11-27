@@ -184,9 +184,11 @@ each in its format, and writes it to its output.
   write is older than `SINK_STALL_MS`; a stalled sink counts toward no window, so a stopped driver
   holds no sender.
 - Past the history's byte bound ([ipc-interface.md](ipc-interface.md) § History), the history
-  evicts an entry a `hold` sink has not written only when no written one is left. The per-slot
-  bound drops a slot's own oldest entry whatever the sinks have written, but for the kernel's slot
-  and logd's own, which no window paces: those keep the entries a `hold` sink has not written.
+  evicts an entry a `hold` sink shows and has not written only when no other is left. The per-slot
+  bound drops a slot's own oldest entry no `hold` sink shows and has not written, else its oldest,
+  so a sender's lines below every `hold` sink's level, which no window paces, do not push out its
+  own lines a sink has still to write; the kernel's slot and logd's own, which no window paces at
+  all, keep the entries a `hold` sink shows and has not written.
 - A `skip` sink holds no sender and keeps no entry: what the history evicts before it is read is
   counted as dropped.
 - A sink whose level is `off` takes part in none of the above, whatever its pace: it counts toward

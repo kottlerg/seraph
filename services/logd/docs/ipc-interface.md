@@ -352,18 +352,18 @@ retired slot's entries within a byte bound fixed when logd starts: the machine's
 RAM read from memmgr's `QUERY_POOL_STATUS` and the floor when memmgr does not answer
 (`Bounds::for_ram`). Each entry is charged its bytes, its field table, and its key and value in the
 history map. Retaining an entry past the bound drops the oldest entry no `hold` sink (serial by
-default) shows and has not written, or, when every entry is such, the oldest entry of the slot with
-the most entries, until the new one fits. A slot keeps at most its last `PER_SLOT_HISTORY_MIN` (32)
-entries, scaled by the byte bound's ratio to the floor, a further entry dropping its own oldest
-entry no `hold` sink shows and has not written, else its oldest, so one sender logging without pause
-does not push a quieter or a dead sender's last lines out alone, and a sender's lines below every
-`hold` sink's level, which no window paces, do not push out its own lines a sink has still to write.
-The kernel's slot and logd's own are the exception: no window paces them (§ Hold window), so a
-further entry of theirs drops their oldest entry no `hold` sink shows and has not written, and keeps
-the others, which the byte bound alone then limits. An entry dropped before a sink reached it is
-counted as that sink's drop. The bound holds whatever the number of senders, so a logd restarted
-while memory is critical, to which every live sender is new, holds no more history than any other
-([README](../README.md) § Role, Reserve service).
+default) shows and has not written, or, when a `hold` sink keeps every entry, the oldest entry of
+the slot with the most entries, until the new one fits. A slot keeps at most its last
+`PER_SLOT_HISTORY_MIN` (32) entries, scaled by the byte bound's ratio to the floor, a further entry
+dropping its own oldest entry no `hold` sink shows and has not written, else its oldest, so one
+sender logging without pause does not push a quieter or a dead sender's last lines out alone, and a
+sender's lines below every `hold` sink's level, which no window paces, do not push out its own lines
+a sink has still to write. The kernel's slot and logd's own are the exception: no window paces them
+(§ Hold window), so a further entry of theirs drops their oldest entry no `hold` sink shows and has
+not written, and keeps the others, which the byte bound alone then limits. An entry dropped before a
+sink reached it is counted as that sink's drop. The bound holds whatever the number of senders, so a
+logd restarted while memory is critical, to which every live sender is new, holds no more history
+than any other ([README](../README.md) § Role, Reserve service).
 
 ### Retired slots
 

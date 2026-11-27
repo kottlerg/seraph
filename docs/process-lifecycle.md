@@ -182,8 +182,8 @@ well-known names it owns into its own registry
 `GRANT`), `DEVMGR_REGISTRY`,
 `DEVMGR_SHUTDOWN`, `DEVMGR_BIND` (seed-only, a name whose seeds receive `SEND|GRANT`),
 `DEVMGR_ACPI`, the `DEVMGR_CLASS_PREFIX` class names, `VFSD_MOUNT`, `VFSD_DENY`, `VFSD_SWAP`,
-`MEMMGR_SWAP` (seed-only, its seeds keeping `GRANT`), `LOGD_QUERY`, minted from the endowed
-sources) and
+`MEMMGR_SWAP` (seed-only, its seeds keeping `GRANT`), `LOGD_QUERY`, `LOGD_FLUSH`, minted from the
+endowed sources) and
 installs devmgr's `/services/drivers/` cap via
 `devmgr_labels::SET_DRIVERS_DIR`.
 The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`, `acpid.power`, `acpid.deny`) are

@@ -288,7 +288,8 @@ pub struct SvcmgrCaps
     /// real-logd's master-log RECV from it on every (re)launch, and the
     /// one-shot `HANDOVER_PULL` SEND on the first launch and on a restart
     /// until procmgr reports init reaped, and publishes the
-    /// `LOG_QUERY_AUTHORITY` SEND minted from it as `logd.query`. Holding it
+    /// `LOG_QUERY_AUTHORITY` and `LOG_FLUSH_AUTHORITY` SENDs minted from it as
+    /// `logd.query` and `logd.flush`. Holding it
     /// keeps the log endpoint object alive across a logd crash. Zero if
     /// absent.
     pub master_log_source: u64,

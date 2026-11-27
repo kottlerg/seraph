@@ -661,6 +661,8 @@ name = "pwrmgr"
 version = "0.1.5"
 dependencies = [
  "ipc",
+ "log",
+ "logd-codec",
  "syscall",
  "syscall-abi",
 ]

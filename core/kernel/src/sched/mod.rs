@@ -6711,9 +6711,10 @@ fn rt_push_target(
 /// [`rt_push_target`] from the other CPUs' ranks, read lock-free from this
 /// CPU's `rt_push_cursor`, which a miss moves past the CPUs it read, and
 /// moves the thread through [`pull_unpinned_ready`] under
-/// [`PullRule::Waiting`], which decides again under both locks and sends the
-/// wake IPI that preempts at the target (core/kernel/docs/scheduler.md § Load
-/// Balancing, "RT push").
+/// [`PullRule::Waiting`], which decides again under both locks and wakes the
+/// target: the wake IPI that preempts at a target running a thread, or the
+/// clear of an idle target's idle wake flag (core/kernel/docs/scheduler.md
+/// § Load Balancing, "RT push").
 ///
 /// # Safety
 /// Called from `this_cpu`'s `timer_tick` with no scheduler lock held;

@@ -786,8 +786,10 @@ runs at once:
    rank, read under the target's. An empty window fails the rule (`PullOutcome::RuleFailed`), so a
    push never moves a thread that outranks its source's running thread, which runs there at the
    next return to user mode, nor one to a CPU whose ranks, read under its lock, it does not
-   outrank. The pull's wake IPI then
-   preempts at the target (§ Wake Preemption).
+   outrank. The pull's wake then
+   preempts at the target (§ Wake Preemption): the wake IPI to a target running a thread, or,
+   for an idle one waiting on its idle wake word, the clear of its flag, on which its idle loop
+   dispatches the thread (§ Idle Thread).
 
 The scan is a window so that the cost a push adds to the tick of the running thread, which is the
 higher RT thread the waiting one is queued behind, does not grow with the CPU count. A full scan
@@ -1171,7 +1173,7 @@ eligible CPU runs or queues such a thread, when hard affinity, the save-window p
 wake's guard places it, and when the levels its placement sampled went stale before its link (two
 wakes placed on one CPU at once). An unpinned thread so waiting, or one left waiting when another
 CPU's dispatch lowers that CPU's level, is moved by the RT push of the CPU it waits on (§ Load
-Balancing, "RT push") to a CPU whose running and queued threads it outranks, where the wake IPI
+Balancing, "RT push") to a CPU whose running and queued threads it outranks, where the pull's wake
 preempts as above: within one tick of the CPU it waits on in a boot of up to 129 CPUs, and within
 ceil((n - 1) / 128) such ticks in a boot of n CPUs above that (64 at the 8192 of `MAX_CPUS`). Each
 push that a contended try-lock defers, or that the re-check under the locks refuses (a thread linked
@@ -1376,8 +1378,8 @@ Otherwise, by target state:
   a preemption by an outranking thread (§ Wake Preemption), voluntary
   yield, or IPC block. The re-enqueue site in `schedule()`
   checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU —
-  linking the thread directly on the destination's run queue and IPIing
-  it — instead of doing a local enqueue
+  linking the thread directly on the destination's run queue and waking it (`wake_idle_cpu`: the
+  wake IPI, or the clear of its idle wake flag) — instead of doing a local enqueue
   (see [scheduling-internals.md](scheduling-internals.md) § ThreadState Transitions).
   Worst-case latency is therefore one time slice of the thread (its slice
   length × tick period: `TIME_SLICE_TICKS` for a thread dispatched at an

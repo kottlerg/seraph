@@ -4685,10 +4685,11 @@ fn unseal(l: &mut MemLedger, rec: NodeIdx, obj: NodeIdx)
 /// it ends.
 fn retire_objects(l: &mut MemLedger, answer: &mut Answer)
 {
-    if l.retiring_object().is_some()
+    if l.retiring_object().is_none()
     {
-        answer.flush(l);
+        return;
     }
+    answer.flush(l);
     let mut any = false;
     while let Some((obj, own_va, pages)) = l.retiring_object()
     {
@@ -5061,8 +5062,11 @@ struct Answer
 {
     reply: ipc::serve::Reply,
     undo: Option<Undo>,
-    /// The call a flush's receive bound, the next turn's request.
-    next: Option<IpcMessage>,
+    /// The call a flush's receive bound, the next turn's request, while
+    /// [`Self::bound`].
+    next: IpcMessage,
+    /// A flush's receive bound a call, held in [`Self::next`].
+    bound: bool,
     /// memmgr's service endpoint, on which every receive waits.
     ep: u64,
     /// memmgr's registered IPC buffer page ([`Self::new`]'s contract).
@@ -5082,7 +5086,8 @@ impl Answer
         Self {
             reply: ipc::serve::Reply::new(),
             undo: None,
-            next: None,
+            next: IpcMessage::new(0),
+            bound: false,
             ep,
             ipc_buf,
         }
@@ -5151,29 +5156,39 @@ impl Answer
                 &mut self.reply,
                 self.ipc_buf,
                 syscall::WAIT_TRY_ONCE,
+                &mut self.next,
             )
         };
         self.settle(l);
-        self.next = got.ok();
+        self.bound = got.is_ok();
     }
 
-    /// The next request: the call a flush bound, or else the next call on
-    /// memmgr's endpoint, waiting up to `timeout_ms` milliseconds (`0`:
-    /// without bound), after sending the reply, when one is still set, with
-    /// the receive. Its undo runs on return when the reply was not delivered,
-    /// before memmgr serves anything else.
+    /// The next request, into `req`: the call a flush bound, or else the
+    /// next call on memmgr's endpoint, waiting up to `timeout_ms`
+    /// milliseconds (`0`: without bound), after sending the reply, when one
+    /// is still set, with the receive, which reads the call into `req` in
+    /// place. Its undo runs on return when the reply was not delivered, before
+    /// memmgr serves anything else.
     ///
     /// # Errors
     /// [`ipc::serve::next_request_timeout`]'s.
-    fn next_request(&mut self, timeout_ms: u64) -> Result<IpcMessage, i64>
+    fn next_request(&mut self, timeout_ms: u64, req: &mut IpcMessage) -> Result<(), i64>
     {
-        if let Some(req) = self.next.take()
+        if self.bound
         {
-            return Ok(req);
+            self.bound = false;
+            *req = self.next;
+            return Ok(());
         }
         // SAFETY: as in flush.
         let got = unsafe {
-            ipc::serve::next_request_timeout(self.ep, &mut self.reply, self.ipc_buf, timeout_ms)
+            ipc::serve::next_request_timeout(
+                self.ep,
+                &mut self.reply,
+                self.ipc_buf,
+                timeout_ms,
+                req,
+            )
         };
         // No reference to the ledger is held across the receive.
         self.settle(ledger_mut());
@@ -5682,11 +5697,13 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
     // with a receive that does not wait, when they have work to do; a reply
     // still set rides the next receive, and a call the earlier send bound is
     // the next request. The first turn has no receive before it.
-    let mut req = None;
+    // The request buffer every receive reads into, valid while `has_req`.
+    let mut req = IpcMessage::new(0);
+    let mut has_req = false;
     let mut received = false;
     loop
     {
-        if let Some(req) = req.take()
+        if has_req
         {
             dispatch(&req, &mut answer, &boot);
             retire_objects(ledger_mut(), &mut answer);
@@ -5713,26 +5730,26 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
         {
             0
         };
-        let got = answer.next_request(wait);
+        let got = answer.next_request(wait, &mut req);
         // A failed receive ends its turn too, so the top-up before the retry
         // can recheck the deferred list: that top-up is what refills a spent
         // receive reserve.
         begin_turn();
         received = true;
-        req = match got
+        has_req = match got
         {
-            Ok(got) =>
+            Ok(()) =>
             {
                 guard.on_success();
-                Some(got)
+                true
             }
             // The bounded wait ended with no message: a turn of its own.
-            Err(e) if wait != 0 && e == SyscallError::WouldBlock as i64 => None,
+            Err(e) if wait != 0 && e == SyscallError::WouldBlock as i64 => false,
             Err(e) =>
             {
                 guard.on_failure(e);
                 received = false;
-                None
+                false
             }
         };
     }

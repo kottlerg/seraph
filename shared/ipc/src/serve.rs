@@ -164,7 +164,10 @@ impl Reply
     /// `Ok` when no reply is set.
     pub unsafe fn flush(&mut self, ipc_buf: *mut u64) -> Result<(), i64>
     {
-        self.flush_with(&mut Kernel { ipc_buf })
+        self.flush_with(&mut Kernel {
+            ipc_buf,
+            wait: Unbounded,
+        })
     }
 
     fn flush_with<T: Transport>(&mut self, kernel: &mut T) -> Result<(), i64>
@@ -207,8 +210,9 @@ impl Default for Reply
 }
 
 /// Receive the next request on `ep`, waiting without bound, after sending
-/// `reply`'s reply when one is set, and empty the slot: [`next_request_timeout`]
-/// with a `timeout_ms` of `0`.
+/// `reply`'s reply when one is set, and empty the slot: the turn of
+/// [`next_request_timeout`] with a `timeout_ms` of `0`, which returns the
+/// request.
 ///
 /// # Safety
 /// As [`next_request_timeout`].
@@ -220,14 +224,28 @@ impl Default for Reply
 pub unsafe fn next_request(ep: u64, reply: &mut Reply, ipc_buf: *mut u64)
 -> Result<IpcMessage, i64>
 {
-    // SAFETY: this fn's contract is next_request_timeout's.
-    unsafe { next_request_timeout(ep, reply, ipc_buf, 0) }
+    let delivery = next_with(
+        &mut Kernel {
+            ipc_buf,
+            wait: Unbounded,
+        },
+        ep,
+        reply,
+    )?;
+    // The message is read once, here, whichever syscall received it, so no
+    // path moves it again.
+    // SAFETY: ipc_buf is the registered IPC buffer page (this fn's contract);
+    // the kernel wrote the delivered words and cap handles there before return.
+    Ok(unsafe { IpcMessage::from_delivery(ipc_buf, &delivery) })
 }
 
 /// Receive the next request on `ep` under `SYS_IPC_RECV`'s `timeout_ms`
 /// policy (`0` waits without bound, any other value but
 /// `syscall::WAIT_TRY_ONCE` up to that many milliseconds), after sending
-/// `reply`'s reply when one is set, and empty the slot.
+/// `reply`'s reply when one is set, and empty the slot. The request is read
+/// into `req` in place ([`IpcMessage::read_delivery`]), so a loop that
+/// receives into one buffer copies no whole message; on an error `req` is
+/// left as it was.
 ///
 /// With a reply set this is one [`crate::ipc_reply_recv`]. Its errors come
 /// from three parts, before the reply, of the reply, and after it, and the
@@ -257,14 +275,21 @@ pub unsafe fn next_request_timeout(
     reply: &mut Reply,
     ipc_buf: *mut u64,
     timeout_ms: u64,
-) -> Result<IpcMessage, i64>
+    req: &mut IpcMessage,
+) -> Result<(), i64>
 {
-    let delivery = next_with(&mut Kernel { ipc_buf }, ep, reply, timeout_ms)?;
-    // The message is read once, here, whichever syscall received it, so no
-    // path moves it again.
+    let delivery = next_with(
+        &mut Kernel {
+            ipc_buf,
+            wait: timeout_ms,
+        },
+        ep,
+        reply,
+    )?;
     // SAFETY: ipc_buf is the registered IPC buffer page (this fn's contract);
     // the kernel wrote the delivered words and cap handles there before return.
-    Ok(unsafe { IpcMessage::from_delivery(ipc_buf, &delivery) })
+    unsafe { req.read_delivery(ipc_buf, &delivery) };
+    Ok(())
 }
 
 /// The syscalls of a turn of [`next_request_timeout`], behind a trait so that
@@ -274,23 +299,64 @@ trait Transport
     /// What a receive returns: the kernel's delivery, from which the message
     /// is read.
     type Got;
+    /// The `timeout_ms` every receive carries.
+    fn timeout_ms(&self) -> u64;
     fn recv(&mut self, ep: u64, timeout_ms: u64) -> Result<Self::Got, i64>;
     fn reply(&mut self, msg: &IpcMessage) -> Result<(), i64>;
     fn reply_recv(&mut self, ep: u64, msg: &IpcMessage, timeout_ms: u64) -> Result<Self::Got, i64>;
     fn delete_cap(&mut self, cap: u64);
 }
 
-/// The kernel, through the calling thread's registered IPC buffer page.
-struct Kernel
+/// The kernel, through the calling thread's registered IPC buffer page, with
+/// the receives' bound `wait`.
+struct Kernel<W>
 {
     /// The calling thread's registered IPC buffer page
     /// ([`next_request_timeout`]'s contract).
     ipc_buf: *mut u64,
+    wait: W,
 }
 
-impl Transport for Kernel
+/// A receive's bound under `SYS_IPC_RECV`'s `timeout_ms` policy: a `u64` of
+/// milliseconds, or [`Unbounded`], which fixes it at `0` when the turn is
+/// compiled, so a loop that always waits without bound passes none at run
+/// time.
+trait Wait: Copy
+{
+    fn ms(self) -> u64;
+}
+
+/// No bound: every receive waits until a request arrives.
+#[derive(Clone, Copy)]
+struct Unbounded;
+
+impl Wait for Unbounded
+{
+    #[inline]
+    fn ms(self) -> u64
+    {
+        0
+    }
+}
+
+impl Wait for u64
+{
+    #[inline]
+    fn ms(self) -> u64
+    {
+        self
+    }
+}
+
+impl<W: Wait> Transport for Kernel<W>
 {
     type Got = syscall::IpcDelivery;
+
+    #[inline]
+    fn timeout_ms(&self) -> u64
+    {
+        self.wait.ms()
+    }
 
     #[inline]
     fn recv(&mut self, ep: u64, timeout_ms: u64) -> Result<syscall::IpcDelivery, i64>
@@ -325,13 +391,9 @@ impl Transport for Kernel
 }
 
 #[inline]
-fn next_with<T: Transport>(
-    kernel: &mut T,
-    ep: u64,
-    reply: &mut Reply,
-    timeout_ms: u64,
-) -> Result<T::Got, i64>
+fn next_with<T: Transport>(kernel: &mut T, ep: u64, reply: &mut Reply) -> Result<T::Got, i64>
 {
+    let timeout_ms = kernel.timeout_ms();
     reply.lost = false;
     if !reply.pending
     {
@@ -380,7 +442,7 @@ mod tests
         recv: Result<u64, i64>,
         reply: Result<(), i64>,
         reply_recv: Result<u64, i64>,
-        /// The `timeout_ms` every receive must carry.
+        /// The bound the transport gives, which every receive must carry.
         timeout: u64,
         calls: [Option<Call>; 8],
         count: usize,
@@ -437,6 +499,11 @@ mod tests
         /// The label of the request received.
         type Got = u64;
 
+        fn timeout_ms(&self) -> u64
+        {
+            self.timeout
+        }
+
         fn recv(&mut self, ep: u64, timeout_ms: u64) -> Result<u64, i64>
         {
             assert_eq!(ep, EP);
@@ -490,7 +557,7 @@ mod tests
     fn an_empty_slot_receives_alone()
     {
         let mut kernel = Script::new();
-        let got = next_with(&mut kernel, EP, &mut Reply::new(), 0);
+        let got = next_with(&mut kernel, EP, &mut Reply::new());
         assert_eq!(got, Ok(NEXT));
         assert_eq!(kernel.calls(), &[Some(Call::Recv)]);
     }
@@ -502,9 +569,9 @@ mod tests
     {
         let mut kernel = Script::new();
         let mut reply = with_reply();
-        assert_eq!(next_with(&mut kernel, EP, &mut reply, 0), Ok(NEXT));
+        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
         assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))]);
-        assert_eq!(next_with(&mut kernel, EP, &mut reply, 0), Ok(NEXT));
+        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
         assert_eq!(
             kernel.calls(),
             &[Some(Call::ReplyRecv(REPLY)), Some(Call::Recv)]
@@ -549,7 +616,7 @@ mod tests
         let mut reply = with_reply();
         assert_eq!(reply.flush_with(&mut kernel), Ok(()));
         assert_eq!(reply.flush_with(&mut kernel), Ok(()));
-        assert_eq!(next_with(&mut kernel, EP, &mut reply, 0), Ok(NEXT));
+        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
         assert_eq!(
             kernel.calls(),
             &[Some(Call::Reply(REPLY)), Some(Call::Recv)]
@@ -565,7 +632,7 @@ mod tests
         let mut kernel = Script::new();
         kernel.reply_recv = Err(err(SyscallError::InvalidCapability));
         kernel.reply = Err(err(SyscallError::InvalidCapability));
-        let got = next_with(&mut kernel, EP, &mut with_owned_reply(), 0);
+        let got = next_with(&mut kernel, EP, &mut with_owned_reply());
         assert_eq!(got, Ok(NEXT));
         assert_eq!(
             kernel.calls(),
@@ -598,14 +665,14 @@ mod tests
     {
         let mut kernel = Script::new();
         assert_eq!(
-            next_with(&mut kernel, EP, &mut with_owned_reply(), 0),
+            next_with(&mut kernel, EP, &mut with_owned_reply()),
             Ok(NEXT)
         );
         assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))]);
 
         let mut kernel = Script::new();
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
-        let got = next_with(&mut kernel, EP, &mut with_owned_reply(), 0);
+        let got = next_with(&mut kernel, EP, &mut with_owned_reply());
         assert_eq!(got, Err(err(SyscallError::QuotaExceeded)));
         assert_eq!(
             kernel.calls(),
@@ -627,7 +694,7 @@ mod tests
             let mut kernel = Script::new();
             kernel.reply_recv = Err(err(e));
             assert_eq!(
-                next_with(&mut kernel, EP, &mut with_reply(), 0),
+                next_with(&mut kernel, EP, &mut with_reply()),
                 Err(err(e))
             );
             assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))], "{e:?}");
@@ -642,7 +709,7 @@ mod tests
     {
         let mut kernel = Script::new();
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
-        let got = next_with(&mut kernel, EP, &mut with_reply(), 0);
+        let got = next_with(&mut kernel, EP, &mut with_reply());
         assert_eq!(got, Err(err(SyscallError::QuotaExceeded)));
         assert_eq!(
             kernel.calls(),
@@ -659,7 +726,7 @@ mod tests
         let mut kernel = Script::new();
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         kernel.reply = Err(err(SyscallError::InvalidCapability));
-        let got = next_with(&mut kernel, EP, &mut with_reply(), 0);
+        let got = next_with(&mut kernel, EP, &mut with_reply());
         assert_eq!(got, Ok(NEXT));
         assert_eq!(
             kernel.calls(),
@@ -681,17 +748,17 @@ mod tests
         let mut kernel = Script::new();
         kernel.timeout = WAIT;
         assert_eq!(
-            next_with(&mut kernel, EP, &mut Reply::new(), WAIT),
+            next_with(&mut kernel, EP, &mut Reply::new()),
             Ok(NEXT)
         );
         assert_eq!(
-            next_with(&mut kernel, EP, &mut with_reply(), WAIT),
+            next_with(&mut kernel, EP, &mut with_reply()),
             Ok(NEXT)
         );
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         kernel.reply = Err(err(SyscallError::InvalidCapability));
         assert_eq!(
-            next_with(&mut kernel, EP, &mut with_reply(), WAIT),
+            next_with(&mut kernel, EP, &mut with_reply()),
             Ok(NEXT)
         );
         assert_eq!(
@@ -719,10 +786,10 @@ mod tests
         kernel.reply = Err(err(SyscallError::InvalidCapability));
         let mut reply = with_reply();
         assert!(reply.is_set());
-        assert_eq!(next_with(&mut kernel, EP, &mut reply, 0), Ok(NEXT));
+        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
         assert!(reply.undelivered());
         assert!(!reply.is_set());
-        assert_eq!(next_with(&mut kernel, EP, &mut reply, 0), Ok(NEXT));
+        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
         assert!(!reply.undelivered());
 
         reply.set(reply_msg());
@@ -738,12 +805,12 @@ mod tests
         let mut kernel = Script::new();
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         let mut reply = with_reply();
-        let got = next_with(&mut kernel, EP, &mut reply, 0);
+        let got = next_with(&mut kernel, EP, &mut reply);
         assert_eq!(got, Err(err(SyscallError::QuotaExceeded)));
         assert!(!reply.undelivered());
         reply.set(reply_msg());
         kernel.reply_recv = Ok(NEXT);
-        assert_eq!(next_with(&mut kernel, EP, &mut reply, 0), Ok(NEXT));
+        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
         assert!(!reply.undelivered());
     }
 }

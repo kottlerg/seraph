@@ -441,12 +441,16 @@ fn slice_due() -> Option<u64>
 pub(crate) fn turn(l: &mut MemLedger, answer: &mut Answer)
 {
     let done = done_jobs();
+    let any_done = done.contains(&true);
     let slice = slice_due();
-    if done.contains(&true) || slice.is_some()
+    if any_done || slice.is_some()
     {
         answer.flush(l);
     }
-    drain(l, done);
+    if any_done
+    {
+        drain(l, done);
+    }
     let Some(now) = slice
     else
     {

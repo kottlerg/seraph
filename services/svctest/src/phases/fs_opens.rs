@@ -207,10 +207,7 @@ impl Opener
     fn new(node: u64, tag: u64, log: &ReleaseLog, ipc_buf: *mut u64) -> Self
     {
         let endpoint =
-            std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-                syscall::cap_create_endpoint(slab).ok()
-            })
-            .expect("fs_eviction: endpoint creation failed");
+            std::os::seraph::create_endpoint().expect("fs_eviction: endpoint creation failed");
         let send = syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND).expect("release SEND");
         let stop = syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND).expect("stop SEND");
         let log = log.clone();
@@ -584,10 +581,8 @@ fn spawn_reclaim_child(node: u64, release: u64) -> (std::process::Child, u64)
 {
     use std::os::seraph::process::CommandExt;
 
-    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .expect("fs_reclaim: server endpoint creation failed");
+    let ep =
+        std::os::seraph::create_endpoint().expect("fs_reclaim: server endpoint creation failed");
     let root = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND).expect("fs_reclaim: root SEND");
     let stop = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, RECLAIM_STOP_BADGE)
         .expect("fs_reclaim: stop SEND");
@@ -715,10 +710,7 @@ pub fn fs_reclaims_dead_opens_phase(_: &Caps)
 fn killed_childs_open(node: u64, ipc_buf: *mut u64) -> (u64, u64)
 {
     let release_ep =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
-        .expect("fs_reclaim: release endpoint creation failed");
+        std::os::seraph::create_endpoint().expect("fs_reclaim: release endpoint creation failed");
     let release = syscall::cap_derive(release_ep, syscall::RIGHTS_EP_SEND)
         .expect("fs_reclaim: release SEND derive");
     let child_node = syscall::cap_derive(node, syscall::RIGHTS_EP_SEND_GRANT)

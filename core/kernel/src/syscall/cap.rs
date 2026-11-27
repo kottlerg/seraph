@@ -152,11 +152,12 @@ fn slot_field<T>(block_virt: u64, offset: u64) -> *mut T
 ///
 /// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The Memory cap
 /// MUST carry `MemRights::RETYPE` and have at least the size class of
-/// `dispatch_for(Endpoint, 0).raw_bytes` (72 B = 24 wrapper + 48
-/// `EndpointState`, debited as the 128 B `BIN_128` class) of `available_bytes`.
+/// `dispatch_for(Endpoint, 0).raw_bytes` (`ipc::endpoint::retype_bytes`: 24
+/// wrapper + 48 `EndpointState` + the slot hints, two bits per CPU of the
+/// boot; the `BIN_128` class up to 224 CPUs) of `available_bytes`.
 ///
 /// On success, the wrapper + `EndpointState` are constructed in place inside
-/// the source Memory cap's region; a cap with `SEND | RECEIVE | GRANT |
+/// the source Memory cap's region, followed by the zeroed slot hints; a cap with `SEND | RECEIVE | GRANT |
 /// IDENTIFY` rights is inserted into the caller's `CSpace`; returns the new cap
 /// handle.
 ///
@@ -206,7 +207,8 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout: EndpointObject at offset 0; EndpointState at offset
-    // size_of::<EndpointObject>() (24). Total 24 + 48 = 72 B, rounds to 128 B.
+    // size_of::<EndpointObject>() (24); the slot hints from offset 72 to the
+    // end of entry.raw_bytes (`ipc::endpoint::hints`).
     let ep_obj_ptr = block_virt as *mut EndpointObject;
     let state_offset = core::mem::size_of::<EndpointObject>() as u64;
     let ep_state_ptr = slot_field::<EndpointState>(block_virt, state_offset);
@@ -214,11 +216,16 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
     let ancestor = memory_obj_nn;
 
     // SAFETY: ep_state_ptr points into the just-allocated region; alignment:
-    // the region is page-aligned (memory.base is page-aligned, and BIN_128
-    // sub-page slots inherit 8-byte alignment from `bump_offset`'s
-    // initialisation at zero plus 128 B granularity, which exceeds the 8-byte
-    // alignment requirement of EndpointState).
+    // the region is page-aligned (memory.base is page-aligned, and sub-page
+    // slots inherit 8-byte alignment from `bump_offset`'s initialisation at
+    // zero plus 128 B granularity, which exceeds the 8-byte alignment
+    // requirement of EndpointState).
     unsafe { core::ptr::write(ep_state_ptr, EndpointState::new()) };
+    // A freed slot keeps an earlier object's bytes: no hint may name a slot
+    // before the endpoint's first park.
+    // SAFETY: the hints lie inside the just-allocated region (entry.raw_bytes
+    // is `retype_bytes`), which nothing else references yet.
+    unsafe { crate::ipc::endpoint::hints(ep_state_ptr) }.fill(0);
     // SAFETY: ep_obj_ptr points into the just-allocated region, at its start,
     // aligned as for the write above.
     unsafe {

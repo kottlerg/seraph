@@ -133,10 +133,7 @@ impl Foreign
     /// A new endpoint; panics, naming `phase`, when none can be made.
     pub(super) fn new(phase: &str) -> Self
     {
-        let endpoint =
-            std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-                syscall::cap_create_endpoint(slab).ok()
-            })
+        let endpoint = std::os::seraph::create_endpoint()
             .unwrap_or_else(|| panic!("{phase}: an endpoint of svctest's own"));
         Self(endpoint)
     }

@@ -1197,10 +1197,7 @@ impl OwnFatfs
 
 fn new_endpoint() -> u64
 {
-    std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .expect("fs_block_faults: endpoint creation failed")
+    std::os::seraph::create_endpoint().expect("fs_block_faults: endpoint creation failed")
 }
 
 /// An event queue with room for the one death its one binding posts.

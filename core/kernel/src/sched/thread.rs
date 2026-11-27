@@ -365,7 +365,7 @@ pub struct PlacementCounts
     pub idle_wakes: core::sync::atomic::AtomicU32,
     /// Wakes that linked the thread on a CPU other than its `preferred_cpu`.
     pub wake_moves: core::sync::atomic::AtomicU32,
-    /// Load-balancer pulls that moved the thread to another CPU.
+    /// Load-balancer pulls and RT pushes that moved the thread to another CPU.
     pub pulls: core::sync::atomic::AtomicU32,
     /// Wakes with the synchronous hint whose placement reached the synchronous
     /// wake rule: the thread had no hard affinity and no context save in

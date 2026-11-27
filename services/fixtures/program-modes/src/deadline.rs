@@ -135,10 +135,7 @@ pub fn main()
         "the fixture, spawned with no bootstrap caps, holds a creator endpoint"
     );
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .expect("create the upcall endpoint");
+    let ep = std::os::seraph::create_endpoint().expect("create the upcall endpoint");
 
     let _worker = std::thread::spawn(|| {
         WORKER.store(
@@ -236,10 +233,7 @@ fn at(start: Instant, after: Duration) -> Instant
 /// once the scope ends.
 fn call_deadline(ipc_buf: *mut u64)
 {
-    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .expect("create the endpoint nobody receives on");
+    let ep = std::os::seraph::create_endpoint().expect("create the endpoint nobody receives on");
 
     let start = Instant::now();
     let looked_up = with_call_deadline(at(start, CALL_BOUND), || {

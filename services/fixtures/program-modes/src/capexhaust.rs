@@ -161,12 +161,10 @@ pub fn main() -> !
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    // An Endpoint costs the kernel's raw retype debit, `ENDPOINT_RETYPE_BYTES`
-    // (wrapper plus state), served from the 128 B `BIN_128` size class.
-    let Some(ep) =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
+    // An Endpoint costs the kernel's raw retype debit for this boot
+    // (`std::os::seraph::endpoint_retype_bytes`: wrapper, state and slot
+    // hints), served from the 128 B `BIN_128` size class up to 224 CPUs.
+    let Some(ep) = std::os::seraph::create_endpoint()
     else
     {
         std::os::seraph::log!("cap_create_endpoint failed");

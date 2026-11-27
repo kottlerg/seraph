@@ -737,9 +737,12 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 the non-experimental `ssaia` and `smaia` CPU properties. `xtask/src/qemu.rs` passes
 `-machine virt,aia=aplic-imsic` and
 `-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,ssaia=on,smaia=on`
-followed by `,smstateen=on,svadu=off,svade=on`, the `--riscv-zkr` suffix (default `,zkr=on`)
-and the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
-`-cpu max,migratable=no` on x86-64 TCG, plus the `--x86-paging` `la57` suffix (default
+followed by `,smstateen=on,svadu=off,svade=on`, the `--idle-wait` suffix (default `,zawrs=off`), the
+`--riscv-zkr` suffix (default `,zkr=on`) and the `--riscv-mmu` satp-mode suffix (default
+`,sv57=off`) for RISC-V and `-cpu max,migratable=no` on x86-64 TCG, plus the `--idle-wait`
+`monitor` suffix (default `,monitor=off`, appended to every x86-64 accelerator's `-cpu` model;
+`on` appends `,monitor=on` under TCG and passes `-overcommit cpu-pm=on` under KVM), the
+`--x86-paging` `la57` suffix (default
 `,la57=off`, appended to every x86-64 accelerator's `-cpu` model) and the
 `--x86-shadow-stack` `cet-ss` suffix (default `,cet-ss=off`, appended likewise when the QEMU's
 `-cpu help` lists the `cet-ss` flag; a QEMU without the flag, the 10.2 of the CI image among
@@ -765,9 +768,13 @@ S-mode when the hart implements it, so the kernel's pool seeds from it beside th
 seed and the boot log shows
 `entropy: seeded from hardware RNG`; the source is optional, and `--riscv-zkr off` boots without
 it ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Sources and graceful
-degradation). The named `-cpu rva23s64` model
-(QEMU ≥ 10.0, 2025-04) adds the remaining RVA23 mandates; `xtask` does not expose it, and the
-explicit string stays so the 9.0 minimum holds.
+degradation). `zawrs=off` and `monitor=off` leave out the monitored wait the kernel's idle loop
+takes where every CPU has it ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md)
+§ Idle Thread): under TCG, `WRS.NTO`, and `MWAIT` with more than one vCPU, return at once, so
+an idle vCPU offered them spins on its host thread, and a boot takes the wait only with
+`--idle-wait on` ([xtask/README.md](../xtask/README.md#cargo-xtask-run)). The named
+`-cpu rva23s64` model (QEMU ≥ 10.0, 2025-04) adds the remaining RVA23 mandates; `xtask` does not
+expose it, and the explicit string stays so the 9.0 minimum holds.
 
 ---
 

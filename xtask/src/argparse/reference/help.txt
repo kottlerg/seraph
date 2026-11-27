@@ -162,6 +162,8 @@ Options:
           Guest RISC-V paging-mode ceiling (riscv64 only; ignored on `x86_64`). The kernel negotiates the highest advertised mode at boot, so this selects the mode a run exercises [default: sv48] [possible values: sv39, sv48, sv57]
       --riscv-zkr <RISCV_ZKR>
           Whether the guest RISC-V CPU implements the Zkr entropy source (riscv64 only; ignored on `x86_64`). `off` boots the kernel's hardware-RNG path without a source: its probe of the `seed` CSR traps and the pool seeds from the firmware boot seed and jitter [default: on] [possible values: on, off]
+      --idle-wait <IDLE_WAIT>
+          Whether the guest CPU offers the monitored wait the kernel's idle loop waits in (`MONITOR`/`MWAIT` on `x86_64`, Zawrs on riscv64). `on` boots the polling idle and the IPI-free wake of an idle CPU (core/kernel/docs/scheduler.md "Idle Thread"); under TCG an idle vCPU then spins on its host thread. `off` boots the halting idle [default: off] [possible values: off, on]
       --x86-paging <X86_PAGING>
           Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `la57` property; the bootloader enables 5-level paging when CPUID reports LA57, so this selects the depth a run exercises [default: 4] [possible values: 4, 5]
       --x86-shadow-stack <X86_SHADOW_STACK>
@@ -276,6 +278,15 @@ Options:
           - off: Leave `Zkr` out (`zkr=off`)
           
           [default: on]
+
+      --idle-wait <IDLE_WAIT>
+          Whether the guest CPU offers the monitored wait the kernel's idle loop waits in (`MONITOR`/`MWAIT` on `x86_64`, Zawrs on riscv64). `on` boots the polling idle and the IPI-free wake of an idle CPU (core/kernel/docs/scheduler.md "Idle Thread"); under TCG an idle vCPU then spins on its host thread. `off` boots the halting idle
+
+          Possible values:
+          - off: Leave the wait out (`monitor=off`, `zawrs=off`) — the default. The kernel idles in `HLT` or `WFI` and wakes an idle CPU with an IPI
+          - on:  Offer the wait: `zawrs=on` on riscv64, `monitor=on` on `x86_64` TCG, and on `x86_64` KVM `-overcommit cpu-pm=on`, under which KVM runs the guest's `MWAIT` without an exit and QEMU reports `MONITOR` to the guest, where the host's KVM can disable `MWAIT` exits
+          
+          [default: off]
 
       --x86-paging <X86_PAGING>
           Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `la57` property; the bootloader enables 5-level paging when CPUID reports LA57, so this selects the depth a run exercises

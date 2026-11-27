@@ -661,10 +661,10 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest
 A boot that redoes the bootloader's steps 6 and 7 logs `boot: memory map: mapredo knob present;
 redoing steps 6 and 7`, which `run --runs --require` matches, once in the run
 ([docs/testing.md](../docs/testing.md#steps-6-and-7-redo-ktest-cell) § Steps 6 and 7 redo). A
-log-levels file that sets only `vfsd = debug` (`services/init/log-levels-vfsd-debug.conf`) makes
-`DEBUG  [vfsd] ` and `DEBUG  [fatfs] ` lines appear, fatfs logging at the level of vfsd, which
-spawns it, and no `DEBUG  [devmgr] ` or `DEBUG  [procmgr] ` line, which `run --runs --require` and
-`--fail-also` match
+log-levels file that sets only `vfsd = debug` (`services/init/log-levels-vfsd-debug.conf`), with
+logd's serial sink at debug, makes `DEBUG [vfsd] ` and `DEBUG [fatfs] ` lines appear, fatfs logging
+at the level of vfsd, which spawns it, and no `DEBUG [devmgr] ` or `DEBUG [procmgr] ` line, which
+`run --runs --require` and `--fail-also` match
 ([docs/testing.md](../docs/testing.md#log-levels-usertest-cell) § Log levels).
 
 The image's kind. Every pack writes on the root and data partitions what the kind of image its

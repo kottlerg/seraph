@@ -8,14 +8,15 @@ a program reads, follows and steers the log.
 
 ## Implementation status
 
-Built: the eight severities and their console tags, the console prefix
-`[sec.usfrac] LEVEL  [name] ` that both receivers write, the kernel's records read and written as
-`[kernel]` lines, the history as the journal the sinks write from, the serial and framebuffer
-outputs as two sinks with a cursor and a writer thread each, the hold window and its `WINDOW_FULL`
-refusal, the serial sink's `hold` pace (its writes of an entry as plain chunks and then a
-zero-length `SERIAL_WRITE_SENT` barrier, its cursor moving once the entry is sent) and the
-framebuffer's `skip` pace, the drop lines, and `LOG_FLUSH` over the serial sink's cursor, whose
-token is the next `seq`
+Built: the eight severities and their console tags, the console prefix `[sec.usfrac] LEVEL  [name] `
+that both receivers write, its seconds right-aligned to five columns, the kernel's records read and
+written as `[kernel]` lines, each device sink's settings from logd's recipe (§ Settings) with the
+console format's field list and the framebuffer's coloured tag, the rfc5424 format with no
+timestamp, the history as the journal the sinks write from, the serial and framebuffer outputs as
+two sinks with a cursor and a writer thread each, the hold window and its `WINDOW_FULL` refusal, the
+serial sink's `hold` pace (its writes of an entry as plain chunks and then a zero-length
+`SERIAL_WRITE_SENT` barrier, its cursor moving once the entry is sent) and the framebuffer's `skip`
+pace, the drop lines, and `LOG_FLUSH` over the serial sink's cursor, whose token is the next `seq`
 ([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks, § Hold window, § Flush barrier).
 
 Everything else this document states is design intent, not yet implemented, unless a sentence names
@@ -136,9 +137,10 @@ emergency for a fault or panic print (#1491; today every record is informational
 
 *Built: the cursor and order, the `hold` and `skip` paces and the hold window, the drops, the
 serial and framebuffer device sinks' writers, serial's answers to `STALLED` and to a failed call,
-and `LOG_FLUSH` ([ipc-interface.md](ipc-interface.md) § Output sinks, § Hold window, § Flush
-barrier). Design intent (#1493, #1494): a sink's `level`, `format` and `relayed` settings, the
-`off` level, the framebuffer's level and emergency walk, pstore, and external sinks.*
+`LOG_FLUSH` ([ipc-interface.md](ipc-interface.md) § Output sinks, § Hold window, § Flush
+barrier), and each device sink's settings, the `off` level, the framebuffer's level and its
+emergency walk (#1493). Design intent: `SINK_SET` and external sinks (#1494), and pstore
+(#1498).*
 
 A sink is one output of the log. Every sink, inside logd or outside it, follows one contract: it
 reads the history in `seq` order through a cursor, shows the entries at or above its level, renders
@@ -309,7 +311,9 @@ an unknown gap, and starts from the new instance's oldest entry.
 
 ## Settings
 
-*Design intent (#1493).*
+*Built (#1493): the `SERIAL` and `FRAMEBUFFER` entries with every key but `time`, and
+`LOGD_HOSTNAME`. Design intent: `time` (#1493, § Wall time), the `PSTORE` entry (#1498), and
+`SINK_SET` (#1494).*
 
 Each device sink's settings come from one `env` entry of logd's recipe
 (`rootfs/config/svcmgr/services/logd.svc`), so they are set per distribution, signed as
@@ -340,12 +344,27 @@ LOGD_SINK_<NAME>=<key>=<value>,<key>=<value>,...
   they show the nil value `-`.
 - Quiet mode is a sink's level, and `level=off` turns a sink off: it writes nothing, holds no
   sender and stalls nothing, and `SINK_SET` can turn it on again.
-- The sender-side level ([ipc-interface.md](ipc-interface.md) § Levels, Filter) is still the only
-  thing that stops a line from being sent. A sink's level only selects among the lines logd
-  retains, and the history keeps every retained line whatever the sinks show.
+- Two levels decide whether a line reaches a sink. The sender's level
+  ([ipc-interface.md](ipc-interface.md) § Levels, Filter; at info unless the log-level
+  configuration sets another, [init bootstrap](../../init/docs/bootstrap.md) § Log levels) is the
+  only thing that stops a line from being sent. A sink's level only selects among the lines logd
+  retains, and the history keeps every retained line whatever the sinks show. So a service's debug
+  lines reach serial when both are at debug: the service's in the log-level configuration, serial's
+  as `LOGD_SINK_SERIAL=level=debug` in logd's recipe; a query of the history (`QUERY_HISTORY`)
+  reads them with the sender's level alone.
+- Before the handover, init-logd writes the UART and reads no recipe: the sender's level alone
+  filters what it writes ([init bootstrap](../../init/docs/bootstrap.md) § Bootstrap). logd's serial
+  level applies from the handover on, and serial does not show the `relayed` entries init-logd
+  wrote.
+- The settings live in logd's state, one `SinkSettings` per device sink (`LogdState::settings`,
+  under the state lock), the defaults with the recipe's entry applied at start. A sink's writer
+  reads them at each entry it takes, so a change there applies from the next entry on; `SINK_SET`
+  changes them there, through the same parser.
 - `SINK_SET` (§ Queries, follow and control) changes a setting for the life of the logd instance; a
   restarted logd starts from its recipe again.
-- The parser is one host-tested type in `logd-codec`, which `SINK_SET` uses too.
+- The parser is one host-tested type in `logd-codec`, `SinkSettings::parse_over` in
+  `logd_codec::settings`, which `SINK_SET` uses too; `SinkKind::defaults` holds the defaults of
+  § Device sinks.
 
 An external sink's settings are its own recipe's, in the same keys.
 
@@ -353,8 +372,8 @@ An external sink's settings are its own recipe's, in the same keys.
 
 ## The console format
 
-*Built: the prefix with the tag padded to six. Design intent: the seconds' alignment, the
-instance numbers, the field list, wall-clock display and the colour (#1492, #1493).*
+*Built: the prefix with the tag padded to six, the seconds' alignment, the field list and the
+colour (#1493). Design intent: the instance numbers (#1492) and wall-clock display (#1493).*
 
 The default console line, the same on serial and the framebuffer:
 
@@ -423,7 +442,9 @@ line reaches the screen rarely.
 
 ## The rfc5424 format
 
-*Design intent (#1493 for a device sink, #1499 for the network sink).*
+*Built for a device sink (#1493), with TIMESTAMP and STRUCTURED-DATA `-` until logd reads the
+boot wall offset (§ Wall time). Design intent: the timestamp and `timeQuality` (#1493), the
+network sink (#1499).*
 
 A sink in the `rfc5424` format writes each entry as one RFC 5424 message:
 
@@ -468,8 +489,7 @@ message longer than the transport carries is cut at a character boundary of MSG.
 
 ## The kernel's lines
 
-*Built: the reader and its acknowledgement by the `hold` sinks' cursors, serial's alone while
-`off` is design intent.*
+*Built: the reader and its acknowledgement by the `hold` sinks' cursors.*
 
 logd's kernel log reader retains each kernel record as an entry of the kernel's slot
 (`LOG_BADGE_KERNEL`), and the sinks write it as any entry

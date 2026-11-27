@@ -780,11 +780,14 @@ and a driver devmgr spawns and a fatfs instance vfsd spawns inherit their spawne
 ([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels). The
 committed configuration sets no level, so no default boot shows whether a level reaches its
 service. CI's `usertest` cell packs a configuration setting vfsd to debug
-(`services/init/log-levels-vfsd-debug.conf`, `vfsd = debug`) with its staging, and its own boot
+(`services/init/log-levels-vfsd-debug.conf`, `vfsd = debug`) with its staging, sets logd's serial
+sink to debug in logd's recipe, whose default of info would hide the debug lines logd writes
+([services/logd/docs/sinks.md](../services/logd/docs/sinks.md) § Settings), and its own boot
 requires vfsd's and fatfs's debug lines and fails on devmgr's or procmgr's. Locally, after the
 usertest staging of [Gating](#gating):
 
 ```sh
+echo 'env = LOGD_SINK_SERIAL=level=debug' >> sysroot/config/svcmgr/services/logd.svc
 cargo xtask mkdisk --arch <arch> --repack-only \
     --log-levels services/init/log-levels-vfsd-debug.conf
 cargo xtask run --arch <arch> --runs 1 --require 'DEBUG  \[vfsd\] ' \

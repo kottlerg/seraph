@@ -448,7 +448,10 @@ jobs:
         # The usertest cell also packs the log-level configuration that sets
         # vfsd to debug (services/init/log-levels-vfsd-debug.conf), and its
         # boot checks that the level reached vfsd and the fatfs it spawns and
-        # no other service. The ktest cell also stages the `mapredo` knob, so
+        # no other service. Its logd recipe gains an `env` line that sets the
+        # serial sink to debug, whose default of info would hide vfsd's debug
+        # lines once logd writes the console (services/logd/docs/sinks.md
+        # § Settings). The ktest cell also stages the `mapredo` knob, so
         # the bootloader redoes the first attempt of its steps 6 and 7, and
         # its boot checks the bootloader's line for the redo; the boot host
         # test `the_mapredo_knob_redoes_the_first_attempt_alone` holds the redo
@@ -478,6 +481,8 @@ jobs:
               cp sysroot/config/svcmgr/tests/usertest.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
+              echo 'env = LOGD_SINK_SERIAL=level=debug' \
+                >> sysroot/config/svcmgr/services/logd.svc
               xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
                 --log-levels services/init/log-levels-vfsd-debug.conf
               ;;

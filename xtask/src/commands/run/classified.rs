@@ -1712,6 +1712,18 @@ mod tests
         assert!(matches!(classify_log(log), Status::Ok));
     }
 
+    // Defect caught: a line of logd's, whose stamp right-aligns its seconds,
+    // not read as a userspace line, so the boot reads as having lost its
+    // console at the handover.
+    #[test]
+    fn a_padded_logd_line_after_the_handover_keeps_the_console()
+    {
+        let log = "[   46.540540] INFO   [init-logd] handover complete; init-logd thread exiting
+                   [   47.500000] INFO   [logd] resolved the serial driver
+";
+        assert!(matches!(classify_log(log), Status::Ok));
+    }
+
     #[test]
     fn a_kernel_line_logd_wrote_after_the_handover_keeps_the_console()
     {

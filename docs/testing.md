@@ -632,7 +632,7 @@ path, so a count moved in the debug profile does not predict the count moved in 
 regression that exists only in the debug profile, such as a debug assertion added to a hot path,
 is therefore not gated: it costs nothing on hardware, and the functional cells still boot both
 profiles. [core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md)
-§ Profile gives the counts of both profiles per path.
+§ Profile gives the counts of both profiles per path, as of the head its account names.
 
 A one-CPU count gates only when its timed window does not idle. While every vCPU idles, the
 guest's clock follows the host's time, so a window that idles counts host time, which no band

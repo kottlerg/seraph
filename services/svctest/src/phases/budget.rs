@@ -739,10 +739,7 @@ fn arm_handler() -> u64
     };
     let va = region.va_start();
     REGION_VA.store(va, Ordering::Release);
-    let Some(endpoint) =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
+    let Some(endpoint) = std::os::seraph::create_endpoint()
     else
     {
         exit(CHILD_SETUP_FAILED)

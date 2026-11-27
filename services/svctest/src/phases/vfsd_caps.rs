@@ -99,10 +99,7 @@ const CASES: [Case; 5] = [
 /// A new endpoint, whose cap holds its only Receive right.
 fn new_endpoint() -> u64
 {
-    std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .expect("vfsd_namespace_stray_caps: endpoint creation failed")
+    std::os::seraph::create_endpoint().expect("vfsd_namespace_stray_caps: endpoint creation failed")
 }
 
 /// Send `case`'s request on `dir` carrying the Receive rights of

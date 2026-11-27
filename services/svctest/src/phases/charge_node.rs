@@ -403,11 +403,7 @@ fn holder_death(top: u64)
 {
     let what = "the charge-holder child";
     let node = sub_node(top, DONATED_MAX, "NODE_CREATE of the holder's node");
-    let endpoint =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
-        .expect("endpoint retype");
+    let endpoint = std::os::seraph::create_endpoint().expect("endpoint retype");
     let send = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND_GRANT, HOLDER_BADGE)
         .expect("cap_derive_badge");
     let reply = budget::try_create_role(HOLDER_ROLE, 0, None, None, Some(send), what);

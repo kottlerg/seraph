@@ -182,10 +182,7 @@ impl Hold
         let mut endpoints = [0u64; SLOTS];
         for slot in &mut endpoints
         {
-            let Some(cap) =
-                std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |s| {
-                    syscall::cap_create_endpoint(s).ok()
-                })
+            let Some(cap) = std::os::seraph::create_endpoint()
             else
             {
                 delete_caps(&endpoints);
@@ -604,10 +601,7 @@ impl Hold
         };
         let _ = syscall::wait_set_remove(self.wait_set, *cell);
         delete_caps(&[*cell]);
-        *cell = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |s| {
-            syscall::cap_create_endpoint(s).ok()
-        })
-        .unwrap_or(0);
+        *cell = std::os::seraph::create_endpoint().unwrap_or(0);
         if *cell == 0
         {
             self.holds.retire(slot);

@@ -42,10 +42,7 @@ const STOP_TIMEOUT_MS: u32 = 10_000;
 /// Run the benchmark: one result line per word count.
 pub fn run(counters: &Counters, cpus: u32) -> Outcome
 {
-    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .ok_or_else(|| "create the endpoint".to_string())?;
+    let ep = std::os::seraph::create_endpoint().ok_or_else(|| "create the endpoint".to_string())?;
     let server = std::thread::Builder::new()
         .name("ubench-ipc-server".into())
         .spawn(move || serve(ep))

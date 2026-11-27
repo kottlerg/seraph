@@ -469,11 +469,7 @@ fn debugger_session(authority: u64, process: u64, threads: &[u64])
         .expect("crash_endpoint: a parked thread's cap");
     let crash_badge = exception_badge(parked, "a parked thread")
         .expect("crash_endpoint: a registered thread bound to the crash endpoint");
-    let endpoint =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
-        .expect("crash_endpoint: a debugger endpoint");
+    let endpoint = std::os::seraph::create_endpoint().expect("crash_endpoint: a debugger endpoint");
     let send = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, DEBUGGER_BADGE)
         .expect("crash_endpoint: a debugger SEND");
     let bind = || {
@@ -577,11 +573,7 @@ fn debugger_tag_check(authority: u64)
             .expect("crash_endpoint: the child's stdout"),
     );
     let mut line = String::new();
-    let endpoint =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
-        .expect("crash_endpoint: a debugger endpoint");
+    let endpoint = std::os::seraph::create_endpoint().expect("crash_endpoint: a debugger endpoint");
     let send = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, DEBUGGER_BADGE)
         .expect("crash_endpoint: a debugger SEND");
     let bind = || {
@@ -678,11 +670,7 @@ fn expect_registration_refused()
         let _ = release_rx.recv();
     });
     let own = cap_rx.recv().expect("crash_endpoint: the helper's cap");
-    let endpoint =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
-        .expect("crash_endpoint: a debugger endpoint");
+    let endpoint = std::os::seraph::create_endpoint().expect("crash_endpoint: a debugger endpoint");
     let send = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, DEBUGGER_BADGE)
         .expect("crash_endpoint: a debugger SEND");
     syscall::thread_set_fault_handler(own, send, FAULT_CLASS_EXCEPTION | FAULT_CLASS_UPCALL)

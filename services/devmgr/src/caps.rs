@@ -606,10 +606,7 @@ pub fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DevmgrCap
     bootstrap_round1(creator, ipc_buf, &mut caps, &mut firmware)?;
     bootstrap_rounds(creator, ipc_buf, &mut caps, &mut firmware)?;
 
-    caps.self_bootstrap_ep =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })?;
+    caps.self_bootstrap_ep = std::os::seraph::create_endpoint()?;
 
     caps.firmware = std::sync::Arc::new(firmware);
 

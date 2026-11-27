@@ -789,10 +789,7 @@ fn spawn_end_queue_child(mode: &str, queue: u64) -> std::process::Child
 {
     use std::os::seraph::process::CommandExt;
 
-    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .expect("process_tree: endpoint creation failed");
+    let ep = std::os::seraph::create_endpoint().expect("process_tree: endpoint creation failed");
     let send = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND_GRANT)
         .expect("process_tree: deriving the child's SEND failed");
     let ready = std::sync::Arc::new(AtomicBool::new(false));

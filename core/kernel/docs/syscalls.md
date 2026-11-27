@@ -806,6 +806,12 @@ Send + Receive + Grant + Identify rights.
 |---|---|---|
 | 0 | `memory_cap` | Memory capability (Retype rights) the endpoint object is carved from |
 
+The retype debit is `SYS_SYSTEM_INFO(EndpointRetypeBytes)`, fixed for a boot: the 24-byte object
+wrapper, the 48-byte endpoint state, and the slot hints of the CPUs' parked-receiver tables, two
+bits for each CPU of the boot, zeroed at creation ([ipc-internals.md](ipc-internals.md) § Object
+Structure). The kernel rounds it up to its size class: the 128-byte bin up to 224 CPUs, the
+512-byte bin up to 1760, and whole pages above.
+
 **Return:**
 
 - `rax`/`a0`: new capability descriptor on success (positive); `SyscallError` on failure
@@ -3891,6 +3897,14 @@ pub enum SystemInfoType
     /// loop, so that its result line says whether a timed window waited with
     /// the CPU idle (shared/bench/README.md § Idle halts).
     IdleHalts           = 15,
+
+    /// Raw retype debit of one Endpoint, in bytes: the 24-byte object
+    /// wrapper, the 48-byte endpoint state, and the slot hints of the CPUs'
+    /// parked-receiver tables, two bits for each CPU of the boot. Fixed for a
+    /// boot, not across machines; the kernel rounds it up to its size class.
+    /// ruststd sizes every endpoint's slab request from it
+    /// (`std::os::seraph::create_endpoint`).
+    EndpointRetypeBytes = 16,
 }
 ```
 

@@ -1016,6 +1016,10 @@ pub fn run_all(ctx: &TestContext)
         sysinfo::thread_retype_bytes_funds_one_thread(ctx)
     );
     run_test!(
+        "sysinfo::endpoint_retype_bytes_funds_one_endpoint",
+        sysinfo::endpoint_retype_bytes_funds_one_endpoint(ctx)
+    );
+    run_test!(
         "sysinfo::live_cspace_count",
         sysinfo::live_cspace_count(ctx)
     );

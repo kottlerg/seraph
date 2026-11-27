@@ -82,6 +82,46 @@ fn query_thread_retype_pages() -> Option<u64>
     Some(pages)
 }
 
+/// Bytes one Endpoint retype takes from init's arena front: the kernel's
+/// debit (`SystemInfoType::EndpointRetypeBytes`, which the boot's CPU count
+/// sizes) rounded to its size class (`syscall_abi::retype_class_bytes`).
+/// Sizes the endpoint part of init's arena reserve
+/// ([`bootstrap::init_retype_reserve_pages`]); init cannot size it without
+/// it, so a failed query ends init.
+///
+/// `run` makes the first query, through [`query_endpoint_retype_class`],
+/// before serial output is up, and ends init itself when it fails; every
+/// later call reads the cached answer.
+pub(crate) fn endpoint_retype_class() -> u64
+{
+    let Some(class) = query_endpoint_retype_class()
+    else
+    {
+        logging::log("init: FATAL: cannot query the Endpoint retype size");
+        syscall::thread_exit();
+    };
+    class
+}
+
+/// [`endpoint_retype_class`] without the log: `None` when the query fails.
+/// The first successful answer is cached, since the debit is fixed for the
+/// boot.
+fn query_endpoint_retype_class() -> Option<u64>
+{
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != 0
+    {
+        return Some(cached);
+    }
+    let bytes =
+        syscall::system_info(syscall_abi::SystemInfoType::EndpointRetypeBytes as u64).ok()?;
+    let class = syscall_abi::retype_class_bytes(bytes);
+    CACHED.store(class, Ordering::Relaxed);
+    Some(class)
+}
+
 /// Pages init carves for memmgr/procmgr's `AddressSpace`, all reaching
 /// the kernel: page 0 holds the wrapper, page 1 the root PT, and the
 /// remaining 46 form the initial PT growth pool. Mirrors procmgr's constant,
@@ -640,11 +680,13 @@ fn run(info_ptr: u64) -> !
     // the one body init's `CSpace` backs from the kernel's seed, and the fund
     // pays for every later body and port-binding table, the serial port's
     // binding on x86-64 among them (`bootstrap::fund_own_cspace`). Nothing
-    // before `serial_init` logs: the Thread retype size the reserve needs is
-    // queried without the log, and a failure is reported once serial is up.
+    // before `serial_init` logs: the Thread and Endpoint retype sizes the
+    // reserve needs are queried without the log, and a failure is reported once
+    // serial is up.
     let backing_pages = 1 + logging::LOG_THREAD_STACK_PAGES + 1;
-    let retype_known = query_thread_retype_pages().is_some();
-    let init_arena = if retype_known
+    let thread_known = query_thread_retype_pages().is_some();
+    let endpoint_known = query_endpoint_retype_class().is_some();
+    let init_arena = if thread_known && endpoint_known
     {
         bootstrap::BootArena::carve_reserve(
             &mut alloc,
@@ -664,9 +706,14 @@ fn run(info_ptr: u64) -> !
     // Set up serial output (FATAL pre-IPC errors fall back to this).
     arch::current::serial_init(info, info.thread_cap);
 
-    if !retype_known
+    if !thread_known
     {
         logging::log("init: FATAL: cannot query the Thread retype size");
+        syscall::thread_exit();
+    }
+    if !endpoint_known
+    {
+        logging::log("init: FATAL: cannot query the Endpoint retype size");
         syscall::thread_exit();
     }
     let Some(mut init_arena) = init_arena
@@ -716,6 +763,9 @@ fn run(info_ptr: u64) -> !
     }
 
     // ── Create endpoints ─────────────────────────────────────────────────────
+    //
+    // The five endpoints below are retyped before the log thread's, and init's
+    // arena reserve counts them (`bootstrap::INIT_ENDPOINTS_BEFORE_LOG_THREAD`).
 
     let Ok(init_bootstrap_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
@@ -1046,6 +1096,10 @@ fn run(info_ptr: u64) -> !
     let endpoint_cap = pm.service_ep;
 
     // ── Create remaining endpoints ───────────────────────────────────────────
+    //
+    // These two and svcmgr's bootstrap endpoint (service.rs) are retyped after
+    // the log thread's, and init's arena reserve counts them
+    // (`bootstrap::INIT_ENDPOINTS_AFTER_LOG_THREAD`).
 
     let Ok(devmgr_registry_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else

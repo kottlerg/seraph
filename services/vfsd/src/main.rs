@@ -61,9 +61,9 @@ use worker_pool::WorkerPool;
 /// forced unmount of a mount on a new disk found withdrawn, which blocks as
 /// an `UNMOUNT` does. A `GET_SWAP_PARTITION` handler also waits for the
 /// discovery lock, held across one discovery, and for the swap lock, which
-/// its holder keeps across the first request's discovery and one
-/// `REGISTER_PARTITION` call to the block driver; none of devmgr, memmgr
-/// and the block drivers calls vfsd.
+/// its holder keeps across a hand-out: one `BLK_RETIRE_PARTITION` and one
+/// `REGISTER_PARTITION` call to the block driver and one discovery; none of
+/// devmgr, memmgr and the block drivers calls vfsd.
 const SERVICE_THREAD_COUNT: usize = 4;
 
 /// Bound on a fall-through call the namespace thread makes to the root
@@ -507,10 +507,10 @@ pub struct VfsdRuntime
     /// on each successful MOUNT; the namespace dispatcher reads on each
     /// `NS_*` request.
     pub root_backend: Mutex<VfsdRootBackend>,
-    /// The swap partition cap vfsd keeps, registered by the first
-    /// `GET_SWAP_PARTITION` that finds the partition. The lock is held
-    /// across a whole hand-out, so the first request's registration and a
-    /// later request's revoke never interleave.
+    /// The partition cap of the swap partition's current grant, which each
+    /// `GET_SWAP_PARTITION` cuts off and registers anew. The lock is held
+    /// across a whole hand-out, so one request's registration and another's
+    /// cut-off never interleave.
     pub swap: Mutex<swap::SwapPartition>,
     /// The disk the firmware booted from, identified once at startup
     /// ([`identify_boot_disk`]); `None` when there is none, and then no
@@ -599,8 +599,8 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///
 /// No `do_mount`- or `do_unmount`-touched state is shared without one of
 /// these locks. `GET_SWAP_PARTITION` holds `rt.swap` across a hand-out;
-/// the first one runs a discovery while it holds it, taking `rt.discovery`
-/// and then `rt.disks`, and nothing takes `rt.swap` while it holds either.
+/// each runs a discovery while it holds it, taking `rt.discovery` and then
+/// `rt.disks`, and nothing takes `rt.swap` while it holds either.
 fn service_loop(rt: &'static VfsdRuntime) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();

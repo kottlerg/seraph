@@ -81,12 +81,12 @@ vfsd/
   [`docs/namespace-composition.md`](docs/namespace-composition.md#unmount).
 - **Swap-partition hand-out** — `GET_SWAP_PARTITION`, gated on the
   `SWAP_AUTHORITY` badge bit, hands the swap service a raw partition cap
-  on the `SERAPH_SWAP` partition, which vfsd never mounts. The first
-  request looks the partition up and registers it, so vfsd's startup does
-  not depend on one; each later request cuts off the grant handed out
-  before (revoke, retire, delete) and registers the partition again, so one
-  holder at a time reaches the partition. The hand-out's decisions are the
-  host-tested `vfsd-swap` crate, the cut-off the `vfsd-grant` crate. See
+  on the `SERAPH_SWAP` partition, which vfsd never mounts. Each request
+  cuts off the grant handed out before (revoke, retire, delete), then looks
+  the partition up and registers it as a new grant, so vfsd's startup does
+  not depend on one and one holder at a time reaches the partition. The
+  hand-out's decisions are the host-tested `vfsd-swap` crate, the cut-off
+  the `vfsd-grant` crate. See
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md) and
   [`docs/storage.md`](../../docs/storage.md).
 - **System-root cap delivery** — vfsd does not push a system-root

@@ -191,7 +191,7 @@ label, or a filesystem UUID. The model is:
   only.
 - **The swap partition is never mounted.** It carries no filesystem: vfsd
   resolves it, by the statement's `swap` line or else on the boot disk by
-  the arch-neutral `SERAPH_SWAP` type GUID, on the first
+  the arch-neutral `SERAPH_SWAP` type GUID, on each
   `GET_SWAP_PARTITION` request, not at startup, and hands the swap
   service a raw partition cap on it. A boot with no swap partition boots
   as one with: the request then replies `NO_MOUNT`. The in-tree image

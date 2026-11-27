@@ -414,10 +414,14 @@ was sent, then delete `partition`
 ([virtio-blk README](../../drivers/virtio/blk/README.md#grants-and-regions)
 § Grants and regions). A partition granted again is registered again, a
 new grant under a new badge; a restart and each swap hand-out do so. The
-block driver's death makes the retire fail with the grant already gone;
-any other failure is logged, and vfsd then gives the partition to no new
-holder, so a restart becomes a removal (§ Driver restart). The sequence
-is the host-tested `vfsd-grant` crate.
+block driver's death makes the retire fail with the grant already gone. A
+retire answered `OUT_OF_BOUNDS` on `partition` finds the badge already
+retired, by its holder or by an earlier retire whose reply was lost, and
+completes the cut-off
+([virtio-blk README](../../drivers/virtio/blk/README.md#label-10-blk_retire_partition)
+§ Label 10). Any other failure is logged, and vfsd then gives the partition
+to no new holder, so a restart becomes a removal (§ Driver restart).
+The sequence is the host-tested `vfsd-grant` crate.
 Revoking a cap the backend retains reaches only that cap's descendants,
 not the driver's receive copy, so it does not stop the server.
 Per-cap revocation — invalidating one issued node cap without affecting
@@ -442,17 +446,17 @@ vfsd holds two un-badged endpoints:
   handler blocks on (the driver's `FS_UNMOUNT` and its death, each
   within a bound, procmgr's `DESTROY_PROCESS`, and the root-mount walk
   for a fall-through cap) never calls the service endpoint, and neither
-  does the discovery of new disks a `MOUNT` and the first
+  does the discovery of new disks a `MOUNT` and each
   `GET_SWAP_PARTITION` run before their role lookup: devmgr's
   `QUERY_DEVICE` and `QUERY_DEVICE_LOCATION`, the GPT reads of each new disk on its block driver, a
   scratch page from memmgr when a failed read lost the one held, and
   the forced unmount of a mount on a new disk found withdrawn, which
   blocks as an `UNMOUNT` does. A `GET_SWAP_PARTITION` also waits for
   the discovery lock, held across one discovery, and for the swap lock,
-  which its holder keeps across the first request's discovery and one
-  `REGISTER_PARTITION` call to the block driver. Neither devmgr, nor
-  memmgr, nor a block driver calls vfsd. A request past the last free
-  handler waits in the endpoint queue.
+  which its holder keeps across a hand-out: one `BLK_RETIRE_PARTITION` and
+  one `REGISTER_PARTITION` call to the block driver and one discovery.
+  Neither devmgr, nor memmgr, nor a block driver calls vfsd. A request
+  past the last free handler waits in the endpoint queue.
 - **Namespace endpoint** — `NS_LOOKUP`, `NS_STAT`, `NS_READDIR`.
   Single dispatcher thread; the `NamespaceBackend` methods are
   in-memory walks of one node's children or ancestors, and the only

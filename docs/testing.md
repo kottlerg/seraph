@@ -650,6 +650,27 @@ the region between two reads, the benchmark's measured operation, as follows:
   order. An out-of-order hart may overlap a small window's edges with the work around it, so a
   window shorter than its pipeline's depth measures the region only to within that overlap.
 
+A window whose thread may run on another CPU between its two reads, as in a window-mean row
+([shared/bench/README.md § Window-mean rows](../shared/bench/README.md#window-mean-rows)), takes
+both reads on the CPU it measures on, since riscv64 keeps no two harts' counters in step. Their
+difference then measures the window only while that CPU's counter advanced throughout, whatever
+ran where:
+
+- **Under icount**, on both architectures, the counter follows the clock the vCPUs share, so the
+  difference counts what every vCPU retired in the window, as at more than one CPU above, and
+  the host's time while every vCPU idled.
+- **On hardware, x86-64**, the invariant TSC advances at a constant rate in every C-state, so the
+  difference is the window's reference cycles.
+- **On hardware, riscv64**, `cycle` counts the hart's own cycles, whatever thread it runs, and
+  whether it advances while the hart waits in `wfi` is the implementation's choice.
+
+Such a window therefore counts only when both reads ran on the measuring CPU and that CPU did not
+halt between them, which the idle-halt span around the window shows: its close fails on another
+CPU than its open's, and otherwise returns the halts between them. The one move the span does not
+see is a move onto the measuring CPU in the few instructions between the closing read and the
+close, which takes a preemption and a pull there. A window-mean row runs at more than one CPU, so
+its counts are reported, not gated (below).
+
 Every sample therefore includes the cost of the reads themselves: their instructions on the
 region's side under icount, and on hardware the cycles of those instructions and of the fences.
 The `empty_window` benchmark of each suite, `ktest.empty_window` and `ubench.empty_window`,

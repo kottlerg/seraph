@@ -17,6 +17,7 @@ bench/
     ├── counters.rs         # Counters, Reading
     ├── stats.rs            # Samples, Summary, summarize
     ├── line.rs             # Report, Unit, Value, parse_line, Parsed, LineError, ParseError
+    ├── window.rs           # WindowShape, WindowEnd, WindowTally, window_mean
     └── arch/
         ├── mod.rs          # Architecture dispatch
         ├── x86_64/mod.rs   # ARCH, the rdtsc read
@@ -110,6 +111,35 @@ whole log can be scanned. A program logs no other text of the form `bench <word>
 
 ---
 
+## Window-mean rows
+
+A benchmark whose thread may run on another CPU between two counter reads, such as a client with
+no affinity whose server the scheduler may bring to it or keep apart, cannot time one operation
+per sample. It times windows of several operations instead, the thread reading the counters on
+the CPU it measures on at each window's edges, and reports a window-mean row: a result line of
+the form above, each of whose samples is one window's difference divided by its operations,
+rounded down, so `n=` counts windows and the percentiles are of window means. The row carries
+the extra `window_ops=` (`WINDOW_OPS_KEY`), the operations each window ran, and the counts of
+the windows it left out, `moved=` (`MOVED`) and `halted=` (`HALTED`), below.
+
+A difference of two reads on one CPU measures the window, wherever the thread ran in between,
+only when both reads ran on that CPU and the CPU did not halt between them
+([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)). The thread
+therefore opens its idle-halt span (§ Idle halts) on the measuring CPU right before the window's
+opening read and closes it right after the closing read, with no blocking call between either
+pair, and `WindowEnd::from_close` classifies the window by the close: a close that fails ran on
+another CPU than the open (`Moved`), a close that returns halts saw the CPU halt (`Halted`), and
+a close that returns `0` counts the window (`Counted`). `WindowShape::for_ops` splits a
+benchmark's operations into windows of `WINDOW_OPS` (16), or one window of all of them when
+there are fewer. A row whose counted windows are fewer than half its windows
+(`WindowShape::floor`) is no mean of its case, only of the windows that happened to stay on the
+CPU, and the benchmark logs no result line for it.
+
+A window-mean row names itself by a variant parameter, so it never pairs with a per-operation
+row of the same case: `affinity=any` for a thread with no affinity.
+
+---
+
 ## Idle halts
 
 Under QEMU's icount (`cargo xtask run --icount`) a timed window that idles counts host time: while
@@ -118,11 +148,12 @@ every vCPU idles, the guest's clock follows the host's
 therefore calls `SYS_SYSTEM_INFO(IdleHalts)` (`syscall::idle_halts`, which answers for the
 calling CPU alone) right before a measured loop, which marks that CPU's idle-halt count in the
 calling thread, and right after it, which returns the halts since the mark, both outside every
-timed window, with the thread pinned to that CPU across both calls and making no other such call
-between them. The line reports that count as the extra `idle_halts=` (`IDLE_HALTS`): the times
-the CPU found no thread to run while the loop ran. The kernel counts only from the mark: a call
-that has none on its CPU (the thread's first, or one after a move) returns an error, and the line
-then carries no count.
+timed window, with the thread pinned to that CPU across both calls (a window-mean row's thread,
+unpinned between them, is held to the CPU by the close, § Window-mean rows) and making no other
+such call between them. The line reports that count as the extra `idle_halts=` (`IDLE_HALTS`):
+the times the CPU found no thread to run while the loop ran. The kernel counts only from the mark:
+a call that has none on its CPU (the thread's first, or one after a move) returns an error, and
+the line then carries no count.
 
 The span holds every timed window of the line and the untimed work of the loop between them (a
 warm-up iteration, a check, a step that readies the next sample). A count of zero says that no
@@ -138,7 +169,7 @@ where a count says that the loop waited on an event.
 |---|---|---|
 | [ktest](../../core/ktest/README.md) Tier 3 | `Harness::recorder`, taken right before the loop, to its `Recorder::summary`, right after | CPU 0 |
 | [ubench](../../services/ubench/README.md) | `IdleSpan::open` and `close` around each loop, its warm-up iterations included; in `fault_scaling`, each worker around its own loop, the line summing them | `BENCH_CPU` (0); each worker's CPU |
-| [fsbench](../../services/fixtures/fsbench/README.md) | Around each timed loop, after its warm-up | CPU 0 |
+| [fsbench](../../services/fixtures/fsbench/README.md) | Around each timed loop, after its warm-up; in a window-mean row, around each window, the line summing the spans that closed (§ Window-mean rows) | CPU 0 |
 
 A line whose samples other threads took on their own CPUs (`ktest.tlb_shootdown_concurrent`)
 carries no count.
@@ -150,7 +181,7 @@ carries no count.
 | Consumer | Suite | What it reports |
 |---|---|---|
 | [`core/ktest`](../../core/ktest/README.md) | `ktest` | Tier 3, one line per kernel benchmark (§ Tier 3) |
-| [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3` |
+| [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3`; at more than one CPU, the window-mean rows `fsbench.read size=16 path=inline affinity=any` and `fsbench.open depth=3 affinity=any` |
 | [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.console_write`, per variant, and `ubench.empty_window` |
 
 ---

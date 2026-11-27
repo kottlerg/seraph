@@ -144,6 +144,11 @@ pub struct SinkQueue<const N: usize>
     /// write up ([`Self::not_written`]); cleared when the writer completes a
     /// write ([`Self::written`]).
     stalled: bool,
+    /// Set when the writer gives a write up ([`Self::not_written`]), and
+    /// cleared when it completes one ([`Self::written`]): the writer's own
+    /// evidence that the driver does not take lines, which a flush reads
+    /// ([`Self::unwritten_through`]), as it does not read a producer's stall.
+    gave_up: bool,
     /// Lines queued since the queue was made: the number of the last one.
     queued: u64,
     /// Lines the writer has taken ([`Self::pop`]).
@@ -167,6 +172,7 @@ impl<const N: usize> SinkQueue<N>
             dropped: 0,
             given_up: 0,
             stalled: false,
+            gave_up: false,
             queued: 0,
             taken: 0,
             done: 0,
@@ -304,6 +310,7 @@ impl<const N: usize> SinkQueue<N>
     {
         self.done = self.taken;
         self.stalled = false;
+        self.gave_up = false;
     }
 
     /// The writer gave up a write: the driver did not take all of it, or took
@@ -320,6 +327,7 @@ impl<const N: usize> SinkQueue<N>
         self.done = self.taken;
         self.given_up = self.given_up.saturating_add(lost);
         self.stalled = true;
+        self.gave_up = true;
     }
 
     /// Whether line number `line` ([`Offer::Queued`]) is written, or given
@@ -329,6 +337,38 @@ impl<const N: usize> SinkQueue<N>
     {
         // Numbers wrap after 2^64 lines; the distance stays below 2^63.
         self.done.wrapping_sub(line) < 1 << 63
+    }
+
+    /// The number of the last line queued, 0 before the first: the token of a
+    /// flush started now (`services/logd/docs/ipc-interface.md` § Flush
+    /// barrier).
+    #[must_use]
+    pub const fn last_queued(&self) -> u64
+    {
+        self.queued
+    }
+
+    /// The lines numbered up to `token` ([`Self::last_queued`]) that the
+    /// writer is still to write: 0 once it has written or given up line
+    /// `token`, while its last write was given up and none has completed
+    /// since (the sink is stalled), and for a token above every number this
+    /// queue has issued, which only another queue can have issued (that of a
+    /// logd instance that has since restarted). A producer's stall
+    /// ([`Self::stall`]) does not count: a producer that waited out the stall
+    /// bound behind a long queue sets it while the writer still works through
+    /// the lines ahead of it.
+    #[must_use]
+    pub const fn unwritten_through(&self, token: u64) -> u64
+    {
+        // Numbers wrap after 2^64 lines; the distance stays below 2^63.
+        if self.gave_up || self.is_written(token) || self.queued.wrapping_sub(token) >= 1 << 63
+        {
+            0
+        }
+        else
+        {
+            token.wrapping_sub(self.done)
+        }
     }
 
     /// A producer waited out the stall bound for its line's write: the sink
@@ -371,6 +411,32 @@ impl<const N: usize> SinkQueue<N>
             *dst = *src;
         }
     }
+}
+
+/// Whether a write the writer started at `started_us` (`None` while it
+/// writes nothing) has run past [`SINK_STALL_MS`] at `now_us`, on one
+/// microsecond clock: the writer is then stalled in it, and a flush waits on
+/// the sink for nothing.
+#[must_use]
+pub const fn write_overdue(started_us: Option<u64>, now_us: u64) -> bool
+{
+    match started_us
+    {
+        Some(start) => now_us.saturating_sub(start) > SINK_STALL_MS as u64 * 1000,
+        None => false,
+    }
+}
+
+/// The retry hint, in milliseconds, of a flush that waits on `lines` lines of
+/// a sink whose writer took `line_us` microseconds for its last line: their
+/// expected time, rounded up, at least 1 ms, so a waiter does not ask again
+/// at once, and at most [`SINK_STALL_MS`], after which a writer that has not
+/// finished is stalled and the flush answers at once.
+#[must_use]
+pub fn flush_hint_ms(lines: u64, line_us: u64) -> u32
+{
+    let ms = lines.saturating_mul(line_us).div_ceil(1000);
+    u32::try_from(ms.clamp(1, u64::from(SINK_STALL_MS))).unwrap_or(SINK_STALL_MS)
 }
 
 impl<const N: usize> Default for SinkQueue<N>
@@ -690,5 +756,114 @@ mod tests
         let p = q.pop(&mut short).unwrap();
         assert_eq!(&short[..p.len], b"abc");
         assert_eq!(drain(&mut q), [(b"gh".to_vec(), 0)]);
+    }
+
+    // Defect caught: a flush answered flushed while a line queued before it
+    // was still unwritten, or held on a line queued after it.
+    #[test]
+    fn a_flush_waits_for_the_lines_queued_before_it_alone()
+    {
+        let mut q: SinkQueue<{ 4 * (HEADER_BYTES + 4) }> = SinkQueue::new();
+        // Nothing queued: token 0, flushed.
+        assert_eq!(q.last_queued(), 0);
+        assert_eq!(q.unwritten_through(0), 0);
+        for _ in 0..2
+        {
+            assert!(matches!(
+                q.offer(b"line", LineKind::Logged, false),
+                Offer::Queued(_)
+            ));
+        }
+        let token = q.last_queued();
+        assert_eq!(token, 2);
+        assert_eq!(q.unwritten_through(token), 2);
+        // A line queued after the token is not waited for.
+        assert!(matches!(
+            q.offer(b"late", LineKind::Logged, false),
+            Offer::Queued(3)
+        ));
+        let mut buf = [0u8; 8];
+        assert!(q.pop(&mut buf).is_some());
+        // Taken is not written: the write may still fail to leave the device.
+        assert_eq!(q.unwritten_through(token), 2);
+        q.written();
+        assert_eq!(q.unwritten_through(token), 1);
+        assert!(q.pop(&mut buf).is_some());
+        q.written();
+        assert_eq!(q.unwritten_through(token), 0);
+        assert_eq!(q.unwritten_through(3), 1);
+    }
+
+    // Defect caught: a flush answered flushed while the writer still worked
+    // through the lines before its token, because a producer had waited out
+    // the stall bound behind them; or one that waited on a writer that had
+    // given a write up.
+    #[test]
+    fn a_flush_waits_through_a_producers_stall_and_not_on_a_writer_that_gave_up()
+    {
+        let mut q: SinkQueue<{ 4 * (HEADER_BYTES + 4) }> = SinkQueue::new();
+        let _ = q.offer(b"one", LineKind::Logged, false);
+        let _ = q.offer(b"two", LineKind::Logged, false);
+        let token = q.last_queued();
+        q.stall();
+        assert!(q.is_stalled());
+        assert_eq!(
+            q.unwritten_through(token),
+            2,
+            "a producer's stall is not the writer's"
+        );
+        let mut buf = [0u8; 8];
+        assert!(q.pop(&mut buf).is_some());
+        q.written();
+        assert_eq!(q.unwritten_through(token), 1);
+        // A write given up stalls the sink until the writer next completes
+        // one, so the line after it is not waited for meanwhile.
+        assert!(q.pop(&mut buf).is_some());
+        let _ = q.offer(b"six", LineKind::Logged, false);
+        let token = q.last_queued();
+        q.not_written(1);
+        assert_eq!(q.unwritten_through(token), 0, "the writer gave a write up");
+        assert!(q.pop(&mut buf).is_some());
+        q.written();
+        assert_eq!(q.unwritten_through(token), 0);
+        let _ = q.offer(b"ten", LineKind::Logged, false);
+        assert_eq!(
+            q.unwritten_through(q.last_queued()),
+            1,
+            "a completed write ends the stall"
+        );
+    }
+
+    // Defect caught: a token from a logd instance before its restart, above
+    // every number the new queue has issued, held its caller to its bound.
+    #[test]
+    fn a_token_this_queue_did_not_issue_is_flushed()
+    {
+        let mut q: SinkQueue<{ 4 * (HEADER_BYTES + 4) }> = SinkQueue::new();
+        let _ = q.offer(b"one", LineKind::Logged, false);
+        assert_eq!(q.unwritten_through(1), 1);
+        assert_eq!(q.unwritten_through(2), 0);
+        assert_eq!(q.unwritten_through(u64::MAX), 0);
+    }
+
+    #[test]
+    fn a_write_is_overdue_only_past_the_stall_bound()
+    {
+        let bound_us = u64::from(SINK_STALL_MS) * 1000;
+        assert!(!write_overdue(None, u64::MAX));
+        assert!(!write_overdue(Some(5), 5 + bound_us));
+        assert!(write_overdue(Some(5), 6 + bound_us));
+        // A start after the reading (another thread's clock read) is not overdue.
+        assert!(!write_overdue(Some(10), 5));
+    }
+
+    #[test]
+    fn the_flush_hint_is_the_expected_time_within_its_clamp()
+    {
+        assert_eq!(flush_hint_ms(0, 500), 1);
+        assert_eq!(flush_hint_ms(3, 0), 1);
+        assert_eq!(flush_hint_ms(3, 400), 2);
+        assert_eq!(flush_hint_ms(10, 2_000), 20);
+        assert_eq!(flush_hint_ms(u64::MAX, u64::MAX), SINK_STALL_MS);
     }
 }

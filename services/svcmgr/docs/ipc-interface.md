@@ -97,7 +97,7 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 | Field | Value |
 |---|---|
 | caps[..] | the present slots, in slot order |
-| slot 0 | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch, and the handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`) on the first launch and on a restart until procmgr reports init reaped (see [`log_sink`](service-definitions.md#log_sink)), and the `LOG_QUERY_AUTHORITY` SEND it publishes as `logd.query`; holding it keeps the log endpoint alive across a logd crash (absent if its derive fails) |
+| slot 0 | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch, and the handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`) on the first launch and on a restart until procmgr reports init reaped (see [`log_sink`](service-definitions.md#log_sink)), and the `LOG_QUERY_AUTHORITY` and `LOG_FLUSH_AUTHORITY` SENDs it publishes as `logd.query` and `logd.flush`; holding it keeps the log endpoint alive across a logd crash (absent if its derive fails) |
 | slot 1 | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap from it per launch (absent if its derive fails), and the `DEBUG_AUTHORITY` `SEND\|GRANT` cap of a `debug_authority = yes` service |
 | slot 2 | `kernel_log_source`: `KernelLog` source carrying `Read`, derived by init from the root `KernelLog` capability the kernel mints into it; svcmgr mints real-logd's slot-5 `KernelLog` cap (`RIGHTS_KLOG_READ`) from it per launch (absent if init holds none or its derive fails) |
 | data[0] | `3` (`LOGD_SOURCES`) |
@@ -126,7 +126,8 @@ definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
 `svcmgr`, `svcmgr.grant`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`, `devmgr.acpi`,
-`vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`) into its own registry,
+`vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`,
+`logd.flush`) into its own registry,
 configures devmgr's device classes and publishes each as `devmgr.class.<stem>` (the class file's
 name without `.class`), and installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`,
 with the cap of `/config/devmgr/platform/` as its optional second cap when the walk to it
@@ -230,9 +231,10 @@ freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint. `QUERY_ENDPOINT`
 
 Only public names resolve. A name whose cap carries authority is published seed-only and answers
 `UNKNOWN_NAME`, as an unknown name does: `rootfs.root`, the five `devmgr.*` names (`devmgr.bind` and
-`devmgr.acpi` included), `vfsd.mount`, `vfsd.swap`, `memmgr.swap`, `logd.query`, and each provider
-name whose badge carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` and `:grant` entries, today
-`pwrmgr.shutdown`, `acpid.power`, `swapd.restore`, `sessiond.operator` and `crashd.core`).
+`devmgr.acpi` included), `vfsd.mount`, `vfsd.swap`, `memmgr.swap`, `logd.query`, `logd.flush`, and
+each provider name whose badge carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` and `:grant`
+entries, today `pwrmgr.shutdown`, `acpid.power`, `swapd.restore`, `sessiond.operator` and
+`crashd.core`).
 `vfsd.deny` and `svcmgr.grant` carry no authority but are seed-only too: they are svctest's test
 twins, reached only through svctest's recipe. `svcmgr.grant` is a `SEND|GRANT` on svcmgr's own
 service endpoint under the published `svcmgr` badge, through which svctest sends requests that
@@ -403,8 +405,8 @@ no cap, and svcmgr deletes any it carries.
 `svcmgr_labels::PUBLISH_AUTHORITY` is a verb-bit (the top bit of the
 caller's cap badge) gating `PUBLISH_ENDPOINT` for *external* publishers.
 svcmgr publishes the well-known names it owns (`rootfs.root`, `svcmgr`,
-`svcmgr.grant`, the four `devmgr.*` names, the three `vfsd.*` names, `logd.query`, and each
-provider's `provides` names) directly into
+`svcmgr.grant`, the four `devmgr.*` names, the three `vfsd.*` names, `logd.query`, `logd.flush`, and
+each provider's `provides` names) directly into
 its own registry, so those need no badge. The gate exists for a future
 external publisher — devmgr holds a `PUBLISH_AUTHORITY`-badged SEND from
 its bootstrap bundle, reserved for driver registrations. The SEND

@@ -17,7 +17,11 @@
 //! * `caps[2]` = `POWER_AUTHORITY`-badged SEND on acpid's service endpoint
 //!   (the `acpid.power` seed), through which the x86-64 arch module reaches
 //!   the ACPI sleep and reset registers and waits for the power button.
-//! * `caps[3]` = a receive-only derivation of the core-death queue, which
+//! * `caps[3]` = `LOG_FLUSH_AUTHORITY`-badged SEND on logd's master log
+//!   endpoint (the `logd.flush` seed), through which pwrmgr waits for the
+//!   log to be written before it powers off or resets
+//!   (`services/logd/docs/ipc-interface.md` § Flush barrier).
+//! * `caps[4]` = a receive-only derivation of the core-death queue, which
 //!   the death observers of svcmgr's, memmgr's and procmgr's main threads and
 //!   address spaces post to and which svcmgr serves the shutdown actuator
 //!   after its seeds; an entry on it is a core death (docs/supervision.md
@@ -38,6 +42,8 @@ pub struct Bootstrap
     pub devmgr_shutdown: u64,
     /// The `acpid.power` seed. Zero if absent.
     pub acpid_power: u64,
+    /// The `logd.flush` seed. Zero if absent.
+    pub log_flush: u64,
     /// The receive-only derivation of the core-death queue. Zero if absent.
     pub core_death: u64,
 }
@@ -53,12 +59,18 @@ pub fn request_bootstrap(info: &StartupInfo, ipc_buf: *mut u64) -> Option<Bootst
     // SAFETY: `ipc_buf` is the kernel-registered per-thread IPC buffer.
     // Only the present caps ride, named by each round's presence word; an
     // absent slot decodes as `0`.
-    let [service_ep, devmgr_shutdown, acpid_power, core_death] =
-        unsafe { ipc::bootstrap::request_slots::<4>(creator, ipc_buf) }.ok()?;
+    let [
+        service_ep,
+        devmgr_shutdown,
+        acpid_power,
+        log_flush,
+        core_death,
+    ] = unsafe { ipc::bootstrap::request_slots::<5>(creator, ipc_buf) }.ok()?;
     Some(Bootstrap {
         service_ep,
         devmgr_shutdown,
         acpid_power,
+        log_flush,
         core_death,
     })
 }

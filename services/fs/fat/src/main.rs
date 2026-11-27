@@ -1207,7 +1207,7 @@ fn handle_read(
 /// write or truncate through any cap on the node is seen at once.
 ///
 /// Returns the cookie of the page it handed the client, which the loop
-/// gives back if the reply is not delivered ([`PendingRelease`]); `None`
+/// gives back if the reply is not delivered ([`Undo::Page`]); `None`
 /// when the reply hands over no page.
 #[expect(
     clippy::too_many_lines,
@@ -1418,7 +1418,7 @@ fn read_memory_for_open(
         .build();
     // A reply the client's `CSpace` cannot take leaves the child cap here,
     // and the send deletes it; the loop then gives the page back
-    // ([`PendingRelease`]).
+    // ([`Undo::Page`]).
     reply.set_or_delete_caps(answer);
     Some(cookie)
 }

@@ -1549,9 +1549,9 @@ pub const RIGHTS_SBI_BASE: u64 = 1 << 3;
 /// `SbiControl`: may forward the SBI Debug Console (DBCN) extension (RISC-V only).
 pub const RIGHTS_SBI_DBCN: u64 = 1 << 4;
 
-/// `SbiControl`: may forward the SBI Performance Monitoring Unit (PMU) extension
-/// (RISC-V only).
-pub const RIGHTS_SBI_PMU: u64 = 1 << 5;
+// Bit 5 is reserved: `SYS_SBI_CALL` never forwards the SBI Performance Monitoring
+// Unit (PMU) extension, and no other extension's right takes the bit
+// (docs/capability-model.md § `SbiControl`).
 
 // EntropyControl ──
 
@@ -2580,7 +2580,6 @@ mod tests
                 RIGHTS_SBI_CPPC,
                 RIGHTS_SBI_BASE,
                 RIGHTS_SBI_DBCN,
-                RIGHTS_SBI_PMU,
             ],
             // EntropyControl
             &[RIGHTS_ENTROPY_CONTRIBUTE],

@@ -709,7 +709,7 @@ CSpace        INSERT=0 DELETE=1 DERIVE=2 REVOKE=3
 WaitSet       MODIFY=0 WAIT=1
 IoPort        USE=0
 SchedControl  (no rights bits: presence + [min, max] band is the authority)
-SbiControl    RESET=0 SUSPEND=1 CPPC=2 BASE=3 DBCN=4 PMU=5
+SbiControl    RESET=0 SUSPEND=1 CPPC=2 BASE=3 DBCN=4 (bit 5 reserved)
 EntropyControl CONTRIBUTE=0
 KernelLog     READ=0
 ```

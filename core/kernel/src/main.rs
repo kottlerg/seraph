@@ -724,6 +724,13 @@ unsafe fn kernel_entry_post_rebase(
         arch::current::paging::verify_paging_extensions();
     }
     kprintln!("paging-ext ok");
+    // Choose the idle loop's wait (x86-64 MWAIT, riscv64 Zawrs WRS.NTO, where
+    // every CPU has it) before any AP starts and any idle thread runs.
+    #[cfg(not(test))]
+    {
+        let wait = arch::current::cpu::init_idle_wait();
+        kprintln!("idle: wait {wait}");
+    }
     // Enable hardware address-space tags (x86-64 PCID / RISC-V ASID) where
     // available, seeding the tag pool sized to boot_cpu_count. Where the feature
     // is absent this is a no-op and the kernel keeps the full-flush

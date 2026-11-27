@@ -149,6 +149,11 @@ Each feature is classified per architecture as one of:
   § x86-64 Mechanism).
 - **TSC-deadline timer mode** — drives the preemption tick when present; the periodic APIC
   timer is the fallback.
+- **MONITOR/MWAIT** — the idle loop's wait, with the C1 hint, the state `HLT` enters, when
+  CPUID.01H:ECX.MONITOR reports it: a wake of a thread onto an idle CPU then stores to that CPU's
+  idle wake word instead of sending an IPI. Without it the idle loop halts in `HLT` and every
+  remote wake sends the IPI
+  ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md) § Idle Thread).
 - **UMIP** (`CR4.UMIP`) — set on every CPU when present, so ring-3 `SGDT`, `SIDT`, `SLDT`, `SMSW`,
   and `STR` raise `#GP`. It is not uniform at the platform floor (Intel's Skylake-derived 10th
   generation lacks it), so it is not required. Without it ring 3 can read the IDT and GDT bases,
@@ -287,6 +292,12 @@ Each feature is classified per architecture as one of:
 - **Sv57** — a larger-VA expansion above the Sv48 default; used when the
   platform advertises and the probe confirms it.
 - **Zvk vector crypto** — crypto acceleration (design intent; not yet enabled).
+- **Zawrs** — the idle loop's wait, `WRS.NTO` on an `lr.w` reservation of the hart's idle wake
+  word, when the firmware tables advertise it for every hart (`HART_CAP_ZAWRS`); RVA23 mandates
+  it. A wake of a thread onto an idle hart then stores to that word instead of sending an IPI.
+  Without it the idle loop halts in `WFI` and every remote wake sends the IPI
+  ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md) § Idle Thread). The
+  M-mode firmware must leave `mstatus.TW` clear, as `WFI` needs.
 - **EFI_RNG_PROTOCOL** — the boot seed's only firmware source under the EDK2 firmware the
   default boot uses, exposed through the firmware's `VirtioRngDxe` binding `virtio-rng`;
   firmware that delivers a DTB may supply `/chosen/rng-seed` instead, and with neither the pool

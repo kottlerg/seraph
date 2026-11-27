@@ -323,6 +323,35 @@ jobs:
           name: tree-${{ matrix.arch }}-bench
           arch: ${{ matrix.arch }}
 
+      - name: Build the idle-wait ktest image
+        # The x86_64 debug tree with a focused ktest: the tests that wake
+        # threads onto idle CPUs, which the x86_64 debug ktest cell boots a
+        # second time on the monitored idle wait (docs/testing.md § Idle wait
+        # (ktest cell)). Only when that cell is owed: the select job writes
+        # each cell as {"arch":..,"profile":..,"tester":..}, in that key
+        # order (xtask/src/commands/cells.rs). The lint pass is the build's
+        # above, so only ktest compiles again.
+        if: >-
+          matrix.arch == 'x86_64' && matrix.profile == 'debug'
+          && contains(needs.select.outputs.validate, '{"arch":"x86_64","profile":"debug","tester":"ktest"}')
+        run: |
+          selection=stress::idle_wake_race,stress::load_balance_handoff_steal
+          selection=$selection,integration::idle_pull_starved_ready
+          selection=$selection,integration::idle_past_watchdog_threshold
+          selection=$selection,integration::rt_push_waiting
+          selection=$selection,integration::rt_wake_placement,integration::rt_wake_preempt
+          cargo xtask build --arch x86_64 --skip-lints --ktest-only "$selection"
+
+      - name: Ship the idle-wait ktest image
+        if: >-
+          matrix.arch == 'x86_64' && matrix.profile == 'debug'
+          && contains(needs.select.outputs.validate, '{"arch":"x86_64","profile":"debug","tester":"ktest"}')
+        uses: ./.github/actions/tree
+        with:
+          mode: ship
+          name: tree-x86_64-idlewait
+          arch: x86_64
+
       - name: Save the build output
         uses: ./.github/actions/carry
         with:
@@ -575,6 +604,12 @@ jobs:
               checks=(--require 'mapredo knob present; redoing steps 6 and 7'
                       --fail-also ' SKIP ') ;;
           esac
+          # The riscv64 debug ktest boot runs on the monitored idle wait
+          # (docs/testing.md § Idle wait (ktest cell)), and checks that the
+          # kernel took it.
+          if [ "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" = riscv64-debug-ktest ]; then
+            checks+=(--idle-wait on --require 'idle: wait wrs\.nto')
+          fi
           budgeted xtask run \
             --arch ${{ matrix.arch }} \
             --runs 1 --timeout "$budget" \
@@ -636,6 +671,30 @@ jobs:
           xtask test --cell ${{ matrix.tester }} --arch ${{ matrix.arch }} $release \
             --lanes 3
 
+      - name: Fetch the idle-wait ktest image
+        # The focused ktest the x86_64 debug build job built, over the cell's
+        # tree, after the cell's cases, which boot the full one.
+        if: matrix.arch == 'x86_64' && matrix.profile == 'debug' && matrix.tester == 'ktest'
+        uses: ./.github/actions/tree
+        with:
+          mode: fetch
+          name: tree-x86_64-idlewait
+          arch: x86_64
+
+      - name: Run the idle-wait ktest
+        # The focused ktest on the monitored idle wait (docs/testing.md § Idle
+        # wait (ktest cell)): its pass marker is the focused one
+        # (--ktest-only-ok), and the boot checks that the kernel took MWAIT.
+        # Under TCG an idle vCPU on the wait spins on its host thread; the
+        # budget is a bound until CI's passes give a worst pass to derive it
+        # from.
+        if: matrix.arch == 'x86_64' && matrix.profile == 'debug' && matrix.tester == 'ktest'
+        run: |
+          xtask mkdisk --arch x86_64 --harness ktest
+          xtask run --arch x86_64 --idle-wait on --ktest-only-ok \
+            --runs 1 --timeout 120 --save-logs target/xtask/run-saved/idle-wait \
+            --require 'idle: wait mwait' --fail-also ' SKIP '
+
       - name: Upload run logs
         if: always()
         uses: actions/upload-artifact@v7
@@ -662,6 +721,8 @@ jobs:
             target/xtask/run-saved/*.crash.txt
             target/xtask/run-saved/crash-endpoint/*.log
             target/xtask/run-saved/crash-endpoint/*.crash.txt
+            target/xtask/run-saved/idle-wait/*.log
+            target/xtask/run-saved/idle-wait/*.crash.txt
           if-no-files-found: ignore
           retention-days: 14
 

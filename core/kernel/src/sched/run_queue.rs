@@ -108,13 +108,35 @@ fn no_run_queue() -> !
 /// idle queue's bit is never set: it is below every queue.
 const fn queues_above(level: u8) -> u32
 {
-    // queue_index(level) < NUM_RUN_QUEUES <= 32, so the narrowing is lossless
-    // and the shift amount at most 32, which checked_shl maps to no bits.
-    match u32::MAX.checked_shl((queue_index(level) as u32).saturating_add(1))
+    queues_above_rank(level_rank(level))
+}
+
+/// The `non_empty` bits of every run queue above the queue of rank `rank`
+/// ([`CpuRanks`]): those whose threads outrank every thread of a CPU of that
+/// effective rank.
+const fn queues_above_rank(rank: u32) -> u32
+{
+    // A rank is a queue index, below NUM_RUN_QUEUES <= 32, so the shift amount
+    // is at most 32, which checked_shl maps to no bits.
+    match u32::MAX.checked_shl(rank.saturating_add(1))
     {
         Some(mask) => mask,
         None => 0,
     }
+}
+
+/// The `non_empty` bits of the RT run queues: every queue above the fair
+/// queue.
+const RT_QUEUES: u32 = queues_above(syscall::PRIORITY_MIN);
+
+/// The run queues a push may take a waiting RT thread from
+/// (core/kernel/docs/scheduler.md § Load Balancing, "RT push"): those of
+/// `waiting`, the source's [`PerCpuScheduler::waiting_rt`], whose threads
+/// outrank every thread of a destination whose ranks are `dst`, so the moved
+/// thread runs there at once. Empty when no waiting thread would.
+pub const fn push_window(waiting: u32, dst: CpuRanks) -> u32
+{
+    waiting & queues_above_rank(dst.effective())
 }
 
 /// A CPU's ranks as a wake's placement compares them: the rank of the level
@@ -608,6 +630,15 @@ pub struct PerCpuScheduler
     /// reference can reach it.
     idle_pull_cursor: AtomicUsize,
 
+    /// Where this CPU's RT push starts its scan of the other CPUs: the CPU
+    /// after the last one the previous scan read when it found no target, so
+    /// successive misses read successive windows of at most
+    /// `sched::RT_PUSH_SCAN_CPUS` CPUs (core/kernel/docs/scheduler.md § Load
+    /// Balancing, "RT push"). Written and read only by this CPU's
+    /// `timer_tick`, so Relaxed suffices; atomic only so a shared reference can
+    /// reach it.
+    rt_push_cursor: AtomicUsize,
+
     /// Interrupt-flag word saved by [`lock_saving_flags`](Self::lock_saving_flags)
     /// while this CPU's lock is held as part of an all-CPU-locks operation
     /// (`commit_state_under_all_locks`, `relocate_ready_priority`'s walk
@@ -671,6 +702,7 @@ impl PerCpuScheduler
             backlog_episode: AtomicU32::new(0),
             idle_pull_held: AtomicBool::new(false),
             idle_pull_cursor: AtomicUsize::new(0),
+            rt_push_cursor: AtomicUsize::new(0),
             saved_lock_flags: AtomicU64::new(0),
             deferred_reclaim_head: AtomicPtr::new(core::ptr::null_mut()),
             return_work: AtomicPtr::new(core::ptr::null_mut()),
@@ -1074,6 +1106,25 @@ impl PerCpuScheduler
         }
     }
 
+    /// The RT run queues of this CPU that link a thread the running thread is
+    /// not outranked by: a thread of its own RT level or below that waits while
+    /// the running one runs, which the RT push moves to a CPU running lower
+    /// (core/kernel/docs/scheduler.md § Load Balancing, "RT push"). One AND of
+    /// `non_empty`, the RT queues, and the complement of `outranking`; empty
+    /// while the level is [stale](Self::level_stale), whose mask has every bit.
+    ///
+    /// Reads `non_empty` and `outranking` Relaxed, holding no lock. Exact for
+    /// this CPU's own level, which only this CPU records; the caller is this
+    /// CPU's `timer_tick` with interrupts masked, under `lock`, or a push's
+    /// re-decision under `lock` and the destination's.
+    #[inline]
+    pub fn waiting_rt(&self) -> u32
+    {
+        self.non_empty.load(Ordering::Relaxed)
+            & RT_QUEUES
+            & !self.outranking.load(Ordering::Relaxed)
+    }
+
     /// Whether a thread queued on this CPU outranks the running one: the
     /// highest non-empty run queue other than the idle queue is above the
     /// queue of `current_level`. Any RT level outranks a fair level and the
@@ -1348,24 +1399,30 @@ impl PerCpuScheduler
         true
     }
 
-    /// Scan all run queues from highest to lowest and return the first queued
-    /// TCB whose pointer satisfies `pred`, along with a level of the queue it
-    /// is on: its RT level, or the lowest fair level for a fair thread, which
-    /// `remove_from_queue` and `enqueue` resolve to the same fair queue.
+    /// Scan the run queues whose `non_empty` bits `within` names, from highest
+    /// to lowest, and return the first queued TCB whose pointer satisfies
+    /// `pred`, along with a level of the queue it is on: its RT level, or the
+    /// lowest fair level for a fair thread, which `remove_from_queue` and
+    /// `enqueue` resolve to the same fair queue.
     ///
     /// Used by the cross-CPU load balancer to pick a migratable (unpinned)
-    /// thread from a busier CPU's queue.
+    /// thread from a busier CPU's queue, over every queue, and by the RT push
+    /// over its window ([`push_window`]).
     ///
     /// # Safety
     /// The caller holds `self.lock`.
-    pub unsafe fn find_runnable<F>(&self, mut pred: F) -> Option<(*mut ThreadControlBlock, u8)>
+    pub unsafe fn find_runnable<F>(
+        &self,
+        within: u32,
+        mut pred: F,
+    ) -> Option<(*mut ThreadControlBlock, u8)>
     where
         F: FnMut(*mut ThreadControlBlock) -> bool,
     {
         // SAFETY: the caller holds `self.lock` (contract), so no `&mut` to the
         // queues is live.
         let queues = unsafe { self.queues.as_ref_unchecked() };
-        let mut ne = self.non_empty.load(Ordering::Relaxed);
+        let mut ne = self.non_empty.load(Ordering::Relaxed) & within;
         while ne != 0
         {
             let q = ne.ilog2() as usize;
@@ -1480,6 +1537,22 @@ impl PerCpuScheduler
     pub fn set_idle_pull_cursor(&self, cpu: usize)
     {
         self.idle_pull_cursor.store(cpu, Ordering::Relaxed);
+    }
+
+    /// Where this CPU's RT push starts its scan (see the `rt_push_cursor`
+    /// field).
+    #[cfg(not(test))]
+    pub fn rt_push_cursor(&self) -> usize
+    {
+        self.rt_push_cursor.load(Ordering::Relaxed)
+    }
+
+    /// Record `cpu` as where this CPU's RT push starts its next scan. Called
+    /// only by this CPU's `timer_tick`.
+    #[cfg(not(test))]
+    pub fn set_rt_push_cursor(&self, cpu: usize)
+    {
+        self.rt_push_cursor.store(cpu, Ordering::Relaxed);
     }
 
     // Test stubs for host-side unit tests
@@ -1655,7 +1728,7 @@ mod tests
         assert!(enq(&sched, pf, 12));
         assert!(enq(&sched, pr, 23));
         // SAFETY: single-threaded test.
-        let found = unsafe { sched.find_runnable(|t| core::ptr::eq(t, pf)) };
+        let found = unsafe { sched.find_runnable(u32::MAX, |t| core::ptr::eq(t, pf)) };
         let Some((tcb, level)) = found
         else
         {
@@ -1664,10 +1737,144 @@ mod tests
         assert_eq!(tcb, pf);
         assert!(rm(&sched, pf, level));
         // SAFETY: single-threaded test.
-        let found = unsafe { sched.find_runnable(|t| core::ptr::eq(t, pr)) };
+        let found = unsafe { sched.find_runnable(u32::MAX, |t| core::ptr::eq(t, pr)) };
         assert_eq!(found, Some((pr, 23)));
         assert!(rm(&sched, pr, 23));
         assert_eq!(sched.non_empty_mask(), 0);
+    }
+
+    // Defect caught: a pick over every queue where the push asked for its
+    // window, so the push moves a thread that outranks the running one (which
+    // runs at once where it is) or a fair thread.
+    #[test]
+    fn find_runnable_takes_only_from_the_queues_it_is_given()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut high = make_tcb();
+        let mut low = make_tcb();
+        let mut fair = make_tcb();
+        assert!(enq(&sched, &raw mut *high, RT_PRIORITY_MIN + 7));
+        assert!(enq(&sched, &raw mut *low, RT_PRIORITY_MIN + 3));
+        assert!(enq(&sched, &raw mut *fair, syscall::PRIORITY_MIN));
+        let below_high = bit(RT_PRIORITY_MIN + 3) | bit(syscall::PRIORITY_MIN);
+        // SAFETY: single-threaded test.
+        let found = unsafe { sched.find_runnable(below_high & RT_QUEUES, |_| true) };
+        assert_eq!(found, Some((&raw mut *low, RT_PRIORITY_MIN + 3)));
+        // SAFETY: single-threaded test.
+        let found = unsafe { sched.find_runnable(bit(RT_PRIORITY_MIN + 5), |_| true) };
+        assert_eq!(found, None);
+    }
+
+    // ── RT push ───────────────────────────────────────────────────────────────
+
+    // Defect caught: a waiting test that counts a thread which outranks the
+    // running one (it runs at the next return, where it is), misses one queued
+    // at the running level or below, counts a fair thread, or reads a stale
+    // level as a real one.
+    #[test]
+    fn a_queued_rt_thread_waits_exactly_when_it_does_not_outrank_the_running_one()
+    {
+        for running in 0..NUM_PRIORITY_LEVELS as u8
+        {
+            for queued in syscall::PRIORITY_MIN..NUM_PRIORITY_LEVELS as u8
+            {
+                let sched = PerCpuScheduler::new();
+                let mut tcb = make_tcb();
+                sched.set_current_level(running);
+                assert!(enq(&sched, &raw mut *tcb, queued));
+                let waits = queued >= RT_PRIORITY_MIN && !outranks(queued, running);
+                let expected = if waits { bit(queued) } else { 0 };
+                assert_eq!(
+                    sched.waiting_rt(),
+                    expected,
+                    "running {running}, queued {queued}"
+                );
+                sched.mark_level_stale();
+                assert_eq!(sched.waiting_rt(), 0, "stale, queued {queued}");
+            }
+        }
+    }
+
+    // Defect caught: a window that lets a push move a thread to a CPU whose
+    // running or queued thread it does not outrank, where it waits again, or
+    // that refuses a destination it outranks.
+    #[test]
+    fn the_push_window_holds_the_waiting_levels_that_outrank_the_destination()
+    {
+        let levels = || IDLE_PRIORITY..NUM_PRIORITY_LEVELS as u8;
+        for running in levels()
+        {
+            for queued in syscall::PRIORITY_MIN..NUM_PRIORITY_LEVELS as u8
+            {
+                let src = PerCpuScheduler::new();
+                let mut tcb = make_tcb();
+                src.set_current_level(running);
+                assert!(enq(&src, &raw mut *tcb, queued));
+                let waiting = src.waiting_rt();
+                for dst_running in levels()
+                {
+                    for dst_queued in levels()
+                    {
+                        let dst = CpuRanks::of(dst_running, bit(dst_queued));
+                        let moves = waiting != 0 && level_rank(queued) > dst.effective();
+                        let expected = if moves { bit(queued) } else { 0 };
+                        assert_eq!(
+                            push_window(waiting, dst),
+                            expected,
+                            "src {running}/{queued}, dst {dst_running}/{dst_queued}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Defect caught: a destination dispatch that the push's re-decision cannot
+    // see (the destination records its level after it releases its lock)
+    // leaving the moved thread waiting there with no CPU's push able to move it
+    // again. The model: the destination has dequeued a higher thread under its
+    // lock but not yet recorded its level when the push re-decides; once it
+    // records the level, the moved thread waits there, and that CPU's own
+    // waiting test, at its next tick, finds it for a CPU that still runs lower.
+    #[test]
+    fn a_thread_a_push_moves_behind_a_racing_dispatch_waits_on_for_that_cpus_push()
+    {
+        let waiting_level = RT_PRIORITY_MIN + 3;
+        let src = PerCpuScheduler::new();
+        let dst = PerCpuScheduler::new();
+        let other = PerCpuScheduler::new();
+        let mut low = make_tcb();
+        let mut high = make_tcb();
+        let pl = &raw mut *low;
+        src.set_current_level(RT_PRIORITY_MIN + 7);
+        assert!(enq(&src, pl, waiting_level));
+        dst.set_current_level(syscall::PRIORITY_MIN);
+        other.set_current_level(syscall::PRIORITY_MIN);
+        assert_eq!(src.waiting_rt(), bit(waiting_level));
+
+        // The destination's dispatch dequeues its higher thread under its lock.
+        assert!(enq(&dst, &raw mut *high, RT_PRIORITY_MIN + 9));
+        assert_eq!(deq(&dst), &raw mut *high);
+        // The push re-decides under both locks on the level not yet recorded.
+        let window = push_window(src.waiting_rt(), dst.ranks());
+        assert_eq!(window, bit(waiting_level));
+        // SAFETY: single-threaded test.
+        let pick = unsafe { src.find_runnable(window, |_| true) };
+        assert_eq!(pick, Some((pl, waiting_level)));
+        assert!(rm(&src, pl, waiting_level));
+        assert!(enq(&dst, pl, waiting_level));
+        assert_eq!(src.waiting_rt(), 0);
+
+        // The dispatch records its level: the moved thread waits there, and the
+        // destination's own test finds it for the CPU that still runs lower.
+        dst.set_current_level(RT_PRIORITY_MIN + 9);
+        assert_eq!(dst.waiting_rt(), bit(waiting_level));
+        assert_eq!(
+            push_window(dst.waiting_rt(), other.ranks()),
+            bit(waiting_level)
+        );
+        // Had the push seen the recorded level, it would have refused the move.
+        assert_eq!(push_window(bit(waiting_level), dst.ranks()), 0);
     }
 
     // ── Return work ───────────────────────────────────────────────────────────

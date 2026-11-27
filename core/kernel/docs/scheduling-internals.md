@@ -148,9 +148,9 @@ skipping levels, risks deadlock.
    scheduler.lock(s); when two or more per-CPU scheduler.locks are needed simultaneously, they MUST
    be taken in ascending-CPU order. Live production sites: `sys_thread_set_affinity` active
    migration (`(*tcb).sched_lock`, then `sched::migrate_ready_thread` takes the two CPU locks
-   ascending), `pull_unpinned_ready` (the periodic load balancer; the two CPU locks try-acquired
-   ascending, then the candidate's `sched_lock` try-acquired, the inverse order made deadlock-free
-   by try-locking every acquisition; see
+   ascending), `pull_unpinned_ready` (the periodic load balancer and the RT push; the two CPU
+   locks try-acquired ascending, then the candidate's `sched_lock` try-acquired, the inverse order
+   made deadlock-free by try-locking every acquisition; see
    [scheduler.md § Load Balancing](scheduler.md#load-balancing); it shares only the inner
    `relocate_ready_thread` with `migrate_ready_thread`; rule 5 states the exemption),
    `dealloc_object(Thread)` (`(*tcb).sched_lock` then the all-CPU walk in ascending order),
@@ -545,7 +545,7 @@ write, and the canonical helper / locks held. Deviations from this table are bug
 | `Ready` | `Running` | `schedule()` selecting next | running CPU | `next.sched_lock` (the incoming dispatch flip; serialises with a concurrent `enqueue_and_wake(next)` which then coalesces) |
 | `Running` | `Ready` | `schedule(Requeue::Always)` (yield, preempt) | running CPU | `current.sched_lock` (outer) → running CPU's scheduler.lock (inner); if `cpu_affinity` excludes the running CPU the requeue is linked directly on the target CPU under `current.sched_lock` + the target run-queue lock after dropping the local lock (inlined, not via `enqueue_and_wake`, to avoid re-acquiring `current.sched_lock`) |
 | `Ready` (on CPU A) | `Ready` (on CPU B) | `sys_thread_set_affinity` (active migration) | calling CPU | `(*tcb).sched_lock` (outer, held by the syscall across its affinity write), then `migrate_ready_thread(tcb, A, B)` takes both scheduler.locks in ascending-CPU order (inner); the move runs through `relocate_ready_thread` |
-| `Ready` (on CPU A) | `Ready` (on CPU B) | periodic load balancer | pulling CPU (B) | `pull_unpinned_ready(A, B, rule)`: both scheduler.locks try-locked in ascending-CPU order, the pull's rule re-decided on both loads under them, then the candidate's `sched_lock` try-locked (the inverse order, backing off on contention); the move runs through `relocate_ready_thread` |
+| `Ready` (on CPU A) | `Ready` (on CPU B) | periodic load balancer, or the RT push | pulling CPU (B), or for the push the source CPU (A) at its tick | `pull_unpinned_ready(A, B, rule)`: both scheduler.locks try-locked in ascending-CPU order, the pull's rule re-decided under them (on both loads, or for the push on A's waiting RT queues and B's ranks), then the candidate's `sched_lock` try-locked (the inverse order, backing off on contention); the move runs through `relocate_ready_thread` |
 | `Running` | `Blocked` | IPC blocking entry (`endpoint_call`, `endpoint_recv` (`BlockedOnRecv`), `notification_wait`, `event_queue_recv`, `waitset_wait`) | running CPU | `commit_blocked_under_local_lock(tcb, ipc, blocked_on)` (acquires `(*tcb).sched_lock`); on a refusal (`ParkCommit::RefusedStop`: a stop/exit won, or a pending upcall may end the park, which a call's never is; `ParkCommit::RefusedWake`: `wake_pending` forced a refuse-to-park) the IPC primitive rolls back its waiter registration — a `RefusedStop` rollback stamps the episode cancelled, a `RefusedWake` rollback leaves the deposited payload, and `endpoint_call` stamps the call cancelled on either refusal (Lock Hierarchy rule 8). the receive's dequeued sender rebinds via `commit_reply_rebind_under_local_lock` instead |
 | `Running` | `Blocked` | `sys_thread_sleep` plain sleep | running CPU | `commit_blocked_under_local_lock(tcb, None, null)`, then `sleep_list_add` (see [thread-lifecycle-and-sleep.md § `sys_thread_sleep` and the Plain-Sleep Path](thread-lifecycle-and-sleep.md#sys_thread_sleep-and-the-plain-sleep-path)) |
 | `Blocked` | `Ready` | IPC wake (`notification_send`, `event_queue_post`, `endpoint_reply`, `endpoint_call` server-wake, `waitset_notify`, and the release of an unreplied or displaced caller, `release_unreplied_caller` / `release_displaced_caller`, per [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model) | wake-issuing CPU | source IPC lock to snapshot wakeup payload, *released*, then `enqueue_and_wake(target_cpu)`; `endpoint_reply` takes no source lock: the `reply_tcb` CAS is the claim, then stamp and `enqueue_and_wake(target_cpu)`; `release_unreplied_caller` takes none either: the `reply_tcb` `swap(null)` is the claim (the try-once receive's rebind `swap` claims a displaced caller), then the INTERRUPTED stamp and `enqueue_and_wake(target_cpu)` |
@@ -768,6 +768,62 @@ pulls a pinned thread (eventual consistency, not instant re-homing — #116). Th
 primitive takes the caller-located `priority` (the level `find_runnable` /
 `migrate` found the candidate at), never re-reading `(*tcb).priority`, which a
 concurrent `sys_thread_set_priority` could desync from the linked level.
+
+**The RT push** ([scheduler.md § Load Balancing](scheduler.md#load-balancing), "RT push") is a
+pull that the source CPU makes, `pull_unpinned_ready(this CPU, target, PullRule::Waiting)` from its
+own `timer_tick` with no lock held, so it keeps every invariant of the pull above, and adds none
+of its own to a thread's lifecycle:
+
+1. **Lock order.** It takes the two run-queue locks try-acquired in ascending-CPU order, then the
+   thread's `sched_lock` try-acquired (Lock Hierarchy rule 4; rule 5's exemption), and holds none
+   of them across the target's choice. Every acquisition is a try, so the push waits on no CPU
+   and a contended one defers it to the CPU's next tick.
+2. **What it moves.** Under both locks the pick is the highest thread of the push window, the
+   source's waiting RT queues (`waiting_rt`) above the target's effective rank, that is unpinned
+   and has `context_saved == 1`, and `relocate_ready_thread` moves it only after it reads again,
+   under its `sched_lock`, `Ready`, `context_saved == 1` and an affinity that admits the target.
+   So the push never moves a thread that is running or mid-handoff (step 11), one that a
+   concurrent `sys_thread_set_affinity` pinned, or one whose level a concurrent
+   `sys_thread_set_priority` relinked out of the window (the relink holds the source's lock).
+3. **What a concurrent wake, block or dispatch observes.** The moved thread is `Ready` and linked
+   throughout: unlinked from the source and linked on the target under both run-queue locks and
+   its `sched_lock`, with `preferred_cpu` set to the target, so a wake of it (which takes its
+   `sched_lock` first) finds it `Ready` and coalesces, before or after the move, and no CPU's
+   dispatch can take it between the unlink and the link. The thread is not running, so it cannot
+   block during the push, and the source cannot dispatch it either, since the push runs inside the
+   source's tick. Another CPU's pull, a stop, or a priority change that takes the thread off the
+   source's waiting queues before the push holds the source's lock leaves the pick to find another
+   thread of the window or none (`NothingPullable`, or an empty window and `RuleFailed`). A
+   dispatch on the target raises its level unseen by the push's scan when the scan's lock-free
+   `ranks` read falls between its dequeue, under the target's lock, and its `mark_dispatched`,
+   which records the level after the lock release. A link on the target after the scan raises its
+   queued rank the same way. A priority change that raises the level of the target's running
+   thread does too: `sys_thread_set_priority` only marks the recorded level stale
+   (`mark_level_stale`), so the scan reads the old level until the target's next return to user
+   mode records it again (`preempt_if_outranked`). When the link, or the record of the level by a
+   dispatch or after a priority change, comes before the push's re-check, the re-check reads it
+   under the target's lock and refuses (`RuleFailed`), which costs a tick. A record of the level
+   after the re-check, by a dispatch or after a priority change, is one the re-check cannot see:
+   the thread then waits on the target, whose ticks' waiting test finds it and whose pushes move
+   it on from the target's own cursor, within the push's bound again (one tick up to 129 CPUs,
+   ceil((n - 1) / 128) ticks above;
+   [scheduler.md § Load Balancing](scheduler.md#load-balancing), "RT push"). The pull's wake IPI
+   to the target (always sent, § Wake Protocol Invariants) makes the target's next return to user
+   mode decide the preemption under its lock.
+4. **Lock-free reads.** The waiting test reads the source's own `non_empty` and `outranking`
+   under its lock with interrupts masked. Only that CPU records its level in `outranking`, so the
+   test is exact, save for `LEVEL_STALE`, which `sys_thread_set_priority` on any CPU stores when
+   the running thread's priority changes: a stale level reads no waiting queue, at the tick and at
+   the re-check under the locks, until the CPU's next return to user mode with a thread queued
+   re-records the level, the tick's own return among them, which costs the push one tick.
+   The target's choice reads other CPUs' `ranks`, `current_load` and, on a tie, their siblings'
+   `has_no_work`, all Relaxed and advisory (§ Lock-free readers of a CPU's run queues), and the
+   source's own `rt_push_cursor`. Every decision those reads feed is made again under the locks,
+   save the target's running level, whose staleness costs the push's bound again (item 3).
+
+The host tests `a_thread_a_push_moves_behind_a_racing_dispatch_waits_on_for_that_cpus_push`
+(`sched::run_queue`) model item 3's race, and `sched::rt_push_tests` the target choice and the
+scan window.
 
 Note that the re-enqueue does not re-route via `select_target_cpu`, so a
 concurrent narrowing `sys_thread_set_affinity` that lands between this
@@ -1760,6 +1816,7 @@ the ordering choice is required for correctness; relaxations would introduce a r
 | `idle_pull_episode` (per `PerCpuScheduler`, `AtomicU32`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_candidate` / `set_idle_pull_candidate`, called from `try_pull_idle`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state, meaningful only while `idle_pull_candidate` is set: one CPU writes and reads it, so no ordering edge is needed. |
 | `backlog_episode` (per `PerCpuScheduler`, `AtomicU32`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; written in `link` and `remove_from_queue`; read in `backlog`, by `idle_scan`, `idle_pull_tick` and `pull_under_cpu_locks`) | Relaxed `load` and `store` in `link`, under `lock`, before its Release `non_empty.fetch_or`, when the queues held no thread but the idle thread (an even count two on, an odd one up to the even count before it), and in `remove_from_queue`, under `lock`, before its Release `non_empty.fetch_and`, when its removal leaves no thread but the idle thread queued (the count one lower, odd) | Relaxed `load` in `backlog`, after its Acquire `non_empty` load, rounded up to even | Every write holds `lock`, so a reader under it reads the exact episode. A lock-free sample that sees a link's `non_empty` bit reads that link's episode or a later one (the `non_empty` pair), never an older one; a sample is advisory, and the pull re-checks the episode under the lock. A sample that reads the odd count of a removal it raced rounds it up to the episode that removal continues. A sample that races a dispatch running the backlog dry and the link that refills the queues can read the new episode for the backlog it saw, which costs one pull of a backlog that did not stand a tick, a pull the bound allows. The count wraps: a stale match needs 2^31 backlogs between two samples a tick apart, and would cost one pull, which the bound already allows. |
 | `idle_pull_held` (per `PerCpuScheduler`, `AtomicBool`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_held` / `set_idle_pull_candidate`, which clears it / `hold_idle_pull_candidate` / `forget_idle_pull_candidate`, called from `try_pull_idle` and `try_pull_balance`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only delays a pull by one tick ([scheduler.md](scheduler.md) § SMT Awareness). |
+| `rt_push_cursor` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `rt_push_cursor` / `set_rt_push_cursor`, called from `try_push_waiting_rt`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only orders the RT push's scan, which the push revalidates under the run-queue locks. |
 | `idle_pull_cursor` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_cursor` / `set_idle_pull_cursor`, called from `try_pull_idle`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only orders the idle scan, which every pull revalidates under the run-queue locks. |
 | `park_disposition` (per TCB, `AtomicU8`) | `core/kernel/src/sched/thread.rs` (decl; ops `open_park_episode`, `stamp_park_deposit`, `consume_park_interrupted`, `consume_park_cancel`; `consume_call_disposition` in `core/kernel/src/syscall/ipc.rs`) | Release `store` of `NONE` by `open_park_episode` (directly or via `open_call_episode`) before the thread becomes claimable; Release `store` of the disposition by the wake-claim winner in `stamp_park_deposit` (directly or via `stamp_cancelled_deposit`) | Acquire `load` on resume in `consume_park_interrupted` / `consume_park_cancel` / `consume_call_disposition` | The claim winner's Release orders its deposit (`ipc_msg`, `wakeup_value`) before the stamp, so a resuming thread whose Acquire load observes the stamp also observes the deposit; see [ipc-internals.md § Park Dispositions and Episodes](ipc-internals.md#park-dispositions-and-episodes) for the episode protocol. |
 | `deferred_reclaim_head` (per `PerCpuScheduler`, `AtomicPtr<u8>`) | `core/kernel/src/sched/run_queue.rs` (decl); push in `push_deferred_reclaim` and drain in `drain_deferred_reclaim` (`core/kernel/src/cap/object.rs`) | AcqRel `compare_exchange` push (Acquire on failure and on the head load) | Acquire `load` fast-path empty check, then AcqRel `swap(null)` drain | Lock-free Treiber stack: the push's Release publishes the node's intrusive link written before the CAS, and the drain's Acquire swap observes it, so the draining CPU walks fully linked nodes. |
@@ -1818,7 +1875,8 @@ take no lock:
 - `has_queued_thread` (Relaxed), through `has_no_work`: the softlockup watchdog's per-tick idle
   sample (`system_has_no_work`), the SMT core spread, and the idle pull's sibling hold.
 - `ranks` (Relaxed, with `current_level`): an RT wake's placement on any CPU (§ Wake Protocol
-  Invariants, "The RT rule").
+  Invariants, "The RT rule"), and the RT push's choice of a target (§ ThreadState Transitions,
+  "The RT push").
 
 Four invariants make their samples sound:
 
@@ -1855,7 +1913,9 @@ Four invariants make their samples sound:
    hold count the sibling idle ([scheduler.md § SMT Awareness](scheduler.md#smt-awareness)).
    `ranks`' consumer acts on one sample too: a missed thread, or a level the CPU has since left,
    places an RT wake behind a thread it does not outrank (§ Wake Protocol Invariants, "The RT
-   rule").
+   rule"). The RT push's consumer re-reads the target's ranks under its lock, so a stale sample
+   costs it a futile lock round, save a running level the target records after its lock release,
+   which costs the push's bound again (§ ThreadState Transitions, "The RT push").
    Invariant 2 keeps `relink` from making any reader miss a thread that stays queued.
 
 A new writer of a CPU's run queues MUST keep all four: in particular, it moves a queued thread

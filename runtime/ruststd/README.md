@@ -158,7 +158,8 @@ sleep lets a holder below the waiter run on the waiter's CPU. A waiter in the st
 class runs before every fair thread, and before every lower-level strict-priority thread, on its
 CPU ([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md) § Scheduling Classes).
 Such a waiter that only spun would starve a holder below it there and, with no other CPU idle to
-pull the holder (that document's § Load Balancing), wait forever.
+pull the holder, or, for a strict-priority holder, running a lower level to push it to (that
+document's § Load Balancing), wait forever.
 
 ### Page reservations
 

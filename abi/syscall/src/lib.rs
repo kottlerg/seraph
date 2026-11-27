@@ -563,8 +563,8 @@ pub const THREAD_PLACEMENT_IDLE_WAKES: u64 = 2;
 /// [`CAP_INFO_THREAD_PLACEMENT`] view: wakes that linked the thread on a CPU
 /// other than the one it was last on.
 pub const THREAD_PLACEMENT_WAKE_MOVES: u64 = 3;
-/// [`CAP_INFO_THREAD_PLACEMENT`] view: times the load balancer moved the
-/// thread, queued, to another CPU.
+/// [`CAP_INFO_THREAD_PLACEMENT`] view: times the load balancer or the RT push
+/// moved the thread, queued, to another CPU.
 pub const THREAD_PLACEMENT_PULLS: u64 = 4;
 /// [`CAP_INFO_THREAD_PLACEMENT`] view: wakes of the thread by a synchronous
 /// IPC call, a fault delivery, or the reply of a `SYS_IPC_REPLY_RECV` to a

@@ -10,11 +10,11 @@
 //! the next receive in one `SYS_IPC_REPLY_RECV`, so the kernel places the
 //! caller's wake knowing whether this thread blocks or runs on
 //! (`docs/ipc-design.md` § The Call/Reply Model). A handler with work after
-//! its reply, or one that must answer before something it does next, replies
-//! at once with [`crate::ipc_reply`] and leaves the slot empty; a loop with
-//! work before its next receive sends the slot's reply first
+//! its reply, or one that must answer before something it does next, and a
+//! loop with work before its next receive, send the slot's reply first
 //! ([`Reply::flush`]), with a receive that does not wait, and the call that
-//! receive binds is the one the next [`next_request`] returns. With the slot
+//! receive binds is the one the next [`next_request`] returns; a thread
+//! about to exit sends its last reply alone ([`Reply::send_last`]). With the slot
 //! empty, [`next_request`] is [`crate::ipc_recv`]. A loop whose receive
 //! waits a bounded time uses [`next_request_timeout`], and one that undoes a
 //! request's effect when its reply does not reach the caller reads
@@ -239,6 +239,39 @@ impl Reply
             },
             ep,
         );
+    }
+
+    /// Send the reply now, alone (`SYS_IPC_REPLY`), when one is set, for a
+    /// thread that receives no more requests: one about to exit. A plain reply
+    /// waits behind nothing there, since the thread parks for good, and a
+    /// receive would bind a call the exit then fails with `Interrupted` and
+    /// its caps lost, where the endpoint's queue would have kept it. Any other
+    /// send before work is [`Self::flush`]. The outcome is
+    /// [`Self::undelivered`]'s; the caps of an undelivered reply set with
+    /// [`Self::set_or_delete_caps`] are deleted.
+    ///
+    /// # Safety
+    /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer
+    /// page as registered via `syscall::ipc_buffer_set`.
+    pub unsafe fn send_last(&mut self, ipc_buf: *mut u64)
+    {
+        self.send_last_with(&mut Kernel {
+            ipc_buf,
+            wait: Unbounded,
+        });
+    }
+
+    fn send_last_with<T: Transport>(&mut self, kernel: &mut T)
+    {
+        if self.state != Slot::Pending
+        {
+            return;
+        }
+        self.state = Slot::Empty;
+        if kernel.reply(&self.msg).is_err()
+        {
+            self.lose(kernel);
+        }
     }
 
     fn flush_with<T: Transport>(&mut self, kernel: &mut T, ep: u64)
@@ -762,6 +795,31 @@ mod tests
         );
         Reply::new().flush_with(&mut kernel, EP);
         assert_eq!(kernel.count, 2, "an empty slot's flush sends nothing");
+    }
+
+    // The defect caught: a last send that receives (binding a call the exit
+    // fails), sends an empty slot's reply, or sends a reply twice, or an
+    // undelivered last reply that keeps its caps.
+    #[test]
+    fn a_last_send_replies_alone_once()
+    {
+        let mut kernel = Script::new();
+        let mut reply = with_reply();
+        reply.send_last_with(&mut kernel);
+        reply.send_last_with(&mut kernel);
+        Reply::new().send_last_with(&mut kernel);
+        assert_eq!(kernel.calls(), &[Some(Call::Reply(REPLY))]);
+        assert!(!reply.undelivered());
+
+        let mut kernel = Script::new();
+        kernel.reply = Err(err(SyscallError::InvalidCapability));
+        let mut reply = with_owned_reply();
+        reply.send_last_with(&mut kernel);
+        assert_eq!(
+            kernel.calls(),
+            &[Some(Call::Reply(REPLY)), Some(Call::Delete(CAP))]
+        );
+        assert!(reply.undelivered());
     }
 
     // The defect caught: a flush whose receive found no call, or was refused

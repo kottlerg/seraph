@@ -19,6 +19,7 @@
 pub mod deadline_heap;
 pub mod fpu_switch;
 pub mod hold;
+pub mod idle_wake;
 pub mod registry_list;
 pub mod run_limit;
 pub mod run_queue;
@@ -536,8 +537,9 @@ pub(crate) struct CpuDiag
     syscall_nr: core::sync::atomic::AtomicU64,
     /// The times this CPU's idle thread has halted it since boot, one per
     /// halt of the idle loop ([`note_idle_halt`]): one per stretch in which
-    /// the CPU found no thread to run, and one more for each interrupt that
-    /// ends a halt and leaves it with none. Written by the idle thread only,
+    /// the CPU found no thread to run, and one more for each interrupt or
+    /// wake that ends a halt, or monitored wait, and leaves it with none.
+    /// Written by the idle thread only,
     /// a Relaxed load and store; read by a syscall on this CPU only
     /// (`SYS_SYSTEM_INFO`'s `IdleHalts`, [`idle_halts_since_mark`]), never by
     /// another CPU, and never reported whole: a caller learns only its
@@ -2789,14 +2791,31 @@ fn idle_thread_entry(_cpu_id: u64) -> !
                 crate::arch::current::cpu::disable_interrupts();
             }
 
-            // Step 2: check the run queues. Idle state is not published; a
-            // producer links its thread before it sends the wake IPI, which it
-            // always sends rather than consulting a per-CPU idle mask.
+            // With the monitored wait, set the idle wake flag before the
+            // check: a waker from here on clears it with the store that ends
+            // the wait below, or that the wait's re-check sees, and sends no
+            // IPI; a waker before here found it clear and sent the IPI, which
+            // the masking holds pending until the wait.
             // See core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants.
+            let wake = idle_sched.idle_wake();
+            let monitored = crate::arch::current::cpu::idle_wait_available();
+            if monitored
+            {
+                wake.begin_poll();
+            }
+
+            // Step 2: check the run queues. A producer links its thread before
+            // it clears the flag or sends the wake IPI.
             let has_work = idle_sched.has_runnable();
 
             if has_work
             {
+                // Clear the flag before anything else runs, so a waker from
+                // here on sends the IPI a running thread's preemption needs.
+                if monitored
+                {
+                    wake.end_poll();
+                }
                 // SAFETY: paired with the `disable_interrupts` above.
                 unsafe {
                     crate::arch::current::interrupts::enable();
@@ -2810,13 +2829,26 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             }
 
             // Step 3: no work → halt. Atomic on both arches: x86
-            // `sti;hlt`, RISC-V `wfi; csrsi sstatus, SIE`.
+            // `sti;hlt` or `sti;mwait`, RISC-V `wfi` or `wrs.nto`, then
+            // `csrsi sstatus, SIE`.
             // Returns with interrupts enabled; any pending wake interrupt
             // has been recognised. The halt is counted before it is
             // taken: the interrupt that ends it can switch straight to the
             // thread it woke, which must then read the halt in the count.
             note_idle_halt();
-            halt_until_interrupt();
+            if monitored
+            {
+                // SAFETY: interrupts are masked (step 1), the wait's
+                // precondition; the word is this CPU's own, live for the boot.
+                unsafe {
+                    crate::arch::current::cpu::wait_on_word(wake.word(), idle_wake::POLLING);
+                }
+                wake.end_poll();
+            }
+            else
+            {
+                halt_until_interrupt();
+            }
         }
 
         // Test mode: no real halt; the primitive is a host-side no-op.
@@ -7820,10 +7852,12 @@ pub unsafe fn select_target_cpu(_tcb: *mut ThreadControlBlock, _hint: WakeHint) 
     0
 }
 
-/// Send a wakeup IPI to `target_cpu`. Always sent (except for self) per
-/// the wake-protocol invariant in core/kernel/docs/scheduling-internals.md
-/// § Wake Protocol Invariants — predicating on a per-CPU "is idle" hint
-/// is a missed-wakeup race against the target's halt boundary.
+/// Wake `target_cpu` after a link on its run queues: clear its idle wake flag
+/// when it waits on the word with the monitored wait, whose store ends the
+/// wait, and otherwise send it the wakeup IPI (except for self), per
+/// core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants. The
+/// IPI is skipped only when this call's read-modify-write cleared a set flag;
+/// a plain read of the flag would race the target's re-check.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`).
@@ -7839,6 +7873,17 @@ unsafe fn wake_idle_cpu(target_cpu: usize)
     if target_cpu == current
     {
         return;
+    }
+
+    if crate::arch::current::cpu::idle_wait_available()
+    {
+        // SAFETY: target_cpu is a valid online CPU index (caller contract), so
+        // its scheduler is initialised.
+        let target = unsafe { scheduler_for(target_cpu) };
+        if target.idle_wake().wake()
+        {
+            return;
+        }
     }
 
     // SAFETY: target_cpu is valid; apic_id_for returns the APIC/hart ID.
@@ -8101,6 +8146,16 @@ pub unsafe fn schedule(requeue: Requeue)
     // reference: other CPUs reach this scheduler concurrently, and the run
     // queues are touched only through its lock-held `unsafe` methods.
     let sched = unsafe { crate::percpu::current_scheduler() };
+    // The idle wake flag is set only inside the idle loop's wait, which no
+    // switch interrupts: the idle thread clears it before it calls schedule(),
+    // and an interrupt taken in kernel mode never switches (the timer tick
+    // returns before its switch for the idle thread's zero slice, and the
+    // return work runs only on a return to user mode). A flag left set here
+    // would let wakers skip the IPI a running thread's preemption needs.
+    debug_assert!(
+        !sched.idle_wake().polling(),
+        "schedule: cpu {cpu} entered with its idle wake flag set"
+    );
 
     // The scheduler lock is taken with lock_raw/unlock_raw below, paired before
     // function return (or before the context switch that may change the stack).

@@ -852,7 +852,7 @@ pull_unpinned_ready(src, dst, rule):
         tcb.preferred_cpu = dst
         moved = true
     unlock tcb.sched_lock; unlock both
-    if moved: wake_idle_cpu(dst)               // always-IPI
+    if moved: wake_idle_cpu(dst)               // IPI unless the idle wake flag was set
 ```
 
 The `context_saved == 1` predicate is the load-balancer liveness gate of
@@ -921,8 +921,8 @@ a producer and a consumer thread, neither pinned
 
 | Counter | Counts |
 |---|---|
-| `remote_wakes` | Wakes (`enqueue_and_wake`) that linked the thread on a CPU other than the waker's, each of which sent that CPU a wake IPI ([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol Invariants) |
-| `idle_wakes` | Of those, the wakes whose CPU ran its idle thread at the link, which halts while it has no work, so that the thread waited for the CPU to leave its halt |
+| `remote_wakes` | Wakes (`enqueue_and_wake`) that linked the thread on a CPU other than the waker's, each of which cleared that CPU's idle wake flag or sent it a wake IPI ([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol Invariants) |
+| `idle_wakes` | Of those, the wakes whose CPU ran its idle thread at the link, which halts or waits while it has no work, so that the thread waited for the CPU to leave its halt or wait |
 | `wake_moves` | Wakes that linked the thread on a CPU other than its `preferred_cpu` |
 | `pulls` | Load-balancer pulls and RT pushes that moved the thread (`pull_unpinned_ready`, § Load Balancing) |
 | `sync_wakes` | Synchronous-hint wakes that reached the synchronous wake rule (§ Thread Assignment) |
@@ -1278,12 +1278,34 @@ and the sole-reference table still has work, it runs further drain passes
 ([capability-internals.md](capability-internals.md#sole-reference-observers) § Sole-Reference
 Observers). It then masks interrupts
 and checks `has_runnable`. If the run queues hold work, it re-enables interrupts and calls
-`schedule(Requeue::Always)`, then loops. Otherwise it halts through the atomic enable-and-halt
-`arch::current::cpu::halt_until_interrupt`.
-Masking before the check means a wake IPI that lands between the check and the halt stays
-pending and ends the halt. The protocol is specified in
-[scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
-Invariants.
+`schedule(Requeue::Always)`, then loops. Otherwise it waits, with interrupts enabled
+atomically at the wait, until an interrupt or a waker ends the wait, and loops.
+Masking before the check means a wake IPI that lands between the check and the wait stays
+pending and ends the wait.
+
+The wait is a monitored wait on the CPU's idle wake word where every CPU has one: x86-64
+`MONITOR`/`MWAIT` (CPUID.01H:ECX.MONITOR), riscv64 Zawrs `WRS.NTO` (the bootloader's
+`HART_CAP_ZAWRS`, [docs/platform-requirements.md](../../../docs/platform-requirements.md)).
+The boot CPU chooses it once, before any other CPU starts
+(`arch::current::cpu::init_idle_wait`, which logs `idle: wait mwait`, `hlt`, `wrs.nto` or
+`wfi`). The word (`PerCpuScheduler`'s `IdleWake`, alone in its cache line) holds a polling
+flag:
+
+- With interrupts masked, the idle thread sets the flag before its run-queue check. Finding work,
+  it clears the flag before it runs anything else. Finding none, it arms the wait on the word
+  (x86-64 `MONITOR`, riscv64 an `lr.w` reservation), re-reads the flag, and unless a waker has
+  cleared it waits (`sti; mwait` with the C1 hint, the state `hlt` enters; riscv64 `wrs.nto`
+  then `csrsi sstatus, SIE`). It clears the flag when the wait ends.
+- `wake_idle_cpu` clears the target's flag with one read-modify-write and sends no IPI when the
+  flag was set: its store ends the wait, or the re-read after the arm sees it. When the flag was
+  clear it sends the wakeup IPI. An interrupt ends the wait as it ends a halt.
+
+Without the monitored wait the idle loop halts through the atomic enable-and-halt
+`arch::current::cpu::halt_until_interrupt` (`sti; hlt`, `wfi`), and every remote wake sends the
+IPI. Neither wait enters a state deeper than `hlt`'s. The protocol and its ordering are specified
+in [scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
+Invariants. Under QEMU the monitored wait is offered only to a boot with `cargo xtask run
+--idle-wait on` ([xtask/README.md](../../../xtask/README.md#cargo-xtask-run)).
 
 The idle thread makes no wake-preemption decision of its own (§ Wake Preemption): for the idle
 level every queued thread outranks the running one, so the loop's `has_runnable` check is that

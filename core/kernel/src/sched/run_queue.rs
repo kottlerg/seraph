@@ -27,6 +27,7 @@
 //! ascending-CPU-order rule that applies whenever two scheduler locks are
 //! held simultaneously.
 
+use super::idle_wake::IdleWake;
 use super::thread::ThreadControlBlock;
 use super::{IDLE_PRIORITY, NUM_PRIORITY_LEVELS, RT_PRIORITY_MIN};
 use core::cell::UnsafeCell;
@@ -659,6 +660,15 @@ pub struct PerCpuScheduler
     /// per-type intrusive link field.
     pub deferred_reclaim_head: AtomicPtr<u8>,
 
+    /// This CPU's idle wake word: the flag its idle thread sets while it waits
+    /// on the word with the monitored wait, and the word that wait watches
+    /// (`super::idle_wake`). Written by this CPU's idle thread and by any
+    /// CPU's `sched::wake_idle_cpu`, each a read-modify-write; its orderings
+    /// are specified in core/kernel/docs/scheduling-internals.md § Wake
+    /// Protocol Invariants. Alone in its cache line, so a waker's store to it
+    /// shares no line with the fields this CPU reads.
+    idle_wake: IdleWake,
+
     /// This CPU's `PerCpuData::return_work` word, in which a link that leaves
     /// a queued thread outranking the running one, and a stale level, post
     /// `percpu::return_work::PREEMPT` ([`post_preempt`](Self::post_preempt)).
@@ -705,8 +715,15 @@ impl PerCpuScheduler
             rt_push_cursor: AtomicUsize::new(0),
             saved_lock_flags: AtomicU64::new(0),
             deferred_reclaim_head: AtomicPtr::new(core::ptr::null_mut()),
+            idle_wake: IdleWake::new(),
             return_work: AtomicPtr::new(core::ptr::null_mut()),
         }
+    }
+
+    /// This CPU's idle wake word ([`IdleWake`]).
+    pub fn idle_wake(&self) -> &IdleWake
+    {
+        &self.idle_wake
     }
 
     /// Name `word` as this CPU's `PerCpuData::return_work`. Called once per

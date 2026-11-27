@@ -75,7 +75,6 @@ fn refuse_boot_options(args: &TestArgs) -> Result<()>
         (args.release, "--release"),
         (args.host.alone, "--alone"),
         (args.host.timing, "--timing"),
-        (args.host.grant.is_some(), "--grant"),
     ];
     if let Some((_, flag)) = given.iter().find(|(given, _)| *given)
     {
@@ -96,12 +95,7 @@ mod tests
     #[test]
     fn the_unit_tests_refuse_a_boot_option()
     {
-        for flag in [
-            &["--arch", "riscv64"][..],
-            &["--release"],
-            &["--alone"],
-            &["--grant", "w"],
-        ]
+        for flag in [&["--arch", "riscv64"][..], &["--release"], &["--alone"]]
         {
             let mut line = vec!["xtask", "test"];
             line.extend_from_slice(flag);

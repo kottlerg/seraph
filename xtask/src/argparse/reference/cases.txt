@@ -2622,7 +2622,7 @@ ArgumentConflict
 error: the argument '--alone' cannot be used with '--timing'
 
 ["run","--alone","--grant","7"]
-ok run alone grant=["7"]
+ok run grant=["7"] alone
 
 ["run","--timing","--arch","x86_64"]
 ok run arch=["x86_64"] timing
@@ -2683,7 +2683,7 @@ ArgumentConflict
 error: the argument '--timing' cannot be used with '--alone'
 
 ["run","--timing","--grant","7"]
-ok run timing grant=["7"]
+ok run grant=["7"] timing
 
 ["run","--grant","7","--arch","x86_64"]
 ok run arch=["x86_64"] grant=["7"]
@@ -2740,10 +2740,10 @@ ok run wait_host=["7"] grant=["7"]
 ok run host_override grant=["7"]
 
 ["run","--grant","7","--alone"]
-ok run alone grant=["7"]
+ok run grant=["7"] alone
 
 ["run","--grant","7","--timing"]
-ok run timing grant=["7"]
+ok run grant=["7"] timing
 
 ["run","--arch","x86_64","--gdb","--headless","--verbose","--cpus","7","--mem","7","--riscv-mmu","sv57","--riscv-zkr","on","--x86-paging","4","--x86-shadow-stack","on","--iommu","attached","--second-disk","7","--second-disk-shared-line","--debug-port","7","--test-devices","--wait-host","7","--host-override","--alone","--timing","--grant","7"]
 UnknownArgument
@@ -3773,7 +3773,7 @@ ok test case=["shutdown"] arch=["riscv64"] cpus=["2"] mem=["1024"] cause=["reboo
 ok test cell=["usertest"] arch=["riscv64"] release
 
 ["test","--cell","ktest","--arch","x86_64","--grant","W1","--alone"]
-ok test cell=["ktest"] arch=["x86_64"] alone grant=["W1"]
+ok test cell=["ktest"] arch=["x86_64"] grant=["W1"] alone
 
 ["test","debug-port","--port","4444","--gdb","gdb-multiarch","--timing"]
 ok test case=["debug-port"] port=["4444"] gdb=["gdb-multiarch"] timing
@@ -9190,7 +9190,7 @@ ArgumentConflict
 error: the argument '--alone' cannot be used with '--timing'
 
 ["run","--parallel","1","--runs","1","--alone","--grant","7"]
-ok run runs=["1"] parallel=["1"] alone grant=["7"]
+ok run runs=["1"] parallel=["1"] grant=["7"] alone
 
 ["run","--parallel","1","--runs","1","--timing","--arch","x86_64"]
 ok run arch=["x86_64"] runs=["1"] parallel=["1"] timing
@@ -9309,7 +9309,7 @@ ArgumentConflict
 error: the argument '--timing' cannot be used with '--alone'
 
 ["run","--parallel","1","--runs","1","--timing","--grant","7"]
-ok run runs=["1"] parallel=["1"] timing grant=["7"]
+ok run runs=["1"] parallel=["1"] grant=["7"] timing
 
 ["run","--parallel","1","--runs","1","--grant","7","--arch","x86_64"]
 ok run arch=["x86_64"] runs=["1"] parallel=["1"] grant=["7"]
@@ -9424,10 +9424,10 @@ ok run runs=["1"] parallel=["1"] wait_host=["7"] grant=["7"]
 ok run runs=["1"] parallel=["1"] host_override grant=["7"]
 
 ["run","--parallel","1","--runs","1","--grant","7","--alone"]
-ok run runs=["1"] parallel=["1"] alone grant=["7"]
+ok run runs=["1"] parallel=["1"] grant=["7"] alone
 
 ["run","--parallel","1","--runs","1","--grant","7","--timing"]
-ok run runs=["1"] parallel=["1"] timing grant=["7"]
+ok run runs=["1"] parallel=["1"] grant=["7"] timing
 
 ["run","--parallel","1","--runs","1","--arch","x86_64","--timeout","7","--cpus","7","--mem","7","--riscv-mmu","sv57","--riscv-zkr","on","--x86-paging","4","--x86-shadow-stack","on","--iommu","attached","--display","headless","--pass","7","--fail","7","--fail-also","7","--debug-listen","--hold-on-hang","--fail-grace-secs","7","--save-logs","7","--second-disk","7","--second-disk-shared-line","--debug-port","7","--test-devices","--wait-host","7","--host-override","--alone","--timing","--grant","7"]
 ArgumentConflict
@@ -12762,7 +12762,7 @@ ArgumentConflict
 error: the argument '--alone' cannot be used with '--timing'
 
 ["capture-acpi","--config","x86-default","--alone","--grant","7"]
-ok capture-acpi config=["x86-default"] alone grant=["7"]
+ok capture-acpi config=["x86-default"] grant=["7"] alone
 
 ["capture-acpi","--alone","--grant","7"]
 MissingRequiredArgument
@@ -12810,7 +12810,7 @@ ArgumentConflict
 error: the argument '--timing' cannot be used with '--alone'
 
 ["capture-acpi","--config","x86-default","--timing","--grant","7"]
-ok capture-acpi config=["x86-default"] timing grant=["7"]
+ok capture-acpi config=["x86-default"] grant=["7"] timing
 
 ["capture-acpi","--timing","--grant","7"]
 MissingRequiredArgument
@@ -12850,7 +12850,7 @@ error: the following required arguments were not provided:
   --config <CONFIG>
 
 ["capture-acpi","--config","x86-default","--grant","7","--alone"]
-ok capture-acpi config=["x86-default"] alone grant=["7"]
+ok capture-acpi config=["x86-default"] grant=["7"] alone
 
 ["capture-acpi","--grant","7","--alone"]
 MissingRequiredArgument
@@ -12858,7 +12858,7 @@ error: the following required arguments were not provided:
   --config <CONFIG>
 
 ["capture-acpi","--config","x86-default","--grant","7","--timing"]
-ok capture-acpi config=["x86-default"] timing grant=["7"]
+ok capture-acpi config=["x86-default"] grant=["7"] timing
 
 ["capture-acpi","--grant","7","--timing"]
 MissingRequiredArgument
@@ -20825,7 +20825,7 @@ error: the following required arguments were not provided:
   <COMMANDS>...
 
 ["orch","grant","set","h","c"]
-ok-all orch grant set holder=["h"] commands=["c"]
+ok-all orch grant set timing=default wait=default["1800"] holder=["h"] commands=["c"]
 
 ["orch","grant","set","-h"]
 help xtask orch grant set -h
@@ -27273,3 +27273,14 @@ error: a value is required for '--opt-level <PKG=LEVEL>' but none was supplied
 
 ["build","--debug","kernel","--opt-level","shmem=3"]
 ok build debug=["kernel"] opt_level=["shmem=3"]
+
+["orch","grant","set","--timing","--wait","60","W1","run","--timing","--grant","W1"]
+ok orch grant set timing wait=["60"] holder=["W1"] commands=["run","--timing","--grant","W1"]
+
+["orch","grant","set","--wait","60","W1","run"]
+MissingRequiredArgument
+error: the following required arguments were not provided:
+  --timing
+
+["build","--grant","W1","--wait-host","30"]
+ok build wait_host=["30"] grant=["W1"]

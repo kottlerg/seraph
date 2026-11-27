@@ -321,10 +321,16 @@ args! {
         pub wait_host: Option<u64>,
 
         /// Start even when the host's rules refuse, printing the refusal: for
-        /// the maintainer's interactive use. A boot still registers, so other
-        /// commands see it.
+        /// the maintainer's interactive use. The command still registers, so
+        /// other commands see it.
         #[arg(long)]
         pub host_override: bool,
+
+        /// Run under the exclusive grant `cargo xtask orch grant set` gave
+        /// HOLDER. While a grant is outstanding, a boot that does not name its
+        /// holder is refused, and while a timing grant is, a build too.
+        #[arg(long, value_name = "HOLDER")]
+        pub grant: Option<String>,
     }
 }
 
@@ -347,12 +353,6 @@ args! {
         /// builds while it runs.
         #[arg(long)]
         pub timing: bool,
-
-        /// Boot under the exclusive grant `cargo xtask orch grant set` gave
-        /// HOLDER. While a grant is outstanding, a boot that does not name its
-        /// holder is refused.
-        #[arg(long, value_name = "HOLDER")]
-        pub grant: Option<String>,
     }
 }
 
@@ -2116,6 +2116,15 @@ subcommands! {
         /// Give the exclusive grant. Refuses while one is outstanding.
         Set
         {
+            /// A timing grant: hold every build not under it as well as every
+            /// boot, and return once the host is quiet (no command not under
+            /// the grant holds it), or fail at the bound naming what still
+            /// holds it, the grant left set.
+            #[arg(long)]
+            timing: bool,
+            /// How long a timing grant waits for the host to be quiet.
+            #[arg(long, value_name = "SECS", requires = "timing", default_value_t = 1800)]
+            wait: u64,
             /// The worker that holds the grant.
             holder: String,
             /// The commands the grant covers, flags included.

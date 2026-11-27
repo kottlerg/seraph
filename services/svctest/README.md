@@ -406,8 +406,9 @@ resolves the RTC past the withdrawn ordinal ([services/timed/README.md](../timed
 
 The `logd_sinks` phase's framebuffer-restarted case queries the framebuffer class's ordinal 1
 through `caps[13]`, finds, attaches to, and stops the instance devmgr restarted through `caps[23]`,
-requires a line to wait out logd's stall bound on it, then the line in logd's history through
-`caps[6]`.
+sends as many lines at critical as the stopped case, each answered within half logd's stall bound,
+starts the instance, and requires logd's notice of the framebuffer's drops after the last of them
+through `caps[6]`.
 
 The `logd_flush` phase ([`logd_sinks.rs`](src/phases/logd_sinks.rs) states its cases) checks logd's
 flush barrier through `caps[22]`: `LOG_FLUSH` on `caps[6]` and `QUERY_SLOTS` on `caps[22]` are

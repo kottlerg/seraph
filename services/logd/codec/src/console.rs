@@ -9,14 +9,27 @@
 
 use crate::level::TAG_WIDTH;
 use crate::prefix::{NAME_FIELD_MAX, STAMP_MAX, pad_tag, write_name, write_stamp, write_tag};
-use crate::settings::{Field, Fields, HOSTNAME_MAX};
+use crate::settings::{Field, Fields, HOSTNAME_MAX, Time};
+use crate::wall::{Precision, RFC3339_US_LEN, write_rfc3339};
 
 /// Bytes of the longest `procid` field: a `u64` badge in hex.
 pub(crate) const PROCID_MAX: usize = 16;
 
+/// Bytes of the longest `time` field: the uptime stamp, or a wall time in
+/// brackets, whichever is longer.
+const TIME_FIELD_MAX: usize = if STAMP_MAX > RFC3339_US_LEN + 2
+{
+    STAMP_MAX
+}
+else
+{
+    RFC3339_US_LEN + 2
+};
+
 /// The bytes the console format writes around the message, at most: every
 /// field but `msg` at its longest and a space after each.
-pub const FRAME_MAX: usize = STAMP_MAX + HOSTNAME_MAX + TAG_WIDTH + NAME_FIELD_MAX + PROCID_MAX + 5;
+pub const FRAME_MAX: usize =
+    TIME_FIELD_MAX + HOSTNAME_MAX + TAG_WIDTH + NAME_FIELD_MAX + PROCID_MAX + 5;
 
 /// What the fields of a line show of its entry.
 #[derive(Clone, Copy)]
@@ -24,6 +37,10 @@ pub struct Entry<'a>
 {
     /// When the entry was retained, microseconds since boot.
     pub us: u64,
+    /// The same instant as wall time, microseconds since
+    /// 1970-01-01T00:00:00Z: `us` plus the boot wall offset, `None` while
+    /// the offset is not known ([sinks.md](../../docs/sinks.md) § Wall time).
+    pub wall: Option<u64>,
     /// Its level, an `ipc::stream_labels::LEVEL_*` code.
     pub level: u64,
     /// The sender's badge.
@@ -51,12 +68,16 @@ impl<F: FnMut(u8)> Counter<'_, F>
 }
 
 /// Write `entry`'s line in `fields` through `out`, its message written by
-/// `msg`, without the line's end. The level tag is padded to [`TAG_WIDTH`]
+/// `msg`, without the line's end. The `time` field shows what `time` names:
+/// the uptime, or for [`Time::Wall`] the entry's wall time in brackets,
+/// `[2026-11-25T09:01:11.123456Z]`, while it is known and RFC 3339 can show
+/// it, the uptime otherwise. The level tag is padded to [`TAG_WIDTH`]
 /// columns when another field follows it, so the fields after it line up.
 /// Returns where the tag is among the bytes written, its start and end
 /// offsets, `None` when the fields show no level: what a sink colours.
 pub fn write(
     fields: &Fields,
+    time: Time,
     entry: &Entry<'_>,
     out: &mut impl FnMut(u8),
     msg: impl FnOnce(&mut dyn FnMut(u8)),
@@ -74,7 +95,7 @@ pub fn write(
         }
         match field
         {
-            Field::Time => write_stamp(entry.us, &mut |b| c.put(b)),
+            Field::Time => write_time(time, entry, &mut |b| c.put(b)),
             Field::Host => match entry.host
             {
                 Some(host) => host.iter().for_each(|&b| c.put(b)),
@@ -102,6 +123,21 @@ pub fn write(
         }
     }
     tag
+}
+
+/// Write the `time` field of `entry` for the `time` setting ([`write`]).
+fn write_time(time: Time, entry: &Entry<'_>, out: &mut impl FnMut(u8))
+{
+    match entry.wall.filter(|&w| w <= crate::wall::WALL_MAX_US)
+    {
+        Some(wall) if time == Time::Wall =>
+        {
+            out(b'[');
+            write_rfc3339(wall, Precision::Micros, out);
+            out(b']');
+        }
+        _ => write_stamp(entry.us, out),
+    }
 }
 
 /// Write `value` in lower-case hex, with no leading zeros.
@@ -141,7 +177,7 @@ mod tests
     fn line(fields: &Fields, entry: &Entry<'_>, text: &str) -> (String, Option<(usize, usize)>)
     {
         let mut bytes = Vec::new();
-        let tag = write(fields, entry, &mut |b| bytes.push(b), |out| {
+        let tag = write(fields, Time::Uptime, entry, &mut |b| bytes.push(b), |out| {
             text.bytes().for_each(out);
         });
         (String::from_utf8(bytes).unwrap(), tag)
@@ -149,6 +185,7 @@ mod tests
 
     const ENTRY: Entry<'static> = Entry {
         us: 6_308_457,
+        wall: None,
         level: LEVEL_NOTICE,
         badge: 0x2a,
         name: b"svcmgr",
@@ -209,6 +246,55 @@ mod tests
         assert_eq!(
             line(&fields("host:procid:name:msg"), &named, "m").0,
             "node-1 0 [?] m"
+        );
+    }
+
+    fn wall_line(time: Time, entry: &Entry<'_>) -> String
+    {
+        let mut bytes = Vec::new();
+        let defaults = SinkKind::Serial.defaults();
+        write(
+            &defaults.fields,
+            time,
+            entry,
+            &mut |b| bytes.push(b),
+            |out| {
+                b"m".iter().copied().for_each(out);
+            },
+        );
+        String::from_utf8(bytes).unwrap()
+    }
+
+    // Defect caught: `time=wall` showing the uptime once the wall time is
+    // known, or nothing (or a garbled time) while it is not, or `time=uptime`
+    // showing the wall time.
+    #[test]
+    fn the_time_field_shows_the_wall_time_only_for_time_wall_once_known()
+    {
+        // 2025-11-25T09:01:11.000042Z.
+        let wall = Entry {
+            wall: Some(1_764_061_271_000_042),
+            ..ENTRY
+        };
+        assert_eq!(
+            wall_line(Time::Wall, &wall),
+            "[2025-11-25T09:01:11.000042Z] NOTICE [svcmgr] m"
+        );
+        assert_eq!(
+            wall_line(Time::Uptime, &wall),
+            "[    6.308457] NOTICE [svcmgr] m"
+        );
+        assert_eq!(
+            wall_line(Time::Wall, &ENTRY),
+            "[    6.308457] NOTICE [svcmgr] m"
+        );
+        let past = Entry {
+            wall: Some(crate::wall::WALL_MAX_US + 1),
+            ..ENTRY
+        };
+        assert_eq!(
+            wall_line(Time::Wall, &past),
+            "[    6.308457] NOTICE [svcmgr] m"
         );
     }
 

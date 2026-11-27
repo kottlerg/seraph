@@ -41,6 +41,7 @@ pub mod resync;
 pub mod rfc5424;
 pub mod settings;
 pub mod sink;
+pub mod wall;
 
 mod bounded_str;
 

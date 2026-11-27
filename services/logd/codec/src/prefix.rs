@@ -99,7 +99,7 @@ pub(crate) fn write_name(name: &[u8], out: &mut impl FnMut(u8))
 
 /// Write `value` in decimal, padded on the left with `pad` to at least
 /// `width` bytes (at most 20, a `u64`'s widest).
-fn write_decimal(value: u64, width: usize, pad: u8, out: &mut impl FnMut(u8))
+pub(crate) fn write_decimal(value: u64, width: usize, pad: u8, out: &mut impl FnMut(u8))
 {
     let mut digits = [pad; 20];
     let mut n = value;

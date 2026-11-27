@@ -11,12 +11,13 @@ a program reads, follows and steers the log.
 Built: the eight severities and their console tags, the console prefix `[sec.usfrac] LEVEL  [name] `
 that both receivers write, its seconds right-aligned to five columns, the kernel's records read and
 written as `[kernel]` lines, each device sink's settings from logd's recipe (§ Settings) with the
-console format's field list and the framebuffer's coloured tag, the rfc5424 format with no
-timestamp, the history as the journal the sinks write from, the serial and framebuffer outputs as
-two sinks with a cursor and a writer thread each, the hold window and its `WINDOW_FULL` refusal, the
-serial sink's `hold` pace (its writes of an entry as plain chunks and then a zero-length
-`SERIAL_WRITE_SENT` barrier, its cursor moving once the entry is sent) and the framebuffer's `skip`
-pace, the drop lines, and `LOG_FLUSH` over the `hold` sinks' cursors, whose token is the next `seq`
+console format's field list, its wall-clock display and the framebuffer's coloured tag, the boot
+wall offset read from timed (§ Wall time), the rfc5424 format with its timestamp, the history as the
+journal the sinks write from, the serial and framebuffer outputs as two sinks with a cursor and a
+writer thread each, the hold window and its `WINDOW_FULL` refusal, the serial sink's `hold` pace
+(its writes of an entry as plain chunks and then a zero-length `SERIAL_WRITE_SENT` barrier, its
+cursor moving once the entry is sent) and the framebuffer's `skip` pace, the drop lines, and
+`LOG_FLUSH` over the `hold` sinks' cursors, whose token is the next `seq`
 ([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks, § Hold window, § Flush barrier).
 
 Everything else this document states is design intent, not yet implemented, unless a sentence names
@@ -313,9 +314,8 @@ an unknown gap, and starts from the new instance's oldest entry.
 
 ## Settings
 
-*Built (#1493): the `SERIAL` and `FRAMEBUFFER` entries with every key but `time`, and
-`LOGD_HOSTNAME`. Design intent: `time` (#1493, § Wall time), the `PSTORE` entry (#1498), and
-`SINK_SET` (#1494).*
+*Built (#1493): the `SERIAL` and `FRAMEBUFFER` entries with every key, and `LOGD_HOSTNAME`.
+Design intent: the `PSTORE` entry (#1498), and `SINK_SET` (#1494).*
 
 Each device sink's settings come from one `env` entry of logd's recipe
 (`rootfs/config/svcmgr/services/logd.svc`), so they are set per distribution, signed as
@@ -332,7 +332,7 @@ LOGD_SINK_<NAME>=<key>=<value>,<key>=<value>,...
 | `level` | one of the eight keywords, or `off` | least severe level shown; `off` shows none |
 | `format` | `console`, `rfc5424` | the output format |
 | `fields` | a `:`-separated list of `time`, `host`, `level`, `name`, `procid`, `msg` | the console format's fields, in the order given |
-| `time` | `uptime`, `wall` | what the console format's `time` field shows |
+| `time` | `uptime`, `wall` | what the console format's `time` field shows (default `uptime`) |
 | `pace` | `hold`, `skip` | § Pace |
 | `backlog` | 0 to 256 | § Device sinks |
 | `relayed` | `yes`, `no` | whether `relayed` entries are shown |
@@ -374,8 +374,8 @@ An external sink's settings are its own recipe's, in the same keys.
 
 ## The console format
 
-*Built: the prefix with the tag padded to six, the seconds' alignment, the field list and the
-colour (#1493). Design intent: the instance numbers (#1492) and wall-clock display (#1493).*
+*Built: the prefix with the tag padded to six, the seconds' alignment, the field list, the
+wall-clock display and the colour (#1493). Design intent: the instance numbers (#1492).*
 
 The default console line, the same on serial and the framebuffer:
 
@@ -393,8 +393,9 @@ The default console line, the same on serial and the framebuffer:
   column while the seconds are below 100000.
 - **Time.** Uptime: the seconds right-aligned to five columns, as Linux's `dmesg` writes them, wider
   past 99999 s; six digits of microseconds. With `time=wall`, an RFC 3339 UTC time with microseconds
-  once the boot wall offset is known, and uptime before it. A `previous` entry always shows its own
-  uptime.
+  in brackets, `[2026-11-25T09:01:11.123456Z]`, once the boot wall offset is known, and uptime
+  before it and for a time past 9999-12-31, which RFC 3339's four-digit year cannot show. A
+  `previous` entry always shows its own uptime.
 - **Level.** Every line shows its level, informational included: `EMERG`, `ALERT`, `CRIT`, `ERROR`,
   `WARN`, `NOTICE`, `INFO`, `DEBUG` (`logd_codec::level::tag`).
 - **Name.** `[name]` for a sender's first instance, `[name#n]` for its n-th, `[?]` for a sender that
@@ -445,9 +446,7 @@ line reaches the screen rarely.
 
 ## The rfc5424 format
 
-*Built for a device sink (#1493), with TIMESTAMP and STRUCTURED-DATA `-` until logd reads the
-boot wall offset (§ Wall time). Design intent: the timestamp and `timeQuality` (#1493), the
-network sink (#1499).*
+*Built for a device sink (#1493). Design intent: the network sink (#1499).*
 
 A sink in the `rfc5424` format writes each entry as one RFC 5424 message:
 
@@ -455,35 +454,40 @@ A sink in the `rfc5424` format writes each entry as one RFC 5424 message:
 |---|---|
 | PRI | facility × 8 + severity; the facility is 0 (kernel) for the kernel's entries, the sink's `facility` for every other |
 | VERSION | `1` |
-| TIMESTAMP | `us` plus the boot wall offset, RFC 3339 UTC with microseconds; `-` while no offset is known and for a `previous` entry |
+| TIMESTAMP | `us` plus the boot wall offset, RFC 3339 UTC with microseconds; `-` while no offset is known, for a time past 9999-12-31 and for a `previous` entry |
 | HOSTNAME | `LOGD_HOSTNAME` (or the external sink's own setting), `-` when unset |
 | APP-NAME | the slot's display name without the instance number; each byte outside printable US-ASCII (33 to 126) written `_`, at most 48 bytes; `-` for an unnamed sender |
 | PROCID | the badge in lower-case hex; it tells instances of one name apart; `-` when the sink cannot resolve the entry's slot (§ External sinks) |
 | MSGID | `-` |
-| STRUCTURED-DATA | `[timeQuality tzKnown="1" isSynced="0"]` while the offset comes from an unsynchronised clock, `-` once it is synchronised |
+| STRUCTURED-DATA | `[timeQuality tzKnown="1" isSynced="0"]` beside a TIMESTAMP while the offset comes from an unsynchronised clock, `-` beside a `-` TIMESTAMP and once the clock is synchronised |
 | MSG | the byte order mark, then the console format's message field, each byte of an invalid UTF-8 sequence written `\xNN` as the record renderer writes it, so MSG is valid UTF-8 |
 
 timed sets its offset once, from the RTC, and synchronises to no external source
-([services/timed/README.md](../../timed/README.md)), so every message carries `timeQuality` today. A
+([services/timed/README.md](../../timed/README.md)), so every message with a TIMESTAMP carries
+`timeQuality` today (`logd_codec::rfc5424::TIME_QUALITY`). A
 message longer than the transport carries is cut at a character boundary of MSG.
 
 ---
 
 ## Wall time
 
-*Design intent (#1493). The svcmgr change below is #1493's.*
+*Built (#1493) for logd's device sinks; an external sink's reading of the offset is design intent
+with the external sinks (§ External sinks).*
 
-- svcmgr's `log_sink` round gains a slot 6: the SEND of the `timed` publication, absent when no
+- svcmgr's `log_sink` round carries in slot 6 the SEND of the `timed` publication, absent when no
   recipe provides `timed` ([service-definitions.md](../../svcmgr/docs/service-definitions.md) §
   `log_sink`).
 - A helper thread of logd calls `timed_labels::GET_WALL_TIME` once, with no bound, and stores the
-  boot wall offset, the wall time less the uptime of the same instant. timed answers from memory;
-  its own log calls are served by logd's receive workers, which wait on no call of logd's, so the
-  call cannot deadlock. No receive worker and not the main thread calls timed.
+  boot wall offset, the wall time less the uptime of the same instant (`read_wall_clock`), then
+  deletes the SEND. timed answers from memory; its own log calls are served by logd's receive
+  workers, which wait on no call of logd's, so the call cannot deadlock. No receive worker and not
+  the main thread calls timed.
 - On the answer, logd logs one notice line giving the wall time and the uptime it corresponds to,
   so every uptime in a capture converts:
   `[    3.201440] NOTICE [logd] wall clock 2026-11-25T09:01:11Z at uptime 3.201440`.
-  `WALL_CLOCK_UNAVAILABLE` leaves the offset unknown and logs that at notice.
+  `WALL_CLOCK_UNAVAILABLE` leaves the offset unknown and logs that at notice
+  (`wall clock unavailable`); a failed call leaves it unknown and logs at warning. With no slot 6,
+  the offset stays unknown and nothing is logged.
 - Until the offset is known, a sink that shows wall time shows uptime (console) or `-` (rfc5424).
   A restarted logd reads the offset again.
 - An external sink reads the offset from timed itself, through a `timed` seed of its own recipe.

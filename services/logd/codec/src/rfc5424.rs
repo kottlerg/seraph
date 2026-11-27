@@ -7,25 +7,43 @@
 //! `<PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID - STRUCTURED-DATA BOM MSG`
 //! ([sinks.md](../../docs/sinks.md) § The rfc5424 format).
 //!
-//! TIMESTAMP and STRUCTURED-DATA are the nil value `-`: a sink writes the
-//! wall time only once the boot wall offset is known, and logd does not yet
-//! read it ([sinks.md](../../docs/sinks.md) § Wall time).
+//! TIMESTAMP is the entry's wall time once the boot wall offset is known,
+//! with the `timeQuality` element in STRUCTURED-DATA; both are the nil value
+//! `-` before it ([sinks.md](../../docs/sinks.md) § Wall time).
 
 use ipc::log_badges::LOG_BADGE_KERNEL;
 use ipc::stream_labels::level_or_info;
 
 use crate::console::{Entry, PROCID_MAX, write_hex};
 use crate::settings::HOSTNAME_MAX;
+use crate::wall::{Precision, RFC3339_US_LEN, WALL_MAX_US, write_rfc3339};
 
 /// The most bytes of APP-NAME (RFC 5424 §6.2.5).
 pub const APP_NAME_MAX: usize = 48;
+
+/// The STRUCTURED-DATA of a message whose TIMESTAMP is set: the time zone
+/// is known (UTC), and the clock is not synchronised to an external source,
+/// since timed sets its offset once, from the RTC (RFC 5424 §7.1).
+pub const TIME_QUALITY: &[u8] = br#"[timeQuality tzKnown="1" isSynced="0"]"#;
 
 /// The bytes the rfc5424 format writes before the message, at most: the
 /// PRI, the version, the timestamp, the host name, the APP-NAME, the
 /// PROCID, the MSGID, the structured data, a space after each, and the byte
 /// order mark.
-pub const HEADER_MAX: usize =
-    5 + 2 + 2 + HOSTNAME_MAX + 1 + APP_NAME_MAX + 1 + PROCID_MAX + 1 + 4 + 3;
+pub const HEADER_MAX: usize = 5
+    + 2
+    + RFC3339_US_LEN
+    + 1
+    + HOSTNAME_MAX
+    + 1
+    + APP_NAME_MAX
+    + 1
+    + PROCID_MAX
+    + 1
+    + 2
+    + TIME_QUALITY.len()
+    + 1
+    + 3;
 
 /// The byte order mark a UTF-8 MSG starts with (RFC 5424 §6.4).
 const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
@@ -34,7 +52,9 @@ const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// written by `msg` and each byte of it that is not part of valid UTF-8
 /// written `\xNN` ([`Utf8Escape`]), so MSG is valid UTF-8; without the
 /// line's end. The PRI's facility is 0 (kernel) for the kernel's entries
-/// and `facility` for every other.
+/// and `facility` for every other. TIMESTAMP is the entry's wall time with
+/// microseconds and STRUCTURED-DATA [`TIME_QUALITY`] while the wall time is
+/// known and RFC 3339 can show it; both are `-` otherwise.
 pub fn write(
     entry: &Entry<'_>,
     facility: u8,
@@ -56,11 +76,18 @@ pub fn write(
     out(b'<');
     write_decimal(pri, out);
     out(b'>');
-    // VERSION and the nil TIMESTAMP.
-    for &b in b"1 - "
+    let wall = entry.wall.filter(|&w| w <= WALL_MAX_US);
+    out(b'1');
+    out(b' ');
+    match wall
     {
-        out(b);
+        Some(wall) =>
+        {
+            write_rfc3339(wall, Precision::Micros, out);
+        }
+        None => out(b'-'),
     }
+    out(b' ');
     match entry.host
     {
         Some(host) => host.iter().for_each(|&b| out(b)),
@@ -70,11 +97,17 @@ pub fn write(
     write_app_name(entry.name, out);
     out(b' ');
     write_hex(entry.badge, out);
-    // The nil MSGID and STRUCTURED-DATA.
-    for &b in b" - - "
+    // The nil MSGID.
+    for &b in b" - "
     {
         out(b);
     }
+    match wall
+    {
+        Some(_) => TIME_QUALITY.iter().for_each(|&b| out(b)),
+        None => out(b'-'),
+    }
+    out(b' ');
     for b in BOM
     {
         out(b);
@@ -282,6 +315,7 @@ mod tests
     {
         let entry = Entry {
             us: 1,
+            wall: None,
             level: LEVEL_INFO,
             badge: 0x2a,
             name: b"svcmgr",
@@ -301,6 +335,35 @@ mod tests
         assert!(message(&nameless, 23, b"x").starts_with(b"<191>1 - - - 4 - - "));
     }
 
+    // Defect caught: a TIMESTAMP not in RFC 3339 UTC with microseconds, the
+    // timeQuality element missing beside it or written beside the nil value,
+    // or a time RFC 3339 cannot show written, so a receiver misreads when the
+    // entry was logged or how far to trust it.
+    #[test]
+    fn a_known_wall_time_is_the_timestamp_with_its_time_quality()
+    {
+        let entry = Entry {
+            us: 1,
+            // 2025-11-25T09:01:11.000042Z.
+            wall: Some(1_764_061_271_000_042),
+            level: LEVEL_INFO,
+            badge: 0x2a,
+            name: b"svcmgr",
+            host: None,
+        };
+        let mut want = b"<30>1 2025-11-25T09:01:11.000042Z - svcmgr 2a - ".to_vec();
+        want.extend_from_slice(TIME_QUALITY);
+        want.push(b' ');
+        want.extend_from_slice(&BOM);
+        want.extend_from_slice(b"up");
+        assert_eq!(message(&entry, 3, b"up"), want);
+        let past = Entry {
+            wall: Some(WALL_MAX_US + 1),
+            ..entry
+        };
+        assert!(message(&past, 3, b"up").starts_with(b"<30>1 - - svcmgr 2a - - "));
+    }
+
     // Defect caught: the kernel's entries sent under the sink's facility, so a
     // receiver files the kernel's faults as a daemon's.
     #[test]
@@ -308,6 +371,7 @@ mod tests
     {
         let entry = Entry {
             us: 1,
+            wall: None,
             level: LEVEL_CRITICAL,
             badge: LOG_BADGE_KERNEL,
             name: b"kernel",
@@ -360,6 +424,7 @@ mod tests
         let host = [b'h'; HOSTNAME_MAX];
         let entry = Entry {
             us: 1,
+            wall: Some(WALL_MAX_US),
             level: LEVEL_DEBUG,
             badge: u64::MAX,
             name: &[b'n'; 60],

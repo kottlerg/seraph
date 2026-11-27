@@ -9,7 +9,9 @@ clock, then serves
 `offset + kernel_elapsed_us()` on every request.
 
 `std::time::SystemTime::now()` resolves through this service (via
-`SystemTime`'s PAL in `runtime/ruststd`, wiring tracked separately).
+`SystemTime`'s PAL in `runtime/ruststd`, wiring tracked separately). logd calls it once at start,
+through slot 6 of its `log_sink` round, for the wall time its sinks show
+([logd sinks](../logd/docs/sinks.md) § Wall time).
 
 ---
 

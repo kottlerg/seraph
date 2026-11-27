@@ -17,9 +17,9 @@ once during its own startup; see that document for the wire format.
 ## Bootstrap caps
 
 svcmgr launches and supervises real-logd, minting its bootstrap round —
-rounds for its six positional slots, the last `done = true`, of which only the present
+rounds for its seven positional slots, the last `done = true`, of which only the present
 caps ride, named by a presence word (an absent slot reads as `0`) — from the reserved
-log-sink sources init endows it and the `devmgr.class.*` publications (see
+log-sink sources init endows it, the `devmgr.class.*` publications and the `timed` publication (see
 [`services/svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md)).
 The shape mirrors the README's "Bootstrap caps" table:
 
@@ -31,6 +31,7 @@ The shape mirrors the README's "Bootstrap caps" table:
 | 3 | the `serial` class `SEND`, derived from the `devmgr.class.serial` publication (resolves the serial driver via `QUERY_DEVICE`) |
 | 4 | the `framebuffer` class `SEND`, derived from the `devmgr.class.framebuffer` publication (resolves the framebuffer driver via `QUERY_DEVICE`) |
 | 5 | a `KernelLog` cap carrying `Read`, derived with `RIGHTS_KLOG_READ` from the `KernelLog` source svcmgr holds (reads the kernel's console lines; [`handover-protocol.md`](handover-protocol.md) § Kernel log); absent when svcmgr holds none |
+| 6 | the `timed` `SEND`, derived from the `timed` publication (reads the wall clock once; [`sinks.md`](sinks.md) § Wall time); absent when no recipe provides `timed` |
 
 Every (re)launch mints `cap[0]` fresh from svcmgr's persistent master-log
 source, so a restarted logd re-attaches its RECV to the same endpoint
@@ -46,7 +47,8 @@ logd keeps `cap[0]`, the procmgr `cap[2]` (retained after `REGISTER_DEATH_EQ`), 
 the serial driver's write endpoint and, when a framebuffer driver is present, `cap[4]` the
 framebuffer driver's, on its main thread, which resolves a driver again only when devmgr signals
 that class's watch; `cap[1]` is deleted after the handover release. logd keeps `cap[5]` for its
-lifetime and reads the kernel log through it.
+lifetime and reads the kernel log through it. A helper thread calls `timed_labels::GET_WALL_TIME`
+once through `cap[6]`, then deletes it.
 
 ## Endpoint
 

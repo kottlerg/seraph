@@ -180,26 +180,25 @@ the host-mode bands are taken on the release build
 
 ## Ranked Cuts
 
-Ranked on the release account by the instructions each removes from the one ktest row it
-shortens most, the rows this account covers, on the architecture where that saving is larger,
-as measured when the cut was taken or declined. A cut's saving on the ubench and fsbench rows,
-which repeat a kernel path many times per sample, does not enter the rank. A new cut is ranked
-on an account regenerated for it (§ Regenerating It). Each cut is its own Issue, under #1531. A
-design change goes to the maintainer as a pick: #1548, #1549 and #1550 were approved before
-their Issues were filed, and #1695 before it was built; a local cut needs no pick. Each reports
-the host-mode figure under KVM beside its counts, and a cut that saves instructions but costs
-time is not taken.
+Every cut on the list is taken or declined, so the table is a record: it gives each cut in the
+order its PR merged, with the saving measured when it was taken or declined, in the unit its
+figure names. The next cuts are ranked, before any is taken, on both accounts regenerated for
+them (§ Regenerating It), by the instructions each removes from the gated rows of both. Each cut
+is its own Issue, under #1531. A design change goes to the maintainer as a pick: #1548, #1549
+and #1550 were approved before their Issues were filed, and #1695 before it was built; a local
+cut needs no pick. Each reports the host-mode figure under KVM beside its counts, and a cut that
+saves instructions but costs time is not taken.
 
-| Rank | Cut | Kind | Expected saving (release, x86_64 / riscv64) |
-|---:|---|---|---|
-| 1 | #1540: copy user memory a word at a time on riscv64 (taken: PR #1657) | local | none / 27404 on `thread_read_mem_page`, 1381 on IPC with 7 words, measured; no riscv64 KVM host or hardware for a host-mode figure |
-| 2 | #1550: serve small kernel entropy draws from one squeezed block (taken: PR #1656) | design | 25618 / 25185 per thread lifecycle, measured; 17479 to 14321 cycles on x86_64 under KVM |
-| 3 | #1543: scan kernel stacks a line at a time, and paint them with wider stores (taken: PR #1660) | local | 4632 / 11391 per thread lifecycle, measured; 14284 to 13498 cycles on x86_64 under KVM |
-| 4 | #1542: monomorphise the page-table leaf walker's visitor (taken: PR #1657) | local | 1585 / 1314 per harvest of 32 pages, measured; 4334 to 1239 cycles on x86_64 under KVM |
-| 5 | #1541: build IPC messages in place, copying only the valid words (taken: PR #1567) | local | 384 / 1570 per IPC round trip, measured |
-| 6 | #1548: test the return-to-user work with one per-CPU word (taken: PR #1574) | design | 51 / 65 per null syscall, measured |
-| 7 | #1695: find a parked receiver's slot through a per-CPU hint in the endpoint, with no scan (taken: PR #1709) | design | 13 / 13 per IPC round trip, measured (`ubench.ipc_rt` 13 / 13 to 16); no change resolved on x86_64 under KVM, a median p50 of 3063 cycles before and after |
-| 8 | #1549: dispatch syscalls through one masked table index (not taken: PR #1576 kept the `match`, built from one list) | design | about 50 / 30 per syscall; measured 7 / 6 per null syscall, and about 10 cycles slower on x86_64 under KVM |
+| Cut | Kind | Saving (release, x86_64 / riscv64) |
+|---|---|---|
+| #1541: build IPC messages in place, copying only the valid words (taken: PR #1567) | local | 384 / 1570 per IPC round trip, measured |
+| #1548: test the return-to-user work with one per-CPU word (taken: PR #1574) | design | 51 / 65 per null syscall, measured |
+| #1549: dispatch syscalls through one masked table index (not taken: PR #1576 kept the `match`, built from one list) | design | about 50 / 30 per syscall; measured 7 / 6 per null syscall, and about 10 cycles slower on x86_64 under KVM |
+| #1540: copy user memory a word at a time on riscv64 (taken: PR #1657) | local | none / 27404 on `thread_read_mem_page`, 1381 on IPC with 7 words, measured; no riscv64 KVM host or hardware for a host-mode figure |
+| #1542: monomorphise the page-table leaf walker's visitor (taken: PR #1657) | local | 1585 / 1314 per harvest of 32 pages, measured; 4334 to 1239 cycles on x86_64 under KVM |
+| #1550: serve small kernel entropy draws from one squeezed block (taken: PR #1656) | design | 25618 / 25185 per thread lifecycle, measured; 17479 to 14321 cycles on x86_64 under KVM |
+| #1543: scan kernel stacks a line at a time, and paint them with wider stores (taken: PR #1660) | local | 4632 / 11391 per thread lifecycle, measured; 14284 to 13498 cycles on x86_64 under KVM |
+| #1695: find a parked receiver's slot through a per-CPU hint in the endpoint, with no scan (taken: PR #1709) | design | 13 / 13 per IPC round trip, measured (`ubench.ipc_rt` 13 / 13 to 16); no change resolved on x86_64 under KVM, a median p50 of 3063 cycles before and after |
 
 Not taken:
 

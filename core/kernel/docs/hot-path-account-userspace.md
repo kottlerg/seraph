@@ -56,8 +56,8 @@ can move these rows. The commands and their host time are in
 
 The figures are release, x86_64 / riscv64, at the head the block's first table names
 (§ Regenerating It). Each heading's cut, where one is named, is an Issue
-under #1531; the kernel account's ranked list ([hot-path-account.md](hot-path-account.md)
-§ Ranked Cuts) orders them.
+under #1531; the kernel account's list ([hot-path-account.md](hot-path-account.md)
+§ Ranked Cuts) records them and says how the next cuts are ranked.
 
 ### IPC Round Trip
 

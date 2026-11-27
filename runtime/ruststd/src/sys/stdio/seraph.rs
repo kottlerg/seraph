@@ -389,10 +389,12 @@ impl io::Write for PanicWriter {
         if cap == 0 || ipc_ptr.is_null() {
             return Ok(buf.len());
         }
+        // Sent once: a panicking thread may hold locks other threads wait
+        // for, so it never sleeps on logd's window (`log::write_bytes_once`).
         // SAFETY: `current_ipc_buf` is non-null (checked above), so it is
         // this thread's registered IPC buffer page (`_start` and the spawn
         // trampoline set it after registering).
-        unsafe { ::log::write_bytes(cap, ipc_ptr, ::ipc::stream_labels::LEVEL_ERROR, buf) };
+        unsafe { ::log::write_bytes_once(cap, ipc_ptr, ::ipc::stream_labels::LEVEL_ERROR, buf) };
         Ok(buf.len())
     }
 

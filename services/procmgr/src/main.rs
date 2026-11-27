@@ -105,6 +105,10 @@ fn bootstrap_from_init(creator_ep: u64, ipc_buf: *mut u64) -> Option<InitBootstr
 
 fn main() -> !
 {
+    // logd calls procmgr, so procmgr never waits on logd's window: a line
+    // logd refuses is dropped and counted (`services/logd/docs/ipc-interface.md`
+    // § Hold window).
+    std::os::seraph::log::set_no_wait();
     std::os::seraph::log::register_name(b"procmgr");
     let startup = startup_info();
 

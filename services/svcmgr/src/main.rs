@@ -397,7 +397,8 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
 
     // logd.flush — a `LOG_FLUSH_AUTHORITY`-badged SEND minted from the same
     // source: logd's flush barrier, which the shutdown actuator waits on
-    // before it powers off. Seed-only.
+    // before it powers off and crashd before it declines a fault, either of
+    // which can end logd with lines unwritten. Seed-only.
     publish_minted_send(
         registry,
         caps.master_log_source,

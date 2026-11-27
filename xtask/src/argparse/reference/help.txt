@@ -211,7 +211,7 @@ Options:
       --crash-reports <CRASH_REPORTS>
           Check the crash service's report blocks in each passing run's log: every block well-formed, and `reports` the `crashme` fixture's three reports, `none` no block at all. A run whose check fails is FAIL; a QEMU-CRASH run is not checked [possible values: reports, none]
       --whole-lines <TAG>
-          Check that the console stayed whole in each passing run's log: between the lines `<TAG> begin` and `<TAG> end ...`, every line is one console line, and each sender's numbered lines arrive whole, in order, none missing (svctest's `console_whole_lines` and `serial_transmit` phases); repeatable, each tag's window is checked. A run whose check fails is FAIL; a QEMU-CRASH run is not checked
+          Check that the console stayed whole in each passing run's log: between the lines `<TAG> begin` and `<TAG> end ...`, every line is one console line, and each sender's numbered lines arrive whole, in order, none missing (svctest's `console_whole_lines`, `serial_transmit` and `logd_flood` phases); repeatable, each tag's window is checked. A run whose check fails is FAIL; a QEMU-CRASH run is not checked
       --hold-on-hang
           On a hard-timeout HANG of `--runs`, do not kill the QEMU instance: print the attach instructions and block until it is terminated externally, preserving the wedged guest for inspection (pair with `--debug-listen`). Requires `--parallel 1`
       --fail-grace-secs <FAIL_GRACE_SECS>
@@ -393,7 +393,7 @@ Options:
           - none:    No report block: a boot of an image that stages no crashd
 
       --whole-lines <TAG>
-          Check that the console stayed whole in each passing run's log: between the lines `<TAG> begin` and `<TAG> end ...`, every line is one console line, and each sender's numbered lines arrive whole, in order, none missing (svctest's `console_whole_lines` and `serial_transmit` phases); repeatable, each tag's window is checked. A run whose check fails is FAIL; a QEMU-CRASH run is not checked
+          Check that the console stayed whole in each passing run's log: between the lines `<TAG> begin` and `<TAG> end ...`, every line is one console line, and each sender's numbered lines arrive whole, in order, none missing (svctest's `console_whole_lines`, `serial_transmit` and `logd_flood` phases); repeatable, each tag's window is checked. A run whose check fails is FAIL; a QEMU-CRASH run is not checked
 
       --hold-on-hang
           On a hard-timeout HANG of `--runs`, do not kill the QEMU instance: print the attach instructions and block until it is terminated externally, preserving the wedged guest for inspection (pair with `--debug-listen`). Requires `--parallel 1`

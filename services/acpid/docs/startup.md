@@ -6,8 +6,9 @@ What acpid does on each start, from loading the tables to the pushes, and how it
 
 ## Threads
 
-The main thread takes the bootstrap round (the RECV on acpid's service endpoint and the
-`devmgr.acpi` seed), spawns the evaluation thread, and waits for any of acpid's threads to end. The
+The main thread takes the bootstrap round (the RECV on acpid's service endpoint, the `devmgr.acpi`
+seed and the `logd.flush` seed, `caps[2]`, which [README.md](../README.md) § The last line uses),
+spawns the evaluation thread, and waits for any of acpid's threads to end. The
 evaluation thread runs the whole sequence below and then, for acpid's lifetime, every evaluation the
 service needs, so one thread owns the namespace. It blocks only on its work channel, from which it
 takes a power request a receiver forwards, a GPE the event thread found, the power button to enable

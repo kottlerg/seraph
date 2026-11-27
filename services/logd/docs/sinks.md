@@ -10,11 +10,13 @@ a program reads, follows and steers the log.
 
 Built: the eight severities and their console tags, the console prefix
 `[sec.usfrac] LEVEL  [name] ` that both receivers write, the kernel's records read and written as
-`[kernel]` lines, the serial and framebuffer outputs as two sinks with a bounded queue and a writer
-thread each, the serial sink's writes of a line as plain chunks and then a zero-length
-`SERIAL_WRITE_SENT` barrier, and `LOG_FLUSH` over the serial sink's queue, whose token is the
-number of the queue's last line until the journal gives the sink a cursor
-([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks, § Flush barrier).
+`[kernel]` lines, the history as the journal the sinks write from, the serial and framebuffer
+outputs as two sinks with a cursor and a writer thread each, the hold window and its `WINDOW_FULL`
+refusal, the serial sink's `hold` pace (its writes of an entry as plain chunks and then a
+zero-length `SERIAL_WRITE_SENT` barrier, its cursor moving once the entry is sent) and the
+framebuffer's `skip` pace, the drop lines, and `LOG_FLUSH` over the serial sink's cursor, whose
+token is the next `seq`
+([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks, § Hold window, § Flush barrier).
 
 Everything else this document states is design intent, not yet implemented, unless a sentence names
 it as built. Each section names the Issue that builds it. Until an Issue lands,
@@ -132,8 +134,11 @@ emergency for a fault or panic print (#1491; today every record is informational
 
 ## Sinks
 
-*Design intent (#928, #1493, #1494): the contract below replaces the per-sink queues and the
-producer's wait that [ipc-interface.md](ipc-interface.md) § Output sinks describes.*
+*Built: the cursor and order, the `hold` and `skip` paces and the hold window, the drops, the
+serial and framebuffer device sinks' writers, serial's answers to `STALLED` and to a failed call,
+and `LOG_FLUSH` ([ipc-interface.md](ipc-interface.md) § Output sinks, § Hold window, § Flush
+barrier). Design intent (#1493, #1494): a sink's `level`, `format` and `relayed` settings, the
+`off` level, the framebuffer's level and emergency walk, pstore, and external sinks.*
 
 A sink is one output of the log. Every sink, inside logd or outside it, follows one contract: it
 reads the history in `seq` order through a cursor, shows the entries at or above its level, renders
@@ -172,13 +177,14 @@ each in its format, and writes it to its output.
   completes more lines than the window holds is taken from an empty window. Messages at error or
   more severe have headroom to twice `HOLD_WINDOW`. The reply carries a retry hint, and the sender's
   library sleeps it and sends the message again within its call's bound
-  ([#928](https://github.com/kottlerg/seraph/issues/928) owns the sender's side).
+  ([shared/log](../../../shared/log/README.md)).
 - A `hold` sink is stalled while it is unserved (no driver resolved), or while its writer's current
   write is older than `SINK_STALL_MS`; a stalled sink counts toward no window, so a stopped driver
   holds no sender.
-- Past `HISTORY_BYTES`, the history evicts an entry a `hold` sink has not written only when no
-  written one is left. `PER_SLOT_HISTORY` drops a slot's own oldest entry whatever the sinks have
-  written.
+- Past the history's byte bound ([ipc-interface.md](ipc-interface.md) § History), the history
+  evicts an entry a `hold` sink has not written only when no written one is left. The per-slot
+  bound drops a slot's own oldest entry whatever the sinks have written, but for the kernel's slot
+  and logd's own, which no window paces: those keep the entries a `hold` sink has not written.
 - A `skip` sink holds no sender and keeps no entry: what the history evicts before it is read is
   counted as dropped.
 - A sink whose level is `off` takes part in none of the above, whatever its pace: it counts toward
@@ -190,22 +196,28 @@ each in its format, and writes it to its output.
 
 ### Drops
 
-A sink that dropped entries writes one line of logd's to its own output before the next entry it
-writes, at notice:
+A sink that dropped entries reports the count in one line of logd's, at notice:
 
 ```
 [   12.000031] NOTICE [logd] serial: 37 lines dropped
 ```
 
-The line is the sink's own output: it is not retained, not written to another sink, and not counted
-in any window. `SINK_LIST` reports each device sink's drop count. An external sink writes its own
+- A `hold` sink writes the line to its own output before the next entry it writes. The line is
+  the sink's own output: it is not retained, not written to another sink, and not counted in any
+  window.
+- A `skip` sink retains the line in the journal as an entry of logd's, so every sink and the
+  history carry the count. A sink keeps at most one such entry ahead of its cursor: a drop before
+  the sink reaches it adds to its count, and the count of one evicted before the sink reached it
+  goes into the next.
+
+`SINK_LIST` reports each device sink's drop count. An external sink writes its own
 drop line to its own output in its own format.
 
 ### Device sinks
 
 Device sinks run inside logd, each with its own writer thread, the only logd thread that calls its
 driver. A device sink whose writer cannot be spawned is written inline by the thread that retains
-each entry, each write bounded by `SINK_STALL_MS`, as today.
+each entry, each write bounded by `SINK_STALL_MS`.
 
 | Sink | Level | Format | Pace | Backlog | Relayed | Colour |
 |---|---|---|---|---|---|---|
@@ -230,10 +242,7 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
 - **A `STALLED` answer.** The driver answers a write that waited on a transmitter making no
   progress `STALLED` after its `TX_STALL_MS` (1000 ms), the same answer whichever wait stalled.
   The writer writes an entry in two steps whose `STALLED` answers each mean one thing (built,
-  #1703). Today's writer, which writes from a queue, ends the line on either answer and stalls the
-  sink: a chunk answered `STALLED` drops the line, counted, and a barrier answered `STALLED` ends a
-  line already in the ring, uncounted ([ipc-interface.md](ipc-interface.md) § Output sinks). In
-  this design (#928) a `STALLED` answer does not move serial's cursor: the sink is stalled (§ Pace)
+  #1703). A `STALLED` answer does not move serial's cursor: the sink is stalled (§ Pace)
   and the writer repeats the step that stalled until it is answered without `STALLED`, each attempt
   bounded by the driver's stall bound.
   1. Each chunk of the entry as a plain write. `STALLED` here means the chunk was not appended to
@@ -246,11 +255,10 @@ each entry, each write bounded by `SINK_STALL_MS`, as today.
   A call that fails, the driver's endpoint withdrawn
   ([serial driver](../../drivers/serial/README.md) § Endpoint), is not a `STALLED` answer: the
   bytes the dead driver accepted died with its ring, so the sink is unserved and the writer writes
-  the entry again from its first chunk on the next driver it resolves, where today's writer counts
-  the line as dropped. The cursor passes the entry
+  the entry again from its first chunk on the next driver it resolves. The cursor passes the entry
   only once the barrier is answered without `STALLED` by the driver that accepted every chunk of
   it, so it never passes an entry unsent.
-- **`LOG_FLUSH`** (#928) waits for the cursor of every `hold` sink, serial's by default, which
+- **`LOG_FLUSH`** waits for the cursor of every `hold` sink, serial's by default, which
   passes an entry only once it is sent, and needs no barrier of its own. It reports the log flushed
   once each `hold` sink's cursor has passed the newest entry at the call, or that sink is stalled,
   unserved or `off`, as the kernel reader's acknowledgement does; with no `hold` sink it reports
@@ -460,8 +468,8 @@ message longer than the transport carries is cut at a character boundary of MSG.
 
 ## The kernel's lines
 
-*Built: the reader and its acknowledgement. Design intent: the acknowledgement by the `hold` sinks'
-cursors (#928).*
+*Built: the reader and its acknowledgement by the `hold` sinks' cursors, serial's alone while
+`off` is design intent.*
 
 logd's kernel log reader retains each kernel record as an entry of the kernel's slot
 (`LOG_BADGE_KERNEL`), and the sinks write it as any entry
@@ -503,7 +511,8 @@ waits on no sink's progress for a sender.
 [    1.204630] NOTICE [logd] previous boot: end
 ```
 
-- The pstore sink closes the loss #928 accepts: the entries retained but not yet written to serial,
+- The pstore sink closes the loss [ipc-interface.md](ipc-interface.md) § Lines lost by decision
+  states for a kernel panic: the entries retained but not yet written to serial,
   or to any sink, when the kernel panics reach the next boot: its history holds them, for `log` and
   the external sinks, and its serial console shows them when it has one.
 

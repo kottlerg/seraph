@@ -32,6 +32,12 @@ std's `_start` installs the source of the calling thread's call deadline (`insta
 and a call under a deadline takes the time left when it is shorter; a call the deadline ends does
 not count as an unanswered one
 ([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Call deadline).
+A message logd refuses `stream_labels::WINDOW_FULL` (the sender holds its window of entries the
+serial sink has not written; [logd IPC interface](../../services/logd/docs/ipc-interface.md)
+§ Hold window) carries a retry hint in `data[0]`: the library sleeps the hint and sends the message
+again within the call's bound, and drops it, counted, past that. A process that called
+`std::os::seraph::log::set_no_wait()` (procmgr does) drops it at once. The count is written as one
+`notice` line, `log: <n> lines dropped`, on a later log call.
 `receiver_restarted`, which std exposes as `std::os::seraph::log::receiver_restarted`, returns
 the process to the long bound when it knows a new receiver has started in place of one that
 stopped receiving: svcmgr calls it once it has restarted logd, before it writes the lines it held

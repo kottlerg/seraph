@@ -149,6 +149,7 @@ pub mod heap_commit;
 pub mod image_sharing;
 pub mod layout;
 pub mod log_client;
+pub mod logd_flood;
 pub mod logd_restart;
 pub mod logd_sinks;
 pub mod memmgr;
@@ -313,15 +314,18 @@ fn ordered() -> Vec<Phase>
     out.extend_from_slice(swap_commit::phases());
     out.extend_from_slice(crashd::oom_hold());
     out.extend_from_slice(drivers::phases());
-    // Before logd_sinks, whose stopped serial driver leaves logd's serial sink
-    // stalled until its writer next completes a write: lines sent meanwhile
-    // past the sink's queue are dropped by design, which the whole-lines
-    // check would read as lines lost.
+    // Before logd_sinks, whose stopped serial driver stalls logd's serial sink
+    // until its writer completes its write: a sender's lines past its share
+    // of the history are meanwhile dropped from serial by design, which the
+    // whole-lines check would read as lines lost.
     out.extend_from_slice(console_whole_lines::phases());
     // Beside console_whole_lines, whose console check it shares; it writes
     // its lines to the serial driver itself, so logd_sinks's drops do not
     // touch them and it has no order of its own.
     out.extend_from_slice(serial_transmit::phases());
+    // Before logd_sinks for the same reason: its whole-lines window holds the
+    // probe's lines.
+    out.extend_from_slice(logd_flood::phases());
     out.extend_from_slice(logd_sinks::phases());
     out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());

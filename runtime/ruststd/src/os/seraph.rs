@@ -2252,6 +2252,15 @@ pub mod log {
         ::log::receiver_restarted();
     }
 
+    /// Make every log call of this process send its line once, dropping and
+    /// counting a line logd refuses past the process's window rather than
+    /// waiting to send it again (`::log::set_no_wait`): for a service logd's
+    /// own progress waits on, which calls it once at start.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn set_no_wait() {
+        ::log::set_no_wait();
+    }
+
     /// Macro entry point of a bare `log!`: [`__emit_at`] at the info
     /// level.
     #[doc(hidden)]

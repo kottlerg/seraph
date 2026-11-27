@@ -24,7 +24,8 @@ acpid/
     ├── table.rs          # Where a served table sits in its region's mapping
     ├── sim.rs            # Test host over the captured QEMU tables (tests only)
     ├── main.rs           # Entry, bootstrap, the evaluation thread, the watch on acpid's threads
-    ├── caps.rs           # svcmgr bootstrap: the service endpoint, the `devmgr.acpi` seed
+    ├── caps.rs           # svcmgr bootstrap: the service endpoint, the `devmgr.acpi` and
+    │                     # `logd.flush` seeds
     ├── devmgr.rs         # The calls acpid makes on devmgr
     ├── platform.rs       # The evaluator's `Host`: region grants, configuration access
     ├── startup.rs        # The start-up sequence and the pushes
@@ -84,13 +85,14 @@ turn on the one thread that owns the namespace. A request is checked in order: t
   every fixed event but the power button, S5's wake event, and clears every PM1 and GPE0 status,
   `WAK_STS` among them, as ACPI 6.5 § 16.1.6 requires before `SLP_EN` is written. It then
   writes `PM1a_CNT` twice, keeping its other bits: `SLP_TYPa` with `SLP_EN` clear, then with
-  `SLP_EN` (bit 13) set, and logs `SLEEP(5): PM1a_CNT ...` before the writes. A
+  `SLP_EN` (bit 13) set, and logs `SLEEP(5): PM1a_CNT ...` before the writes (§ The last line). A
   hardware-reduced platform has no `PM1a_CNT` and no fixed events: after `\_PTS(5)` acpid
   writes `WAK_STS` (bit 7) to the FADT's `SLEEP_STATUS_REG`, when devmgr serves it, then
   `SLP_TYPa` in bits 4:2 with `SLP_EN` (bit 5) to its `SLEEP_CONTROL_REG` in one byte
   (`ipc::acpid_labels::sleep_control_value`; ACPI 6.5 § 4.8.3.7), and logs
-  `SLEEP(5): SLEEP_CONTROL_REG ...` before the writes. When the writes return, acpid waits 10 s
-  (`SLEEP_GRACE`), the wait after which ACPICA takes an S5 write as not taken, the events kept
+  `SLEEP(5): SLEEP_CONTROL_REG ...` before the writes (§ The last line). When the writes return,
+  acpid waits 10 s (`SLEEP_GRACE`), the wait after which ACPICA takes an S5 write as not taken, the
+  events kept
   quiesced; when the platform still runs then, acpid logs
   `SLEEP(5): still running 10 s after the writes` without armed events, as on a hardware-reduced
   platform, or, with them, enables the GPEs again, logs
@@ -114,7 +116,7 @@ turn on the one thread that owns the namespace. A request is checked in order: t
   of a core service ([pwrmgr](../pwrmgr/README.md#responsibilities)). The derivation is an object
   of its own, so acpid's death, which deletes acpid's capability, leaves the caller's standing.
 - `RESET`: acpid writes the FADT's `RESET_VALUE` to its `RESET_REG`, a port, or a byte of memory
-  with a volatile byte store, and logs `RESET: RESET_REG ...` before the write.
+  with a volatile byte store, and logs `RESET: RESET_REG ...` before the write (§ The last line).
 - `WAIT_EVENT`: the receiver holds the call, with no bound, until an event is pending, and
   replies `SUCCESS` with the pending events in `data[0]` (`EVENT_POWER_BUTTON`) (§ Events). One
   call waits at a time: a later `WAIT_EVENT` takes its place and the earlier one is replied
@@ -138,6 +140,17 @@ without the `devmgr.acpi` seed. A receive that keeps failing exits acpid (`ipc::
 svcmgr restarts it on the same endpoint. pwrmgr bounds each call at 30 s
 ([pwrmgr](../pwrmgr/README.md#responsibilities)), so a request that acpid, down or blocked, does not
 answer fails rather than holding the shutdown.
+
+### The last line
+
+A log call returns once logd holds its line, before the serial console has it, and the write that
+follows a `SLEEP(5): ...` or `RESET: ...` line ends the machine with the lines logd has not
+written yet. pwrmgr's wait on logd's flush barrier, made before its request, cannot cover a line
+acpid logs after it. So between that line and the write, acpid waits on the barrier itself,
+through its `logd.flush` seed (`seed = devmgr.acpi logd.flush`, `caps[2]`; [logd IPC
+interface](../logd/docs/ipc-interface.md#flush-barrier)), for at most 5 s
+(`log::LOG_CALL_TIMEOUT_MS`), and writes when the wait ends, however it ends. Without the seed it
+writes at once. The seed carries the barrier's authority and nothing else.
 
 ---
 
@@ -223,8 +236,9 @@ devmgr does not leave to the firmware is never ejected under it.
 
 ## Region grants
 
-acpid holds no hardware capability of its own. Beside its service endpoint's `RECV`, its one
-capability, the `devmgr.acpi` seed, carries `ACPI_AUTHORITY`, under which devmgr serves it the
+acpid holds no hardware capability of its own. Beside its service endpoint's `RECV` and the
+`logd.flush` seed (§ The last line), its one capability, the `devmgr.acpi` seed, carries
+`ACPI_AUTHORITY`, under which devmgr serves it the
 FADT's register blocks and grants it, on first use, each `SystemIO` or `SystemMemory` operation
 region its AML reaches. devmgr refuses, logged, a range that a device record (a resource container's
 aside, [docs/driver-binding.md](../../docs/driver-binding.md) § Device Records), a driver or the
@@ -263,7 +277,8 @@ boot. The checks are [docs/devmgr.md](docs/devmgr.md) § Pushes.
 | [shared/ipc/src/acpid_labels.rs](../../shared/ipc/src/acpid_labels.rs) | The `acpid_labels` it serves and their wire contract |
 | [services/pwrmgr/README.md](../pwrmgr/README.md) | The holder of `acpid.power`; powers off and resets x86-64 through acpid, and waits for its power button |
 | [services/devmgr/README.md](../devmgr/README.md) | The hardware authority that grants acpid's regions and keeps its results |
-| [services/svcmgr/README.md](../svcmgr/README.md) | Launcher and supervisor; mints the `devmgr.acpi` seed and publishes `acpid.power` and `acpid.deny` |
+| [services/svcmgr/README.md](../svcmgr/README.md) | Launcher and supervisor; mints the `devmgr.acpi` and `logd.flush` seeds and publishes `acpid.power` and `acpid.deny` |
+| [services/logd/docs/ipc-interface.md](../logd/docs/ipc-interface.md) | The flush barrier acpid waits on before a sleep or reset register write |
 | [services/svctest/README.md](../svctest/README.md) | Services harness; checks what devmgr holds from acpid, the `ACPI_AUTHORITY` gate, and the `POWER_AUTHORITY` gate through `acpid.deny` |
 
 ---

@@ -301,7 +301,7 @@ pub mod return_work
     pub const PREEMPT: u32 = 1 << 5;
     /// The running thread may have a run-limit fault pending
     /// (`sched::run_limit::tick`, and its dispatch through
-    /// `sched::run_limit::return_work_of`).
+    /// `sched::run_limit::follow_to_cpu`).
     pub const RUN_LIMIT: u32 = 1 << 6;
 
     /// The bits a syscall's return handles: every kind.

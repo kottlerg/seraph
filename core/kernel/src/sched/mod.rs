@@ -7881,9 +7881,8 @@ unsafe fn mark_dispatched(
         (*tcb).wake_pending = false;
         (was_pending, (*tcb).thread_id)
     };
-    // A pending upcall and a pending run-limit fault follow the thread to
-    // this CPU. Each is its own test: a thread with neither pays the upcall's
-    // test and one byte's load and test, and no OR of the two words.
+    // A pending upcall follows the thread to this CPU; a pending run-limit
+    // fault follows it in `schedule()`, after its `context_saved` Acquire.
     // SAFETY: tcb is a valid TCB whose sched_lock is held (contract).
     let upcall = unsafe { crate::ipc::upcall::return_work_of(tcb) };
     if upcall != 0
@@ -7891,13 +7890,6 @@ unsafe fn mark_dispatched(
         // SAFETY: this CPU's per-CPU pointer is installed and interrupts are
         // disabled (contract).
         unsafe { crate::percpu::post_return_work(upcall) };
-    }
-    // SAFETY: as for the upcall's read above.
-    let run_limit = unsafe { run_limit::return_work_of(tcb) };
-    if run_limit != 0
-    {
-        // SAFETY: as for the upcall's post above.
-        unsafe { crate::percpu::post_return_work(run_limit) };
     }
     marked
 }
@@ -8700,6 +8692,16 @@ pub unsafe fn schedule(requeue: Requeue)
         }
         spin_site_exit();
     }
+
+    // A run-limit fault pending on `next` follows it to this CPU. Read after
+    // the Acquire of its `context_saved` above (the check or the spin), which
+    // follows every tick its previous CPU took while it was current there: a
+    // tick in its block window, after this CPU's claim, posts the bit on that
+    // CPU, and this read sees the fault it marked
+    // (core/kernel/docs/scheduler.md § Run Limit). Idle has none.
+    // SAFETY: next is null or a valid TCB; this CPU's per-CPU pointer is
+    // installed and interrupts are disabled.
+    unsafe { run_limit::follow_to_cpu(next) };
 
     // Extended-state switch-in: make `next`'s state live unless this CPU's
     // registers still hold it (`fpu_owner` and `next`'s `fpu_cpu` naming each

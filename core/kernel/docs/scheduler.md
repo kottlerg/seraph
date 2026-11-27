@@ -1141,8 +1141,10 @@ which § Scheduling Classes lists as not implemented. The code is `sched::run_li
   the syscall's end when the tick landed in an interrupt-enabled window of a syscall. The tick's
   slice decision is unchanged, so a switch at the slice's expiry, a park in the syscall, or a stop
   can take the thread off the CPU first; the bit's return is then another thread's, which finds no
-  fault of its own. The fault follows the thread as a pending upcall does: its next dispatch posts
-  `RUN_LIMIT` on the CPU it is dispatched to, so its first return to user mode there delivers it.
+  fault of its own. The fault follows the thread as a pending upcall does: the next switch to it
+  posts `RUN_LIMIT` on the CPU it runs on, so its first return to user mode there delivers it. The
+  switch reads the flag after the thread's saved context is published, so it also sees a fault that
+  a tick of its previous CPU marked between its park and that CPU's switch.
   While the fault is pending the tick counts nothing. The fault is `FAULT_EXC_RUN_LIMIT`, delivered
   through the thread's exception binding
   ([fault-handling.md](../../../docs/fault-handling.md#run-limit-faults) § Run-Limit Faults). A

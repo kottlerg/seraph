@@ -12,11 +12,12 @@
 //! a syscall that resets the count sets it to zero
 //! (`syscall::resets_run_count`). The tick that reaches the limit sets the
 //! count to zero, marks the fault pending and posts this CPU's
-//! `percpu::return_work::RUN_LIMIT` bit, and the dispatch of a thread with a
-//! fault pending posts that bit on the CPU it is dispatched to
-//! ([`return_work_of`]), so the thread's next return to user mode delivers it ([`deliver_at_syscall`], [`deliver_at_interrupt`]) as a
-//! `FAULT_EXC_RUN_LIMIT` exception through its exception binding, or ends the
-//! thread with `EXIT_RUN_LIMIT` when none is bound or the handler declines.
+//! `percpu::return_work::RUN_LIMIT` bit, and a switch to a thread with a fault
+//! pending posts that bit on the CPU it switches on ([`follow_to_cpu`]), so the
+//! thread's next return to user mode delivers it ([`deliver_at_syscall`],
+//! [`deliver_at_interrupt`]) as a `FAULT_EXC_RUN_LIMIT` exception through its
+//! exception binding, or ends the thread with `EXIT_RUN_LIMIT` when none is
+//! bound or the handler declines.
 
 #[cfg(not(test))]
 use core::sync::atomic::Ordering;
@@ -31,8 +32,8 @@ use crate::sched::thread::{ThreadControlBlock, ThreadState};
 pub enum TickAction
 {
     /// The thread has no limit, or a run-limit fault is already pending on it
-    /// (its delivery is owed, and the dispatch posts its bit again wherever the
-    /// thread next runs): the tick neither counts nor posts.
+    /// (its delivery is owed, and a switch to the thread posts its bit again
+    /// wherever it next runs): the tick neither counts nor posts.
     Skip,
     /// Count the tick.
     Count,
@@ -68,8 +69,8 @@ pub const fn reaches_limit(count: u32, limit: u32) -> bool
 /// (core/kernel/docs/scheduler.md § Run Limit), and post this CPU's
 /// `RUN_LIMIT` return-work bit when the tick reaches the limit. The tick's
 /// slice decision is left as it is: a switch at the slice's expiry leaves the
-/// fault pending on the thread, and its next dispatch posts the bit again
-/// ([`return_work_of`]).
+/// fault pending on the thread, and the next switch to it posts the bit again
+/// ([`follow_to_cpu`]).
 ///
 /// # Safety
 /// The timer tick, on this CPU with interrupts disabled and its scheduler
@@ -109,28 +110,32 @@ pub unsafe fn tick(tcb: *mut ThreadControlBlock)
     unsafe { crate::percpu::post_return_work(crate::percpu::return_work::RUN_LIMIT) };
 }
 
-/// The return-work bit the dispatch of `tcb` posts for its run limit:
-/// `RUN_LIMIT` while a run-limit fault is pending on it, else 0. A fault
-/// whose bit a return on another thread took, after a switch at the slice's
-/// expiry, or a thread that parked or was stopped before its delivery, is so
-/// delivered at the thread's first return to user mode after it next runs.
+/// Post `RUN_LIMIT` on this CPU when a run-limit fault is pending on `tcb`,
+/// the thread `schedule()` switches to. A fault whose bit a return on another
+/// thread took, after a switch at the slice's expiry, a park or a stop, or
+/// whose bit a tick of the thread's previous CPU posted there after this CPU
+/// claimed it, is so delivered at the thread's first return to user mode here.
+///
+/// The read takes no lock. It follows the Acquire of `tcb`'s `context_saved`,
+/// which orders after it every tick of the CPU `tcb` last ran on, the only
+/// CPU whose tick could set the flag; once switched to, only this CPU's ticks
+/// can, and they post here. A stale `true` (a set or a take clearing it under
+/// `sched_lock` meanwhile) posts a bit whose take finds nothing.
 ///
 /// # Safety
-/// `tcb` must be a valid TCB whose `sched_lock` the caller holds, the lock
-/// the set and the take clear the pending flag under.
+/// `tcb` is null or a valid TCB whose `context_saved` the caller has read
+/// with Acquire; this CPU's per-CPU pointer is installed and interrupts are
+/// disabled.
 #[cfg(not(test))]
 #[inline]
-pub unsafe fn return_work_of(tcb: *mut ThreadControlBlock) -> u32
+pub unsafe fn follow_to_cpu(tcb: *mut ThreadControlBlock)
 {
-    // SAFETY: tcb valid and its sched_lock held (contract); an atomic.
-    let pending = unsafe { (*tcb).run_limit_pending.load(Ordering::Relaxed) };
-    if pending
+    // SAFETY: tcb is null or valid (contract); the field is an atomic.
+    if !tcb.is_null() && unsafe { (*tcb).run_limit_pending.load(Ordering::Relaxed) }
     {
-        crate::percpu::return_work::RUN_LIMIT
-    }
-    else
-    {
-        0
+        // SAFETY: the per-CPU pointer is installed and interrupts are
+        // disabled (contract).
+        unsafe { crate::percpu::post_return_work(crate::percpu::return_work::RUN_LIMIT) };
     }
 }
 

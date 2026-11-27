@@ -8,13 +8,6 @@
 //! failed fill lost among them, keeps the page a client still maps and its
 //! most recently used idle pages, and goes on serving
 //! (services/fs/fat/docs/storage-layout.md, Page cache).
-//!
-//! fatfs's threads run on demand-paged stacks
-//! (runtime/ruststd/src/sys/thread/seraph.rs), so fatfs is charged a thread's
-//! first stack chunk when that thread first runs, which can come after fatfs
-//! has begun serving. The phase therefore measures the fall of a second
-//! pressure cycle, from a charge sampled once the first cycle has shown that
-//! fatfs's pressure thread has run.
 
 use std::collections::BTreeSet;
 
@@ -37,13 +30,6 @@ const SFN: &[u8; 11] = b"PRESSUREBIN";
 const FILE_BYTES: usize = 8 * PAGE;
 /// Bytes of one page, as fatfs caches it.
 const PAGE: usize = 4096;
-/// The warm-up file's name, and its 8.3 entry as the root directory holds
-/// it.
-const WARM_NAME: &[u8] = b"WARMUP.BIN";
-const WARM_SFN: &[u8; 11] = b"WARMUP  BIN";
-/// Bytes of the warm-up file: more pages than fatfs keeps idle under
-/// pressure, so a release gives at least one of them back.
-const WARM_BYTES: usize = (fat_parse::RELEASE_KEEP + 2) * PAGE;
 /// Sectors in one fatfs cache page on the volume.
 const SECTORS_PER_PAGE: usize = PAGE / ramdisk::SECTOR;
 /// File offsets of the page svctest keeps mapped (A) and of the page it
@@ -71,12 +57,8 @@ fn content_byte(at: usize) -> u8
 /// fatfs gives memmgr back its idle cache pages under memory pressure
 /// (services/fs/fat/src/cache.rs, Release under memory pressure):
 ///
-/// 1. svctest writes a file and a warm-up file through a fatfs of its own,
-///    then starts another on the volume, whose cache is empty. It reads the
-///    warm-up file, drives memmgr's level to `Low` and reads it again until
-///    a read fills a page from the device, which shows that fatfs gave pages
-///    back and so that its pressure thread has run, then releases its grants
-///    and waits for `Normal` ([`warm_up`]). The block server fails the first
+/// 1. svctest writes a file through a fatfs of its own, then starts another
+///    on the volume, whose cache is empty. The block server fails the first
 ///    fill of page C of the file and keeps its cap, so the read fails and the
 ///    slot keeps a page it cannot refill. Two reads of the file follow.
 /// 2. svctest takes page A of the file through `FS_READ_MEMORY` and maps it,
@@ -98,27 +80,17 @@ pub fn fs_pressure_release_phase(_: &Caps)
     let (_, _, pool_total) = pool_identity();
     let disk = RamDisk::formatted();
 
-    // 1. The two files; a pressure cycle on the warm-up file; the file, with
-    // page C's cap lost, then read twice.
+    // 1. The file, with page C's cap lost, then read twice.
     let want: Vec<u8> = (0..FILE_BYTES).map(content_byte).collect();
-    let warm_want: Vec<u8> = (0..WARM_BYTES).map(content_byte).collect();
     let sectors = {
         let writer = OwnFatfs::start(&disk);
-        let (file, sectors) = write_file(&writer, &disk, (NAME, SFN), &want);
-        let (warm, _) = write_file(&writer, &disk, (WARM_NAME, WARM_SFN), &warm_want);
-        for cap in [file, warm]
-        {
-            let _ = syscall::cap_delete(cap);
-        }
+        let (file, sectors) = write_file(&writer, &disk, &want);
+        let _ = syscall::cap_delete(file);
         writer.stop();
         sectors
     };
-    let fs = OwnFatfs::start(&disk);
-    let (warm, _, _) = ns_lookup(fs.root, WARM_NAME, 0xFFFF, ipc_buf)
-        .unwrap_or_else(|e| panic!("fs_pressure: lookup of the warm-up file: {e}"));
-    warm_up(warm, &disk, &warm_want);
-    let _ = syscall::cap_delete(warm);
     let _ = lock(&disk).take_reads();
+    let fs = OwnFatfs::start(&disk);
     let (file, _, _) = ns_lookup(fs.root, NAME, 0xFFFF, ipc_buf)
         .unwrap_or_else(|e| panic!("fs_pressure: lookup of the file: {e}"));
     let page_c = page_base(sector_at(&sectors, LOST_AT));
@@ -132,16 +104,8 @@ pub fn fs_pressure_release_phase(_: &Caps)
         lock(&disk).unfired().is_empty(),
         "fs_pressure: the read of page C never filled it"
     );
-    assert_eq!(
-        read_file(file, FILE_BYTES),
-        want,
-        "fs_pressure: the file's first read"
-    );
-    assert_eq!(
-        read_file(file, FILE_BYTES),
-        want,
-        "fs_pressure: the file's second read"
-    );
+    assert_eq!(read_file(file), want, "fs_pressure: the file's first read");
+    assert_eq!(read_file(file), want, "fs_pressure: the file's second read");
 
     // 2. Page A mapped, page B not; both released to fatfs.
     let open = fs_open(file, 0, ipc_buf).expect("fs_pressure: FS_OPEN");
@@ -193,23 +157,19 @@ pub fn fs_pressure_release_phase(_: &Caps)
     }
     fs.stop();
     std::os::seraph::log!(
-        "fs_pressure_release passed: {released} cache pages given back at Low, {floor} or more \
-         required"
+        "fs_pressure_release passed: {released} pages given back at Low of {} the cache \
+         held, the mapped page and {} idle ones kept",
+        filled.len().saturating_add(1),
+        fat_parse::RELEASE_KEEP
     );
 }
 
-/// Create the file `name` in the volume's root, its 8.3 entry `sfn`, and
-/// write `want` to it; returns its cap and the sector of each of its
-/// clusters.
-fn write_file(
-    fs: &OwnFatfs,
-    disk: &ramdisk::SharedDisk,
-    (name, sfn): (&[u8], &[u8; 11]),
-    want: &[u8],
-) -> (u64, Vec<usize>)
+/// Create the file in the volume's root and write `want` to it; returns its
+/// cap and the sector of each of its clusters.
+fn write_file(fs: &OwnFatfs, disk: &ramdisk::SharedDisk, want: &[u8]) -> (u64, Vec<usize>)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    let (file, _) = fs_create(fs.root, name, ipc_buf).expect("fs_pressure: FS_CREATE");
+    let (file, _) = fs_create(fs.root, NAME, ipc_buf).expect("fs_pressure: FS_CREATE");
     let mut at = 0u64;
     for part in want.chunks(CHUNK)
     {
@@ -218,54 +178,13 @@ fn write_file(
             .checked_add(part.len() as u64)
             .expect("fs_pressure: write offset");
     }
-    let sectors = file_sectors(disk, sfn);
+    let sectors = file_sectors(disk);
     assert_eq!(
         sectors.len(),
-        want.len() / ramdisk::SECTOR,
+        FILE_BYTES / ramdisk::SECTOR,
         "fs_pressure: the file's clusters"
     );
     (file, sectors)
-}
-
-/// One pressure cycle before the measured one: read the warm-up file `warm`
-/// whole, drive memmgr's level to `Low`, and read it again until a read
-/// fills a cache page from the device, within [`PRESSURE_WAIT`]; then
-/// release the grants and wait for `Normal`. Every page of the file was
-/// cached before the level turned, and the cache is far from full, so a fill
-/// shows that fatfs gave pages back, which it does only once its pressure
-/// thread has run.
-fn warm_up(warm: u64, disk: &ramdisk::SharedDisk, want: &[u8])
-{
-    assert_eq!(
-        read_file(warm, want.len()),
-        want,
-        "fs_pressure: the warm-up file's first read"
-    );
-    let _ = lock(disk).take_reads();
-    let held = drive_low();
-    let start = std::time::Instant::now();
-    loop
-    {
-        assert_eq!(
-            read_file(warm, want.len()),
-            want,
-            "fs_pressure: the warm-up file read at Low"
-        );
-        if !cache_fills(&lock(disk).take_reads()).is_empty()
-        {
-            break;
-        }
-        assert!(
-            start.elapsed() < PRESSURE_WAIT,
-            "fs_pressure: fatfs gave back no page of the warm-up file at Low"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    for (cap, id) in held
-    {
-        release_grant(cap, id);
-    }
-    await_normal();
 }
 
 /// Take page A of the open's file mapped and page B unmapped through
@@ -299,7 +218,7 @@ fn expect_reread(
 )
 {
     assert_eq!(
-        read_file(file, FILE_BYTES),
+        read_file(file),
         want,
         "fs_pressure: the file read after the release"
     );
@@ -339,12 +258,11 @@ fn expect_pool_identity(pool_total: u64)
     );
 }
 
-/// The sector of every cluster of the file whose 8.3 entry is `sfn`, in
-/// file order, from the volume.
-fn file_sectors(disk: &ramdisk::SharedDisk, sfn: &[u8; 11]) -> Vec<usize>
+/// The sector of every cluster of the file, in file order, from the volume.
+fn file_sectors(disk: &ramdisk::SharedDisk) -> Vec<usize>
 {
     let (lba, off) = lock(disk)
-        .find_root_sfn(sfn)
+        .find_root_sfn(SFN)
         .expect("fs_pressure: the file's entry is not on disk");
     let mut cluster = slot_cluster(disk, lba, off / 32);
     let mut sectors = Vec::new();
@@ -384,12 +302,12 @@ fn cache_fills(reads: &[(usize, usize)]) -> BTreeSet<usize>
         .collect()
 }
 
-/// The first `len` bytes of the file, its whole, through inline `FS_READ`s.
-fn read_file(file: u64, len: usize) -> Vec<u8>
+/// The whole file, through inline `FS_READ`s.
+fn read_file(file: u64) -> Vec<u8>
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut got = Vec::new();
-    while got.len() < len
+    while got.len() < FILE_BYTES
     {
         let part = fs_read_bytes(file, got.len() as u64, CHUNK as u64, ipc_buf)
             .expect("fs_pressure: FS_READ");

@@ -673,8 +673,8 @@ The scratch pages and bundle layout are described in
       - Priority: IDLE_PRIORITY (lowest, reserved; never preempted)
       - Entry: arch::current::context::new_state(idle_thread_entry, stack_top, cpu_id,
         ThreadKind::Kernel)
-      - Idle thread entry calls cpu::halt_until_interrupt() in a loop,
-        checking for pending work before each halt
+      - Idle thread entry waits in a loop (monitored wait or cpu::halt_until_interrupt(),
+        scheduler.md § Idle Thread), checking for pending work before each wait
    c. Register the idle TCB as the CPU scheduler's idle and current thread and as the CPU's
       PerCpuData::current (set_idle, set_current, percpu::init_current_thread)
 3. Emit: "scheduler initialised, N CPUs"

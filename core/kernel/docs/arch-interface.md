@@ -884,6 +884,20 @@ pub unsafe fn disable_interrupts();
 pub fn halt_until_interrupt();
 pub fn halt_loop() -> !;
 
+/// The idle loop's monitored wait (core/kernel/docs/scheduler.md § Idle
+/// Thread). `init_idle_wait`, called once on the boot CPU before any other CPU
+/// starts, chooses it where every CPU has it (x86-64 CPUID.01H:ECX.MONITOR;
+/// RISC-V the bootloader's `HART_CAP_ZAWRS`) and returns the wait's name;
+/// `idle_wait_available` reports the choice. `wait_on_word` arms the wait on
+/// `word` (x86-64 `monitor`; RISC-V `lr.w`), re-reads it, and unless
+/// `word & polling` is clear atomically enables interrupts and waits until a
+/// store to the word or an interrupt (x86-64 `sti; mwait` with the C1 hint;
+/// RISC-V `wrs.nto` then set `sstatus.SIE`); enter with interrupts disabled,
+/// return with them enabled, as for `halt_until_interrupt`.
+pub fn init_idle_wait() -> &'static str;
+pub fn idle_wait_available() -> bool;
+pub unsafe fn wait_on_word(word: &AtomicU32, polling: u32);
+
 /// Copy `len` bytes between kernel and user memory across the SMAP/SUM access
 /// window with in-kernel fault recovery: a fault on an unmapped or read-only
 /// user span returns the count of bytes not copied (at least 1) instead of

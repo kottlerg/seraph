@@ -27,7 +27,8 @@ inputs:
   name:
     description: >-
       The artifact's name, unique in the run: `tree-<arch>-<profile>` for a
-      tree, `tree-<arch>-bench` for a benchmark image.
+      tree, `tree-<arch>-bench` for a benchmark image, `tree-x86_64-idlewait` for the
+      idle-wait ktest image.
     required: true
   arch:
     description: The tree's architecture, `x86_64` or `riscv64`.

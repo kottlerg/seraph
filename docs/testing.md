@@ -550,6 +550,38 @@ cargo xtask run --arch <arch> --runs 1 --timeout <seconds> \
 
 A plain `cargo xtask mkdisk` removes the knob.
 
+### Idle wait (ktest cell)
+
+The kernel's idle loop takes a monitored wait where every CPU has one, and a wake of a thread onto
+an idle CPU then sends no IPI ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md)
+§ Idle Thread). QEMU offers the wait only to a boot with `cargo xtask run --idle-wait on`, since
+under TCG an idle vCPU on it spins on its host thread, so every other boot runs the halting idle
+([xtask/README.md](../xtask/README.md#cargo-xtask-run) § `cargo xtask run`). Two debug ktest
+boots run the wait, and each requires the kernel's line naming it:
+
+- The riscv64 debug ktest cell's own boot passes `--idle-wait on` and requires
+  `idle: wait wrs.nto`. Zawrs costs a riscv64 TCG boot no host time.
+- The x86_64 debug ktest cell, after its cases, boots a focused ktest
+  ([core/ktest/README.md](../core/ktest/README.md#test-selection) § Test selection) with
+  `--idle-wait on` and requires `idle: wait mwait`. Its tests wake threads onto idle CPUs:
+  `stress::idle_wake_race`, `stress::load_balance_handoff_steal`,
+  `integration::idle_pull_starved_ready`, `integration::idle_past_watchdog_threshold`,
+  `integration::rt_push_waiting`, `integration::rt_wake_placement` and
+  `integration::rt_wake_preempt`. The x86_64 debug build job builds it
+  (`build --ktest-only <selection> --skip-lints`) when the cell is owed and ships it as
+  `tree-x86_64-idlewait`. A whole x86_64 ktest on the wait takes over three times its halting
+  boot's host time under TCG, which the cell's budget does not hold.
+
+Every other ktest boot, the x86_64 cell's own and both release cells', runs the halting idle, so
+CI boots both idle paths on both architectures. Locally:
+
+```sh
+cargo xtask build --arch riscv64
+cargo xtask mkdisk --arch riscv64 --harness ktest
+cargo xtask run --arch riscv64 --idle-wait on --runs 1 --timeout <seconds> \
+    --require 'idle: wait wrs\.nto'
+```
+
 ### Benchmarks (`bench` cell)
 
 Each kernel benchmark of ktest's Tier 3 ([core/ktest/README.md](../core/ktest/README.md)) logs one
@@ -1476,12 +1508,14 @@ kills through the GDB stub, attach the debug port too, to reach the stub over it
 surfaces, Framebuffer cell, Debug-port cell, and Release host runs below), filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57` are manual, same
 posture as CPU-count variations), riscv64 Zkr entropy source (on — runs without it via `cargo xtask
-run --riscv-zkr off` are manual, same posture), x86_64 paging depth (4-level — 5-level runs via
-`cargo xtask run --x86-paging 5`, under TCG (`SERAPH_ACCEL=tcg`) on a host whose CPU lacks LA57, are
-manual, same posture), x86_64 CET shadow stacks (off: the launchers pin `cet-ss=off` on a QEMU that
-has the property, and neither the CI runners nor TCG offer them; the boots on them, the `cet` case,
-are the cet device cell, see CET cell below, and other boots on them, via `cargo xtask run
---x86-shadow-stack on` under KVM, are manual, same posture), disk logical block size (512 bytes —
+run --riscv-zkr off` are manual, same posture), the idle wait (the halting idle, but for the
+debug ktest cells' boots on the monitored wait, see Idle wait above), x86_64 paging depth
+(4-level — 5-level runs via `cargo xtask run --x86-paging 5`, under TCG (`SERAPH_ACCEL=tcg`) on a
+host whose CPU lacks LA57, are manual, same posture), x86_64 CET shadow stacks (off: the
+launchers pin `cet-ss=off` on a QEMU that has the property, and neither the CI runners nor TCG
+offer them; the boots on them, the `cet` case, are the cet device cell, see CET cell below, and
+other boots on them, via `cargo xtask run --x86-shadow-stack on` under KVM, are manual, same
+posture), disk logical block size (512 bytes —
 the 4Kn boot, a 4096-byte-block image on a 4096-byte-block device, is a storage cell, see Device
 surfaces and Disk variations below), and disk count (one — the second-disk boots are storage cells
 too). The `virtio-rng` device is a boot-entropy source for the pool seed and KASLR: the firmware's
@@ -1513,7 +1547,7 @@ registry runs it on (its `md-test-cells` rule).
 |---|---|---|---|---|---|
 | `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `crasher-once`, `memhog`, `reserve-creator`, `stopsrc`), crashd's test recipe and oomd's test recipe | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, the restart, out-of-memory, and stop-source paths its fixtures drive, the crash reports of its boot ([Crash reports](#crash-reports)), and the console's whole lines ([Console whole lines](#console-whole-lines)) |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `storage-roles`, `shutdown` | the programs surface, a boot with no crash report ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
-| `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
+| `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob; on riscv64 debug with `--idle-wait on`, and on x86_64 debug a second boot, of a focused ktest with `--idle-wait on` | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), KASLR, and the monitored idle wait ([Idle wait](#idle-wait-ktest-cell)) |
 | `bench` | Canonical | x86_64, riscv64; release | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |
@@ -1689,7 +1723,7 @@ or body):
   one names it, so a change to the count it passes is on the surface); `kernel_reserve_pages` (the
   CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
   `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
-  `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, `TlbShootdownRequest`, `VectorRow`,
+  `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, `IdleWake`, `TlbShootdownRequest`, `VectorRow`,
   `SlotEntry` (the riscv64 IMSIC identity rows, and each `VectorRow`'s entries), `DeliveryGate`,
   `CoreSlot` (the per-CPU core key and index of the SMT topology), and `SyscallScratch` (the
   per-CPU syscall scratch buffer)
@@ -1777,7 +1811,7 @@ S="$S|init_storage|init_per_cpu_storage"
 S="$S|PerCpuSlab|alloc_per_cpu_slab"
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|VectorRow|CpuTopology"
-S="$S|SlotEntry|DeliveryGate|SyscallScratch|CoreSlot"
+S="$S|SlotEntry|DeliveryGate|SyscallScratch|CoreSlot|IdleWake"
 S="$S|madt_cpu_ids|for_each_cpu|cpu_count|record_cpu_id|place_cpu_ids|place_hart_ids"
 S="$S|cpu_id_capacity|madt_cpu_id|CpuWalk|CpuState|record_cpu_prop"
 S="$S|madt_type::(LAPIC|LOCAL_X2APIC|RINTC)|madt_len::(LAPIC|LOCAL_X2APIC|RINTC_ID)"

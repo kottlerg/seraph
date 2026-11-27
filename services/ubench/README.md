@@ -66,7 +66,7 @@ its timed ones.
 | Benchmark | Variant | One sample | Timed samples |
 |---|---|---|---|
 | `ipc_rt` | `words=0\|6\|7\|64` | One `ipc_call` to a server thread of ubench pinned to CPU 0, which receives with `ipc_recv` and answers with `ipc_reply` carrying the call's data words back ([shared/ipc](../../shared/ipc/README.md)). 6 is the most data words that travel in registers, 7 the first count past it, 64 the most a message holds | 1024 per count, after 64 |
-| `fault_fill` | `path=fault\|grant pages=16` | The cost of one 16-page chunk, `DEMAND_CHUNK_PAGES`, the run memmgr backs on a demand fault when a free run covers it ([memmgr Memory Pool § Demand faults](../memmgr/docs/memory-pool.md#demand-faults)). `fault`: the first store into a chunk of a region `register_demand_paged` registered, which is the fault's delivery to memmgr, memmgr's backing of the chunk (run selection, zeroing, the map) and the resume; the registration funds the region's page tables, so no sample funds any. `grant`: `REQUEST_MEMORY_CAPS` for the chunk's pages with `REQUIRE_CONTIGUOUS`, the cap's map into a reservation with `mem_map_funded`, which funds page tables when the map is refused for want of them, and the first store into it | 64 per path, after 4 |
+| `fault_fill` | `path=fault\|grant pages=16`; `path=grant pages=16 affinity=any` at more than one CPU | The cost of one 16-page chunk, `DEMAND_CHUNK_PAGES`, the run memmgr backs on a demand fault when a free run covers it ([memmgr Memory Pool § Demand faults](../memmgr/docs/memory-pool.md#demand-faults)). `fault`: the first store into a chunk of a region `register_demand_paged` registered, which is the fault's delivery to memmgr, memmgr's backing of the chunk (run selection, zeroing, the map) and the resume; the registration funds the region's page tables, so no sample funds any. `grant`: `REQUEST_MEMORY_CAPS` for the chunk's pages with `REQUIRE_CONTIGUOUS`, the cap's map into a reservation with `mem_map_funded`, which funds page tables when the map is refused for want of them, and the first store into it | 64 per path, after 4; `affinity=any`: 128 grants in 8 windows of 16, after 4 |
 | `fault_scaling` | `threads=1\|2\|4\|8 pages=16` | The `fault` sample of `fault_fill`, taken by k threads at once: thread i is pinned to CPU i, opens its own counters there and registers its own region, and all start their timed stores together. The line of k holds every thread's samples. A count above the CPUs online logs a SKIP line | 64 per thread, after 4 |
 | `shmem_ring` | `bytes=64\|512\|4096\|65536 wrap=no\|yes` | `bytes` moved through a byte ring of the stdio pipe's capacity, 2048 bytes ([shared/shmem](../../shared/shmem/README.md), `runtime/ruststd/src/sys/pipe/seraph.rs`): `SpscWriter::write` of what fits, `SpscReader::read` of it, until every byte passed, as a pipe's writer and reader take turns. One thread does both, so a sample is the copies and the index updates, with no notification or IPC. The ring copies a write or a read as two segments where it passes the body's end, so every sample starts at a stated ring index, reached by an untimed transfer before it. `wrap=no` starts at index 0, where no copy splits. `wrap=yes` starts half the transfer, or half the ring when the transfer is larger, before the body's end: the first write and read split into halves, as does every ring-full of a larger transfer | 256 per size and `wrap`, after 16 |
 | `pipeline` | `work=0\|1024\|8192\|65536` | A window of 64 items, 64 bytes each, passed from a producer thread to a consumer thread through a byte ring of the stdio pipe's capacity, 2048 bytes, with the pipe's doorbell protocol ([shared/shmem § Doorbell protocol](../../shared/shmem/README.md#doorbell-protocol)); each side runs `work` iterations of a multiply-add chain per item, a fixed instruction count wherever it runs. Neither thread is pinned: ubench's thread spawns the producer and the producer the consumer. ubench's thread times the window from CPU 0 (below) | 32 per `work`, after a calibration and 2 |
@@ -79,6 +79,17 @@ own charge, `QUERY_MEMORY_USAGE` before and after each store: `faults=`, the tim
 backed pages for, and `backed_pages=`, the pages it backed for them. A store whose page an earlier
 fault already backed adds to neither, so a fault that backs more than its own chunk shows as
 `faults=` below `n=`.
+
+The `path=grant affinity=any` line of `fault_fill` is a window row ([shared/bench/README.md § Window
+rows](../../shared/bench/README.md#window-rows)): 128 grants of the `grant` sample in windows of
+`window_ops=` 16, taken by ubench's thread with its affinity cleared between the window's two
+counter reads, as fsbench's `affinity=any` rows take theirs. The pinned `grant` line measures a
+caller the synchronous wake rule never places beside memmgr, which outranks it; this one measures
+the caller it can place there ([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md)
+§ Thread Assignment). It carries `remote_wakes=`, the thread's wakes linked on another CPU than its
+waker's over the counted windows (`CAP_INFO_THREAD_PLACEMENT`): one per grant while memmgr's reply
+wakes it from another CPU, none while memmgr serves it on its own. At one CPU the case logs a SKIP
+line.
 
 `pipeline` measures where the kernel runs two threads that hand work to each other, as
 [core/kernel/docs/scheduler.md § Thread
@@ -127,7 +138,12 @@ logs one of:
   ```
 
   wrapped above for width only, `idle_halts=` being the halts of the measuring CPU over the
-  measured loop ([shared/bench/README.md § Idle halts](../../shared/bench/README.md#idle-halts));
+  measured loop ([shared/bench/README.md § Idle halts](../../shared/bench/README.md#idle-halts)),
+  over every window whose span closed in a window row, whose `n=` is the windows that counted
+  and whose other extras are those of § Benchmarks; a failed placement read leaves
+  `remote_wakes=` out;
+- for a window row whose counted windows fall below half its windows, no result line but a WARN
+  line, `<name> <variant>: counted windows below the floor`, with the counts;
 - `bench <name> SKIP (<why>)` for a case the boot cannot run (a thread count above the CPUs
   online, or no framebuffer), beside the lines of the cases it ran;
 - `bench <name> FAIL (<why>)` when the benchmark failed: a failed call, a reply of the wrong

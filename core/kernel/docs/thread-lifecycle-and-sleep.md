@@ -883,9 +883,9 @@ The handler then drains the target.
 1. The drain spin in step 4 is the correctness requirement: it returns only once the remote CPU has
    descheduled the target through a trap, which is what gives `sys_thread_read_regs` a fresh
    `trap_frame`. The wakeup IPI contributes no descheduling (its handler only posts `PREEMPT`); it
-   exits a `hlt` on an idle CPU and forces one register snapshot. A stopper restarted after its
-   in-place park upholds this only through the slot it re-resolves: when that slot no longer names
-   the target, the call returns without the drain. `sys_thread_read_regs` and
+   exits the `hlt` or monitored wait of an idle CPU and forces one register snapshot. A stopper
+   restarted after its in-place park upholds this only through the slot it re-resolves: when that
+   slot no longer names the target, the call returns without the drain. `sys_thread_read_regs` and
    `sys_thread_write_regs` do not rely on the drain: they act only on a thread that is `current` on
    no CPU with its save published and is `Stopped` (not by an address-space hold, for the write) or
    `Blocked` (fault-blocked only, for the write), under its `sched_lock` (`sched::with_held_frame`);

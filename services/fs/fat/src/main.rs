@@ -48,6 +48,16 @@
 //! loop itself receives on the service endpoint alone, so a revocation of
 //! the endpoint ends the driver at its next receive.
 //!
+//! Helper start: the eviction worker, the pressure thread and the
+//! donation-end thread each touch [`HELPER_STACK_TOUCH_BYTES`] of their
+//! demand-paged stack as their first action and then report that they have
+//! started ([`helper_start`]); `main` enters the dispatch loop, and so
+//! answers `FS_MOUNT`, only once every helper it started has reported. A
+//! helper acts when memory is short, and the first touch of a thread's stack
+//! takes pages from memmgr, so each takes its stack pages at start, before
+//! the driver serves, and needs no new memory to start acting. A helper whose
+//! spawn failed reports nothing and is not waited for.
+//!
 //! Session end: the donation-end thread waits on a Notification registered
 //! with memmgr (`memmgr_labels::REGISTER_DONATION_END`), which memmgr
 //! signals when the handle state of a node fatfs holds a charged grant on
@@ -83,6 +93,7 @@ mod session;
 use core::num::NonZeroU64;
 use std::os::seraph::{MemoryPressure, StartupInfo, startup_info};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use alloc::{FatError, allocate_cluster};
@@ -186,6 +197,11 @@ fn main() -> !
 
     let eviction = Arc::new(EvictionState::new());
 
+    // Each helper started holds a clone of `started` and reports on it once
+    // its stack is backed (module docs, Helper start); one whose spawn fails
+    // drops its clone unsent.
+    let (started, helpers_started) = channel::<()>();
+
     // Spawn the cache-pressure eviction worker. The worker owns
     // outbound `FS_RELEASE_MEMORY` issuance and the cooperative-
     // release watchdog; main only enqueues. Spawn failure is
@@ -195,9 +211,13 @@ fn main() -> !
     {
         let ev = eviction.clone();
         let f = opens.clone();
+        let report = started.clone();
         if std::thread::Builder::new()
             .name("fatfs-eviction-worker".into())
-            .spawn(move || eviction::worker_loop(&ev, &f, cache))
+            .spawn(move || {
+                helper_start(report);
+                eviction::worker_loop(&ev, &f, cache)
+            })
             .is_err()
         {
             std::os::seraph::log!(error: "eviction worker spawn failed");
@@ -205,12 +225,53 @@ fn main() -> !
         }
     }
 
-    spawn_pressure_thread(caps.service);
-    spawn_donation_end_thread(caps.service, ipc_buf);
+    spawn_pressure_thread(caps.service, &started);
+    spawn_donation_end_thread(caps.service, ipc_buf, &started);
+
+    // Serve only once every helper started has its stack: the receive ends
+    // with an error once each clone of `started` is gone.
+    drop(started);
+    while helpers_started.recv().is_ok()
+    {}
 
     service_loop(
         &caps, &mut state, &mut nodes, &opens, cache, ipc_buf, &eviction,
     );
+}
+
+// ── Helper start ───────────────────────────────────────────────────────────
+
+/// Bytes of stack each helper thread touches at start, below the frame of
+/// its loop: more than its waits, its wake call, an eviction's watchdog spawn
+/// and a log line go down. Each helper's stack is demand-paged, and this
+/// lies within the stack's first demand chunk, which the thread's first
+/// instruction backs.
+const HELPER_STACK_TOUCH_BYTES: usize = 32 * 1024;
+
+/// A helper thread's first action (module docs, Helper start): touch
+/// [`HELPER_STACK_TOUCH_BYTES`] of its stack, so the pages it runs on are
+/// backed before the driver serves, then report on `started`.
+fn helper_start(started: Sender<()>)
+{
+    touch_stack();
+    // The receiver lives until every helper has reported or gone.
+    let _ = started.send(());
+    // Dropped here rather than when the helper ends: `main`'s receive ends
+    // once every clone is gone.
+    drop(started);
+}
+
+/// Touch [`HELPER_STACK_TOUCH_BYTES`] of the stack below this frame.
+#[inline(never)]
+#[expect(
+    clippy::large_stack_arrays,
+    clippy::large_stack_frames,
+    reason = "the probe exists to occupy and touch this much of the stack"
+)]
+fn touch_stack()
+{
+    let mut probe = [0u8; HELPER_STACK_TOUCH_BYTES];
+    std::hint::black_box(&mut probe);
 }
 
 // ── Memory pressure ────────────────────────────────────────────────────────
@@ -231,7 +292,7 @@ const _: () = assert!(LOOP_WAKE != fs_labels::FS_MOUNT && LOOP_WAKE != fs_labels
 /// SEND derived from `service`. Logged and skipped when the process is not
 /// registered for pressure or the cap or the thread cannot be had: the cache
 /// is then kept whatever the level, since the level is advisory.
-fn spawn_pressure_thread(service: u64)
+fn spawn_pressure_thread(service: u64, started: &Sender<()>)
 {
     if std::os::seraph::memory_pressure_notification().is_none()
     {
@@ -244,9 +305,13 @@ fn spawn_pressure_thread(service: u64)
         std::os::seraph::log!(warn: "no wake cap; cache kept under memory pressure");
         return;
     };
+    let report = started.clone();
     if std::thread::Builder::new()
         .name("fatfs-pressure".into())
-        .spawn(move || pressure_thread(wake))
+        .spawn(move || {
+            helper_start(report);
+            pressure_thread(wake);
+        })
         .is_err()
     {
         std::os::seraph::log!(warn: "pressure thread spawn failed; cache kept under memory pressure");
@@ -340,7 +405,7 @@ const DONATION_END_BIT: u64 = 1;
 /// the registration, the cap, or the thread cannot be had: sessions whose
 /// client is gone are then ended only by the sweeps `FS_SESSION` and
 /// `FS_UNMOUNT` make.
-fn spawn_donation_end_thread(service: u64, ipc_buf: *mut u64)
+fn spawn_donation_end_thread(service: u64, ipc_buf: *mut u64, started: &Sender<()>)
 {
     let Some(signal) =
         std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
@@ -364,9 +429,13 @@ fn spawn_donation_end_thread(service: u64, ipc_buf: *mut u64)
         let _ = syscall::cap_delete(signal);
         return;
     };
+    let report = started.clone();
     if std::thread::Builder::new()
         .name("fatfs-donation-end".into())
-        .spawn(move || donation_end_thread(signal, wake))
+        .spawn(move || {
+            helper_start(report);
+            donation_end_thread(signal, wake);
+        })
         .is_err()
     {
         std::os::seraph::log!(warn: "donation-end thread spawn failed; sessions swept on schedule only");

@@ -792,11 +792,85 @@ pub const SYS_THREAD_SET_RUN_LIMIT: u64 = 78;
 /// early to let the caller be preempted. See `core/kernel/docs/syscalls.md`
 /// § `SYS_MEMORY_ZERO` (79).
 pub const SYS_MEMORY_ZERO: u64 = 79;
+/// `PmuControl`: describe the calling CPU's performance counters (the user
+/// counter count, their width and the events they count), through a
+/// `PmuControl` capability carrying [`RIGHTS_PMU_CONFIGURE`]. See
+/// `core/kernel/docs/syscalls.md` § `SYS_PMU_INFO` (80).
+pub const SYS_PMU_INFO: u64 = 80;
+/// `PmuControl`: program the calling CPU's user counters with up to
+/// [`PMU_CONFIGURE_MAX`] events, or release them, through a `PmuControl`
+/// capability carrying [`RIGHTS_PMU_CONFIGURE`]. See
+/// `core/kernel/docs/syscalls.md` § `SYS_PMU_CONFIGURE` (81).
+pub const SYS_PMU_CONFIGURE: u64 = 81;
+/// `PmuControl`: grant or revoke a thread's direct user-mode counter reads,
+/// through a `PmuControl` capability carrying [`RIGHTS_PMU_CONFIGURE`] and a
+/// Thread capability carrying [`RIGHTS_THREAD_CONTROL`]. See
+/// `core/kernel/docs/syscalls.md` § `SYS_PMU_BIND` (82).
+pub const SYS_PMU_BIND: u64 = 82;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_MEMORY_ZERO + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_PMU_BIND + 1;
+
+// ── Performance counters ─────────────────────────────────────────────────────
+//
+// The portable events, the mode filter and the register packing of
+// `SYS_PMU_INFO`, `SYS_PMU_CONFIGURE` and `SYS_PMU_BIND`
+// (`core/kernel/docs/syscalls.md` § `SYS_PMU_CONFIGURE` (81)). An event id is
+// also its bit in the supported-event mask `SYS_PMU_INFO` returns.
+
+/// Event id: core clock cycles, at the rate the core runs.
+pub const PMU_EVENT_CYCLES: u8 = 0;
+/// Event id: instructions retired.
+pub const PMU_EVENT_INSTRUCTIONS: u8 = 1;
+/// Event id: references to the last-level cache.
+pub const PMU_EVENT_LLC_REFERENCES: u8 = 2;
+/// Event id: misses in the last-level cache.
+pub const PMU_EVENT_LLC_MISSES: u8 = 3;
+/// Event id: branch instructions retired.
+pub const PMU_EVENT_BRANCH_INSTRUCTIONS: u8 = 4;
+/// Event id: mispredicted branch instructions retired.
+pub const PMU_EVENT_BRANCH_MISSES: u8 = 5;
+/// Event id: data-TLB misses that walked the page tables.
+pub const PMU_EVENT_DTLB_MISSES: u8 = 6;
+/// Event id: instruction-TLB misses that walked the page tables.
+pub const PMU_EVENT_ITLB_MISSES: u8 = 7;
+/// The number of event ids: every id is below it.
+pub const PMU_EVENT_COUNT: u8 = 8;
+
+/// Mode filter bit: count while the CPU runs in user mode.
+pub const PMU_MODE_USER: u64 = 1 << 0;
+/// Mode filter bit: count while the CPU runs in the kernel.
+pub const PMU_MODE_KERNEL: u64 = 1 << 1;
+
+/// The most events one `SYS_PMU_CONFIGURE` takes, a limit of this version of
+/// the call: its event and handle words carry one byte per event.
+pub const PMU_CONFIGURE_MAX: usize = 8;
+/// Bits of one event id in `SYS_PMU_CONFIGURE`'s event word, and of one read
+/// handle in its result: entry `i` sits at bits `i * 8 .. i * 8 + 8`.
+pub const PMU_ENTRY_BITS: u32 = 8;
+/// Mask of one entry of the event word or the handle word.
+pub const PMU_ENTRY_MASK: u64 = (1 << PMU_ENTRY_BITS) - 1;
+
+/// `SYS_PMU_INFO`'s result: the shift of the user counter count.
+pub const PMU_INFO_COUNTERS_SHIFT: u32 = 0;
+/// `SYS_PMU_INFO`'s result: the mask of the user counter count, after the
+/// shift.
+pub const PMU_INFO_COUNTERS_MASK: u64 = 0xFF;
+/// `SYS_PMU_INFO`'s result: the shift of the counter width in bits.
+pub const PMU_INFO_WIDTH_SHIFT: u32 = 8;
+/// `SYS_PMU_INFO`'s result: the mask of the counter width, after the shift.
+pub const PMU_INFO_WIDTH_MASK: u64 = 0xFF;
+/// `SYS_PMU_INFO`'s result: the shift of the supported-event mask, one bit
+/// per event id.
+pub const PMU_INFO_EVENTS_SHIFT: u32 = 16;
+/// `SYS_PMU_INFO`'s result: the mask of the supported-event mask, after the
+/// shift.
+pub const PMU_INFO_EVENTS_MASK: u64 = 0xFFFF;
+
+const _: () = assert!(PMU_CONFIGURE_MAX * PMU_ENTRY_BITS as usize <= u64::BITS as usize);
+const _: () = assert!(PMU_EVENT_COUNT as u64 <= PMU_INFO_EVENTS_MASK.count_ones() as u64);
 
 // ── Kernel log records ──────────────────────────────────────────────────────
 
@@ -1565,6 +1639,13 @@ pub const RIGHTS_ENTROPY_CONTRIBUTE: u64 = 1 << 0;
 /// [`SYS_KERNEL_LOG_READ`] and bind their notification with
 /// [`SYS_KERNEL_LOG_BIND`].
 pub const RIGHTS_KLOG_READ: u64 = 1 << 0;
+
+// PmuControl ──
+
+/// `PmuControl`: may describe the calling CPU's performance counters with
+/// [`SYS_PMU_INFO`], program them with [`SYS_PMU_CONFIGURE`], and grant a
+/// thread their direct reads with [`SYS_PMU_BIND`].
+pub const RIGHTS_PMU_CONFIGURE: u64 = 1 << 0;
 
 // ABI promise: the MAP_WRITABLE / MAP_EXECUTABLE rustdoc above states that
 // prot bits coincide with the Memory rights bit positions. Nothing decodes
@@ -2585,6 +2666,8 @@ mod tests
             &[RIGHTS_ENTROPY_CONTRIBUTE],
             // KernelLog
             &[RIGHTS_KLOG_READ],
+            // PmuControl
+            &[RIGHTS_PMU_CONFIGURE],
         ];
 
         for bits in spaces

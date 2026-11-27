@@ -274,6 +274,11 @@ pub struct TestContext
     /// when no descriptor names one. Tests of `SYS_ENTROPY_CONTRIBUTE` use it.
     pub entropy_control_cap: u64,
 
+    /// Root `PmuControl` cap (Configure), kernel-minted in init's initial cap
+    /// set and named by its descriptor alone; zero when no descriptor names
+    /// one. Tests of `SYS_PMU_*` use it.
+    pub pmu_control_cap: u64,
+
     /// Root `KernelLog` cap (Read), kernel-minted in init's initial cap set
     /// on both architectures and named by its descriptor alone; zero when no
     /// descriptor names one. ktest reads the kernel log through it
@@ -732,6 +737,10 @@ extern "C" fn run(info_ptr: u64) -> !
         entropy_control_cap: init_info::descriptors(info)
             .iter()
             .find(|d| d.cap_type == init_protocol::CapType::EntropyControl)
+            .map_or(0, |d| d.slot),
+        pmu_control_cap: init_info::descriptors(info)
+            .iter()
+            .find(|d| d.cap_type == init_protocol::CapType::PmuControl)
             .map_or(0, |d| d.slot),
         kernel_log_cap: init_info::descriptors(info)
             .iter()

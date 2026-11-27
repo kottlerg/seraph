@@ -497,8 +497,9 @@ fn trace(ctx: &Context, args: &PathAccountTraceArgs) -> Result<()>
         }
         // The trace boots, so `main` admitted no build: the plugin's compile
         // is admitted here, as a build, and the boot after it as a boot.
-        crate::host_lock::admit_build(ctx, &args.host.common)?;
+        let compile = crate::host_lock::admit_build(ctx, &args.host.common)?;
         let plugin = build_plugin(ctx)?;
+        drop(compile);
         let _host = crate::host_lock::admit_boot(ctx, &args.host, 1, 1)?;
         std::fs::create_dir_all(&out_dir)
             .with_context(|| format!("creating {}", out_dir.display()))?;

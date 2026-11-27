@@ -60,6 +60,7 @@ pub mod mmio_revoke_unmaps;
 pub mod mmio_spill_withdrawn;
 pub mod multi_caller_ipc_fifo;
 pub mod park_interrupted_stop_start;
+pub mod pmu;
 pub mod priority_preemption;
 pub mod queued_waiters_fifo;
 pub mod range_copy_lineage;
@@ -348,6 +349,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::user_mode_controls",
         user_mode_controls::run(ctx)
     );
+    run_integration_test!("integration::pmu", pmu::run(ctx));
     run_integration_test!(
         "integration::idle_past_watchdog_threshold",
         idle_past_watchdog_threshold::run(ctx)

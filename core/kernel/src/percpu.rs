@@ -303,19 +303,29 @@ pub mod return_work
     /// (`sched::run_limit::tick`, and its dispatch through
     /// `sched::run_limit::follow_to_cpu`).
     pub const RUN_LIMIT: u32 = 1 << 6;
+    /// The running thread's counter-read grant may differ from the one in
+    /// effect on this CPU (`perfmon::bind`), which the return applies
+    /// (`perfmon::sync_grant`).
+    pub const PMU_GRANT: u32 = 1 << 7;
 
     /// The bits a syscall's return handles: every kind.
-    pub const AT_SYSCALL: u32 =
-        STOPPED | RECLAIM | SOLE_REF | UPCALL_SYSCALL | UPCALL_ANY | PREEMPT | RUN_LIMIT;
+    pub const AT_SYSCALL: u32 = STOPPED
+        | RECLAIM
+        | SOLE_REF
+        | UPCALL_SYSCALL
+        | UPCALL_ANY
+        | PREEMPT
+        | RUN_LIMIT
+        | PMU_GRANT;
     /// The bits the return from an interrupt taken in user mode handles: the
     /// sole-reference pass, the delivery of a run-limit fault, the interrupt
-    /// delivery point and the wake preemption. The others wait for the
-    /// thread's next syscall.
-    pub const AT_INTERRUPT: u32 = SOLE_REF | RUN_LIMIT | UPCALL_ANY | PREEMPT;
+    /// delivery point, the counter-read grant and the wake preemption. The
+    /// others wait for the thread's next syscall.
+    pub const AT_INTERRUPT: u32 = SOLE_REF | RUN_LIMIT | UPCALL_ANY | PMU_GRANT | PREEMPT;
     /// The bits the return from an exception taken in user mode handles: the
-    /// wake preemption alone, which leads to the interrupt return's work when
-    /// it reschedules.
-    pub const AT_EXCEPTION: u32 = PREEMPT;
+    /// counter-read grant and the wake preemption, which leads to the
+    /// interrupt return's work when it reschedules.
+    pub const AT_EXCEPTION: u32 = PMU_GRANT | PREEMPT;
 }
 
 // ── PerCpuData ────────────────────────────────────────────────────────────────
@@ -427,6 +437,10 @@ pub struct PerCpuData
     /// from its queue, on any CPU, clears its slot by an atomic
     /// compare-and-swap, under that endpoint's lock.
     pub recv_parked: crate::ipc::recv_park::RecvParkTable,
+    /// This CPU's performance counters and the counter-read grant in effect
+    /// on it (`perfmon`). Read and written only by this CPU, with interrupts
+    /// disabled; described once by `perfmon::init_this_cpu`.
+    pub pmu: crate::perfmon::CpuPmu,
 }
 
 impl PerCpuData
@@ -454,6 +468,7 @@ impl PerCpuData
             return_work: AtomicU32::new(0),
             _pad2: 0,
             recv_parked: crate::ipc::recv_park::RecvParkTable::new(),
+            pmu: crate::perfmon::CpuPmu::new(),
         }
     }
 }
@@ -1016,8 +1031,8 @@ mod tests
     // `cpu::current_cpu`, `gdt::set_rsp0`, `gdt::load_iopb`) reads PerCpuData fields at the
     // literal offsets the PERCPU_*_OFFSET constants mirror. The struct layout and the
     // constants MUST agree or the asm touches the wrong field. Size is pinned because the
-    // tagged-TLB counters are appended after the asm-referenced fields; a size change
-    // would mean something was inserted ahead of them.
+    // tagged-TLB counters and the PMU state are appended after the asm-referenced fields; a
+    // size change would mean something was inserted ahead of them.
     #[test]
     fn percpu_offsets_match_asm_constants()
     {
@@ -1031,6 +1046,6 @@ mod tests
             PERCPU_PREEMPT_COUNT_OFFSET
         );
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 248);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 288);
     }
 }

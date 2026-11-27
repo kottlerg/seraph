@@ -486,8 +486,9 @@ pub(super) fn bootloader_under(
     };
     // The case boots, so `main` admitted no build: the compile is admitted
     // here, as a build.
-    crate::host_lock::admit_build(ctx, &args.host.common)?;
+    let compile = crate::host_lock::admit_build(ctx, &args.host.common)?;
     crate::commands::build::compile_boot(ctx, &build, store, boot)?;
+    drop(compile);
     let mut substitutes = Vec::new();
     for image in crate::esp::bootloader_copies(ctx, args.arch)
     {

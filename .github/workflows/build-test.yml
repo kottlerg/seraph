@@ -408,6 +408,15 @@ jobs:
           qemu-system-x86_64 --version
           qemu-system-riscv64 --version
 
+      - name: Report the runner's performance counters
+        # Reported only: CI boots x86-64 under TCG, which offers the guest no
+        # PMU, so ktest's integration::pmu checks the x86-64 case of a CPU
+        # with no counters here (core/kernel/docs/perfmon.md § Testing).
+        run: |
+          echo "arch_perfmon CPUs: $(grep -c arch_perfmon /proc/cpuinfo || true)"
+          echo "perfctr_core CPUs: $(grep -c perfctr_core /proc/cpuinfo || true)"
+          echo "kvm enable_pmu: $(cat /sys/module/kvm/parameters/enable_pmu 2>/dev/null || echo absent)"
+
       - name: Install Rust toolchain
         # The usertest cell alone compiles: its signing and rollback cases
         # build bootloaders under trust stores they generate, from the

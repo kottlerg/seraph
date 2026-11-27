@@ -14,7 +14,8 @@
 //! line to the batch's log beside it, so the log is a by-product of the
 //! changes. `orch state` prints the state as text short enough for a hook to
 //! put into a session's context. The exclusive grant is also written to the
-//! host lock (`crate::host_lock`), which refuses every boot not under it.
+//! host lock (`crate::host_lock`), which refuses every boot not under it,
+//! and, for a timing grant, every build not under it too.
 //!
 //! The directory is the main checkout's, found through the git common
 //! directory as the host lock's is, so the command run in a worker's linked
@@ -35,7 +36,7 @@ use crate::cli::{
     OrchArgs, OrchCommand, OrchGrantCommand, OrchQuestionCommand, OrchRulingCommand, OrchWorkerArgs,
 };
 use crate::context::Context as BuildContext;
-use crate::host_lock;
+use crate::host_lock::{self, GrantKind};
 use crate::util::step;
 
 const STATE_FILE: &str = "state.json";
@@ -76,10 +77,12 @@ enum Change
     },
     /// Remove a worker.
     WorkerRemove(String),
-    /// Give the exclusive grant to `holder` for `commands`.
+    /// Give the exclusive grant of `kind` to `holder` for `commands`.
     GrantSet
     {
-        holder: String, commands: String
+        holder: String,
+        commands: String,
+        kind: GrantKind,
     },
     /// End the exclusive grant.
     GrantClear,
@@ -223,7 +226,11 @@ fn apply(state: &mut Value, change: &Change, now: &str) -> Result<String>
         }
         Change::Worker { name, fields } => apply_worker(state, name, fields, now),
         Change::WorkerRemove(name) => worker_remove(state, name),
-        Change::GrantSet { holder, commands } => grant_set(state, holder, commands, now),
+        Change::GrantSet {
+            holder,
+            commands,
+            kind,
+        } => grant_set(state, holder, commands, *kind, now),
         Change::GrantClear => grant_clear(state),
         Change::Queue { holder, commands } => queue_add(state, holder, commands),
         Change::Unqueue(holder) =>
@@ -325,7 +332,13 @@ fn remove_entry(state: &mut Value, key: &str, field: &str, value: &str) -> Resul
     Ok(list.len() < before)
 }
 
-fn grant_set(state: &mut Value, holder: &str, commands: &str, now: &str) -> Result<String>
+fn grant_set(
+    state: &mut Value,
+    holder: &str,
+    commands: &str,
+    kind: GrantKind,
+    now: &str,
+) -> Result<String>
 {
     let holder = one_line("the grant's holder", holder)?;
     let commands = one_line("the grant's commands", commands)?;
@@ -340,9 +353,19 @@ fn grant_set(state: &mut Value, holder: &str, commands: &str, now: &str) -> Resu
     set(
         state,
         "grant",
-        json!({ "holder": holder, "commands": commands, "since": now }),
+        json!({
+            "holder": holder,
+            "commands": commands,
+            "since": now,
+            "timing": kind == GrantKind::Timing,
+        }),
     )?;
-    Ok(format!("grant to {holder}: {commands}"))
+    let what = match kind
+    {
+        GrantKind::Timing => "timing grant",
+        GrantKind::Boots => "grant",
+    };
+    Ok(format!("{what} to {holder}: {commands}"))
 }
 
 fn question_add(
@@ -486,8 +509,16 @@ fn render_grant(state: &Value, out: &mut String)
         Some(grant) => push_line(
             out,
             &format!(
-                "grant: {} since {}: {}",
+                "grant: {}{} since {}: {}",
                 text(grant, "holder"),
+                if grant.get("timing").and_then(Value::as_bool) == Some(true)
+                {
+                    " (timing)"
+                }
+                else
+                {
+                    ""
+                },
                 text(grant, "since"),
                 text(grant, "commands")
             ),
@@ -823,9 +854,22 @@ fn state_change(command: &OrchCommand) -> Result<Change>
         OrchCommand::Worker(worker) => worker_change(worker)?,
         OrchCommand::Grant { command } => match command
         {
-            OrchGrantCommand::Set { holder, commands } => Change::GrantSet {
+            OrchGrantCommand::Set {
+                timing,
+                holder,
+                commands,
+                ..
+            } => Change::GrantSet {
                 holder: holder.clone(),
                 commands: commands.join(" "),
+                kind: if *timing
+                {
+                    GrantKind::Timing
+                }
+                else
+                {
+                    GrantKind::Boots
+                },
             },
             OrchGrantCommand::Clear => Change::GrantClear,
             OrchGrantCommand::Queue { holder, commands } => Change::Queue {
@@ -926,6 +970,38 @@ pub fn run(ctx: &BuildContext, args: &OrchArgs) -> Result<()>
         }
         OrchCommand::Orchestrator { id: None } => println!("{}", orchestrator_id(&load(&dir)?)?),
         OrchCommand::Grant {
+            command:
+                OrchGrantCommand::Set {
+                    timing: true,
+                    wait,
+                    holder,
+                    ..
+                },
+        } =>
+        {
+            let change_asked = state_change(&args.command)?;
+            let line = change(&dir, &change_asked, secs)?;
+            apply_to_host(ctx, &change_asked)?;
+            println!("{line}");
+            let holder = one_line("the grant's holder", holder)?;
+            host_lock::wait_quiet(
+                &host_lock::lock_dir(ctx),
+                &holder,
+                Duration::from_secs(*wait),
+                host_lock::WAIT_POLL,
+                &host_lock::probe_host,
+                &crate::term::signal::interrupted,
+                &mut |left| {
+                    step(&format!(
+                        "waiting for the host to be quiet: {}",
+                        left.join("; ")
+                    ));
+                },
+            )
+            .with_context(|| format!("the timing grant of {holder} stays set"))?;
+            println!("host quiet for the timing grant of {holder}");
+        }
+        OrchCommand::Grant {
             command: OrchGrantCommand::Clear,
         } => println!(
             "{}",
@@ -955,7 +1031,10 @@ pub fn run(ctx: &BuildContext, args: &OrchArgs) -> Result<()>
 /// refusal is reported.
 fn grant_clear_everywhere(dir: &Path, lock_dir: &Path, secs: u64) -> Result<String>
 {
-    let host_holder = host_lock::read_grant(lock_dir).ok().flatten();
+    let host_holder = host_lock::read_grant(lock_dir)
+        .ok()
+        .flatten()
+        .map(|grant| grant.holder);
     host_lock::clear_grant(lock_dir)?;
     match change(dir, &Change::GrantClear, secs)
     {
@@ -971,17 +1050,24 @@ fn grant_clear_everywhere(dir: &Path, lock_dir: &Path, secs: u64) -> Result<Stri
 }
 
 /// Carry a change of the exclusive grant to the host lock, whose boots it
-/// admits (`crate::host_lock`): `grant set` records the holder there, and
+/// admits (`crate::host_lock`): `grant set` records the holder and the kind there, and
 /// `grant clear` removes it ([`grant_clear_everywhere`], which `run` calls
 /// first).
 fn apply_to_host(ctx: &BuildContext, change: &Change) -> Result<()>
 {
     match change
     {
-        Change::GrantSet { holder, commands } =>
+        Change::GrantSet {
+            holder,
+            commands,
+            kind,
+        } =>
         {
-            let holder = one_line("the grant's holder", holder)?;
-            host_lock::write_grant(&host_lock::lock_dir(ctx), &holder, commands)
+            let grant = host_lock::Grant {
+                holder: one_line("the grant's holder", holder)?,
+                kind: *kind,
+            };
+            host_lock::write_grant(&host_lock::lock_dir(ctx), &grant, commands)
         }
         Change::GrantClear => host_lock::clear_grant(&host_lock::lock_dir(ctx)),
         Change::Orchestrator(_)
@@ -1148,12 +1234,37 @@ mod tests
     }
 
     #[test]
+    fn a_timing_grant_is_recorded_and_printed_as_one()
+    {
+        let mut state = fresh();
+        let timing = Change::GrantSet {
+            holder: "W1".to_owned(),
+            commands: "run --timing".to_owned(),
+            kind: GrantKind::Timing,
+        };
+        assert_eq!(
+            apply(&mut state, &timing, NOW).unwrap(),
+            "timing grant to W1: run --timing"
+        );
+        assert!(render(&state).contains(&format!("grant: W1 (timing) since {NOW}: run --timing")));
+        apply(&mut state, &Change::GrantClear, NOW).unwrap();
+        let plain = Change::GrantSet {
+            holder: "W1".to_owned(),
+            commands: "run --cpus 16".to_owned(),
+            kind: GrantKind::Boots,
+        };
+        apply(&mut state, &plain, NOW).unwrap();
+        assert!(render(&state).contains(&format!("grant: W1 since {NOW}: run --cpus 16")));
+    }
+
+    #[test]
     fn one_grant_is_outstanding_at_a_time()
     {
         let mut state = fresh();
         let grant = |holder: &str| Change::GrantSet {
             holder: holder.to_owned(),
             commands: "run --runs 1 --cpus 8".to_owned(),
+            kind: GrantKind::Boots,
         };
         let queue = |holder: &str| Change::Queue {
             holder: holder.to_owned(),
@@ -1286,6 +1397,7 @@ mod tests
             Change::GrantSet {
                 holder: "W1".to_owned(),
                 commands: "boundary set".to_owned(),
+                kind: GrantKind::Boots,
             },
             Change::Queue {
                 holder: "W2".to_owned(),
@@ -1387,14 +1499,19 @@ mod tests
     {
         let dir = scratch("host-grant");
         let lock_dir = scratch("host-grant-lock");
-        crate::host_lock::write_grant(&lock_dir, "W1", "run --runs 1 --cpus 8").unwrap();
+        let grant = |holder: &str| crate::host_lock::Grant {
+            holder: holder.to_owned(),
+            kind: GrantKind::Boots,
+        };
+        let (w1, w2) = (grant("W1"), grant("W2"));
+        crate::host_lock::write_grant(&lock_dir, &w1, "run --runs 1 --cpus 8").unwrap();
         // No batch state at all.
         let line = grant_clear_everywhere(&dir, &lock_dir, SECS).unwrap();
         assert!(line.contains("host grant of W1 ended"));
         assert_eq!(crate::host_lock::read_grant(&lock_dir).unwrap(), None);
         // A batch whose state records no grant.
         start(&dir, "close out the milestone", SECS).unwrap();
-        crate::host_lock::write_grant(&lock_dir, "W2", "run --runs 1 --cpus 8").unwrap();
+        crate::host_lock::write_grant(&lock_dir, &w2, "run --runs 1 --cpus 8").unwrap();
         grant_clear_everywhere(&dir, &lock_dir, SECS).unwrap();
         assert_eq!(crate::host_lock::read_grant(&lock_dir).unwrap(), None);
         // With no grant anywhere the state's refusal stands.
@@ -1575,6 +1692,8 @@ mod tests
         );
         let command = OrchCommand::Grant {
             command: OrchGrantCommand::Set {
+                timing: true,
+                wait: 60,
                 holder: "W1".to_owned(),
                 commands: vec![
                     "run".to_owned(),
@@ -1590,6 +1709,7 @@ mod tests
             Change::GrantSet {
                 holder: "W1".to_owned(),
                 commands: "run --runs 1 --cpus 8".to_owned(),
+                kind: GrantKind::Timing,
             }
         );
     }

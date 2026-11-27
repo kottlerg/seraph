@@ -1904,20 +1904,27 @@ impl Body<'_>
     }
 }
 
-/// Where a line's level tag is and the palette index it is drawn in
+/// Where a line's level tag is and the colours it is drawn in
 /// ([`write_coloured`]).
 #[derive(Clone, Copy)]
 struct Tag
 {
     start: usize,
     end: usize,
-    colour: u8,
+    colour: logd_codec::level::TagColour,
 }
+
+// The default colours a line is drawn in and a tag's colour is reset to are
+// the terminal's, so a log line leaves the terminal's colours as it found them.
+const _: () = assert!(
+    logd_codec::level::DEFAULT_COLOUR.fg == ansi::DEFAULT_FG
+        && logd_codec::level::DEFAULT_COLOUR.bg == ansi::DEFAULT_BG
+);
 
 /// Render `entry` with message `body` as one line in `settings`' format
 /// (`logd_codec::console`, `logd_codec::rfc5424`) into `out`, ending it with
 /// `\r\n`. The level tag to colour, when the settings colour it and its
-/// colour is not the default foreground.
+/// colours are not the default ones.
 fn render_line(
     settings: &SinkSettings,
     entry: &logd_codec::console::Entry<'_>,
@@ -2326,8 +2333,8 @@ impl Sink
     }
 
     /// Write `bytes`, one line, to the driver behind `cap` ([`write_line`]),
-    /// with the level tag `tag` names drawn in its colour on a driver that
-    /// takes colour: the bytes before the tag, the colour
+    /// with the level tag `tag` names drawn in its colours on a driver that
+    /// takes colour: the bytes before the tag, the colours
     /// ([`Sink::attrs`]), the tag, the default colour, then the rest, so a
     /// terminal's colour is reset by the line
     /// (`services/logd/docs/sinks.md` § Colour). Every call is bounded by
@@ -2354,9 +2361,9 @@ impl Sink
         {
             return write_line(cap, self.op, self.sent, bytes, ipc_buf, bound);
         };
-        let attrs = |colour: u8| {
-            let [r, g, b] = ansi::ansi_rgb(colour);
-            let [br, bg, bb] = ansi::ansi_rgb(ansi::DEFAULT_BG);
+        let attrs = |colour: logd_codec::level::TagColour| {
+            let [r, g, b] = ansi::ansi_rgb(colour.fg);
+            let [br, bg, bb] = ansi::ansi_rgb(colour.bg);
             [r, g, b, br, bg, bb]
         };
         let steps = [
@@ -2379,7 +2386,7 @@ impl Sink
         let reset = call_step(
             cap,
             self.attrs,
-            &attrs(ansi::DEFAULT_FG),
+            &attrs(logd_codec::level::DEFAULT_COLOUR),
             ipc_buf,
             bound,
             Step2::Chunk,

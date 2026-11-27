@@ -411,14 +411,15 @@ The default console line, the same on serial and the framebuffer:
 
 Serial carries no colour: it is captured to files and matched by CI. On the framebuffer, with
 `colour=yes`, only the level tag is coloured, in the terminal's 16-colour palette
-([shared/ansi](../../../shared/ansi/README.md) `ANSI_RGB`): emergency to error red, warning yellow,
-notice bright white, informational the default foreground, debug bright black. The bytes are
-otherwise those serial shows.
+([shared/ansi](../../../shared/ansi/README.md) `ANSI_RGB`): emergency and alert bright white on a
+red background, critical and error red, warning yellow, notice bright cyan, debug bright black,
+each of these on the default background, and informational in the default colours (bright white
+on black). The bytes are otherwise those serial shows.
 
 The framebuffer driver's colour is one global state that the terminal shares
 ([services/drivers/framebuffer/README.md](../../drivers/framebuffer/README.md) § Label 2:
-`FB_SET_ATTRS`). The sink sets the tag's colour, writes the tag, and sets the driver's default
-colour back before the rest of the line, so a colour the terminal had set is reset by a log line
+`FB_SET_ATTRS`). The sink sets the tag's colours, writes the tag, and sets the driver's default
+colours back before the rest of the line, so a colour the terminal had set is reset by a log line
 until the terminal next sets one. Per-client colour state arrives with the display broker
 ([#153](https://github.com/kottlerg/seraph/issues/153)). At the framebuffer's default level a log
 line reaches the screen rarely.

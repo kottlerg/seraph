@@ -37,28 +37,44 @@ pub fn tag(level: u64) -> &'static str
     }
 }
 
-/// The palette index of the colour `level`'s tag is drawn in on a sink that
-/// colours it ([sinks.md](../../docs/sinks.md) § Colour), an index of the
-/// terminal's 16-colour palette (`shared/ansi`): error to emergency red (1),
-/// warning yellow (3), notice bright white (15), debug bright black (8), and
-/// informational, and any other code, [`DEFAULT_COLOUR`].
-#[must_use]
-pub fn colour(level: u64) -> u8
+/// The colours a level tag is drawn in, each an index of the terminal's
+/// 16-colour palette (`shared/ansi`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TagColour
 {
+    /// The text's colour.
+    pub fg: u8,
+    /// The colour behind the text.
+    pub bg: u8,
+}
+
+/// The colours `level`'s tag is drawn in on a sink that colours it
+/// ([sinks.md](../../docs/sinks.md) § Colour): emergency and alert bright
+/// white (15) on red (1), critical and error red (1), warning yellow (3),
+/// notice bright cyan (14), debug bright black (8), each of these on the
+/// default background, and informational, and any other code,
+/// [`DEFAULT_COLOUR`].
+#[must_use]
+pub fn colour(level: u64) -> TagColour
+{
+    let fg = |fg| TagColour {
+        fg,
+        bg: DEFAULT_COLOUR.bg,
+    };
     match level_or_info(level)
     {
-        LEVEL_EMERGENCY | LEVEL_ALERT | LEVEL_CRITICAL | LEVEL_ERROR => 1,
-        LEVEL_WARN => 3,
-        LEVEL_NOTICE => 15,
-        LEVEL_DEBUG => 8,
+        LEVEL_EMERGENCY | LEVEL_ALERT => TagColour { fg: 15, bg: 1 },
+        LEVEL_CRITICAL | LEVEL_ERROR => fg(1),
+        LEVEL_WARN => fg(3),
+        LEVEL_NOTICE => fg(14),
+        LEVEL_DEBUG => fg(8),
         _ => DEFAULT_COLOUR,
     }
 }
 
-/// The palette index of the default foreground (`shared/ansi`'s
-/// `DEFAULT_FG`), which an informational tag is drawn in and the rest of a
-/// line is.
-pub const DEFAULT_COLOUR: u8 = 15;
+/// The default colours (`shared/ansi`'s `DEFAULT_FG` on `DEFAULT_BG`),
+/// which an informational tag is drawn in and the rest of a line is.
+pub const DEFAULT_COLOUR: TagColour = TagColour { fg: 15, bg: 0 };
 
 #[cfg(test)]
 mod tests
@@ -97,19 +113,31 @@ mod tests
         assert_eq!(tag(LEVEL_DEBUG + 1), "INFO");
     }
 
-    // Defect caught: a severe tag drawn in a quiet colour, or an
-    // informational one coloured, against the approved mapping.
+    // Defect caught: a level's tag drawn in another level's colours against
+    // the approved mapping: a severe tag in a quiet colour, emergency or
+    // alert without their red background, an informational tag coloured, or
+    // a notice tag drawn like an informational one (the default foreground
+    // is bright white).
     #[test]
     fn each_level_takes_its_tag_colour()
     {
-        for level in [LEVEL_EMERGENCY, LEVEL_ALERT, LEVEL_CRITICAL, LEVEL_ERROR]
+        let on_default = |fg| TagColour { fg, bg: 0 };
+        let cases = [
+            (LEVEL_EMERGENCY, TagColour { fg: 15, bg: 1 }),
+            (LEVEL_ALERT, TagColour { fg: 15, bg: 1 }),
+            (LEVEL_CRITICAL, on_default(1)),
+            (LEVEL_ERROR, on_default(1)),
+            (LEVEL_WARN, on_default(3)),
+            (LEVEL_NOTICE, on_default(14)),
+            (LEVEL_INFO, DEFAULT_COLOUR),
+            (LEVEL_DEBUG, on_default(8)),
+            (LEVEL_DEBUG + 1, DEFAULT_COLOUR),
+        ];
+        for (level, expected) in cases
         {
-            assert_eq!(colour(level), 1);
+            assert_eq!(colour(level), expected, "level {level}");
         }
-        assert_eq!(colour(LEVEL_WARN), 3);
-        assert_eq!(colour(LEVEL_NOTICE), 15);
-        assert_eq!(colour(LEVEL_INFO), DEFAULT_COLOUR);
-        assert_eq!(colour(LEVEL_DEBUG), 8);
-        assert_eq!(colour(LEVEL_DEBUG + 1), DEFAULT_COLOUR);
+        assert_eq!(DEFAULT_COLOUR, TagColour { fg: 15, bg: 0 });
+        assert_ne!(colour(LEVEL_NOTICE), DEFAULT_COLOUR);
     }
 }

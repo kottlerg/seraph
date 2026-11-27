@@ -473,11 +473,14 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
     if sstatus_at_entry & (1 << 8) == 0 && scause != 8
     {
         let deliver = || {
-            // The interrupt delivery point of an upcall posted with
-            // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
-            // Upcalls): the trap is handled and completed.
+            // A pending run-limit fault (core/kernel/docs/scheduler.md § Run
+            // Limit), then the interrupt delivery point of an upcall posted
+            // with UPCALL_ANY_INSTRUCTION (docs/fault-handling.md
+            // § Asynchronous Upcalls): the trap is handled and completed.
             // SAFETY: U-mode origin, so frame is the thread's live frame on
             // its kernel stack; no lock is held, SIE = 0.
+            unsafe { crate::sched::run_limit::deliver_at_interrupt(frame) };
+            // SAFETY: as for the delivery above.
             unsafe { crate::ipc::upcall::deliver_at_interrupt(frame) };
         };
         if scause >> 63 != 0

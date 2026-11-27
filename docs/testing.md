@@ -650,6 +650,34 @@ the region between two reads, the benchmark's measured operation, as follows:
   order. An out-of-order hart may overlap a small window's edges with the work around it, so a
   window shorter than its pipeline's depth measures the region only to within that overlap.
 
+A window whose thread may run on another CPU between its two reads, as in a window row
+([shared/bench/README.md § Window rows](../shared/bench/README.md#window-rows)), takes
+both reads on the CPU it measures on, since riscv64 keeps no two harts' counters in step. Their
+difference then measures the window only while that CPU's counter advanced throughout, whatever
+ran where:
+
+- **Under icount**, on both architectures, the counter follows the clock the vCPUs share, so the
+  difference counts what every vCPU retired in the window, as at more than one CPU above, and
+  the host's time while every vCPU idled.
+- **On hardware, x86-64**, the invariant TSC advances at a constant rate in every C-state, so the
+  difference is the window's reference cycles.
+- **On hardware, riscv64**, `cycle` counts the hart's own cycles, whatever thread it runs, and
+  whether it advances while the hart waits in `wfi` is the implementation's choice.
+
+Such a window therefore counts only when both reads ran on the measuring CPU and that CPU did not
+halt between them, or its counter ran through the halt: a row whose pinned reader blocks in the
+window (`ubench.pipeline`) checks each window against the kernel's elapsed microseconds and leaves
+out one whose counter did not count them ([shared/bench/README.md § Window rate
+check](../shared/bench/README.md#window-rate-check)). A row whose reads a thread pinned to that CPU
+takes has the first by its pin. A row whose measured thread takes them, with no affinity between
+them, takes the opening read while still pinned and closes its idle-halt span right after the
+closing read: the close fails on another CPU than the span's open, and otherwise returns the halts
+between them. The one move the span does not see is a move onto the measuring CPU in the few
+instructions between the closing read and the close, which takes a preemption and a pull there.
+fsbench's window rows run at more than one CPU, so their counts are reported, not gated (below);
+`ubench.pipeline`'s line at one CPU, whose threads share the CPU so that its window does not idle,
+gates as any other.
+
 Every sample therefore includes the cost of the reads themselves: their instructions on the
 region's side under icount, and on hardware the cycles of those instructions and of the fences.
 The `empty_window` benchmark of each suite, `ktest.empty_window` and `ubench.empty_window`,
@@ -658,15 +686,6 @@ the offset its suite's `empty_window` line reports in the same mode. No tool sub
 reader who wants the region's cost alone subtracts it, which under icount leaves exactly the
 region's instructions only for a window on one CPU that does not idle and that no interrupt or
 other thread enters.
-
-A window line ([shared/bench/README.md § Result line](../shared/bench/README.md#result-line))
-whose reading thread waits while other threads run its work (`ubench.pipeline`) bounds the same
-region: everything between its two reads, wherever it ran. At more than one CPU the reading CPU may
-halt in it, and the window counts that time only where the counter runs through a halt, which
-riscv64 hardware leaves to the implementation; each such window is checked against the kernel's
-elapsed microseconds and left out when its counter did not count them
-([shared/bench/README.md § Window rate check](../shared/bench/README.md#window-rate-check)). At one
-CPU its threads share the CPU, the window does not idle, and its count gates as any other.
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
 miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host

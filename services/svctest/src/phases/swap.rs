@@ -1481,8 +1481,8 @@ pub(super) fn start_fixture(authority: u64, main_pages: u64, fill: Fill) -> (Fix
 }
 
 /// Take the snapshot's room of `pages` pages into `room`, before the hog.
-/// memmgr serves a grant from the smallest free run that covers it, or else
-/// from its largest runs first (services/memmgr/docs/memory-pool.md
+/// memmgr serves a grant from a free run of the smallest size class that
+/// holds one covering it, or else from its largest runs first (services/memmgr/docs/memory-pool.md
 /// § Allocation), and serves the capture's frames the same way once the room
 /// is given back. Taken while the pool is still nearly free, the room holds runs the
 /// capture can be sealed from; one in more than [`ROOM_GRANTS_MAX`] grants

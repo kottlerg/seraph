@@ -7,8 +7,9 @@
 //! measured operation ([`Counters`]), the samples it records and their
 //! summary ([`Samples`], [`Summary`]), and the one result line it reports,
 //! with the parser a comparison reads it back with ([`Report`],
-//! [`parse_line`]), and the check that a window whose CPU may halt counted
-//! its elapsed time ([`CycleRate`]). `shared/bench/README.md` specifies the line.
+//! [`parse_line`]), the windows of a window row ([`WindowShape`]), and the
+//! check that a window whose CPU may halt counted its elapsed time
+//! ([`CycleRate`]). `shared/bench/README.md` specifies the line.
 //!
 //! `no_std`, no allocation, no dependency. The architecture-specific counter
 //! reads live under `arch/`, built with the default `counters` feature; a
@@ -23,6 +24,7 @@ mod counters;
 mod line;
 mod rate;
 mod stats;
+mod window;
 
 #[cfg(feature = "counters")]
 pub use arch::current::ARCH;
@@ -33,3 +35,4 @@ pub use line::{
 };
 pub use rate::{CycleRate, RATE_SLACK_MICROS, RATE_TOLERANCE_PERCENT};
 pub use stats::{Samples, Summary, summarize};
+pub use window::{HALTED, MOVED, WINDOW_OPS, WINDOW_OPS_KEY, WindowEnd, WindowShape, WindowTally};

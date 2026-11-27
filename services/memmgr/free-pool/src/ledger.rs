@@ -235,7 +235,11 @@ const SPAN_BITMAP_BYTES: usize = (MAX_HARVEST_PAGES / 8) as usize;
 
 /// Where the eviction clock's sweep ([`Ledger::sweep`]) goes on: the badge of
 /// the process it reached, and the address in that process's regions it
-/// sweeps from. A hand whose process is gone starts again at the first.
+/// sweeps from. The clock and the swap service's walk
+/// ([`Ledger::next_to_write`]) take the records in record order, the order of
+/// their badges, which no lookup and no growth of the index changes, so a hand
+/// resumes where it stopped whatever ran between two slices. A hand whose
+/// process is gone goes on at the record of the next badge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClockHand
 {
@@ -716,6 +720,17 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             .filter(|&rec| self.record(rec).is_some())
     }
 
+    /// The record slot keyed by `badge`, as [`Ledger::find`], moved to the
+    /// head of its index chain ([`ProcessIndex::find_front`]): for a fault's
+    /// and a grant's lookup of their caller, so the lookup's cost does not
+    /// follow which badges share its bucket.
+    pub fn find_front(&mut self, badge: u64) -> Option<NodeIdx>
+    {
+        self.index
+            .find_front(&mut self.arena, badge)
+            .filter(|&rec| self.record(rec).is_some())
+    }
+
     /// The record in slot `rec`.
     #[must_use]
     pub fn record(&self, rec: NodeIdx) -> Option<ProcessRecord>
@@ -725,6 +740,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Process(r) => Some(r),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -751,6 +767,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Region(r) => Some(r),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Frame(_)
@@ -778,6 +795,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Commit(c) => Some(c),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -829,6 +847,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Caps(c) => Some(c),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -1039,6 +1058,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Handle(s) => Some(s),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -1067,6 +1087,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Limit(l) => Some(l),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -1753,6 +1774,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Object(o) => Some(o),
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -4049,12 +4071,12 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// `None` when it finds none within the budget.
     pub fn next_to_write(&self, hand: &mut ClockHand, budget: u64) -> Option<Victim>
     {
-        let mut rec = hand.badge.and_then(|b| self.find(b)).or_else(|| {
-            hand.va = 0;
-            self.next_record(None)
-        })?;
+        // A hand whose process was the last and is gone has reached the end:
+        // its walk goes on from the first, as one past the last does.
+        let resumed = self.resume(hand);
+        let mut wrapped = resumed.is_none() && hand.badge.is_some();
+        let mut rec = resumed.or_else(|| self.next_record(None))?;
         let mut left = budget;
-        let mut wrapped = false;
         while left > 0
         {
             left = left.saturating_sub(1);
@@ -4063,7 +4085,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             else
             {
                 hand.va = 0;
-                let after = self.next_record(Some(rec));
+                let after = self.record_after(rec);
                 rec = match after
                 {
                     Some(next) => next,
@@ -4430,13 +4452,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         prefer: impl Fn(&Self, NodeIdx) -> bool,
     ) -> usize
     {
-        let found = hand.badge.and_then(|b| self.find(b)).or_else(|| {
-            hand.va = 0;
-            self.next_record(None)
-        });
-        let Some(mut rec) = found
+        let Some(mut rec) = self.resume(hand)
         else
         {
+            // Past the last record, a hand whose process is gone ends the pass.
+            if hand.badge.is_some()
+            {
+                self.end_pass();
+            }
             *hand = ClockHand::default();
             return 0;
         };
@@ -4464,14 +4487,12 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 // The record is done: on to the next. Past the last, the pass is
                 // done and the slice ends with the hand at the first.
                 hand.va = 0;
-                if let Some(next) = self.next_record(Some(rec))
+                if let Some(next) = self.record_after(rec)
                 {
                     rec = next;
                     continue;
                 }
-                self.q_max = self.q_next;
-                self.q_next = 0;
-                self.pass = self.pass.wrapping_add(1);
+                self.end_pass();
                 if let Some(first) = self.next_record(None)
                 {
                     rec = first;
@@ -4592,30 +4613,51 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         span_top
     }
 
-    /// The record after `after` in index order, or the first for `None`;
-    /// `None` past the last, or when `after` is not indexed.
-    fn next_record(&self, after: Option<NodeIdx>) -> Option<NodeIdx>
+    /// The end of a pass of the clock: the greatest rate the pass noted
+    /// scales the next pass's credit, and the pass count moves on.
+    fn end_pass(&mut self)
     {
-        let mut passed = after.is_none();
-        let mut next = None;
+        self.q_max = self.q_next;
+        self.q_next = 0;
+        self.pass = self.pass.wrapping_add(1);
+    }
+
+    /// The record `hand` resumes at: its process's, else, the process gone,
+    /// the record of the next badge with the hand at its first address, or
+    /// the first record for a hand at the start; `None` past the last.
+    fn resume(&self, hand: &mut ClockHand) -> Option<NodeIdx>
+    {
+        if let Some(rec) = hand.badge.and_then(|b| self.find(b))
+        {
+            return Some(rec);
+        }
+        hand.va = 0;
+        self.next_record(hand.badge)
+    }
+
+    /// The record after `rec` in record order ([`ClockHand`]); `None` past
+    /// the last, or when `rec` holds no record.
+    fn record_after(&self, rec: NodeIdx) -> Option<NodeIdx>
+    {
+        self.record(rec)
+            .and_then(|r| self.next_record(Some(r.badge)))
+    }
+
+    /// The record of the least badge above `after`, or of the least badge
+    /// for `None`: record order ([`ClockHand`]), which a walk of every
+    /// indexed slot finds whatever order the index chains hold them in.
+    fn next_record(&self, after: Option<u64>) -> Option<NodeIdx>
+    {
+        let mut next: Option<(u64, NodeIdx)> = None;
         self.index.for_each(&self.arena, |idx| {
-            if next.is_some()
+            if let Some(r) = self.record(idx)
+                && after.is_none_or(|a| r.badge > a)
+                && next.is_none_or(|(b, _)| r.badge < b)
             {
-                return;
-            }
-            if passed
-            {
-                if self.record(idx).is_some()
-                {
-                    next = Some(idx);
-                }
-            }
-            else if Some(idx) == after
-            {
-                passed = true;
+                next = Some((r.badge, idx));
             }
         });
-        next
+        next.map(|(_, idx)| idx)
     }
 
     /// The region of `rec` that holds `va`, else the lowest-based one above
@@ -6198,6 +6240,7 @@ mod tests
                 // Free runs count in `free_pages`, store runs on their chunk.
                 Node::Free
                 | Node::Run(_)
+                | Node::Pooled(_)
                 | Node::Budget(_)
                 | Node::Process(_)
                 | Node::Caps(_)
@@ -6620,6 +6663,114 @@ mod tests
         l.begin_evict(rec, open, BASE, 1).unwrap();
         assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, 0), 1);
         assert_eq!(victims[0].page_base, BASE + CHUNK);
+    }
+
+    #[test]
+    fn a_pass_ages_each_chunk_once_whatever_lookups_reorder_the_index_between_slices()
+    {
+        let mut l = roomy_ledger(10_000);
+        let badges: Vec<u64> = (1..=48).collect();
+        let regs: Vec<NodeIdx> = badges
+            .iter()
+            .map(|&b| charged_under(&mut l, NODE_NULL, b, 1).1)
+            .collect();
+        let mut hand = ClockHand::default();
+        let mut victims = [Victim::default(); 4];
+        let pass = l.pass;
+        let mut slices = 0;
+        while l.pass == pass
+        {
+            // One step a slice, so the pass spans many slices, and between
+            // two of them a fault's or a grant's lookup of every process,
+            // the hand's last, moves each record to the head of its chain.
+            l.sweep(&mut hand, 1, |_, _, _, _| true, &mut victims, u8::MAX);
+            for &b in badges.iter().rev()
+            {
+                l.find_front(b);
+            }
+            if let Some(b) = hand.badge
+            {
+                l.find_front(b);
+            }
+            slices += 1;
+            assert!(slices < 10_000, "the pass never ended");
+        }
+        let ages: Vec<u8> = regs.iter().map(|&r| l.chunk_at(r, BASE).age()).collect();
+        assert!(
+            ages.iter().all(|&a| a == 1),
+            "ages after one pass: {ages:?}"
+        );
+    }
+
+    #[test]
+    fn a_walk_of_the_records_meets_each_once_whatever_lookups_reorder_the_index()
+    {
+        let mut l = roomy_ledger(10_000);
+        let badges: Vec<u64> = (1..=48).collect();
+        for &b in &badges
+        {
+            l.insert_process(b, NodeSpec::TOP).unwrap();
+        }
+        let mut seen = Vec::new();
+        let mut at = l.next_record(None);
+        while let Some(rec) = at
+        {
+            let badge = l.record(rec).unwrap().badge;
+            seen.push(badge);
+            assert!(
+                seen.len() <= badges.len(),
+                "the walk met a record twice: {seen:?}"
+            );
+            for &b in badges.iter().rev()
+            {
+                l.find_front(b);
+            }
+            l.find_front(badge);
+            at = l.next_record(Some(badge));
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, badges);
+    }
+
+    #[test]
+    fn a_pass_goes_on_past_a_process_gone_between_slices()
+    {
+        let mut l = roomy_ledger(10_000);
+        let badges: Vec<u64> = (1..=8).collect();
+        let regs: Vec<NodeIdx> = badges
+            .iter()
+            .map(|&b| charged_under(&mut l, NODE_NULL, b, 1).1)
+            .collect();
+        let mut hand = ClockHand::default();
+        let mut victims = [Victim::default(); 4];
+        let pass = l.pass;
+        let mut gone = None;
+        let mut slices = 0;
+        while l.pass == pass
+        {
+            l.sweep(&mut hand, 1, |_, _, _, _| true, &mut victims, u8::MAX);
+            // The process the hand rests on halfway through the pass dies.
+            if gone.is_none()
+                && let Some(b) = hand.badge
+                && b > 4
+            {
+                l.remove_process(b, pool_all, |_| {}).unwrap();
+                gone = Some(b);
+            }
+            slices += 1;
+            assert!(slices < 10_000, "the pass never ended");
+        }
+        let gone = gone.unwrap();
+        let ages: Vec<u8> = badges
+            .iter()
+            .zip(&regs)
+            .filter(|&(&b, _)| b != gone)
+            .map(|(_, &r)| l.chunk_at(r, BASE).age())
+            .collect();
+        assert!(
+            ages.iter().all(|&a| a == 1),
+            "ages after one pass: {ages:?}"
+        );
     }
 
     /// A record of badge `badge` under the budget node `parent` (a top-level

@@ -24,7 +24,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::Scope;
 
-use bench::{Counters, CycleRate, Value};
+use bench::{Counters, CycleRate, Value, WINDOW_OPS_KEY};
 use shmem::{SpscHeader, SpscReader, SpscWriter};
 use syscall_abi::{
     SyscallError, SystemInfoType, THREAD_PLACEMENT_CPU, THREAD_PLACEMENT_IDLE_WAKES,
@@ -181,7 +181,7 @@ fn line(counters: &Counters, cpus: u32, work: u64) -> Outcome
             measured.clock_stopped, measured.window_us
         ));
     }
-    let mut extras = vec![("window_ops", WINDOW_ITEMS)];
+    let mut extras = vec![(WINDOW_OPS_KEY, WINDOW_ITEMS)];
     extras.extend(measured.placement);
     extras.extend([
         ("apart", measured.apart),

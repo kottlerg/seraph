@@ -161,7 +161,7 @@ how the `on_failure` policy classes each range:
 |---|---|---|
 | `0` (`EXIT_VOLUNTARY`) | Voluntary, clean | not a failure |
 | `1 ..= 0x0FFF` | Voluntary, exit code | not a failure |
-| `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector`) | Fault | failure |
+| `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector`, or `EXIT_RUN_LIMIT`) | Fault | failure |
 | `0x2000` (`EXIT_KILLED`) | Killed | failure |
 
 A stop svcmgr makes for a stop-authority holder

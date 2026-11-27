@@ -284,6 +284,17 @@ pub struct ThreadControlBlock
     /// Intrusive run-queue link (next TCB in the same run queue).
     run_queue_next: Option<*mut ThreadControlBlock>,
 
+    // === Run limit (§ Run Limit) ===
+
+    /// Run limit in timer ticks; 0 for none.
+    run_limit: AtomicU32,
+
+    /// Ticks counted toward the limit since the last reset point.
+    run_count: AtomicU32,
+
+    /// A run-limit fault is pending for the next return to user mode.
+    run_limit_pending: AtomicBool,
+
     // === IPC state ===
 
     /// Inline message buffer for in-flight IPC data (the staged message).
@@ -941,6 +952,7 @@ timer_tick():
         post_return_work(SOLE_REF)            // this CPU's next return makes a pass
     if cpu == 0:                              // BSP only
         sleep_check_wakeups(); watchdog_tick_and_check()
+    run_limit::tick(current)                  // count toward the run limit (§ Run Limit)
     match tick_outcome(current.slice_remaining):   // PerCpuScheduler::tick_outcome
         Idle:                                 // zero slice: the idle thread
             try_pull_idle(cpu); return
@@ -1099,6 +1111,69 @@ enabled.
 The model, the spinlock hold-time bound, and lock ordering are specified in
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) (its
 numbered ordering rules and the "Lock primitive" and "Bare spin locks" paragraphs).
+
+---
+
+## Run Limit
+
+A thread's run limit bounds one stretch of running between two reset points and ends it with a
+fault. It detects a thread that runs without end and never blocks, and so holds its CPU at its level
+from every thread at or below it. It neither throttles nor replenishes: it is not a CPU-time budget,
+which § Scheduling Classes lists as not implemented. The code is `sched::run_limit`.
+
+- **Limit.** `SYS_THREAD_SET_RUN_LIMIT` sets a thread's limit in timer ticks, with Control on the
+  thread and a `SchedControl` capability ([syscalls.md](syscalls.md) § `SYS_THREAD_SET_RUN_LIMIT`).
+  A limit of 0, which a thread has from its creation, is none. Setting a limit sets the thread's
+  count to zero and drops a run-limit fault pending on it.
+- **Count.** Each timer tick on a CPU adds one to the count of its current thread when that thread
+  has a limit: `run_limit::tick`, called by `timer_tick` on the current TCB under the CPU's
+  scheduler lock, after the null-current check, beside the slice accounting and before any
+  reschedule decision. The clock is the tick of the CPU the thread runs on, counted only while the
+  thread is current, so no count is compared across CPUs. A tick that skips a switch because
+  preemption is disabled still counts.
+- **Reset points.** Entry to every syscall that can block, whether or not it then blocks, and to
+  `SYS_THREAD_YIELD`, sets the count to zero. One predicate in the syscall dispatcher names them
+  (`syscall::resets_run_count`; [syscalls.md](syscalls.md) § Atomicity and Preemption Guarantees).
+  Nothing else resets: neither a non-blocking syscall nor a preemption, so a preempted thread keeps
+  its count and goes on counting when it runs again.
+- **Fault.** The tick that brings the count to the limit sets the count to zero, makes a run-limit
+  fault pending on the thread, and posts its CPU's `RUN_LIMIT` return-work bit
+  ([scheduling-internals.md](scheduling-internals.md#return-work) § Return Work). The thread's next
+  return to user mode on that CPU delivers it: at once when the tick interrupted user mode, and at
+  the syscall's end when the tick landed in an interrupt-enabled window of a syscall. The tick's
+  slice decision is unchanged, so a switch at the slice's expiry, a park in the syscall, or a stop
+  can take the thread off the CPU first; the bit's return is then another thread's, which finds no
+  fault of its own. The fault follows the thread as a pending upcall does: the next switch to it
+  posts `RUN_LIMIT` on the CPU it runs on, so its first return to user mode there delivers it. The
+  switch reads the flag after the thread's saved context is published, so it also sees a fault that
+  a tick of its previous CPU marked between its park and that CPU's switch.
+  While the fault is pending the tick counts nothing. The fault is `FAULT_EXC_RUN_LIMIT`, delivered
+  through the thread's exception binding
+  ([fault-handling.md](../../../docs/fault-handling.md#run-limit-faults) § Run-Limit Faults). A
+  handler that resumes the thread gives it a fresh limit; with no handler bound, or a handler that
+  declines it, the thread ends with `EXIT_RUN_LIMIT`.
+- **Time inside a syscall.** Syscall entry masks interrupts, and they stay masked for the whole
+  syscall except in bounded windows (§ Kernel-Mode Preemption Points). A tick that falls in a masked
+  stretch stays pending and is taken at the next unmasking, so a syscall longer than one period adds
+  one tick: the count under-reports time spent in long non-blocking syscalls and never
+  over-reports it. A loop of non-blocking syscalls still accrues.
+- **Stalled vCPUs.** Each timer handler re-arms from the current time and replays no missed
+  period, so a CPU the host stalls takes one tick on resume, whatever the stall's length.
+
+### Interface for Scheduler Changes
+
+A scheduler change keeps these, or changes the run limit's mechanism with them:
+
+1. A CPU whose current thread has a nonzero limit takes a timer interrupt at least once per tick
+   period while that thread runs. A tickless or one-shot design keeps a deadline no later than the
+   next period while such a thread is current.
+2. One timer interrupt adds at most one to the count, so a stall of any length adds one.
+3. Preemption, wake preemption and requeueing, at the head or the tail of a level, neither reset
+   the count nor add to it; only time as the current thread counts.
+4. The reset points are entry to every syscall that can block and `SYS_THREAD_YIELD`. A new
+   blocking syscall joins the dispatcher's predicate.
+5. The count is added for every tick that finds a non-idle current thread with a limit, including
+   one that skips a switch because preemption is disabled.
 
 ---
 

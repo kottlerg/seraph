@@ -336,7 +336,7 @@ them (§ Forced return mitigations).
 | `BHI_DIS_S` | `bhi_dis_s` | `bhi` is `Kernel` and the CPU enumerates `BHI_CTRL` | `IA32_SPEC_CTRL.BHI_DIS_S` (bit 10) set on every CPU |
 | Branch history clearing | `bhb_clear` | `bhi` is `Kernel`, without `BHI_CTRL` | Every entry from user mode |
 | `VERW` on exit | `verw_exit` | `mds`, `tsx_async_abort`, `mmio_stale_data`, `reg_file_data_sampling` or `tsa` is `Kernel` | Every return to user mode |
-| `VERW` before idle | `verw_idle` | `mds` or `tsa` is `Kernel` | Before the idle loop's `hlt` |
+| `VERW` before idle | `verw_idle` | `mds` or `tsa` is `Kernel` | Before the idle loop's `hlt` or `mwait` |
 | RSB fill on switch | `rsb_fill_switch` | Retpoline is selected and the CPU has `rsb_alternate` | Every context switch |
 | RSB fill after IBPB | `rsb_fill_ibpb` | The CPU has `ibpb_leaves_rsb` | After every IBPB the kernel issues |
 | `DOITM` | `doitm` | The CPU enumerates `DOITM` | `IA32_UARCH_MISC_CTL.DOITM` (MSR 1B01H, bit 0) set on every CPU |
@@ -556,11 +556,11 @@ handler's loads would otherwise reach user mode. The spurious-interrupt stub run
 and loads nothing but the frame the CPU pushed, so it runs none. The operand is the kernel's data
 segment selector, a writable one as Intel's MDS guidance asks.
 
-Where `mds` or `tsa` is `Kernel`, the idle loop also runs `VERW` before `hlt`
-(`cpu::halt_until_interrupt`): the halted thread's buffers are repartitioned to the SMT sibling
-(Intel's MDS guidance; TSA-TG). `report` logs a warning when `VERW` is selected on a CPU that
-enumerates none of `MD_CLEAR` (`CPUID.(EAX=07H,ECX=0):EDX[10]`), `RFDS_CLEAR` or `VERW_CLEAR`
-(`CPUID Fn8000_0021 EAX[5]`): its microcode clears nothing.
+Where `mds` or `tsa` is `Kernel`, the idle loop also runs `VERW` before `hlt` or `mwait`
+(`cpu::halt_until_interrupt`, `cpu::wait_on_word`): the halted thread's buffers are repartitioned to
+the SMT sibling (Intel's MDS guidance; TSA-TG). `report` logs a warning when `VERW` is selected on a
+CPU that enumerates none of `MD_CLEAR` (`CPUID.(EAX=07H,ECX=0):EDX[10]`), `RFDS_CLEAR` or
+`VERW_CLEAR` (`CPUID Fn8000_0021 EAX[5]`): its microcode clears nothing.
 
 ### Return stack buffer
 

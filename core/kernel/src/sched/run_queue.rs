@@ -940,7 +940,9 @@ impl PerCpuScheduler
         // `set_current_level` in program order; a link another CPU makes may
         // read `outranking` before a dispatch on this CPU rewrites it, so the
         // wake IPI that follows every remote link posts the bit again on
-        // arrival (core/kernel/docs/scheduling-internals.md § Return Work).
+        // arrival; a remote link that cleared the idle wake flag instead
+        // precedes the idle loop's dispatch
+        // (core/kernel/docs/scheduling-internals.md § Return Work).
         if self.outranked()
         {
             self.post_preempt();
@@ -1141,7 +1143,8 @@ impl PerCpuScheduler
     /// between two batches of a `SYS_MEMORY_ZERO` (`syscall::mem`): a link it
     /// made itself precedes the read in program order, and a link another CPU
     /// makes is followed by the wake IPI, whose own return to user mode, or
-    /// the zero's test after the next batch, reads again
+    /// the zero's test after the next batch, reads again, or, when it cleared
+    /// the idle wake flag, precedes the idle loop's dispatch
     /// (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
     /// § Lock-free readers of a CPU's run queues). `schedule()` then decides
     /// under `lock`; the zero only ends its call.
@@ -1393,7 +1396,7 @@ impl PerCpuScheduler
         // A move that leaves a queued thread outranking the running one posts
         // PREEMPT as a link does, tested once the old queue's bit is cleared so
         // a thread moved below the running one posts nothing. A move another
-        // CPU makes is followed by the wake IPI, as for a link
+        // CPU makes is followed by the wake, as for a link
         // (core/kernel/docs/scheduling-internals.md § Return Work).
         if self.outranked()
         {

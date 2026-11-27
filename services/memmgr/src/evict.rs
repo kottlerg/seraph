@@ -38,9 +38,9 @@ use free_pool::{
 use syscall_abi::PAGE_SIZE;
 
 use crate::{
-    FaultDecline, FaultTarget, MemLedger, SCRUB_VA, SCRUB_WINDOW_PAGES, coalesce, current_pressure,
-    ensure_slots, insert_run, map_client_chunk, map_self, pool_total_pages, quiescent,
-    recheck_deferred, release_unmapped_chunk, return_taken, select, self_aspace,
+    Answer, FaultDecline, FaultTarget, MemLedger, SCRUB_VA, SCRUB_WINDOW_PAGES, coalesce,
+    current_pressure, ensure_slots, insert_run, map_client_chunk, map_self, pool_total_pages,
+    quiescent, recheck_deferred, release_unmapped_chunk, return_taken, select, self_aspace,
 };
 
 /// Job slots of the compression worker: evictions in flight at once.
@@ -401,30 +401,62 @@ pub(crate) fn clocking() -> bool
     evictor().notify != 0 && current_pressure() != PressureLevel::Normal
 }
 
-/// One turn's eviction work, after the turn's message, if any: drain the done
-/// jobs, then, while the clock runs and the interval since the last slice has
-/// passed, run a slice of it. While memmgr reclaims, the slice finds the cold
-/// chunks and posts a job for each whose eviction raises the free pages
-/// outside `promised`, or, while it evicts for frames, those above the
-/// growth floor, as many as there are free slots;
-/// otherwise it finds the chunks idle for [`RECLAIM_IDLE_SWEEPS`]. The rest
-/// it finds are kept for direct reclaim ([`keep_victims`]).
-pub(crate) fn turn(l: &mut MemLedger)
+/// Which job slots the worker has finished, for this turn's drain
+/// ([`turn`]).
+fn done_jobs() -> [bool; JOB_SLOTS]
 {
-    drain(l);
+    core::array::from_fn(|slot| {
+        STATE
+            .get(slot)
+            .is_some_and(|s| s.load(Ordering::Acquire) == DONE)
+    })
+}
+
+/// The time, in microseconds since boot, when a slice of the clock is due
+/// this turn: the clock runs and [`SWEEP_INTERVAL_US`] has passed since the
+/// last slice. `None` otherwise.
+fn slice_due() -> Option<u64>
+{
     if !clocking()
     {
-        return;
+        return None;
     }
     let now = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
-    // Each reach of `EVICTOR` below ends before the next call of the
-    // accessor, `reclaiming` and `post` among them.
-    let last = &mut evictor().last_slice_us;
-    if now.saturating_sub(*last) < SWEEP_INTERVAL_US
+    (now.saturating_sub(evictor().last_slice_us) >= SWEEP_INTERVAL_US).then_some(now)
+}
+
+/// One turn's eviction work, after the turn's message, if any: drain the done
+/// jobs, then, while the clock runs and the interval since the last slice has
+/// passed, run a slice of it. A turn with either sends its reply first, with
+/// a receive that does not wait ([`Answer::flush`]), so no caller waits for
+/// this work; it drains only the
+/// jobs done when it looked, and leaves one done since to the next turn,
+/// which the receive's bounded wait brings (services/memmgr/docs/memory-pool.md
+/// § Receive loop). While memmgr reclaims, the slice finds the cold chunks and
+/// posts a job for each whose eviction raises the free pages outside
+/// `promised`, or, while it evicts for frames, those above the growth floor,
+/// as many as there are free slots;
+/// otherwise it finds the chunks idle for [`RECLAIM_IDLE_SWEEPS`]. The rest
+/// it finds are kept for direct reclaim ([`keep_victims`]).
+pub(crate) fn turn(l: &mut MemLedger, answer: &mut Answer)
+{
+    let done = done_jobs();
+    let any_done = done.contains(&true);
+    let slice = slice_due();
+    if any_done || slice.is_some()
+    {
+        answer.flush(l);
+    }
+    if any_done
+    {
+        drain(l, done);
+    }
+    let Some(now) = slice
+    else
     {
         return;
-    }
-    *last = now;
+    };
+    evictor().last_slice_us = now;
     let background = reclaiming(l);
     let frames = background && frames_short(l);
     let idle = if background
@@ -843,19 +875,15 @@ fn begin(l: &mut MemLedger, v: &Victim, slot: usize, idle: u8) -> Option<Job>
     })
 }
 
-/// Drain every done job: unmap its input window, then store the chunk's
+/// Drain the jobs `done` marks finished ([`done_jobs`]): unmap each one's input window, then store the chunk's
 /// stream and swap the chunk, or keep a chunk whose stream gains nothing raw
 /// ([`finish`]); when neither is done, map the chunk's runs back and mark it
 /// resident. A job whose
 /// chunk a fault or a teardown took first is stale, and only frees its slot.
-fn drain(l: &mut MemLedger)
+fn drain(l: &mut MemLedger, done: [bool; JOB_SLOTS])
 {
-    for (slot, state) in STATE.iter().enumerate()
+    for ((slot, state), _) in STATE.iter().enumerate().zip(done).filter(|(_, done)| *done)
     {
-        if state.load(Ordering::Acquire) != DONE
-        {
-            continue;
-        }
         // SAFETY: the window is memmgr's own zone, mapped for this job alone.
         let _ = unsafe { syscall::mem_unmap(self_aspace(), input_va(slot), CHUNK_PAGES) };
         let job = evictor().jobs.get_mut(slot).and_then(Option::take);

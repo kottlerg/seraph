@@ -26,6 +26,41 @@ mod platform;
 mod server;
 mod startup;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// acpid's `logd.flush` seed, `0` when absent: set once at start, before
+/// any thread that writes a power register runs.
+static LOG_FLUSH: AtomicU64 = AtomicU64::new(0);
+
+/// The longest acpid waits for logd to write its line before a write that
+/// ends the machine: a log call's own bound.
+const FLUSH_BOUND_MS: u32 = log::LOG_CALL_TIMEOUT_MS;
+
+/// Wait, at most [`FLUSH_BOUND_MS`], for logd to write every line acpid
+/// logged before the call (logd's flush barrier, `LOG_FLUSH`): a log call
+/// returns once logd holds the line, and the register write that follows
+/// ends the machine and the lines logd holds unwritten with it. A refused,
+/// failed or timed-out wait returns all the same, and the caller writes
+/// (`services/logd/docs/ipc-interface.md` § Flush barrier).
+pub fn flush_log()
+{
+    let cap = LOG_FLUSH.load(Ordering::Relaxed);
+    if cap == 0
+    {
+        return;
+    }
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let start = Instant::now();
+    ipc::log_flush::wait(
+        FLUSH_BOUND_MS,
+        || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+        |request, timeout| unsafe { ipc::ipc_call_timeout(cap, request, ipc_buf, timeout) }.ok(),
+        |ms| std::thread::sleep(Duration::from_millis(ms)),
+    );
+}
+
 /// The evaluation thread's stack: the evaluator's and the parser's own
 /// bound ([`aml::EVAL_STACK_BYTES`], [`aml::PARSE_STACK_BYTES`]), whichever
 /// is larger, and 256 KiB for acpid's frames below them. A spawned thread's
@@ -61,6 +96,7 @@ fn main() -> !
             std::thread::park();
         }
     };
+    LOG_FLUSH.store(caps.log_flush, Ordering::Relaxed);
     if caps.registry == 0
     {
         std::os::seraph::log!(error: "bootstrap failed: no devmgr.acpi seed; refusing power requests");

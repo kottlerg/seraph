@@ -651,7 +651,7 @@ ok build wait_host=["7"] host_override
 ok build arch=["x86_64"] release component=["kernel"] debug=["kernel"] skip_lints wait_host=["7"] host_override
 
 ["run"]
-ok-all run arch=default["x86_64"] cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default icount=default ktest_only_ok=default gdb=default debug_listen=default verbose=default parallel=default["1"] timeout=default["30"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] hold_on_hang=default fail_grace_secs=default["10"] host_override=default alone=default timing=default
+ok-all run arch=default["x86_64"] cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] idle_wait=default["off"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default icount=default ktest_only_ok=default gdb=default debug_listen=default verbose=default parallel=default["1"] timeout=default["30"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] hold_on_hang=default fail_grace_secs=default["10"] host_override=default alone=default timing=default
 
 ["run","-h"]
 help xtask run -h
@@ -987,6 +987,22 @@ error: invalid value '7' for '--riscv-zkr <RISCV_ZKR>'
 ["run","--riscv-zkr","on","--riscv-zkr","on"]
 ArgumentConflict
 error: the argument '--riscv-zkr <RISCV_ZKR>' cannot be used multiple times
+
+["run","--idle-wait"]
+InvalidValue
+error: a value is required for '--idle-wait <IDLE_WAIT>' but none was supplied
+  [possible values: off, on]
+
+["run","--idle-wait","on"]
+ok run idle_wait=["on"]
+
+["run","--idle-wait","off"]
+ok run idle_wait=["off"]
+
+["run","--idle-wait","7"]
+InvalidValue
+error: invalid value '7' for '--idle-wait <IDLE_WAIT>'
+  [possible values: off, on]
 
 ["run","--x86-paging"]
 InvalidValue
@@ -4000,7 +4016,7 @@ UnknownArgument
 error: unexpected argument 'extra' found
 
 ["run","--parallel","1","--runs","1"]
-ok-all run arch=default["x86_64"] cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default icount=default runs=["1"] ktest_only_ok=default gdb=default debug_listen=default verbose=default parallel=["1"] timeout=default["30"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] hold_on_hang=default fail_grace_secs=default["10"] host_override=default alone=default timing=default
+ok-all run arch=default["x86_64"] cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] idle_wait=default["off"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default icount=default runs=["1"] ktest_only_ok=default gdb=default debug_listen=default verbose=default parallel=["1"] timeout=default["30"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] hold_on_hang=default fail_grace_secs=default["10"] host_override=default alone=default timing=default
 
 ["run","--parallel","1","--runs","1","-h"]
 help xtask run -h

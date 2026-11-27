@@ -80,16 +80,17 @@ release. It resolves the serial and framebuffer drivers through devmgr first, be
 its death queue, writing nothing: a halt on a later start step writes its `FATAL` line, and the
 panic sink its output, only to a resolved serial driver, and its first write after the release
 then does not call devmgr while the log endpoint has no reader. A driver devmgr does not serve by
-then is resolved later on its class watch, and its sink queues the lines meanwhile
-([`ipc-interface.md`](ipc-interface.md) § Output sinks). It also holds each line it self-logs, at
-most `SELF_LOG_HELD_MAX` (12) of them, and writes them in order, with the time each was logged, once
-`handover::transfer` returns. A line past that bound is dropped and counted, and logd writes the
-count in one line after the held ones. Init-logd writes its last line,
+then is resolved later on its class watch, and the history holds the lines meanwhile
+([`ipc-interface.md`](ipc-interface.md) § Output sinks). It also retains each line it self-logs
+in the history, under the reserved badge `LOG_BADGE_LOGD` in a slot named `logd`, and its writers
+open, and write those lines in order with the time each was logged, once init-logd acknowledges
+the release (`handover::transfer` returns). The history's bounds apply to them as to any entry.
+Init-logd writes its last line,
 `handover complete; init-logd thread exiting`, before it acknowledges the release, and nothing
 after it. Two writes are not held: logd's panic sink, and a `FATAL` line on the way to a halt,
-which writes the held lines first. A restarted logd with no handover source (`cap[1] = 0`, minted
-once init is reaped) holds nothing.
-When no release reaches init-logd (§ Failure modes), logd writes the held lines when the attempts
+which writes the retained lines first. A restarted logd with no handover source (`cap[1] = 0`,
+minted once init is reaped) opens its writers at once.
+When no release reaches init-logd (§ Failure modes), logd opens its writers when the attempts
 end, and its serial writes can then interleave with init-logd's.
 
 ## Call shape

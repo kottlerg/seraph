@@ -322,7 +322,8 @@ impl Power
     /// to the sleep status and control registers, the status write left out
     /// when the platform has no status register. Returns, true, only when
     /// the platform keeps running; false without a write when no sleep
-    /// register is held.
+    /// register is held. The writes follow acpid's line naming them and
+    /// its wait for logd to write it ([`crate::flush_log`]).
     pub fn sleep(&self, state: u8, slp_typ: u16) -> bool
     {
         let Some(pm1a) = self.pm1a
@@ -338,6 +339,7 @@ impl Power
             "SLEEP({state}): PM1a_CNT {:#x} <- {typed:#x}, then {enter:#x}",
             pm1a.port
         );
+        crate::flush_log();
         // SAFETY: as the read; writing `SLP_TYP` with `SLP_EN` clear to
         // `PM1a_CNT` is the first step of the ACPI sleep sequence.
         unsafe { outw(pm1a.port, typed) };
@@ -364,6 +366,7 @@ impl Power
             self.sleep_status
                 .map_or_else(|| "(none)".into(), |s| s.describe())
         );
+        crate::flush_log();
         for (register, value) in acpid::power::reduced_writes(slp_typ)
         {
             match register
@@ -406,7 +409,9 @@ impl Power
 
     /// Reset the platform: write `RESET_VALUE` to `RESET_REG`, a port or a
     /// byte of memory. Returns, true, only when the platform keeps running;
-    /// false without a write when `RESET_REG` is not held.
+    /// false without a write when `RESET_REG` is not held. The write follows
+    /// acpid's line naming it and its wait for logd to write it
+    /// ([`crate::flush_log`]).
     pub fn reset(&self) -> bool
     {
         let Some((register, value)) = self.reset
@@ -415,6 +420,7 @@ impl Power
             return false;
         };
         std::os::seraph::log!("RESET: RESET_REG {} <- {value:#x}", register.describe());
+        crate::flush_log();
         register.write(value);
         true
     }

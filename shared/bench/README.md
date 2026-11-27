@@ -145,7 +145,8 @@ one that returns halts saw the CPU halt (`Halted`), and one that returns `0` cou
 `halted=` (`HALTED`), and a row whose counted windows are fewer than half its windows
 (`WindowShape::floor`) does not measure its case, only the windows that happened to stay on the CPU,
 so the benchmark logs no result line for it. fsbench's `affinity=any` rows are such rows
-([services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md)).
+([services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md)), as is ubench's
+`fault_fill path=grant affinity=any` ([services/ubench/README.md](../../services/ubench/README.md)).
 
 ---
 
@@ -177,7 +178,7 @@ where a count says that the loop waited on an event.
 | Harness | Span | CPU |
 |---|---|---|
 | [ktest](../../core/ktest/README.md) Tier 3 | `Harness::recorder`, taken right before the loop, to its `Recorder::summary`, right after | CPU 0 |
-| [ubench](../../services/ubench/README.md) | `IdleSpan::open` and `close` around each loop, its warm-up iterations included; in `fault_scaling`, each worker around its own loop, the line summing them | `BENCH_CPU` (0); each worker's CPU |
+| [ubench](../../services/ubench/README.md) | `IdleSpan::open` and `close` around each loop, its warm-up iterations included; in `fault_scaling`, each worker around its own loop, the line summing them; in a window row, around each window, the line summing the spans that closed (§ Window rows) | `BENCH_CPU` (0); each worker's CPU |
 | [fsbench](../../services/fixtures/fsbench/README.md) | Around each timed loop, after its warm-up; in a window row, around each window, the line summing the spans that closed (§ Window rows) | CPU 0 |
 
 A line whose samples other threads took on their own CPUs (`ktest.tlb_shootdown_concurrent`)

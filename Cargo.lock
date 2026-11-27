@@ -8,6 +8,7 @@ version = "0.1.5"
 dependencies = [
  "aml",
  "ipc",
+ "log",
  "mmio",
  "syscall",
  "syscall-abi",
@@ -890,6 +891,7 @@ dependencies = [
  "ipc",
  "log",
  "logd-codec",
+ "logd-slot-table",
  "mem-fill",
  "memmgr-free-pool",
  "namespace-protocol",

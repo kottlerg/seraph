@@ -236,6 +236,7 @@ fn launch(
         incoming: None,
         riscv_mmu: args.riscv_mmu,
         riscv_zkr: crate::qemu::RiscvZkr::On,
+        idle_wait: crate::qemu::IdleWait::Off,
         x86_paging: args.x86_paging,
         x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
         iommu: Iommu::Attached,

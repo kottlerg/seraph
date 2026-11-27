@@ -20,7 +20,8 @@ use crate::context::Profile;
 use crate::disk::BlockSize;
 use crate::esp::Knob;
 use crate::qemu::{
-    DiskLine, Execution, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
+    DiskLine, Execution, IdleWait, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging,
+    X86ShadowStack,
 };
 use crate::svctest_stage::SvctestSet;
 
@@ -606,6 +607,14 @@ args! {
         #[arg(long, default_value = "on")]
         pub riscv_zkr: RiscvZkr,
 
+        /// Whether the guest CPU offers the monitored wait the kernel's idle
+        /// loop waits in (`MONITOR`/`MWAIT` on `x86_64`, Zawrs on riscv64).
+        /// `on` boots the polling idle and the IPI-free wake of an idle CPU
+        /// (core/kernel/docs/scheduler.md "Idle Thread"); under TCG an idle
+        /// vCPU then spins on its host thread. `off` boots the halting idle.
+        #[arg(long, default_value = "off")]
+        pub idle_wait: IdleWait,
+
         /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins
         /// the QEMU CPU's `la57` property; the bootloader enables 5-level paging
         /// when CPUID reports LA57, so this selects the depth a run exercises.
@@ -838,8 +847,8 @@ args! {
         /// Check that the console stayed whole in each passing run's log:
         /// between the lines `<TAG> begin` and `<TAG> end ...`, every line is
         /// one console line, and each sender's numbered lines arrive whole, in
-        /// order, none missing (svctest's `console_whole_lines` and
-        /// `serial_transmit` phases); repeatable, each tag's window is
+        /// order, none missing (svctest's `console_whole_lines`,
+        /// `serial_transmit` and `logd_flood` phases); repeatable, each tag's window is
         /// checked. A run whose check fails is FAIL; a QEMU-CRASH run is not
         /// checked.
         #[arg(long, value_name = "TAG", requires = "runs")]

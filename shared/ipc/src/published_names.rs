@@ -162,8 +162,10 @@ pub const LOGD_QUERY: &[u8] = b"logd.query";
 /// SEND on the master log endpoint badged
 /// `log_labels::LOG_FLUSH_AUTHORITY`: logd's `LOG_FLUSH` barrier. svcmgr
 /// mints it from its master-log source. Seed-only; seeded by pwrmgr, which
-/// waits on it before it powers the system off or resets it, and by svctest,
-/// whose `logd_flush` phase checks it.
+/// waits on it before it powers the system off or resets it, by acpid,
+/// before its sleep or reset register write, by crashd, before it declines
+/// a fault, and by svctest, whose `logd_flush` phase checks it
+/// (`services/logd/docs/ipc-interface.md` § Flush barrier).
 pub const LOGD_FLUSH: &[u8] = b"logd.flush";
 
 /// SEND on sessiond's service endpoint badged

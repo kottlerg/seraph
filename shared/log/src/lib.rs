@@ -17,7 +17,9 @@
 //!   `ProcessInfo.log_send_cap`. No discovery roundtrip — the cap is
 //!   live from the first user instruction. Beside it, the name the process
 //!   registered on that cap ([`register_name`]), which a log call sends
-//!   again when the receiver has lost it (`ipc::stream_labels::SENDER_NAMED`).
+//!   again when the receiver has lost it (`ipc::stream_labels::SENDER_NAMED`),
+//!   and the count of lines logd refused past the process's window that the
+//!   process dropped (`ipc::stream_labels::WINDOW_FULL`, [`set_no_wait`]).
 //! * **Process-global level filter ([`set_max_level`], [`enabled`],
 //!   [`max_level`]):** the most verbose level [`emit`] sends, which std's
 //!   `_start` sets from the process's `SERAPH_LOG` environment entry
@@ -61,7 +63,7 @@ use ipc::{
     stream_labels::{
         LEVEL_ALERT, LEVEL_CRITICAL, LEVEL_DEBUG, LEVEL_EMERGENCY, LEVEL_ERROR, LEVEL_INFO,
         LEVEL_NOTICE, LEVEL_WARN, NAME_UNKNOWN, SENDER_NAMED, STREAM_BYTES, STREAM_RECORD,
-        STREAM_REGISTER_NAME, level_bits, level_or_info,
+        STREAM_REGISTER_NAME, WINDOW_FULL, level_bits, level_or_info,
     },
 };
 use syscall_abi::{MSG_DATA_WORDS_MAX, SyscallError};
@@ -246,74 +248,239 @@ fn bounded<T>(left: Option<Duration>, call: impl FnOnce(u32) -> Result<T, i64>) 
 
 /// One call of `msg` on `cap`, bounded as [`RECEIVER_UNANSWERED`] and the
 /// calling thread's call deadline select ([`bounded`]). The reply's label
-/// when the call was answered.
+/// and its first data word when the call was answered.
 ///
 /// # Safety
 /// `ipc_buf` must be this thread's registered IPC buffer page (the contract
 /// of `ipc::ipc_call`).
-unsafe fn bounded_call(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Option<u64>
+unsafe fn bounded_call(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Option<(u64, u64)>
 {
     // SAFETY: the caller's contract covers `ipc_buf`.
     bounded(time_left(), |bound| unsafe {
         ipc::ipc_call_timeout(cap, msg, ipc_buf, bound)
     })
-    .map(|reply| reply.label)
+    .map(|reply| (reply.label, reply.word(0)))
 }
 
-/// One log message, `msg`, delivered on `cap` ([`deliver`]): each call
-/// bounded ([`bounded_call`]), and the process's registered name
+/// Whether a message logd refused [`WINDOW_FULL`] is sent again
+/// (`services/logd/docs/ipc-interface.md` § Hold window).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pace
+{
+    /// Sleep the receiver's retry hint and send it again, while the
+    /// message's bound has room ([`may_wait`]).
+    Resend,
+    /// Drop it at once: a process that must not wait on the log
+    /// ([`set_no_wait`]), and the panic path ([`write_bytes_once`]).
+    Once,
+}
+
+/// What became of a log message ([`deliver`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome
+{
+    /// The receiver answered its last call.
+    Answered,
+    /// A call failed: the receiver may or may not have received it
+    /// ([`LOG_CALL_TIMEOUT_MS`]).
+    Failed,
+    /// The receiver refused it [`WINDOW_FULL`] and it was not sent again:
+    /// dropped, and counted ([`DROPPED`]).
+    Dropped,
+}
+
+/// Whether a refused message is sent again after a retry hint of `hint_ms`,
+/// `spent_ms` after its first call, with `left` of the calling thread's
+/// call deadline to run (`None` for none): when the sleep ends within
+/// [`LOG_CALL_TIMEOUT_MS`] of the first call and before the deadline, so a
+/// log call waits on the receiver for no longer than its own bound.
+fn may_wait(spent_ms: u64, hint_ms: u32, left: Option<Duration>) -> bool
+{
+    let ends = spent_ms.saturating_add(u64::from(hint_ms));
+    ends <= u64::from(LOG_CALL_TIMEOUT_MS)
+        && left.is_none_or(|left| Duration::from_millis(u64::from(hint_ms)) < left)
+}
+
+/// Milliseconds since boot, the clock of a message's bound.
+fn now_ms() -> u64
+{
+    syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0) / 1000
+}
+
+/// Whether the process drops a message logd refuses [`WINDOW_FULL`] rather
+/// than wait to send it again ([`set_no_wait`]).
+// restore: none
+static NO_WAIT: AtomicBool = AtomicBool::new(false);
+
+/// Make every log call of the process send its message once: a message logd
+/// refuses [`WINDOW_FULL`] is dropped and counted, never waited on. For a
+/// service logd's own progress waits on (memmgr, which backs logd's pages,
+/// and procmgr, which logd calls), so its log calls never wait on logd in
+/// turn. Called once at start; there is no way back.
+pub fn set_no_wait()
+{
+    NO_WAIT.store(true, Ordering::Relaxed);
+}
+
+/// Lines the process dropped because logd refused them [`WINDOW_FULL`],
+/// not yet reported. The next log call sends the count first, as a notice of
+/// the process's ([`drop_notice`]).
+// restore: none
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// The lines `msg` carries, for [`DROPPED`]: one per newline of a
+/// `STREAM_BYTES` chunk, at least one, and one for a record.
+fn lines_of(msg: &IpcMessage) -> u64
+{
+    if msg.label & 0xFFFF != STREAM_BYTES
+    {
+        return 1;
+    }
+    let len = usize::try_from((msg.label >> 16) & 0xFFFF).unwrap_or(0);
+    let bytes = msg.data_bytes();
+    let newlines = bytes
+        .get(..len)
+        .unwrap_or(bytes)
+        .iter()
+        .fold(0u64, |n, &b| n.saturating_add(u64::from(b == b'\n')));
+    newlines.max(1)
+}
+
+/// The notice naming `dropped` lines the process dropped, sent as a record
+/// at [`LEVEL_NOTICE`], so it does not join a text line the process has
+/// not finished; whatever the process's level, since it reports lines that
+/// level let through. `named` is the message's [`SENDER_NAMED`] bit.
+fn drop_notice(dropped: u64, named: u64) -> IpcMessage
+{
+    let record = RecordWriter::new(format_args!("log: {dropped} lines dropped"));
+    let bytes = record.as_bytes();
+    IpcMessage::builder(record_label(bytes.len(), LEVEL_NOTICE) | named)
+        .bytes(0, bytes)
+        .build()
+}
+
+/// One log message, `msg`, delivered on `cap` ([`deliver`]) at `pace`:
+/// each call bounded ([`bounded_call`]), the process's registered name
 /// ([`REGISTERED_NAME`]) sent again when the receiver answers that it has
-/// lost it. `true` when the message's last call was answered.
+/// lost it, and a message refused [`WINDOW_FULL`] sent again after the
+/// receiver's hint, or dropped and counted ([`DROPPED`]). The count of
+/// earlier drops goes first ([`drop_notice`]), and back to the count when
+/// it is not answered. `true` when the message's last call was answered.
 ///
 /// # Safety
 /// `ipc_buf` must be this thread's registered IPC buffer page (the contract
 /// of `ipc::ipc_call`).
-unsafe fn log_call(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> bool
+unsafe fn log_call(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64, pace: Pace) -> bool
+{
+    let pace = if NO_WAIT.load(Ordering::Relaxed)
+    {
+        Pace::Once
+    }
+    else
+    {
+        pace
+    };
+    let dropped = DROPPED.swap(0, Ordering::Relaxed);
+    if dropped > 0
+    {
+        let notice = drop_notice(dropped, msg.label & SENDER_NAMED);
+        // SAFETY: the caller's contract covers `ipc_buf`.
+        if unsafe { log_call_once(cap, &notice, ipc_buf, pace) } != Outcome::Answered
+        {
+            DROPPED.fetch_add(dropped, Ordering::Relaxed);
+        }
+    }
+    // SAFETY: the caller's contract covers `ipc_buf`.
+    match unsafe { log_call_once(cap, msg, ipc_buf, pace) }
+    {
+        Outcome::Answered => true,
+        Outcome::Failed => false,
+        Outcome::Dropped =>
+        {
+            DROPPED.fetch_add(lines_of(msg), Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+/// [`deliver`] of `msg` on `cap` at `pace`, on this thread's page
+/// `ipc_buf`, with the clock and the sleep of a running process.
+///
+/// # Safety
+/// `ipc_buf` must be this thread's registered IPC buffer page (the contract
+/// of `ipc::ipc_call`).
+unsafe fn log_call_once(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64, pace: Pace) -> Outcome
 {
     let registration = || {
         let mut name = [0u8; NAME_KEPT_MAX];
         let len = REGISTERED_NAME.load(&mut name)?;
         Some(name_message(name.get(..len)?))
     };
+    let start = now_ms();
+    let wait = |hint: u32| {
+        pace == Pace::Resend
+            && may_wait(now_ms().saturating_sub(start), hint, time_left())
+            && syscall::thread_sleep(u64::from(hint)).is_ok()
+    };
     // SAFETY: the caller's contract covers `ipc_buf`.
-    deliver(msg, registration, |m| unsafe {
-        bounded_call(cap, m, ipc_buf)
-    })
+    deliver(
+        msg,
+        registration,
+        |m| unsafe { bounded_call(cap, m, ipc_buf) },
+        wait,
+    )
 }
 
 /// Deliver the log message `msg` through `call`, which makes one call and
-/// returns its reply's label, `None` when the call failed. A message that
-/// carries [`SENDER_NAMED`] and is answered [`NAME_UNKNOWN`] was not
-/// consumed: the receiver holds no name for the sender (a restarted logd's
-/// fresh table), so the name `registration` builds, when the process keeps
-/// one, is sent, and the message is sent once more without the bit, which no
-/// receiver refuses. A message is thus refused at most once and costs at most
-/// three calls, the two after the first only when the receiver answered it.
-/// `true` when the last call made was answered.
+/// returns its reply's label and first data word, `None` when the call
+/// failed.
+///
+/// A message that carries [`SENDER_NAMED`] and is answered [`NAME_UNKNOWN`]
+/// was not consumed: the receiver holds no name for the sender (a restarted
+/// logd's fresh table), so the name `registration` builds, when the process
+/// keeps one, is sent, and the message is sent once more without the bit,
+/// which no receiver refuses for it.
+///
+/// A message answered [`WINDOW_FULL`] was not consumed either: logd's
+/// `hold` sink has not written enough of the sender's lines. `wait` is
+/// given the retry hint the reply carries; when it has slept it, the same
+/// message is sent again, and when it declines, the message is dropped.
 fn deliver(
     msg: &IpcMessage,
     registration: impl FnOnce() -> Option<IpcMessage>,
-    mut call: impl FnMut(&IpcMessage) -> Option<u64>,
-) -> bool
+    mut call: impl FnMut(&IpcMessage) -> Option<(u64, u64)>,
+    mut wait: impl FnMut(u32) -> bool,
+) -> Outcome
 {
-    let Some(reply) = call(msg)
-    else
+    let mut msg = *msg;
+    let mut registration = Some(registration);
+    loop
     {
-        return false;
-    };
-    if msg.label & SENDER_NAMED == 0 || reply != NAME_UNKNOWN
-    {
-        return true;
+        let Some((reply, word)) = call(&msg)
+        else
+        {
+            return Outcome::Failed;
+        };
+        if reply == WINDOW_FULL
+        {
+            if wait(u32::try_from(word).unwrap_or(u32::MAX))
+            {
+                continue;
+            }
+            return Outcome::Dropped;
+        }
+        if msg.label & SENDER_NAMED == 0 || reply != NAME_UNKNOWN
+        {
+            return Outcome::Answered;
+        }
+        if let Some(name) = registration.take().and_then(|build| build())
+        {
+            // A registration that fails leaves the resend below to render as
+            // unnamed; the next refused message tries again.
+            let _ = call(&name);
+        }
+        msg.label &= !SENDER_NAMED;
     }
-    if let Some(name) = registration()
-    {
-        // A registration that fails leaves the resend below to render as
-        // unnamed; the next refused message tries again.
-        let _ = call(&name);
-    }
-    let mut again = *msg;
-    again.label &= !SENDER_NAMED;
-    call(&again).is_some()
 }
 
 // ── Process-global registered name ──────────────────────────────────────────
@@ -650,7 +817,7 @@ fn labelled(id: u64, len: usize, level: u64) -> u64
 pub unsafe fn write_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8])
 {
     // SAFETY: the caller's contract covers `ipc_buf`.
-    let _ = unsafe { send_bytes(cap, ipc_buf, level, bytes) };
+    let _ = unsafe { send_bytes(cap, ipc_buf, level, bytes, Pace::Resend) };
 }
 
 /// [`write_bytes`], reporting whether every chunk's call was answered: `false`
@@ -661,7 +828,7 @@ pub unsafe fn write_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8])
 ///
 /// # Safety
 /// As for [`write_bytes`].
-unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8]) -> bool
+unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8], pace: Pace) -> bool
 {
     if cap == 0 || ipc_buf.is_null()
     {
@@ -675,12 +842,25 @@ unsafe fn send_bytes(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8]) -> b
             .build();
         // SAFETY: ipc_buf is non-null (checked above), so the caller's
         // contract makes it this thread's registered IPC buffer page.
-        if !unsafe { log_call(cap, &msg, ipc_buf) }
+        if !unsafe { log_call(cap, &msg, ipc_buf, pace) }
         {
             return false;
         }
     }
     true
+}
+
+/// [`write_bytes`] for the panic path (std's panic output): each chunk is
+/// sent once, and one logd refuses [`WINDOW_FULL`] is dropped and counted
+/// rather than waited on, so a panicking thread, which may hold locks other
+/// threads wait for, never sleeps on the log.
+///
+/// # Safety
+/// As for [`write_bytes`].
+pub unsafe fn write_bytes_once(cap: u64, ipc_buf: *mut u64, level: u64, bytes: &[u8])
+{
+    // SAFETY: the caller's contract covers `ipc_buf`.
+    let _ = unsafe { send_bytes(cap, ipc_buf, level, bytes, Pace::Once) };
 }
 
 /// Send `record`, a record's payload (`ipc::log_record`), at `level` as one
@@ -707,7 +887,7 @@ pub unsafe fn write_record(cap: u64, ipc_buf: *mut u64, level: u64, record: &[u8
         .build();
     // SAFETY: ipc_buf is non-null (checked above), so the caller's contract
     // makes it this thread's registered IPC buffer page.
-    let _ = unsafe { log_call(cap, &msg, ipc_buf) };
+    let _ = unsafe { log_call(cap, &msg, ipc_buf, Pace::Resend) };
 }
 
 /// The record of `message` and `fields`, each field's value formatted with
@@ -774,7 +954,7 @@ pub unsafe fn register_name(cap: u64, ipc_buf: *mut u64, name: &[u8])
 pub unsafe fn write_args(cap: u64, ipc_buf: *mut u64, level: u64, args: core::fmt::Arguments<'_>)
 {
     // SAFETY: the caller's contract covers `ipc_buf`.
-    let send = |chunk: &[u8]| unsafe { send_bytes(cap, ipc_buf, level, chunk) };
+    let send = |chunk: &[u8]| unsafe { send_bytes(cap, ipc_buf, level, chunk, Pace::Resend) };
     format_line(args, send);
 }
 
@@ -1187,9 +1367,106 @@ mod tests
                 replies
                     .next()
                     .expect("a call past the replies the test gives")
+                    .map(|label| (label, 0))
+            },
+            |_| panic!("no reply here is WINDOW_FULL"),
+        );
+        (labels, delivered == Outcome::Answered)
+    }
+
+    /// A [`deliver`] of a line whose calls are answered `replies` in turn,
+    /// each a label and its first word, with `waits` the answers of the
+    /// waits in turn: the label of each call made, the hints waited on, and
+    /// the outcome.
+    fn paced(replies: &[(u64, u64)], waits: &[bool]) -> (Vec<u64>, Vec<u32>, Outcome)
+    {
+        let msg = IpcMessage::builder(stream_label(5, LEVEL_INFO))
+            .bytes(0, b"line\n")
+            .build();
+        let mut labels = Vec::new();
+        let mut hints = Vec::new();
+        let mut replies = replies.iter().copied();
+        let mut waits = waits.iter().copied();
+        let outcome = deliver(
+            &msg,
+            || None,
+            |m| {
+                labels.push(m.label);
+                replies.next()
+            },
+            |hint| {
+                hints.push(hint);
+                waits.next().expect("a wait past those the test gives")
             },
         );
-        (labels, delivered)
+        (labels, hints, outcome)
+    }
+
+    // Defect caught: a line logd refused for its window taken as delivered, so
+    // it is lost uncounted, or sent again without the wait, so the sender
+    // spins on logd.
+    #[test]
+    fn a_window_refusal_waits_the_hint_and_sends_the_same_message_again()
+    {
+        let line = stream_label(5, LEVEL_INFO);
+        let (labels, hints, outcome) =
+            paced(&[(WINDOW_FULL, 7), (WINDOW_FULL, 3), (0, 0)], &[true, true]);
+        assert_eq!(labels, [line, line, line]);
+        assert_eq!(hints, [7, 3]);
+        assert_eq!(outcome, Outcome::Answered);
+    }
+
+    // Defect caught: a refused line whose wait was declined (no room in its
+    // bound, or a process that must not wait) sent again or read as
+    // delivered, so it is not counted as dropped.
+    #[test]
+    fn a_declined_wait_drops_the_message()
+    {
+        let (labels, hints, outcome) = paced(&[(WINDOW_FULL, 9)], &[false]);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(hints, [9]);
+        assert_eq!(outcome, Outcome::Dropped);
+        // A call that fails is not a drop: the receiver may have it.
+        assert_eq!(paced(&[], &[]).2, Outcome::Failed);
+    }
+
+    // Defect caught: a resend that outlasts the call's own bound or the
+    // thread's call deadline, so a refused sender waits on logd longer than a
+    // wedged logd would hold it.
+    #[test]
+    fn a_resend_waits_only_within_the_bound_and_the_deadline()
+    {
+        let ms = Duration::from_millis;
+        assert!(may_wait(0, 10, None));
+        assert!(may_wait(u64::from(LOG_CALL_TIMEOUT_MS) - 10, 10, None));
+        assert!(!may_wait(u64::from(LOG_CALL_TIMEOUT_MS) - 9, 10, None));
+        assert!(may_wait(0, 10, Some(ms(11))));
+        assert!(!may_wait(0, 10, Some(ms(10))));
+        assert!(!may_wait(u64::MAX, u32::MAX, None));
+    }
+
+    // Defect caught: a dropped chunk counted as no line, or a chunk of three
+    // lines as one, so the drop notice understates the loss.
+    #[test]
+    fn a_dropped_message_counts_its_lines()
+    {
+        let bytes = |b: &[u8]| {
+            IpcMessage::builder(stream_label(b.len(), LEVEL_INFO))
+                .bytes(0, b)
+                .build()
+        };
+        assert_eq!(lines_of(&bytes(b"a\nb\nc\n")), 3);
+        assert_eq!(lines_of(&bytes(b"no newline")), 1);
+        assert_eq!(lines_of(&IpcMessage::new(record_label(4, LEVEL_INFO))), 1);
+        // The notice is a record at notice, carrying the count.
+        let notice = drop_notice(37, SENDER_NAMED);
+        assert_eq!(notice.label & 0xFFFF, STREAM_RECORD);
+        assert_eq!(ipc::stream_labels::level_of(notice.label), LEVEL_NOTICE);
+        assert_eq!(notice.label & SENDER_NAMED, SENDER_NAMED);
+        let len = usize::try_from((notice.label >> 16) & 0xFFFF).unwrap();
+        let record =
+            ipc::log_record::Record::decode(&notice.data_bytes()[..len]).expect("a record");
+        assert_eq!(record.message(), b"log: 37 lines dropped");
     }
 
     /// The label of the `STREAM_REGISTER_NAME` message carrying `name`.

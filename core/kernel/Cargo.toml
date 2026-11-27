@@ -18,12 +18,21 @@ process-layout = { workspace = true }
 font = { workspace = true }
 syscall = { workspace = true }
 text = { workspace = true }
+# The cycle counter read of the `sched-stages` feature, the one the
+# benchmarks read.
+bench = { path = "../../shared/bench", optional = true }
 
 # Only the riscv64 interrupt controller (`arch/riscv64/aia.rs`) orders its MMIO
 # through `mmio`. The host tests compile that module out, so the dependency is
 # the bare-metal kernel's alone (`target_os = "none"`, the kernel targets').
 [target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]
 mmio = { workspace = true }
+
+[features]
+# Stamp the cycle counter at the stages of `schedule()` and answer
+# `SystemInfoType::SchedStages` (`sched/stages.rs`;
+# `cargo xtask build --sched-stages`). Off, the stamps compile to nothing.
+sched-stages = ["dep:bench"]
 
 [[bin]]
 name = "kernel"

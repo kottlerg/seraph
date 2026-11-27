@@ -2127,6 +2127,33 @@ pub fn idle_halts() -> Result<u64, i64>
     system_info(syscall_abi::SystemInfoType::IdleHalts as u64)
 }
 
+/// One word of the `schedule()` stage breakdown of a kernel built with its
+/// `sched-stages` feature (`SystemInfoType::SchedStages`): the word `word`
+/// names (`syscall_abi::SCHED_STAGE_*`, `SCHED_STAGES_*`). `SCHED_STAGES_ARM`
+/// zeroes every sum and count and collects on the calling CPU.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` for an unknown
+/// word, and from a kernel built without the feature.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "a non-negative return is the queried value"
+)]
+#[inline]
+pub fn sched_stages(word: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall2 issues raw syscall instruction; arg0 is the
+    // SchedStages discriminant and arg1 the word, which the kernel validates.
+    let ret = unsafe {
+        syscall2(
+            SYS_SYSTEM_INFO,
+            syscall_abi::SystemInfoType::SchedStages as u64,
+            word,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
 /// Exclusive top of the user half of the caller's address space
 /// (`SystemInfoType::UserVaTop`): the first virtual address a mapping syscall
 /// refuses, fixed per architecture and boot paging mode.

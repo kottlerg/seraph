@@ -5,7 +5,8 @@
 
 //! RISC-V machine-code encoders for the stubs `crate::unit::retype` and
 //! `crate::integration::aspace_exit_notification` and
-//! `crate::integration::aspace_hold` map executable in a fresh address space
+//! `crate::integration::aspace_hold` map executable in a fresh address space,
+//! and `crate::bench::ipc`'s `aspace=` cases in a fresh one or ktest's own,
 //! and run a child thread from. Each returns the stub's bytes.
 
 use syscall_abi::{SYS_ASPACE_EXIT, SYS_CAP_DELETE};
@@ -66,6 +67,52 @@ pub fn syscall_program() -> [u8; 72]
         0xFF5F_F06F, // jal zero, done (-12)
     ];
     let mut out = [0u8; 72];
+    let (slots, _) = out.as_chunks_mut::<4>();
+    for (slot, word) in slots.iter_mut().zip(words)
+    {
+        *slot = word.to_le_bytes();
+    }
+    out
+}
+
+/// Encode the repeating syscall program runner: [`syscall_program`]'s
+/// records, except that word 7 holds a repeat count on entry. The runner
+/// makes a record's syscall that many times, stopping early at a negative
+/// primary return, and stores in word 7 the calls not completed (0 when all
+/// returned without error, the failed one counted otherwise) before it moves
+/// to the next record. It ends at the `u64::MAX` record as
+/// [`syscall_program`] does. Its loop state lives in `s0` and `s1`, which
+/// no syscall writes.
+#[must_use]
+pub fn syscall_repeat() -> [u8; 96]
+{
+    let words: [u32; 24] = [
+        0x0005_0413, // addi s0, a0, 0
+        0x0004_3883, // ld a7, 0(s0)
+        0xFFF0_0293, // addi t0, zero, -1
+        0x0458_8263, // beq a7, t0, done (+68)
+        0x0384_3483, // ld s1, 56(s0)
+        0x0204_8863, // beq s1, zero, next (+48)
+        0x0004_3883, // ld a7, 0(s0)
+        0x0084_3503, // ld a0, 8(s0)
+        0x0104_3583, // ld a1, 16(s0)
+        0x0184_3603, // ld a2, 24(s0)
+        0x0204_3683, // ld a3, 32(s0)
+        0x0284_3703, // ld a4, 40(s0)
+        0x0304_3783, // ld a5, 48(s0)
+        0x0000_0073, // ecall
+        0x0005_4663, // blt a0, zero, next (+12)
+        0xFFF4_8493, // addi s1, s1, -1
+        0xFD5F_F06F, // jal zero, again (-44)
+        0x0294_3C23, // sd s1, 56(s0)
+        0x0404_0413, // addi s0, s0, 64
+        0xFB9F_F06F, // jal zero, top (-72)
+        0x0084_3283, // ld t0, 8(s0)
+        0x0012_8293, // addi t0, t0, 1
+        0x0054_3423, // sd t0, 8(s0)
+        0xFF5F_F06F, // jal zero, done (-12)
+    ];
+    let mut out = [0u8; 96];
     let (slots, _) = out.as_chunks_mut::<4>();
     for (slot, word) in slots.iter_mut().zip(words)
     {

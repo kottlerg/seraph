@@ -104,7 +104,8 @@ Build Seraph components and populate `sysroot/`.
 ```
 cargo xtask build [--arch x86_64|riscv64] [--release] \
     [--component <name>|all] [--debug <comp>[,...]] [--limited-debug <comp>[,...]] \
-    [--opt-level <pkg>=<level>[,...]] [--ktest-bench-only | --ktest-only <prefix>[,...]]
+    [--opt-level <pkg>=<level>[,...]] [--ktest-bench-only | --ktest-only <prefix>[,...]] \
+    [--sched-stages]
 ```
 
 | Option | Default | Description |
@@ -117,6 +118,7 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 | `--opt-level` | (none) | Build the named workspace package(s) at another opt-level within the active profile, as `<package>=<level>` with the level one of `0`, `1`, `2`, `3`, `s`, `z`, e.g. `--opt-level shmem=3,framebuffer=3`: `--config profile.<active>.package."<pkg>".opt-level=<level>` on every cargo build of the build, so a library takes it wherever it is compiled, `-Z build-std`'s crates included. Refused for a package the workspace does not have, for one named twice, and for a component `--debug` names (`all` names every component, not the libraries), which builds it at opt-level 1. Under `--release`, fat LTO optimizes the merged module at the linking binary's level, so a library's override may not survive into the image. `compare-images` builds each commit without `--opt-level`: whether an override survives is read by committing it as a `[profile.<p>.package."<pkg>"]` table in a scratch commit and comparing that commit with its parent. See [Opt-level overrides](../docs/build-system.md#opt-level-overrides). |
 | `--ktest-bench-only` | off | Build ktest with its `bench-only` feature, which runs Tier 3 alone at its benchmark iteration count ([core/ktest/README.md](../core/ktest/README.md#compile-time-options) § Compile-time options); refused with a `--component` other than `ktest` or `all` |
 | `--ktest-only` | (none) | Build a focused ktest, which runs only the tests whose names start with one of the comma-separated prefixes, each of ASCII letters, digits, `_` and `:` ([core/ktest/README.md](../core/ktest/README.md#test-selection) § Test selection): ktest's compile reads them from `SERAPH_KTEST_ONLY`, which every other build clears, and the build records them in `sysroot/.ktest-selection`, which a build of the full ktest removes. `run --runs` refuses the image without `--ktest-only-ok`. Refused with `--ktest-bench-only` and with a `--component` other than `ktest` or `all` |
+| `--sched-stages` | off | Build the kernel with its `sched-stages` feature: `schedule()` stamps the cycle counter at its stages and answers `SYS_SYSTEM_INFO(SchedStages)`, whose means ktest's `context_switch_pair` line reports ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md#stage-breakdown) § Stage Breakdown). The stamps add their own cycles to every switch, so such an image measures where a switch's cycles go, not how many it takes. Refused with a `--component` that builds no kernel |
 
 Before it compiles, the build checks that the workspace's Rust source is formatted as
 `cargo fmt` formats it (`cargo fmt --all --check`) and fails on a file that is not, printing

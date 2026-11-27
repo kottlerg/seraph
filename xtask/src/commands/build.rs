@@ -957,10 +957,11 @@ fn build_group(
 /// `--ktest-only` sets it ([`selection_env`]).
 const KTEST_SELECTION_VAR: &str = "SERAPH_KTEST_ONLY";
 
-/// Refuse the ktest options of `args` on a build they cannot apply to:
-/// `--ktest-bench-only` or `--ktest-only` with a component other than `all` or
-/// `ktest`, and the two together, since a bench-only ktest runs no named test
-/// a selection could select.
+/// Refuse the ktest and kernel feature options of `args` on a build they
+/// cannot apply to: `--ktest-bench-only` or `--ktest-only` with a component
+/// other than `all` or `ktest`, the two together, since a bench-only ktest
+/// runs no named test a selection could select, and `--sched-stages` with a
+/// component other than `all` or `kernel`.
 fn check_ktest_options(args: &BuildArgs) -> Result<()>
 {
     let builds_ktest = matches!(
@@ -978,6 +979,14 @@ fn check_ktest_options(args: &BuildArgs) -> Result<()>
     if args.ktest_only.is_some() && !builds_ktest
     {
         bail!("--ktest-only builds ktest: give --component all or --component ktest");
+    }
+    let builds_kernel = matches!(
+        args.component,
+        BuildComponent::All | BuildComponent::Spec("kernel")
+    );
+    if args.sched_stages && !builds_kernel
+    {
+        bail!("--sched-stages builds the kernel: give --component all or --component kernel");
     }
     Ok(())
 }
@@ -1017,17 +1026,24 @@ fn install_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec, cargo_out: &P
 
 /// The cargo feature flags of a build of the components `names`: ktest's
 /// `bench-only` feature under `--ktest-bench-only` when ktest is among them,
-/// none otherwise.
+/// the kernel's `sched-stages` feature under `--sched-stages` when the kernel
+/// is, none otherwise.
 fn feature_flags(args: &BuildArgs, names: &[&str]) -> Vec<String>
 {
+    let mut features = Vec::new();
     if args.ktest_bench_only && names.contains(&"ktest")
     {
-        vec!["--features".into(), "ktest/bench-only".into()]
+        features.push("ktest/bench-only");
     }
-    else
+    if args.sched_stages && names.contains(&"kernel")
     {
-        Vec::new()
+        features.push("kernel/sched-stages");
     }
+    if features.is_empty()
+    {
+        return Vec::new();
+    }
+    vec!["--features".into(), features.join(",")]
 }
 
 // ── Single component build ────────────────────────────────────────────────────
@@ -1695,6 +1711,7 @@ mod tests
             skip_lints: true,
             ktest_bench_only: false,
             ktest_only: ktest_only.map(str::to_string),
+            sched_stages: false,
             host: crate::cli::HostArgs::default(),
         }
     }
@@ -1763,6 +1780,19 @@ mod tests
         };
         let error = check_ktest_options(&both).unwrap_err();
         assert!(error.to_string().contains("--ktest-bench-only"), "{error}");
+        let stages = |component| BuildArgs {
+            sched_stages: true,
+            ..build_args(component, None)
+        };
+        check_ktest_options(&stages(kernel)).unwrap();
+        check_ktest_options(&stages(BuildComponent::All)).unwrap();
+        let error = check_ktest_options(&stages(ktest)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--sched-stages builds the kernel"),
+            "{error}"
+        );
     }
 
     // Defect caught: `--ktest-bench-only` building ktest without its
@@ -1782,6 +1812,30 @@ mod tests
         );
         assert_eq!(feature_flags(&build(true), &["init", "procmgr"]), none);
         assert_eq!(feature_flags(&build(false), &["ktest"]), none);
+    }
+
+    // Defect caught: `--sched-stages` building the kernel without its
+    // feature, passing it to a group without the kernel, where cargo refuses
+    // a feature of a package it does not build, or a build with both feature
+    // options dropping one of them.
+    #[test]
+    fn the_sched_stages_feature_goes_to_kernel_builds_only()
+    {
+        let build = |ktest_bench_only, sched_stages| BuildArgs {
+            ktest_bench_only,
+            sched_stages,
+            ..build_args(BuildComponent::All, None)
+        };
+        let none: [String; 0] = [];
+        assert_eq!(
+            feature_flags(&build(false, true), &["kernel"]),
+            ["--features", "kernel/sched-stages"]
+        );
+        assert_eq!(feature_flags(&build(false, true), &["init", "ktest"]), none);
+        assert_eq!(
+            feature_flags(&build(true, true), &["kernel", "ktest"]),
+            ["--features", "ktest/bench-only,kernel/sched-stages"]
+        );
     }
 
     /// A build's arguments with `--debug` and `--opt-level` as given.
@@ -1807,6 +1861,7 @@ mod tests
             skip_lints: true,
             ktest_bench_only: false,
             ktest_only: None,
+            sched_stages: false,
             host: crate::cli::HostArgs::default(),
         }
     }

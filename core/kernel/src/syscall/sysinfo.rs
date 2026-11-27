@@ -17,19 +17,28 @@ use syscall::SyscallError;
 
 /// One past the highest `SystemInfoType` discriminant `sys_system_info`
 /// answers. A discriminant at or past it is refused before the match.
+#[cfg(not(feature = "sched-stages"))]
 const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::EndpointRetypeBytes as u64 + 1;
+/// The bound of a kernel built with the `sched-stages` feature, the only one
+/// that answers `SchedStages`.
+#[cfg(feature = "sched-stages")]
+const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::SchedStages as u64 + 1;
 
 /// `SYS_SYSTEM_INFO` (43): query kernel/system information.
 ///
 /// arg0 = `SystemInfoType` discriminant (u64).
 /// arg1 = the stack class for `StackHighWater` (`syscall::STACK_CLASS_*`), the
-/// view for `SpeculationControls` (`syscall::SPECULATION_VIEW_*`), or the CPU
-/// index for `SmtSibling`; ignored by every other discriminant.
+/// view for `SpeculationControls` (`syscall::SPECULATION_VIEW_*`), the CPU
+/// index for `SmtSibling`, or the word for `SchedStages`
+/// (`syscall::SCHED_STAGE_*`, `SCHED_STAGES_*`); ignored by every other
+/// discriminant.
 ///
 /// Returns the queried value as a scalar `u64`. No buffer is required.
 /// Returns `InvalidArgument` for an unknown discriminant, an unknown
 /// `StackHighWater` class, an unknown `SpeculationControls` view or an
-/// `SmtSibling` CPU index at or past the CPU count, and
+/// `SmtSibling` CPU index at or past the CPU count, an unknown `SchedStages`
+/// word, `SchedStages` from a kernel built without the `sched-stages`
+/// feature, and
 /// `NotSupported` for the handoff class when the kernel could not locate the
 /// handoff stack and for `SpeculationControls` on riscv64, and `InvalidState`
 /// for `IdleHalts` when the caller has no mark on its CPU.
@@ -164,6 +173,15 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         {
             Ok(crate::ipc::endpoint::retype_bytes())
         }
+        #[cfg(feature = "sched-stages")]
+        17 =>
+        // SchedStages — a word of the stage breakdown of `schedule()` on the
+        // collecting CPU, or the arm that zeroes it and collects on this CPU
+        // (`sched::stages::query`); a measurement aid only the `sched-stages`
+        // build answers (core/kernel/docs/cross-boundary-disclosure.md).
+        {
+            crate::sched::stages::query(tf.arg(1)).ok_or(SyscallError::InvalidArgument)
+        }
         _ => Err(SyscallError::InvalidArgument),
     }
 }
@@ -247,7 +265,7 @@ mod tests
     #[test]
     fn system_info_bound_is_one_past_the_highest_discriminant()
     {
-        let kinds = [
+        let mut kinds = vec![
             SystemInfoType::KernelVersion,
             SystemInfoType::CpuCount,
             SystemInfoType::PageSize,
@@ -264,6 +282,10 @@ mod tests
             SystemInfoType::IdleHalts,
             SystemInfoType::EndpointRetypeBytes,
         ];
+        if cfg!(feature = "sched-stages")
+        {
+            kinds.push(SystemInfoType::SchedStages);
+        }
         let max = kinds.iter().map(|&k| k as u64).max();
         assert!(kinds.iter().all(|&k| (k as u64) < SYSTEM_INFO_BOUND));
         assert_eq!(max.map(|m| m + 1), Some(SYSTEM_INFO_BOUND));

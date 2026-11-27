@@ -44,6 +44,13 @@ returns a `Reading` of every column a result line can report: `cycles`, `instret
 programmable `events`. The cycle counter is the only one read; the others read `None`.
 `Reading::since` subtracts an earlier reading, column by column.
 
+The kernel reads the same counter: a kernel built with its `sched-stages` feature calls
+`Counters::open()` and `read()` from `schedule()`, in kernel mode with interrupts disabled
+([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md#stage-breakdown) § Stage
+Breakdown).
+Both therefore stay free of syscalls, allocation and any other side effect: `open` builds the
+handle alone, and `read` executes the counter read and nothing else.
+
 | Architecture | Cycle counter | User-mode access |
 |---|---|---|
 | x86-64 | `rdtsc`: reference cycles at a constant rate on a CPU with an invariant TSC | The kernel clears `CR4.TSD` on every CPU |
@@ -227,12 +234,14 @@ such a delay leaves a window out, and the check rests on the invariant TSC § Co
 |---|---|---|
 | [`core/ktest`](../../core/ktest/README.md) | `ktest` | Tier 3, one line per kernel benchmark (§ Tier 3) |
 | [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3`; at more than one CPU, the window rows `fsbench.read size=16 path=inline affinity=any` and `fsbench.open depth=3 affinity=any` |
+| [`core/kernel`](../../core/kernel/README.md), with its `sched-stages` feature | none: it prints no result line | `SYS_SYSTEM_INFO(SchedStages)`, the cycles of each stage of `schedule()`, which ktest's `context_switch_pair` line reports as extras |
 | [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.pipeline`, `ubench.console_write`, per variant, and `ubench.empty_window` |
 
 ---
 
 ## Summarized By
 
+[Scheduler Internals](../../core/kernel/docs/scheduler.md),
 [core/ktest/README.md](../../core/ktest/README.md),
 [services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md),
 [services/ubench/README.md](../../services/ubench/README.md)

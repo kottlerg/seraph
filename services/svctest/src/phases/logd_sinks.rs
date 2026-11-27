@@ -3,9 +3,9 @@
 
 // services/svctest/src/phases/logd_sinks.rs
 
-//! logd's output sinks: a sink driver that does not answer holds neither the
-//! log stream nor logd's other sink (`services/logd/docs/ipc-interface.md`
-//! § Output sinks), and the serial and framebuffer drivers are debuggable.
+//! logd's output sinks: a sink driver that does not answer holds no log call
+//! (`services/logd/docs/ipc-interface.md` § Output sinks, § Hold window), and
+//! the serial and framebuffer drivers are debuggable.
 //!
 //! Through the debug authority svctest holds, the phase attaches to each sink
 //! driver it finds by name (`LIST_PROCESSES`, `ATTACH_PROCESS`): the attach
@@ -14,47 +14,43 @@
 //! (`ATTACH_FLAG_NO_CORE`), and the driver's main thread must have its
 //! exception class bound, the path a fault takes to the crash service.
 //!
-//! - **Serial stopped.** The phase stops every thread of the serial driver and
-//!   sends logd lines with raw `STREAM_BYTES` calls on its own log cap, more
-//!   lines than logd has receive workers. The first must be answered within
-//!   the log client's bound (`log::LOG_CALL_TIMEOUT_MS`): logd waits for its
-//!   write for at most its stall bound (`SINK_STALL_MS`), where a logd that
-//!   waited on the driver without a bound would answer none. Every later one
-//!   must be answered within the stall bound, since the sink is then stalled
-//!   and logd waits on it for nothing. The last must be in logd's history. The
-//!   lines stay within the serial sink's queue
-//!   (`logd_codec::sink::SINK_QUEUE_BYTES`), so none is dropped from the
-//!   console CI reads; they are written when the phase starts the threads
-//!   again.
+//! Every line is a raw `STREAM_BYTES` call on svctest's own log cap, and every
+//! call must be answered before half the stall bound (`SINK_STALL_MS`) has
+//! passed: logd answers a line once it is retained, and no receive worker
+//! waits on a sink, where a logd that wrote a line before it answered would
+//! hold the call until the write ended or the stall bound passed.
+//!
+//! - **Serial stopped.** The phase stops every thread of the serial driver,
+//!   the `hold` sink's, and sends more lines than logd has receive workers,
+//!   each taken. It then sends lines until logd refuses one `WINDOW_FULL`,
+//!   which it must do once svctest's lines the stopped sink has not written
+//!   pass the hold window (`HOLD_WINDOW`), with a retry hint of 1 ms to the
+//!   stall bound. Once the stall bound has passed the sink is stalled and
+//!   holds no sender: the refused line, sent again, is taken. The last line
+//!   must be in logd's history. The lines stay within svctest's share of the
+//!   history (`PER_SLOT_HISTORY`), so none is dropped from the console CI
+//!   reads; they are written once the phase starts the driver again.
 //! - **Framebuffer stopped**, on a boot with a framebuffer driver (the
-//!   framebuffer cell; otherwise the case logs that it skipped). The lines
-//!   sent while the driver is stopped exceed the framebuffer sink's queue, so
-//!   the sink stalls and then drops lines, counted, under the same bounds on
-//!   the calls; the serial console shows every line, and logd's line
-//!   counting the framebuffer's drops once the driver is started again.
+//!   framebuffer cell; otherwise the case logs that it skipped). The
+//!   framebuffer sink is `skip` and holds nobody. While its driver is stopped
+//!   the phase sends more lines than svctest's share of the history holds at
+//!   its largest, so the history drops svctest's oldest before the sink
+//!   writes them. A line logd refuses for the running serial sink's window
+//!   is sent again after its hint, as the log client does. Once the driver
+//!   is started again, logd must retain its notice counting the
+//!   framebuffer's drops (`framebuffer: <n> lines dropped`,
+//!   `services/logd/docs/sinks.md` § Drops) after the last line.
 //! - **Framebuffer killed.** The phase then makes the framebuffer driver's main
 //!   thread fault at an unmapped address, waits until procmgr no longer lists
-//!   the driver and devmgr answers its ordinal `WITHDRAWN`, and sends more
-//!   than a queue's worth of lines again, under the same bounds as the
-//!   serial-stopped case. A call to the dead driver ends only when devmgr
-//!   revokes its endpoint, after the `WITHDRAWN` answer, so the first line
-//!   can still wait out the stall bound on a writer blocked in such a call.
+//!   the driver and devmgr answers its ordinal `WITHDRAWN`, and sends as many
+//!   lines again, under the same bound.
 //! - **Framebuffer restarted.** devmgr restarts the killed driver
 //!   (services/devmgr/docs/responsibilities.md § Driver Restart): the phase
 //!   requires the class's next ordinal to answer with the new instance, and
-//!   logd to write to it. It stops the new instance and sends more than a
-//!   queue's worth of lines: once logd has resolved the new instance on its
-//!   class watch, its framebuffer writer blocks in a write to it, and a line
-//!   that finds the queue full waits out the stall bound, which a sink that
-//!   resolved no driver never makes a line do. Until then the phase starts
-//!   the instance, waits, and tries again, within a bound. A try that logd's
-//!   move to the new instance lands inside, after its first line, can leave
-//!   a later line waiting a whole stall bound from its own call, past the
-//!   bound on such a line; no later try can meet that move, so such a try is
-//!   tried again too, and fails the phase only once the bound has passed.
-//!   The lines' calls stay under the serial-stopped case's bounds, the last is in logd's
-//!   history, and once the instance is started again logd writes it the
-//!   queued lines and the line counting its drops.
+//!   logd's framebuffer writer to take it up. On a new driver a `skip` sink's
+//!   cursor starts at most its backlog (`SKIP_BACKLOG`) behind the newest
+//!   entry, so the writer counts the lines sent while no driver ran as
+//!   dropped, in a notice logd retains after the last of them.
 //!
 //! The serial driver is only stopped, since a kill would end the console the
 //! boot is judged on.
@@ -66,26 +62,28 @@
 //! - **Authority.** `LOG_FLUSH` on `logd.query` is refused `FLUSH_DENIED`,
 //!   `QUERY_SLOTS` on `logd.flush` is refused `QUERY_DENIED`, and a request
 //!   of another version `FLUSH_VERSION_MISMATCH`.
-//! - **Serial running.** After a line of svctest's, a flush is answered
-//!   `FLUSHED` within the log client's bound, asked again with its token.
+//! - **Serial running.** After a burst of svctest's lines, a flush is
+//!   answered `FLUSH_PENDING`, then `FLUSHED` within the log client's
+//!   bound, asked again with its token. The serial sink that the first phase
+//!   stalled answers a flush `FLUSHED` at once until its write in flight
+//!   returns, so the burst and the flush are repeated until the sink holds the
+//!   flush, within twice the stall bound. The flushed sink then holds none of
+//!   svctest's lines, so the next case's line is taken within its window.
 //! - **Serial stopped.** With every thread of the serial driver stopped, a
-//!   line logged from another thread is queued and not written, and a flush
-//!   started meanwhile is answered `FLUSH_PENDING`, with a retry hint of
-//!   1 ms to the stall bound, before the stall bound has passed. Asked again
-//!   with its token, it is answered `FLUSHED` while the driver is still
-//!   stopped, once the sink is stalled, within twice the stall bound: logd
-//!   does not hold a flush on a sink that writes nothing. A stop can find
-//!   the sink already stalled (its writer's last write given up, none
-//!   completed since), and every flush is then answered `FLUSHED`; the
-//!   phase then starts the driver, lets a write end the stall, and stops it
-//!   again, at most three stops in all.
+//!   line svctest logs is retained and not written, and a flush started then
+//!   is answered `FLUSH_PENDING`, with a retry hint of 1 ms to the stall
+//!   bound. Asked again with its token, it is answered `FLUSHED` while the
+//!   driver is still stopped, once the sink is stalled, within twice the
+//!   stall bound: logd does not hold a flush on a sink that writes nothing.
 
 use std::time::{Duration, Instant};
 
+use ipc::log_badges::LOG_BADGE_LOGD;
 use ipc::log_flush::{FLUSH_DENIED, FLUSH_VERSION_MISMATCH, FlushAnswer};
-use ipc::stream_labels::{LEVEL_INFO, STREAM_BYTES, level_bits};
+use ipc::stream_labels::{LEVEL_INFO, STREAM_BYTES, WINDOW_FULL, level_bits};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
-use logd_codec::sink::{SINK_QUEUE_BYTES, SINK_STALL_MS};
+use logd_codec::sink::SINK_STALL_MS;
+use logd_slot_table::{HISTORY_BYTES_MAX, HISTORY_BYTES_MIN, HOLD_WINDOW, PER_SLOT_HISTORY_MIN};
 use syscall_abi::FAULT_CLASS_EXCEPTION;
 
 use crate::arch::current::{IP_OFFSET, REGS_SIZE};
@@ -112,55 +110,52 @@ pub fn phases() -> &'static [Phase]
 const SERIAL_NAME: &[u8] = b"/services/drivers/serial";
 
 /// The framebuffer driver's process name, as the serial driver's.
-const FRAMEBUFFER_NAME: &[u8] = b"/services/drivers/framebuffer";
+pub(super) const FRAMEBUFFER_NAME: &[u8] = b"/services/drivers/framebuffer";
 
-/// Lines sent while the serial driver is stopped: more than logd's four
+/// Lines sent first while the serial driver is stopped: more than logd's four
 /// receive workers (`RECV_WORKERS`), each of which would hold one unanswered
-/// line if logd wrote a line before replying.
+/// line if logd wrote a line before replying, and fewer than the hold window.
 const SERIAL_STOP_LINES: usize = 9;
 
-/// Body bytes of each line of the framebuffer cases, newline included: one
-/// `STREAM_BYTES` call's payload, below its 512 bytes.
-const FLOOD_LINE_BYTES: usize = 400;
+/// Lines logged before each flush of the running case: enough that a writing
+/// serial sink has not written them all when the flush arrives, and fewer
+/// than the hold window, so none is refused.
+const RUNNING_BURST: usize = 8;
 
-/// Lines of each framebuffer case: their bodies alone exceed the sink's
-/// queue by half again, so the queue fills whatever logd's prefix adds.
-const FLOOD_LINES: usize = SINK_QUEUE_BYTES * 3 / 2 / FLOOD_LINE_BYTES + 1;
+/// Lines of each framebuffer case: more than a slot's share of the history
+/// at its largest, so svctest's oldest are dropped before the stopped
+/// framebuffer sink writes them whatever logd's bounds, and more than the
+/// sink's backlog on a new driver.
+const FLOOD_LINES: usize = PER_SLOT_HISTORY_MIN * (HISTORY_BYTES_MAX / HISTORY_BYTES_MIN) + 1;
 
 /// The log client's bound on a log call.
 const LOG_CALL_BOUND: Duration = Duration::from_millis(log::LOG_CALL_TIMEOUT_MS as u64);
 
-/// logd's bound on what one sink costs a line's producer.
+/// logd's bound on what one sink costs: the age of a write past which its
+/// sink is stalled.
 const STALL_BOUND: Duration = Duration::from_millis(SINK_STALL_MS as u64);
+
+/// The longest a line's call may take: half the stall bound. A line answered
+/// once retained takes well under a millisecond; one that waited on a
+/// stopped sink driver would wait for the stall bound.
+const ANSWERED: Duration = Duration::from_millis(SINK_STALL_MS as u64 / 2);
 
 /// An address no process maps (the first page), which the killed thread's
 /// instruction pointer is set to.
 const UNMAPPED_IP: u64 = 0;
 
-/// How long the phase waits, at most, for the killed driver to be gone, and
-/// for logd to write to the restarted one.
+/// How long the phase waits, at most, for the killed driver to be gone, for
+/// its restart, and for a notice of logd's.
 const DEATH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The shortest call that counts as a line waiting out the stall bound: half
-/// of it. A line dropped by a sink that resolved no driver is answered in
-/// well under a millisecond, and one that waits on a blocked writer waits
-/// until the bound from the writer's call, sent a few milliseconds earlier.
-const STALL_SEEN: Duration = Duration::from_millis(SINK_STALL_MS as u64 / 2);
-
-/// How many times the flush phase stops the serial driver, at most, for a
-/// stop that finds logd's serial sink not stalled. A stop can find it
-/// stalled, its writer's last write given up and none completed since, and
-/// every flush is then rightly answered `FLUSHED`.
-const STOP_ATTEMPTS: u32 = 3;
-
-/// How long the flush phase lets the restarted serial driver run before it
-/// stops it again: time for logd's writer to complete a write, which ends
-/// the sink's stall.
-const STALL_CLEAR: Duration = Duration::from_millis(100);
-
-/// How long the phase waits between tries for logd to resolve the restarted
-/// framebuffer driver.
-const RESOLVE_RETRY: Duration = Duration::from_millis(200);
+/// logd's answer to one line ([`send_line`]).
+enum Answer
+{
+    /// Retained.
+    Taken,
+    /// Refused `WINDOW_FULL`, with this retry hint in milliseconds.
+    Refused(u32),
+}
 
 /// Check logd's sinks around a stopped serial driver and a stopped, then
 /// killed and restarted, framebuffer driver (see the module documentation).
@@ -174,13 +169,15 @@ pub fn logd_sinks_phase(caps: &Caps)
         .expect("logd_sinks: LIST_PROCESSES lists no serial driver");
     let threads = attach(authority, serial, "serial");
     stop(&threads, "serial");
-    let lines = send_lines("serial stopped", SERIAL_STOP_LINES, 0, LOG_CALL_BOUND);
+    let stopped = serial_stopped(Instant::now());
     start(&threads, "serial");
     detach(authority, serial, threads, "serial");
-    let (lines, _) = lines.unwrap_or_else(|e| panic!("{e}"));
-    check_retained(caps.logd_query, &lines, "serial stopped");
+    let (lines, hint) = stopped.unwrap_or_else(|e| panic!("{e}"));
+    retained_seq(caps.logd_query, &lines, "serial stopped");
     std::os::seraph::log!(
-        "logd_sinks: {SERIAL_STOP_LINES} lines answered while the serial driver was stopped"
+        "logd_sinks: {} lines taken while the serial driver was stopped, one refused with a \
+         {hint} ms hint and taken once the sink stalled",
+        lines.len()
     );
 
     let Some(fb) = super::crash::badge_named(authority, FRAMEBUFFER_NAME)
@@ -191,49 +188,240 @@ pub fn logd_sinks_phase(caps: &Caps)
     };
     let threads = attach(authority, fb, "framebuffer");
     stop(&threads, "framebuffer");
-    let start_at = Instant::now();
-    let lines = send_lines(
-        "framebuffer stopped",
-        FLOOD_LINES,
-        FLOOD_LINE_BYTES,
-        LOG_CALL_BOUND,
-    );
-    let took = start_at.elapsed().as_millis();
+    let sent = send_lines("framebuffer stopped", FLOOD_LINES);
     start(&threads, "framebuffer");
     detach(authority, fb, threads, "framebuffer");
-    let (lines, _) = lines.unwrap_or_else(|e| panic!("{e}"));
-    check_retained(caps.logd_query, &lines, "framebuffer stopped");
+    let lines = sent.unwrap_or_else(|e| panic!("{e}"));
+    let last = retained_seq(caps.logd_query, &lines, "framebuffer stopped");
+    let dropped = await_fb_notice(caps.logd_query, last, "the stopped driver's start");
     std::os::seraph::log!(
-        "logd_sinks: {FLOOD_LINES} lines answered in {took} ms while the framebuffer driver was \
-         stopped"
+        "logd_sinks: {FLOOD_LINES} lines taken while the framebuffer driver was stopped, \
+         {dropped} counted dropped"
     );
 
     kill(authority, fb, "framebuffer");
     await_gone(authority, fb, FRAMEBUFFER_NAME, "framebuffer");
     await_withdrawn(caps.framebuffer_deny_class);
-    let start_at = Instant::now();
-    if let Err(e) = send_lines(
-        "framebuffer killed",
-        FLOOD_LINES,
-        FLOOD_LINE_BYTES,
-        LOG_CALL_BOUND,
-    )
-    {
-        panic!("{e}");
-    }
-    let took = start_at.elapsed().as_millis();
+    let lines = send_lines("framebuffer killed", FLOOD_LINES).unwrap_or_else(|e| panic!("{e}"));
+    let last = retained_seq(caps.logd_query, &lines, "framebuffer killed");
     std::os::seraph::log!(
-        "logd_sinks: {FLOOD_LINES} lines answered in {took} ms after the framebuffer driver died"
+        "logd_sinks: {FLOOD_LINES} lines taken after the framebuffer driver died"
     );
 
     await_restarted(caps.framebuffer_deny_class);
-    let restarted = super::crash::badge_named(authority, FRAMEBUFFER_NAME)
-        .expect("logd_sinks: LIST_PROCESSES lists no restarted framebuffer driver");
-    let longest = await_stall_on(caps.logd_query, authority, restarted);
+    let dropped = await_fb_notice(caps.logd_query, last, "the driver's restart");
     std::os::seraph::log!(
-        "logd_sinks: logd writes to the restarted framebuffer driver (a line waited {} ms on it)",
-        longest.as_millis()
+        "logd_sinks: logd's framebuffer writer took up the restarted driver, {dropped} lines \
+         counted dropped"
     );
+}
+
+/// With the serial driver stopped since `stopped_at`: send
+/// [`SERIAL_STOP_LINES`] lines, each taken, then lines until one is refused
+/// `WINDOW_FULL`, within the hold window and before half the stall bound has
+/// passed, with a hint within the stall bound; past the stall bound, send it
+/// again, to be taken. The lines taken and the hint, or the first failure: no
+/// assertion panics here, since a panic's message would wait behind the
+/// stopped driver.
+fn serial_stopped(stopped_at: Instant) -> Result<(Vec<Vec<u8>>, u32), String>
+{
+    let case = "serial stopped";
+    let mut lines = Vec::new();
+    for i in 0..SERIAL_STOP_LINES
+    {
+        let text = line_text(case, i);
+        if let Answer::Refused(_) = send_line(&text, case, i)?
+        {
+            return Err(format!(
+                "logd_sinks: line {i} with the {case} refused WINDOW_FULL, within the first \
+                 {SERIAL_STOP_LINES}"
+            ));
+        }
+        lines.push(text);
+    }
+    let mut i = SERIAL_STOP_LINES;
+    let (text, hint) = loop
+    {
+        let text = line_text(case, i);
+        match send_line(&text, case, i)?
+        {
+            Answer::Refused(hint) => break (text, hint),
+            Answer::Taken if i < HOLD_WINDOW && stopped_at.elapsed() < ANSWERED =>
+            {
+                lines.push(text);
+                i = i.saturating_add(1);
+            }
+            Answer::Taken =>
+            {
+                return Err(format!(
+                    "logd_sinks: {} lines taken in {} ms with the {case}, none refused \
+                     WINDOW_FULL",
+                    i.saturating_add(1),
+                    stopped_at.elapsed().as_millis()
+                ));
+            }
+        }
+    };
+    if !(1..=SINK_STALL_MS).contains(&hint)
+    {
+        return Err(format!(
+            "logd_sinks: retry hint {hint} ms outside 1 to {SINK_STALL_MS} ms"
+        ));
+    }
+    // The writer began its write of a line at or after the stop; past the
+    // stall bound from then, the sink is stalled.
+    std::thread::sleep(STALL_BOUND.saturating_add(Duration::from_millis(100)));
+    if let Answer::Refused(_) = send_line(&text, case, i)?
+    {
+        return Err(format!(
+            "logd_sinks: line {i} refused WINDOW_FULL again {} ms after the {case}, past the \
+             stall bound",
+            stopped_at.elapsed().as_millis()
+        ));
+    }
+    lines.push(text);
+    Ok((lines, hint))
+}
+
+/// Send `count` numbered lines tagged `case`, each call answered within
+/// [`ANSWERED`]; a line refused `WINDOW_FULL` is sent again after its hint,
+/// as the log client does, for at most the log client's bound. Each line's
+/// text, or the first failure: no assertion panics here, since a sink driver
+/// may be stopped.
+fn send_lines(case: &str, count: usize) -> Result<Vec<Vec<u8>>, String>
+{
+    let mut sent = Vec::with_capacity(count);
+    for i in 0..count
+    {
+        let text = line_text(case, i);
+        let start_at = Instant::now();
+        while let Answer::Refused(hint) = send_line(&text, case, i)?
+        {
+            if start_at.elapsed() >= LOG_CALL_BOUND
+            {
+                return Err(format!(
+                    "logd_sinks: line {i} with the {case} refused WINDOW_FULL for {} ms",
+                    LOG_CALL_BOUND.as_millis()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(u64::from(hint)));
+        }
+        sent.push(text);
+    }
+    Ok(sent)
+}
+
+/// The text of line `i` of `case`.
+fn line_text(case: &str, i: usize) -> Vec<u8>
+{
+    format!("logd_sinks: line {i} while the {case}").into_bytes()
+}
+
+/// One raw `STREAM_BYTES` call of `text` and its newline at info on
+/// svctest's log cap, line `i` of `case`, which must be answered within
+/// [`ANSWERED`]: logd's answer, or the failure.
+fn send_line(text: &[u8], case: &str, i: usize) -> Result<Answer, String>
+{
+    let cap = std::os::seraph::log::acquire();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let mut line = text.to_vec();
+    line.push(b'\n');
+    let label = STREAM_BYTES | ((line.len() as u64) << 16) | level_bits(LEVEL_INFO);
+    let msg = IpcMessage::builder(label).bytes(0, &line).build();
+    let bound = u32::try_from(LOG_CALL_BOUND.as_millis()).unwrap_or(u32::MAX);
+    let start_at = Instant::now();
+    // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call_timeout(cap, &msg, ipc_buf, bound) }.map_err(|e| {
+        format!("logd_sinks: line {i} with the {case} not answered within {bound} ms ({e})")
+    })?;
+    let took = start_at.elapsed();
+    if took >= ANSWERED
+    {
+        return Err(format!(
+            "logd_sinks: line {i} with the {case} took {} ms, not under {} ms",
+            took.as_millis(),
+            ANSWERED.as_millis()
+        ));
+    }
+    match reply.label
+    {
+        0 => Ok(Answer::Taken),
+        WINDOW_FULL => Ok(Answer::Refused(
+            u32::try_from(reply.word(0)).unwrap_or(u32::MAX),
+        )),
+        other => Err(format!(
+            "logd_sinks: line {i} with the {case} refused ({other:#x})"
+        )),
+    }
+}
+
+/// Require the last of `lines` in logd's history, read through `query`: its
+/// `seq`.
+fn retained_seq(query: u64, lines: &[Vec<u8>], case: &str) -> u64
+{
+    let last = lines.last().expect("logd_sinks: no line sent");
+    super::procmgr::logd_history_with(query, None, |entry| {
+        (entry.seq, entry.bytes.starts_with(last))
+    })
+    .into_iter()
+    .find_map(|(seq, found)| found.then_some(seq))
+    .unwrap_or_else(|| {
+        panic!("logd_sinks: the last line sent with the {case} is not in logd's history")
+    })
+}
+
+/// The `seq` of the newest entry of logd's history, read through `query`.
+pub(super) fn newest_seq(query: u64) -> u64
+{
+    let mut newest = 0;
+    super::procmgr::logd_history_each(query, None, |entry| {
+        newest = entry.seq;
+        false
+    });
+    newest
+}
+
+/// Wait until logd's history holds its notice counting lines its
+/// framebuffer sink dropped, retained after the entry `after`, within
+/// [`DEATH_TIMEOUT`]; `what` names the event that lets the sink's writer go
+/// on. The count it names.
+pub(super) fn await_fb_notice(query: u64, after: u64, what: &str) -> u64
+{
+    let start_at = Instant::now();
+    loop
+    {
+        let mut count = None;
+        super::procmgr::logd_history_each(query, Some(LOG_BADGE_LOGD), |entry| {
+            if entry.seq <= after
+            {
+                return false;
+            }
+            count = count.or_else(|| fb_drop_count(entry.bytes));
+            count.is_none()
+        });
+        if let Some(count) = count
+        {
+            return count;
+        }
+        assert!(
+            start_at.elapsed() < DEATH_TIMEOUT,
+            "logd_sinks: logd retained no notice of the framebuffer's drops within {} s of {what}",
+            DEATH_TIMEOUT.as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The count of a notice `framebuffer: <n> lines dropped`, with or without
+/// its newline; `None` for any other text.
+fn fb_drop_count(text: &[u8]) -> Option<u64>
+{
+    let text = core::str::from_utf8(text).ok()?;
+    let count = text
+        .trim_end_matches('\n')
+        .strip_prefix("framebuffer: ")?
+        .strip_suffix(" lines dropped")?;
+    count.parse().ok()
 }
 
 /// Check logd's flush barrier, with the serial driver running and stopped
@@ -267,9 +455,7 @@ pub fn logd_flush_phase(caps: &Caps)
         "logd_flush: a stale version not refused"
     );
 
-    std::os::seraph::log!("logd_flush: a line before a flush with the serial driver running");
-    let first = flush_answer(flush, None).unwrap_or_else(|e| panic!("{e}"));
-    let took = await_flushed(flush, first, LOG_CALL_BOUND).unwrap_or_else(|e| panic!("{e}"));
+    let took = flush_while_running(flush).unwrap_or_else(|e| panic!("{e}"));
     std::os::seraph::log!(
         "logd_flush: flushed in {} ms with the serial driver running",
         took.as_millis()
@@ -278,45 +464,15 @@ pub fn logd_flush_phase(caps: &Caps)
     let serial = super::crash::badge_named(authority, SERIAL_NAME)
         .expect("logd_flush: LIST_PROCESSES lists no serial driver");
     let threads = attach(authority, serial, "serial");
-    let mut stopped = None;
-    for attempt in 1..=STOP_ATTEMPTS
-    {
-        stop(&threads, "serial");
-        // The line's call waits on the stopped driver up to the stall bound,
-        // so another thread makes it while this one flushes. No assertion
-        // panics until the driver runs again, since its message would wait
-        // behind it.
-        let line = std::thread::spawn(|| {
-            std::os::seraph::log!("logd_flush: a line while the serial driver is stopped");
-        });
-        let answered = flush_while_stopped(flush);
-        start(&threads, "serial");
-        let _ = line.join();
-        if matches!(answered, Ok(None)) && attempt < STOP_ATTEMPTS
-        {
-            std::os::seraph::log!(
-                "logd_flush: the serial sink was stalled at the driver's stop (attempt \
-                 {attempt} of {STOP_ATTEMPTS}); stopping it again"
-            );
-            // The line above returns once queued on the stalled sink; the
-            // writer's next completed write ends the stall.
-            std::thread::sleep(STALL_CLEAR);
-            continue;
-        }
-        stopped = Some(answered);
-        break;
-    }
+    stop(&threads, "serial");
+    // The line is retained at once and its write waits on the stopped driver.
+    // No assertion panics until the driver runs again, since its message
+    // would wait behind the line.
+    std::os::seraph::log!("logd_flush: a line while the serial driver is stopped");
+    let answered = flush_while_stopped(flush);
+    start(&threads, "serial");
     detach(authority, serial, threads, "serial");
-    let (hint, took) = match stopped
-    {
-        Some(Ok(Some(answer))) => answer,
-        Some(Err(e)) => panic!("{e}"),
-        Some(Ok(None)) | None => panic!(
-            "logd_flush: no flush pending within {} ms of the serial driver's stop, in \
-             {STOP_ATTEMPTS} stops",
-            STALL_SEEN.as_millis()
-        ),
-    };
+    let (hint, took) = answered.unwrap_or_else(|e| panic!("{e}"));
     std::os::seraph::log!(
         "logd_flush: pending with a {hint} ms hint, then flushed in {} ms with the serial driver \
          stopped",
@@ -324,42 +480,67 @@ pub fn logd_flush_phase(caps: &Caps)
     );
 }
 
-/// With the serial driver stopped: start flushes until one is pending, which
-/// must happen before [`STALL_SEEN`] passes, with a hint within the stall
-/// bound, then ask again with its token until it is flushed, within twice the
-/// stall bound. The hint and the time to flushed; `None` when no flush was
-/// pending, since the sink was stalled from the stop on (a write the stop cut
-/// off); or the first failure.
-fn flush_while_stopped(flush: u64) -> Result<Option<(u32, Duration)>, String>
+/// With the serial driver running: log [`RUNNING_BURST`] lines and start a
+/// flush, until one is pending, then ask again with its token until it is
+/// flushed, within the log client's bound. A flush answered `FLUSHED` at once
+/// is one the sink did not hold, since it is still stalled from the first
+/// phase or wrote the burst before the call (`services/logd/docs/ipc-interface.md`
+/// § Flush barrier); the burst is repeated after 10 ms for twice the stall
+/// bound. The time from the pending answer to flushed, or the first failure.
+fn flush_while_running(flush: u64) -> Result<Duration, String>
 {
     let start_at = Instant::now();
-    let (token, hint) = loop
+    loop
     {
-        match flush_answer(flush, None)?
+        for i in 0..RUNNING_BURST
         {
-            FlushAnswer::Pending { token, retry_ms } => break (token, retry_ms),
-            FlushAnswer::Flushed { .. } if start_at.elapsed() < STALL_SEEN =>
-            {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            FlushAnswer::Flushed { .. } => return Ok(None),
+            std::os::seraph::log!(
+                "logd_flush: line {i} before a flush with the serial driver running"
+            );
         }
+        let answer = flush_answer(flush, None)?;
+        if matches!(answer, FlushAnswer::Pending { .. })
+        {
+            return await_flushed(flush, answer, LOG_CALL_BOUND);
+        }
+        if start_at.elapsed() > STALL_BOUND.saturating_mul(2)
+        {
+            return Err(format!(
+                "logd_flush: no flush pending with the serial driver running within {} ms",
+                STALL_BOUND.saturating_mul(2).as_millis()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// With the serial driver stopped and a line of svctest's unwritten: start a
+/// flush, which must be pending, with a hint within the stall bound, then ask
+/// again with its token until it is flushed, within twice the stall bound.
+/// The hint and the time to flushed, or the first failure.
+fn flush_while_stopped(flush: u64) -> Result<(u32, Duration), String>
+{
+    let FlushAnswer::Pending { token, retry_ms } = flush_answer(flush, None)?
+    else
+    {
+        return Err(
+            "logd_flush: a flush answered FLUSHED with a line unwritten on the stopped serial \
+             driver"
+                .to_string(),
+        );
     };
-    if !(1..=SINK_STALL_MS).contains(&hint)
+    if !(1..=SINK_STALL_MS).contains(&retry_ms)
     {
         return Err(format!(
-            "logd_flush: retry hint {hint} ms outside 1 to {SINK_STALL_MS} ms"
+            "logd_flush: retry hint {retry_ms} ms outside 1 to {SINK_STALL_MS} ms"
         ));
     }
     let took = await_flushed(
         flush,
-        FlushAnswer::Pending {
-            token,
-            retry_ms: hint,
-        },
+        FlushAnswer::Pending { token, retry_ms },
         STALL_BOUND.saturating_mul(2),
     )?;
-    Ok(Some((hint, took)))
+    Ok((retry_ms, took))
 }
 
 /// Ask again, after each pending answer's hint, until `flush` answers flushed
@@ -428,49 +609,10 @@ fn await_restarted(class: u64)
     }
 }
 
-/// Stop the restarted framebuffer driver `process` and flood logd until a
-/// line waits out the stall bound on it (see the module documentation),
-/// starting the driver again after each try; the longest call of that try.
-/// The try's calls must stay under the flood's bounds, a failed try being
-/// tried again until [`DEATH_TIMEOUT`] (see the module documentation), and
-/// the last line sent must be in logd's history, read through `query`.
-fn await_stall_on(query: u64, authority: u64, process: u64) -> Duration
-{
-    let start_at = Instant::now();
-    loop
-    {
-        let threads = attach(authority, process, "restarted framebuffer");
-        stop(&threads, "restarted framebuffer");
-        let sent = send_lines(
-            "restarted framebuffer stopped",
-            FLOOD_LINES,
-            FLOOD_LINE_BYTES,
-            LOG_CALL_BOUND,
-        );
-        start(&threads, "restarted framebuffer");
-        detach(authority, process, threads, "restarted framebuffer");
-        let in_time = start_at.elapsed() < DEATH_TIMEOUT;
-        match sent
-        {
-            Ok((lines, longest)) if longest >= STALL_SEEN =>
-            {
-                check_retained(query, &lines, "restarted framebuffer stopped");
-                return longest;
-            }
-            Ok(_) => assert!(
-                in_time,
-                "logd_sinks: logd's framebuffer writer did not reach the restarted driver"
-            ),
-            Err(e) => assert!(in_time, "{e}"),
-        }
-        std::thread::sleep(RESOLVE_RETRY);
-    }
-}
-
 /// Attach to `process`, the driver named `what`, and check that it is
 /// debuggable and off the core path; the caps of its threads, main thread
 /// first.
-fn attach(authority: u64, process: u64, what: &str) -> Vec<u64>
+pub(super) fn attach(authority: u64, process: u64, what: &str) -> Vec<u64>
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let msg = IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
@@ -507,7 +649,7 @@ fn attach(authority: u64, process: u64, what: &str) -> Vec<u64>
 
 /// Stop every thread in `threads`; on a failure, start again those already
 /// stopped, so the driver is not left stopped when the phase fails.
-fn stop(threads: &[u64], what: &str)
+pub(super) fn stop(threads: &[u64], what: &str)
 {
     for (i, &thread) in threads.iter().enumerate()
     {
@@ -520,7 +662,7 @@ fn stop(threads: &[u64], what: &str)
 }
 
 /// Start every thread in `threads` again.
-fn start(threads: &[u64], what: &str)
+pub(super) fn start(threads: &[u64], what: &str)
 {
     for &thread in threads
     {
@@ -530,7 +672,7 @@ fn start(threads: &[u64], what: &str)
 }
 
 /// Let go of `process` (`DETACH_PROCESS`) and delete its thread caps.
-fn detach(authority: u64, process: u64, threads: Vec<u64>, what: &str)
+pub(super) fn detach(authority: u64, process: u64, threads: Vec<u64>, what: &str)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let msg = IpcMessage::builder(procmgr_labels::DETACH_PROCESS)
@@ -549,71 +691,6 @@ fn detach(authority: u64, process: u64, threads: Vec<u64>, what: &str)
     {
         let _ = syscall::cap_delete(cap);
     }
-}
-
-/// Send `count` numbered lines tagged `case`, each padded to `pad_to` bytes
-/// (newline included) when longer than its text, one raw `STREAM_BYTES` call
-/// each on svctest's log cap. The first must be answered within `first`,
-/// every later one within [`STALL_BOUND`]. Each line's text before its
-/// padding, with the longest call, or the first failure: no assertion panics
-/// here, since a sink driver may be stopped, and a panic's message would
-/// wait behind it.
-fn send_lines(
-    case: &str,
-    count: usize,
-    pad_to: usize,
-    first: Duration,
-) -> Result<(Vec<Vec<u8>>, Duration), String>
-{
-    let cap = std::os::seraph::log::acquire();
-    let ipc_buf = std::os::seraph::current_ipc_buf();
-    let mut sent = Vec::with_capacity(count);
-    let mut longest = Duration::ZERO;
-    for i in 0..count
-    {
-        let within = if i == 0 { first } else { STALL_BOUND };
-        let bound = u32::try_from(within.as_millis()).unwrap_or(u32::MAX);
-        let head = format!("logd_sinks: line {i} of {count} while the {case}").into_bytes();
-        let mut line = head.clone();
-        line.resize(line.len().max(pad_to.saturating_sub(1)), b'.');
-        line.push(b'\n');
-        let label = STREAM_BYTES | ((line.len() as u64) << 16) | level_bits(LEVEL_INFO);
-        let msg = IpcMessage::builder(label).bytes(0, &line).build();
-        let start_at = Instant::now();
-        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
-        let reply = unsafe { ipc::ipc_call_timeout(cap, &msg, ipc_buf, bound) }.map_err(|e| {
-            format!("logd_sinks: line {i} with the {case} not answered within {bound} ms ({e})")
-        })?;
-        let took = start_at.elapsed();
-        if reply.label != 0
-        {
-            return Err(format!(
-                "logd_sinks: line {i} with the {case} refused ({:#x})",
-                reply.label
-            ));
-        }
-        if took >= within
-        {
-            return Err(format!(
-                "logd_sinks: line {i} with the {case} took {} ms, not under {bound} ms",
-                took.as_millis()
-            ));
-        }
-        longest = longest.max(took);
-        sent.push(head);
-    }
-    Ok((sent, longest))
-}
-
-/// Require a line that starts with the last of `lines` in logd's history.
-fn check_retained(query: u64, lines: &[Vec<u8>], case: &str)
-{
-    let last = lines.last().expect("logd_sinks: no line sent");
-    let history = super::procmgr::logd_history(query, None);
-    assert!(
-        history.iter().any(|(_, bytes)| bytes.starts_with(last)),
-        "logd_sinks: the last line sent with the {case} is not in logd's history"
-    );
 }
 
 /// Kill the driver `process`, named `what`: stop its main thread, set its

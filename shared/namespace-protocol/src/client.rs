@@ -174,10 +174,7 @@ impl<'a> PathWalk<'a>
         kind: u64,
     ) -> Result<(), StepError>
     {
-        if consumed == 0 || consumed > request.components
-        {
-            return Err(StepError::ConsumedOutOfRange);
-        }
+        consumed_in_range(consumed, request.components)?;
         for _ in 0..consumed
         {
             let after = self
@@ -188,12 +185,40 @@ impl<'a> PathWalk<'a>
                 .unwrap_or_default();
             self.rest = skip_separators(after);
         }
+        self.may_stop_at(kind)
+    }
+
+    /// Whether the walk, as it stands after a reply, may have reached an entry
+    /// of `kind` (the reply's `data[0]`): an entry that is not a directory
+    /// only when no component remains.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError::NotADirectory`] when components remain and `kind` is not
+    /// a directory.
+    pub(crate) fn may_stop_at(&self, kind: u64) -> Result<(), StepError>
+    {
         if !self.is_finished() && kind != NodeKind::Dir as u64
         {
             return Err(StepError::NotADirectory);
         }
         Ok(())
     }
+}
+
+/// Whether a reply's `consumed` count is one a request of `carried`
+/// components allows: 1 to `carried`.
+///
+/// # Errors
+///
+/// [`StepError::ConsumedOutOfRange`] for zero or a count past `carried`.
+pub(crate) fn consumed_in_range(consumed: u64, carried: u64) -> Result<(), StepError>
+{
+    if consumed == 0 || consumed > carried
+    {
+        return Err(StepError::ConsumedOutOfRange);
+    }
+    Ok(())
 }
 
 /// `path` without its leading separators.
@@ -297,5 +322,47 @@ mod tests
         let mut walk = PathWalk::new(b"a/b");
         walk.advance(&request, 2, NodeKind::File as u64).unwrap();
         assert!(walk.is_finished());
+    }
+}
+
+/// Proofs of the client's check of a server's `NS_LOOKUP` reply
+/// (docs/testing.md § Bounded verification, Parser proofs).
+///
+/// The reply's words, the consumed count and the kind, are a server's and
+/// may be hostile; the path is the client's own. [`PathWalk::advance`] checks
+/// the count with `consumed_in_range` before it moves, skips that many
+/// components of the client's path, and checks the kind with
+/// `PathWalk::may_stop_at`. The count proof proves the count check on every
+/// count and every request's component count, and the kind proof the kind
+/// check on every kind, with components left and with none. What lies outside
+/// the proofs is the skip, `PathWalk::request` and the walk's reading of the
+/// path, which read the client's own path and no server's word; the fuzz
+/// target `namespace-protocol` and the replay of the checked-in inputs check
+/// them, and the whole walk against the replies, on paths of every length.
+#[cfg(kani)]
+mod proofs
+{
+    use crate::property;
+
+    /// Every reply's count is taken exactly when it is 1 to the request's
+    /// component count, for every count and component count. No loop.
+    #[kani::proof]
+    fn every_reply_count_is_checked_against_its_request()
+    {
+        property::consumed_holds(kani::any(), kani::any());
+    }
+
+    /// Every reply's kind is checked against whether components remain: the
+    /// walks of the paths of up to two bytes, `a` and `/` among them, hold
+    /// a component and none. The longest loops are the walks of the two
+    /// bytes, so an unwind bound of 4 covers them.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn every_reply_kind_is_checked_against_the_rest_of_the_walk()
+    {
+        let path: [u8; 2] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= path.len());
+        property::stop_holds(&crate::client::PathWalk::new(&path[..len]), kani::any());
     }
 }

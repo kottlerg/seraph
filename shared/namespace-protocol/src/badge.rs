@@ -362,3 +362,19 @@ mod tests
         assert_eq!(r, rights);
     }
 }
+
+/// Proof of the badge encoders' contract with the decoders (docs/testing.md
+/// § Bounded verification, Parser proofs) on every node, identifier and
+/// rights mask: they read words, so the proof takes every value of each.
+#[cfg(kani)]
+mod proofs
+{
+    use crate::property;
+
+    /// Every badge the encoders make decodes to what they packed. No loop.
+    #[kani::proof]
+    fn every_packed_badge_decodes_to_its_fields()
+    {
+        property::badge_holds(kani::any(), kani::any(), kani::any());
+    }
+}

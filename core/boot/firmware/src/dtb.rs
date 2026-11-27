@@ -352,20 +352,36 @@ fn close<S: Copy, const D: usize>(states: &[S; D], depth: &mut usize) -> Closed<
 /// `reg` (`#address-cells = <1>` under `/cpus`), and its `status` does not
 /// start with `disabled`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cpu
+pub struct Cpu<'a>
 {
     /// The hart ID, its `reg`.
     pub hart_id: u32,
-    /// The `HART_CAP_*` bits of the [`HART_CAP_NAMES`](crate::isa::HART_CAP_NAMES) extensions its
-    /// `riscv,isa-extensions` list or legacy `riscv,isa` string names.
-    pub caps: u64,
+    /// The `riscv,isa-extensions` list's value, the last when the node
+    /// repeats it, or empty when it has none.
+    pub isa_extensions: &'a [u8],
+    /// The legacy `riscv,isa` string's value, likewise.
+    pub isa: &'a [u8],
     /// The S-mode paging mode its `mmu-type` claims ([`mmu_type`]).
     pub mmu: Option<PagingMode>,
 }
 
+impl Cpu<'_>
+{
+    /// The `HART_CAP_*` bits of the [`HART_CAP_NAMES`](crate::isa::HART_CAP_NAMES) extensions
+    /// the node's `riscv,isa-extensions` list or legacy `riscv,isa` string
+    /// names.
+    #[must_use]
+    pub fn caps(&self) -> u64
+    {
+        crate::isa::hart_caps(|ext| {
+            compatible_contains(self.isa_extensions, ext) || isa_string_has_ext(self.isa, ext)
+        })
+    }
+}
+
 /// The state of one open node for [`CpuWalk`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CpuState
+pub struct CpuState<'a>
 {
     /// `compatible` names `riscv`.
     pub is_riscv_cpu: bool,
@@ -373,36 +389,39 @@ pub struct CpuState
     pub hart_id: Option<u32>,
     /// `status` starts with `disabled`.
     pub disabled: bool,
-    /// The `HART_CAP_*` bits named so far.
-    pub caps: u64,
+    /// The `riscv,isa-extensions` value, the last when the node repeats it.
+    pub isa_extensions: &'a [u8],
+    /// The `riscv,isa` value, the last when the node repeats it.
+    pub isa: &'a [u8],
     /// The `mmu-type` claim.
     pub mmu: Option<PagingMode>,
 }
 
-impl CpuState
+impl CpuState<'_>
 {
     /// A node with no property read.
     pub const EMPTY: Self = Self {
         is_riscv_cpu: false,
         hart_id: None,
         disabled: false,
-        caps: 0,
+        isa_extensions: &[],
+        isa: &[],
         mmu: None,
     };
 }
 
 /// The walk that reports every enabled CPU node ([`Cpu`]).
-pub struct CpuWalk<const D: usize>
+pub struct CpuWalk<'a, const D: usize>
 {
     /// The open nodes' states.
-    pub states: [CpuState; D],
+    pub states: [CpuState<'a>; D],
     /// Nodes open.
     pub depth: usize,
     /// What the walk met past its bounds.
     pub limits: Limits,
 }
 
-impl<const D: usize> Default for CpuWalk<D>
+impl<const D: usize> Default for CpuWalk<'_, D>
 {
     fn default() -> Self
     {
@@ -414,10 +433,10 @@ impl<const D: usize> Default for CpuWalk<D>
     }
 }
 
-impl<const D: usize> CpuWalk<D>
+impl<'a, const D: usize> CpuWalk<'a, D>
 {
     /// Take one event, yielding a closing node that is an enabled CPU.
-    pub fn step(&mut self, event: FdtEvent<'_>) -> Step<Cpu>
+    pub fn step(&mut self, event: FdtEvent<'a>) -> Step<Cpu<'a>>
     {
         match event
         {
@@ -438,7 +457,8 @@ impl<const D: usize> CpuWalk<D>
                 {
                     (true, Some(hart_id)) => Step::Yield(Cpu {
                         hart_id,
-                        caps: s.caps,
+                        isa_extensions: s.isa_extensions,
+                        isa: s.isa,
                         mmu: s.mmu,
                     }),
                     _ => Step::Continue,
@@ -461,7 +481,7 @@ impl<const D: usize> CpuWalk<D>
 }
 
 /// Record the property `name` of value `data` into the CPU-node state `s`.
-pub fn record_cpu_prop(s: &mut CpuState, name: &[u8], data: &[u8])
+pub fn record_cpu_prop<'a>(s: &mut CpuState<'a>, name: &[u8], data: &'a [u8])
 {
     match name
     {
@@ -469,11 +489,8 @@ pub fn record_cpu_prop(s: &mut CpuState, name: &[u8], data: &[u8])
         b"compatible" => s.is_riscv_cpu |= compatible_contains(data, b"riscv"),
         b"reg" if data.len() >= 4 => s.hart_id = Some(be_u32(data, 0)),
         b"status" => s.disabled |= data.starts_with(b"disabled"),
-        b"riscv,isa-extensions" =>
-        {
-            s.caps |= crate::isa::hart_caps(|ext| compatible_contains(data, ext));
-        }
-        b"riscv,isa" => s.caps |= crate::isa::hart_caps(|ext| isa_string_has_ext(data, ext)),
+        b"riscv,isa-extensions" => s.isa_extensions = data,
+        b"riscv,isa" => s.isa = data,
         b"mmu-type" => s.mmu = mmu_type(data),
         _ =>
         {}
@@ -824,7 +841,7 @@ impl<'a> Tree<'a>
 
     /// Call `f` on each enabled CPU node, in tree order, until it returns
     /// `false`.
-    pub fn for_each_cpu(&self, mut f: impl FnMut(Cpu) -> bool)
+    pub fn for_each_cpu(&self, mut f: impl FnMut(Cpu<'a>) -> bool)
     {
         let mut walk = CpuWalk::<MAX_DEPTH>::default();
         for event in self.fdt.events()
@@ -943,7 +960,7 @@ impl<'a> Tree<'a>
         let mut all = u64::MAX;
         self.for_each_cpu(|cpu| {
             seen = true;
-            all &= cpu.caps;
+            all &= cpu.caps();
             true
         });
         (self.timebase_frequency(), if seen { all } else { 0 })
@@ -1553,6 +1570,40 @@ mod tests
     }
 
     #[test]
+    fn caps_join_both_isa_properties()
+    {
+        let blob = tree(None, |b| {
+            cpu_node(
+                b,
+                b"cpu@0",
+                0,
+                &[
+                    (b"riscv,isa-extensions", b"i\0sstc\0"),
+                    (b"riscv,isa", b"rv64i_svinval\0"),
+                ],
+            );
+        });
+        assert_eq!(hart_caps(&blob).1, HART_CAP_SSTC | HART_CAP_SVINVAL);
+    }
+
+    #[test]
+    fn caps_read_a_repeated_property_by_its_last_value()
+    {
+        let blob = tree(None, |b| {
+            cpu_node(
+                b,
+                b"cpu@0",
+                0,
+                &[
+                    (b"riscv,isa-extensions", b"i\0sstc\0"),
+                    (b"riscv,isa-extensions", b"i\0svinval\0"),
+                ],
+            );
+        });
+        assert_eq!(hart_caps(&blob).1, HART_CAP_SVINVAL);
+    }
+
+    #[test]
     fn cap_denied_only_for_the_bit_a_hart_lacks()
     {
         // Per-bit AND: hart 1 advertises svinval but not sstc/svpbmt, so
@@ -2008,14 +2059,16 @@ mod proofs
         }
     }
 
-    /// Any CPU-node state.
-    fn cpu_state() -> CpuState
+    /// Any CPU-node state with no ISA property, whose value a step only
+    /// replaces.
+    fn cpu_state<'a>() -> CpuState<'a>
     {
         CpuState {
             is_riscv_cpu: kani::any(),
             hart_id: kani::any(),
             disabled: kani::any(),
-            caps: kani::any(),
+            isa_extensions: &[],
+            isa: &[],
             mmu: mmu(),
         }
     }
@@ -2131,13 +2184,17 @@ mod proofs
     /// value of up to the bytes given: a `compatible` of 8, which holds
     /// `riscv` at a list's second place (`a\0riscv\0`); a `reg` of 5, a cell
     /// and one past it; a `status` of 9, `disabled` and one past it; a
-    /// `riscv,isa-extensions` and a `riscv,isa` of 5, which hold `sstc` with
-    /// its NUL; and an `mmu-type` of 12, `riscv,sv57x` with its NUL. Whether
-    /// a list names an entry is the shared `compatible_contains`'s, proved in
-    /// `firmware_tables`, and an ISA string's reading over longer strings is
-    /// `every_isa_string_names_its_whole_segments`'s, so these two harnesses
-    /// check that the step records the reading in the open node. The
-    /// loops are the values' entries, the extension names and the states'
+    /// `riscv,isa-extensions` and a `riscv,isa` of 5, which the step keeps
+    /// whole in the open node; and an `mmu-type` of 12, `riscv,sv57x` with
+    /// its NUL. Whether a list names an entry is the shared
+    /// `compatible_contains`'s, proved in `firmware_tables`. The two ISA
+    /// properties are read only by `Cpu::caps`, over the names of
+    /// `HART_CAP_NAMES`: each name's reading of an ISA string is
+    /// `every_isa_string_names_its_whole_segments`'s, the bits the names
+    /// give are `isa::hart_caps`'s, which the host tests check over every
+    /// subset of the table, and `Cpu::caps` over whole trees is the fuzz
+    /// target's, against `cpu_walks_hold`, so no step harness's cost grows
+    /// with the table. The loops are the values' entries and the states'
     /// compare, so each unwinds two past its value's bytes; the names are
     /// constants, whose compares need no unwinding.
     macro_rules! cpu_property_proofs {

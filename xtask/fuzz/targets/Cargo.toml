@@ -19,6 +19,7 @@ bin = [
     { name = "gpt", path = "src/bin/gpt.rs", test = false },
     { name = "hwrng-protocol", path = "src/bin/hwrng-protocol.rs", test = false },
     { name = "init-protocol", path = "src/bin/init-protocol.rs", test = false },
+    { name = "namespace-protocol", path = "src/bin/namespace-protocol.rs", test = false },
     { name = "objsig", path = "src/bin/objsig.rs", test = false },
     { name = "planted-length", path = "src/bin/planted-length.rs", test = false },
     { name = "planted-magic", path = "src/bin/planted-magic.rs", test = false },
@@ -44,6 +45,7 @@ firmware-tables = { path = "../../../shared/firmware-tables" }
 fuzz-engine = { path = "../engine" }
 hwrng-protocol = { path = "../../../shared/hwrng-protocol" }
 init-protocol = { path = "../../../abi/init-protocol" }
+namespace-protocol = { path = "../../../shared/namespace-protocol" }
 objsig = { path = "../../../shared/objsig" }
 storage-statement = { path = "../../../shared/storage-statement" }
 vfsd-gpt = { path = "../../../services/vfsd/gpt" }

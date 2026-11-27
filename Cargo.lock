@@ -294,6 +294,7 @@ dependencies = [
  "fuzz-engine",
  "hwrng-protocol",
  "init-protocol",
+ "namespace-protocol",
  "objsig",
  "storage-statement",
  "vfsd-gpt",

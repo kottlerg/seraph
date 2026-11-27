@@ -43,6 +43,8 @@ pub mod badge;
 pub mod client;
 pub mod gate;
 pub mod name;
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
 pub mod rights;
 pub mod wire;
 
@@ -505,28 +507,117 @@ fn handle_lookup<B: NamespaceBackend>(
 /// leading, trailing or doubled `/`, included) otherwise.
 fn lookup_path(msg: &ipc::IpcMessage) -> Result<&[u8], WalkError>
 {
-    let path_len = ((msg.label >> 16) & 0xFFFF) as usize;
+    let path = request_path(msg.label, msg.data_bytes()).ok_or(WalkError {
+        error: NsError::InvalidName,
+        component: 0,
+    })?;
+    path_components(path)?;
+    Ok(path)
+}
+
+/// Check each `/`-separated component of `path` as [`validate_name`] does,
+/// scanning the path one character at a time.
+///
+/// # Errors
+///
+/// [`NsError::InvalidName`] at the first component that fails
+/// [`validate_name`] (an empty one, from a leading, trailing or doubled `/`,
+/// included).
+pub(crate) fn path_components(path: &[u8]) -> Result<(), WalkError>
+{
+    let mut scan = PathScan::START;
+    let mut rest = path;
+    while !rest.is_empty()
+    {
+        let width;
+        (scan, width) = scan.step(rest)?;
+        rest = rest.get(width..).unwrap_or_default();
+    }
+    scan.finish()
+}
+
+/// Where a scan of an `NS_LOOKUP` path, one character at a time, stands:
+/// the index of the component being scanned, and the scan of its name so
+/// far.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct PathScan
+{
+    /// The index of the component being scanned.
+    pub(crate) component: u64,
+    /// The scan of that component's name so far.
+    pub(crate) name: name::NameScan,
+}
+
+impl PathScan
+{
+    /// The scan of no byte: at the start of component 0.
+    pub(crate) const START: Self = Self {
+        component: 0,
+        name: name::NameScan::START,
+    };
+
+    /// Scan the character `rest` starts with: a `/` ends the component,
+    /// whose name is then judged, and starts the next; any other character
+    /// is scanned into the component's name. Answers the scan after it and
+    /// its width.
+    ///
+    /// # Errors
+    ///
+    /// [`NsError::InvalidName`] at the component when the character, or the
+    /// name a `/` ends, fails [`validate_name`]'s rules.
+    pub(crate) fn step(self, rest: &[u8]) -> Result<(Self, usize), WalkError>
+    {
+        let at = |_| WalkError {
+            error: NsError::InvalidName,
+            component: self.component,
+        };
+        if rest.first() == Some(&b'/')
+        {
+            self.name.finish().map_err(at)?;
+            // A path holds at most `MAX_LOOKUP_PATH_LEN` components, so the
+            // count does not saturate.
+            let next = Self {
+                component: self.component.saturating_add(1),
+                name: name::NameScan::START,
+            };
+            return Ok((next, 1));
+        }
+        let (name, width) = self.name.step(rest).map_err(at)?;
+        Ok((
+            Self {
+                component: self.component,
+                name,
+            },
+            width,
+        ))
+    }
+
+    /// Judge the last component's name at the path's end.
+    ///
+    /// # Errors
+    ///
+    /// [`NsError::InvalidName`] at the component when its name fails
+    /// [`validate_name`]'s rules.
+    pub(crate) fn finish(self) -> Result<(), WalkError>
+    {
+        self.name.finish().map_err(|_| WalkError {
+            error: NsError::InvalidName,
+            component: self.component,
+        })
+    }
+}
+
+/// The path bytes of an `NS_LOOKUP` request with `label` and the data bytes
+/// `data`: the `path_len` bytes after the rights word, `path_len` being
+/// the label's bits 16..32. `None` when `path_len` is zero, longer than
+/// [`MAX_LOOKUP_PATH_LEN`], or longer than the data after the rights word.
+fn request_path(label: u64, data: &[u8]) -> Option<&[u8]>
+{
+    let path_len = ((label >> 16) & 0xFFFF) as usize;
     // The rights word takes data bytes 0..8; the path starts at byte 8.
-    let path = msg
-        .data_bytes()
-        .get(8..)
+    data.get(8..)
         .and_then(|rest| rest.get(..path_len))
         .filter(|_| path_len != 0 && path_len <= MAX_LOOKUP_PATH_LEN)
-        .ok_or(WalkError {
-            error: NsError::InvalidName,
-            component: 0,
-        })?;
-    for (component, name) in (0u64..).zip(path.split(|&b| b == b'/'))
-    {
-        if validate_name(name).is_err()
-        {
-            return Err(WalkError {
-                error: NsError::InvalidName,
-                component,
-            });
-        }
-    }
-    Ok(path)
 }
 
 /// Walk `path` from directory `dir`, which the caller holds with
@@ -791,6 +882,8 @@ fn nth_visible_entry<B: NamespaceBackend>(
 #[cfg(test)]
 mod tests
 {
+    extern crate std;
+
     use super::*;
 
     #[test]
@@ -1510,5 +1603,139 @@ mod tests
             0,
         );
         assert_eq!(reply.label, NsError::PermissionDenied.as_label());
+    }
+
+    /// The checked-in inputs of the fuzz target `namespace-protocol` of the
+    /// `kinds` given (`seeds`, `regressions`).
+    fn fuzz_inputs(kinds: &[&str]) -> std::vec::Vec<std::vec::Vec<u8>>
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/namespace-protocol");
+        let mut inputs = std::vec::Vec::new();
+        for kind in kinds
+        {
+            let Ok(entries) = std::fs::read_dir(dir.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in entries
+            {
+                inputs.push(std::fs::read(entry.unwrap().path()).unwrap());
+            }
+        }
+        inputs
+    }
+
+    // Defect caught: a parser change that breaks its contract on an input
+    // the fuzz target once found or started from; `cargo xtask test` replays
+    // every checked-in input of fuzz/namespace-protocol/ on each change.
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_parser_contract()
+    {
+        let inputs = fuzz_inputs(&["seeds", "regressions"]);
+        assert!(
+            !inputs.is_empty(),
+            "no checked-in input under fuzz/namespace-protocol"
+        );
+        for bytes in &inputs
+        {
+            property::namespace_protocol_holds(bytes);
+        }
+    }
+
+    // Defect caught: seeds that no longer reach an accepted lookup path, so
+    // the search starts from no request a server walks.
+    #[test]
+    fn a_seed_is_a_lookup_request_the_server_walks()
+    {
+        let walked = fuzz_inputs(&["seeds"]).iter().any(|bytes| {
+            let words: std::vec::Vec<u64> = bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|word| u64::from_le_bytes(*word))
+                .collect();
+            let msg = ipc::IpcMessage::builder(words[0])
+                .words(0, &words[2..])
+                .build();
+            lookup_path(&msg).is_ok_and(|path| path.contains(&b'/'))
+        });
+        assert!(walked, "no seed is a lookup of more than one component");
+    }
+}
+
+/// Proofs of the request decoders: `request_path` on every request of up to
+/// one header and one path past the longest, and `path_components` by steps,
+/// as `name.rs` proves `validate_name`: each step of the scan, from any
+/// state, over every rest of up to five bytes; the end of the scan from any
+/// state; and the whole check on every path of up to three bytes, so the
+/// scan starts, ends a component at a `/` (`a/b`), refuses an empty one,
+/// and ends.
+/// `lookup_path` is `request_path` followed by `path_components`.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{MAX_LOOKUP_PATH_LEN, PathScan, name::NameScan, property};
+
+    /// A request's data: the 8-byte header, the longest path, and a word past
+    /// it.
+    const DATA_BOUND: usize = 8 + MAX_LOOKUP_PATH_LEN + 8;
+
+    /// Any state a path scan can stand in, and more.
+    fn any_scan() -> PathScan
+    {
+        PathScan {
+            component: kani::any(),
+            name: NameScan {
+                len: kani::any(),
+                dots_only: kani::any(),
+            },
+        }
+    }
+
+    /// Every request's path is cut inside its data, or the request refused.
+    #[kani::proof]
+    fn every_lookup_path_is_cut_inside_its_request()
+    {
+        let data: [u8; DATA_BOUND] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= data.len());
+        property::request_path_holds(kani::any(), &data[..len]);
+    }
+
+    /// Step of the path scan: from any state, every rest of up to five bytes
+    /// either ends a component at a `/` or steps its name. The longest loop
+    /// is the character check's comparison of up to four bytes, so an unwind
+    /// bound of 6 covers it.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn each_character_of_a_path_steps_its_scan()
+    {
+        let rest: [u8; 5] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= rest.len());
+        property::path_step_holds(any_scan(), &rest[..len]);
+    }
+
+    /// End of the path scan: from any state, the last component is judged as
+    /// a name.
+    #[kani::proof]
+    fn every_path_scan_ends_on_its_last_component()
+    {
+        property::path_finish_holds(any_scan());
+    }
+
+    /// Base of the path scan: every path of up to three bytes is checked
+    /// component by component. The longest loops are the walks of the three
+    /// bytes, the scan's and the property's split and name checks, so an
+    /// unwind bound of 5 covers every loop.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_short_lookup_path_is_checked_component_by_component()
+    {
+        let path: [u8; 3] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= path.len());
+        property::components_holds(&path[..len]);
     }
 }

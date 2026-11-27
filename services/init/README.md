@@ -99,10 +99,10 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    shutdown (a benign hold, not a wedge).
    svcmgr publishes the well-known names it now owns (`rootfs.root`,
    `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
-   `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`,
-   `logd.flush`), configures devmgr's device classes and publishes each as
-   `devmgr.class.<stem>` (the class file's name without `.class`), and
-   installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR` from the endowment (see [svcmgr
+   `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`, `logd.follow`,
+   `logd.control`, `logd.flush`), configures devmgr's device classes and publishes each as
+   `devmgr.class.<stem>` (the class file's name without `.class`), and installs devmgr's
+   `/services/drivers/` cap via `SET_DRIVERS_DIR` from the endowment (see [svcmgr
    IPC interface](../svcmgr/docs/ipc-interface.md)); it then launches the non-bootstrap services
    itself — real-logd (the log sink), `timed` and `pwrmgr` (providers), `entropyd`, `terminal`, the
    staged test harnesses — and publishes their names (see [svcmgr](../svcmgr/README.md)). The

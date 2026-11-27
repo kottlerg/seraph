@@ -19,6 +19,13 @@ pub mod current;
 
 pub mod nospec;
 
+// The riscv64 register-map and encoding arithmetic is pure, so its proofs run
+// on every host: `cargo kani` builds only the host's architecture module
+// above (docs/testing.md § Bounded verification).
+#[cfg(all(kani, not(target_arch = "riscv64")))]
+#[path = "riscv64/encoding.rs"]
+mod riscv64_encoding;
+
 /// Which privilege level a new thread runs at, selecting its first-dispatch
 /// interrupt state in `context::new_state` (the first-dispatch trampoline rule of
 /// core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership).

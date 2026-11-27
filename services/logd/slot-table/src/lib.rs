@@ -452,29 +452,39 @@ impl History
     }
 
     /// Retain `entry` as `slot`'s newest, under the next `seq`, and return
-    /// that `seq`: drop the slot's oldest entries while it holds
-    /// [`Bounds::per_slot`], then entries ([`Self::victim`]) until the new
-    /// one fits in [`Bounds::bytes`]. The slot of a sender no window holds
-    /// back ([`unwindowed`]) keeps the entries a `hold` sink shows and has
-    /// not written past [`Bounds::per_slot`], within [`Bounds::bytes`]:
-    /// nothing else paces it to the sink, and the kernel's records are
-    /// acknowledged once written.
+    /// that `seq`: while the slot holds [`Bounds::per_slot`], drop its
+    /// oldest entry no `hold` sink keeps ([`Self::kept`]), then entries
+    /// ([`Self::victim`]) until the new one fits in [`Bounds::bytes`]. A
+    /// window counts only the entries a holding sink shows, so a sender's
+    /// lines below every `hold` sink's level are not paced, and they must not
+    /// push out its own lines a sink has still to write; when every entry of
+    /// the slot is kept, its oldest goes. The slot of a sender no window holds
+    /// back ([`unwindowed`]) instead keeps the entries a `hold` sink shows
+    /// and has not written past [`Bounds::per_slot`], within
+    /// [`Bounds::bytes`]: nothing else paces it to the sink, and the kernel's
+    /// records are acknowledged once written.
     fn push(&mut self, slot: &mut Slot, entry: HistoryEntry) -> u64
     {
         let keep_unwritten = unwindowed(entry.badge);
         while slot.seqs.len() >= self.bounds.per_slot
-            && let Some(&oldest) = slot.seqs.front()
         {
-            let unwritten = self
-                .entries
-                .get(&oldest)
-                .is_some_and(|held| self.kept(oldest, held));
-            if keep_unwritten && unwritten
+            let free = slot.seqs.iter().position(|&seq| {
+                self.entries
+                    .get(&seq)
+                    .is_none_or(|held| !self.kept(seq, held))
+            });
+            let index = match free
+            {
+                Some(index) => index,
+                None if keep_unwritten => break,
+                None => 0,
+            };
+            let Some(seq) = slot.seqs.remove(index)
+            else
             {
                 break;
-            }
-            slot.seqs.pop_front();
-            self.remove(oldest);
+            };
+            self.remove(seq);
         }
         self.make_room(entry.charge());
         let seq = self.next_seq;
@@ -1480,6 +1490,39 @@ mod tests
             2,
             "a skip sink counts toward no window"
         );
+    }
+
+    // Defect caught: a sender's burst of lines below the hold sink's level,
+    // which no window paces, pushing its own unwritten info line out of the
+    // per-slot bound; and, with every entry kept, the bound not holding.
+    #[test]
+    fn the_per_slot_bound_drops_a_senders_unshown_lines_before_its_unwritten_ones()
+    {
+        let mut table = SlotTable::default();
+        table.history.set_mark(0, Some(mark(0, INFO, Pace::Hold)));
+        let info = push(&mut table, 1, INFO, b"info");
+        for _ in 0..PER_SLOT_HISTORY_MIN + 4
+        {
+            push(&mut table, 1, DEBUG, b"debug");
+        }
+        let seqs = seqs_of(&table, 1);
+        assert_eq!(seqs.len(), PER_SLOT_HISTORY_MIN);
+        assert_eq!(seqs[0], info, "the unwritten info line stays");
+        let mut kept_all = SlotTable::default();
+        kept_all
+            .history
+            .set_mark(0, Some(mark(0, INFO, Pace::Hold)));
+        for _ in 0..PER_SLOT_HISTORY_MIN + 4
+        {
+            push(&mut kept_all, 1, INFO, b"info");
+        }
+        assert_eq!(seqs_of(&kept_all, 1).len(), PER_SLOT_HISTORY_MIN);
+        assert_eq!(
+            seqs_of(&kept_all, 1)[0],
+            4,
+            "the oldest goes when all are kept"
+        );
+        assert_eq!(table.history.bytes(), recount(&table));
     }
 
     // Defect caught: the byte bound evicting an entry a hold sink shows and has

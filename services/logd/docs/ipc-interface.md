@@ -70,10 +70,11 @@ arrive in the IPC message's data words, packed at word 0. logd
 appends the bytes to the slot keyed by the kernel-delivered
 `msg.badge`; every `\n` flushes the slot's partial buffer as one
 line, retained under the state lock in logd's history as the slot's entry with
-its level and time. Each sink's writer renders the entry as
-`[sec.usfrac] LEVEL  [name] <line>\r\n` (§ Levels) when it reaches it and writes
-it to the serial driver (`SERIAL_WRITE_BYTES`) and the framebuffer driver
-(`FB_WRITE_BYTES`) when one is present (§ Output sinks).
+its level and time. Each sink whose level shows the entry renders it in the sink's own format,
+by default the console format `[sec.usfrac] LEVEL  [name] <line>\r\n` (§ Levels;
+[sinks.md](sinks.md) § Settings), when its writer reaches it, and writes it to its driver: the
+serial driver (`SERIAL_WRITE_BYTES`), and the framebuffer driver (`FB_WRITE_BYTES`) when one is
+present (§ Output sinks).
 
 logd's history holds the completed entries of every slot, text lines and records, within
 the history's byte bound (256 KiB to 2 MiB with the machine's RAM) together, and at most the
@@ -347,20 +348,22 @@ a record's field table again when it installs the chunk.
 
 The history is also the journal the sinks write from (§ Output sinks). It holds every live and
 retired slot's entries within a byte bound fixed when logd starts: the machine's RAM over 2048
-(`RAM_PER_HISTORY_BYTE`), within `HISTORY_BYTES_MIN` (256 KiB) and `HISTORY_BYTES_MAX` (2 MiB),
-the RAM read from memmgr's `QUERY_POOL_STATUS` and the floor when memmgr does not answer
-(`Bounds::for_ram`). Each entry is charged its bytes, its field table, and its key and value in
-the history map. Retaining an entry past the bound drops the oldest entry the serial sink has
-written, or, when it has written none of them, the oldest entry of the slot with the most entries
-it has not written, until the new one fits. A slot keeps at most its last
-`PER_SLOT_HISTORY_MIN` (32) entries, scaled by the byte bound's ratio to the floor, a further entry
-dropping its own oldest, so one sender logging without pause does not push a quieter or a dead
-sender's last lines out alone. The kernel's slot and logd's own are the exception: no window paces
-them (§ Hold window), so a further entry of theirs drops their oldest entry the `hold` sinks have
-written, and keeps the ones they have not, which the byte bound alone then limits. An entry dropped
-before a sink reached it is counted as that sink's drop. The bound holds whatever the number of
-senders, so a logd restarted while memory is critical, to which every live sender is new, holds no
-more history than any other ([README](../README.md) § Role, Reserve service).
+(`RAM_PER_HISTORY_BYTE`), within `HISTORY_BYTES_MIN` (256 KiB) and `HISTORY_BYTES_MAX` (2 MiB), the
+RAM read from memmgr's `QUERY_POOL_STATUS` and the floor when memmgr does not answer
+(`Bounds::for_ram`). Each entry is charged its bytes, its field table, and its key and value in the
+history map. Retaining an entry past the bound drops the oldest entry no `hold` sink (serial by
+default) shows and has not written, or, when every entry is such, the oldest entry of the slot with
+the most entries, until the new one fits. A slot keeps at most its last `PER_SLOT_HISTORY_MIN` (32)
+entries, scaled by the byte bound's ratio to the floor, a further entry dropping its own oldest
+entry no `hold` sink shows and has not written, else its oldest, so one sender logging without pause
+does not push a quieter or a dead sender's last lines out alone, and a sender's lines below every
+`hold` sink's level, which no window paces, do not push out its own lines a sink has still to write.
+The kernel's slot and logd's own are the exception: no window paces them (§ Hold window), so a
+further entry of theirs drops their oldest entry no `hold` sink shows and has not written, and keeps
+the others, which the byte bound alone then limits. An entry dropped before a sink reached it is
+counted as that sink's drop. The bound holds whatever the number of senders, so a logd restarted
+while memory is critical, to which every live sender is new, holds no more history than any other
+([README](../README.md) § Role, Reserve service).
 
 ### Retired slots
 
@@ -597,8 +600,8 @@ ending logd, first waits on `log_labels::LOG_FLUSH` (18) until the lines logd ha
 the console, for at most a bound of its own, and goes on with the act when the wait ends, however
 it ends: flushed, timed out, refused or failed. The flush only orders the act after the console;
 it never keeps the act from happening. `ipc::log_flush::wait` holds a client's steps, and every
-holder calls it. The serial sink is the one sink that holds the log ([sinks.md](sinks.md) § Device
-sinks): a flush waits on it alone, never on the framebuffer.
+holder calls it. A flush waits on the `hold` sinks that are holding, the serial sink by default
+([sinks.md](sinks.md) § Device sinks), and on no `skip` sink, the framebuffer's default.
 
 Each holder of the barrier's authority holds it for one such act:
 

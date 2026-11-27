@@ -1724,9 +1724,13 @@ struct Cursor
     /// The entry the sink's writer has copied and is writing, whose eviction
     /// is no drop of the sink's ([`Mark::taken`]).
     taken: Option<u64>,
-    /// The `seq` after the last emergency entry the sink took: its next
+    /// The `seq` after the last emergency entry the sink moved past: its next
     /// emergency walk looks back no further, so no entry is walked twice.
     walked: u64,
+    /// The [`Self::walked`] the emergency entry being written sets once the
+    /// sink moves past it ([`Sink::advance`]); an entry a driver lost with
+    /// its endpoint is taken, and walked, again for the next driver.
+    walk_end: Option<u64>,
     /// Entries the sink has dropped and not yet reported.
     dropped: u64,
     /// A `skip` sink's drop notice the journal holds and the sink has not
@@ -2049,6 +2053,7 @@ impl Sink
         {
             cursor.next = table.history().next_seq();
             cursor.taken = None;
+            cursor.walk_end = None;
             cursor.dropped = 0;
             return Step::Idle;
         }
@@ -2087,7 +2092,7 @@ impl Sink
         if level_or_info(taken.level) == LEVEL_EMERGENCY
         {
             walk.collect(table.history(), seq, cursor.walked, &settings);
-            cursor.walked = seq.saturating_add(1);
+            cursor.walk_end = Some(seq.saturating_add(1));
         }
         if cursor.dropped > 0
         {
@@ -2107,6 +2112,10 @@ impl Sink
             {
                 cursor.next = cursor.next.max(seq.saturating_add(1));
                 cursor.taken = None;
+                if let Some(end) = cursor.walk_end.take()
+                {
+                    cursor.walked = cursor.walked.max(end);
+                }
                 cursor.dropped = cursor
                     .dropped
                     .saturating_add(u64::from(wrote != Wrote::All));
@@ -2125,6 +2134,7 @@ impl Sink
         if let Some(cursor) = st.cursors.get_mut(self.index)
         {
             cursor.taken = None;
+            cursor.walk_end = None;
         }
         st.sync_marks();
     }

@@ -16,10 +16,12 @@
 //!   logd takes their lines, the log client waiting out each `WINDOW_FULL`
 //!   refusal's hint;
 //! - a resender, which sends each line again at once when logd refuses it
-//!   `WINDOW_FULL`, and must have been refused.
+//!   `WINDOW_FULL`, and must have been refused. Its lines are at critical,
+//!   which the framebuffer sink shows at its default level.
 //!
 //! On a boot with a framebuffer driver the phase also stops that driver for
-//! the flooded calls, so logd's `skip` framebuffer sink drops lines.
+//! the flooded calls, so logd's `skip` framebuffer sink drops the
+//! resender's lines.
 //!
 //! The phase requires:
 //!
@@ -43,7 +45,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ipc::IpcMessage;
-use ipc::stream_labels::{LEVEL_INFO, STREAM_BYTES, WINDOW_FULL, level_bits};
+use ipc::stream_labels::{LEVEL_CRITICAL, LEVEL_INFO, STREAM_BYTES, WINDOW_FULL, level_bits};
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -315,7 +317,8 @@ fn flooder_main() -> !
 }
 
 /// The resender: for [`FLOOD_FOR`], raw `STREAM_BYTES` calls of numbered
-/// lines, each sent again at once while logd refuses it `WINDOW_FULL`. Exits
+/// lines at critical, so the framebuffer sink owes them, each sent again at
+/// once while logd refuses it `WINDOW_FULL`. Exits
 /// 0 once refused at least once, [`RESENDER_NEVER_REFUSED`] if never, 1 on a
 /// failed call.
 fn resender_main() -> !
@@ -330,7 +333,7 @@ fn resender_main() -> !
     while start_at.elapsed() < FLOOD_FOR
     {
         let line = format!("resend {sent}\n");
-        let label = STREAM_BYTES | ((line.len() as u64) << 16) | level_bits(LEVEL_INFO);
+        let label = STREAM_BYTES | ((line.len() as u64) << 16) | level_bits(LEVEL_CRITICAL);
         let msg = IpcMessage::builder(label).bytes(0, line.as_bytes()).build();
         loop
         {

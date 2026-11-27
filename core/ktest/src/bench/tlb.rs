@@ -3,9 +3,10 @@
 
 // core/ktest/src/bench/tlb.rs
 
-//! TLB-shootdown latency benchmark.
+//! TLB benchmarks: the shootdown latency and the reach.
 //!
-//! Pre-spawns one worker thread per available CPU (besides ktest's
+//! `tlb_reach` (below) times loads over a growing number of pages, on the
+//! harness thread alone. The shootdown benchmarks pre-spawn one worker thread per available CPU (besides ktest's
 //! own CPU 0), each pinned to a distinct CPU and running in ktest's
 //! address space — so the aspace is `current` on every CPU during
 //! the measure loop. The benchmark loop then `mem_map`s + `mem_unmap`s
@@ -41,7 +42,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use syscall::{
     cap_create_notification, cap_delete, notification_send, system_info, thread_exit, thread_yield,
 };
-use syscall_abi::SystemInfoType;
+use syscall_abi::{PAGE_SIZE, SystemInfoType};
 
 use ::bench::{Counters, Value};
 
@@ -782,4 +783,149 @@ fn gather(
         }
     }
     super::Measured::of_other_cpus(recorder.summary())
+}
+
+// ── TLB reach ─────────────────────────────────────────────────────────────────
+
+/// The `pages=` cases of `tlb_reach`, each a power of two, in increasing
+/// order: each case maps the pages the one before it left out.
+const REACH_PAGES: [u64; 5] = [16, 64, 256, 1024, 4096];
+
+/// Scratch VA (crate docs § Scratch VAs) of `tlb_reach`'s first page; its
+/// pages run up from it, 16 MiB at the largest case.
+const REACH_VA: u64 = 0x1_A000_0000;
+
+/// Loads one `tlb_reach` sample times: the line's `accesses=` extra, by
+/// which a reader divides its columns for the cycles of one access.
+const REACH_ACCESSES: u64 = 256;
+
+/// The step, in pages, between two loads of `tlb_reach`, taken modulo the
+/// case's page count. Odd, so the walk visits every page of a power-of-two
+/// count before it repeats one, and large, so consecutive loads land on
+/// pages far apart.
+const REACH_STRIDE: u64 = 509;
+
+/// The offsets within a page a `tlb_reach` load may add: a word-aligned
+/// offset inside the page.
+const REACH_OFFSET_MASK: u64 = PAGE_SIZE - 8;
+
+/// Benchmark `tlb_reach`: the cost of a load as the pages it touches grow
+/// past what the TLBs hold. One pool frame is mapped at every page of the
+/// case, so every load reads the one word at the frame's start and hits the
+/// data cache: what grows with `pages=` is the translation's cost alone. Each
+/// sample is [`REACH_ACCESSES`] loads, each at the page [`REACH_STRIDE`] pages
+/// on from the last, and each address taking the word the previous load read
+/// (always 0), so every load waits for the one before it. Under icount each
+/// case counts the same instructions; the line's worth is the host-mode time.
+pub(super) fn bench_tlb_reach(ctx: &crate::TestContext, h: &mut Harness)
+{
+    let Some(frame) = crate::frame_pool::alloc()
+    else
+    {
+        return h.skip(REACH_NAME, "frame_pool alloc failed");
+    };
+    let mut mapped: u64 = 0;
+    for &pages in &REACH_PAGES
+    {
+        if let Err(e) = map_reach_pages(ctx, frame, &mut mapped, pages)
+        {
+            h.skip(REACH_NAME, format_args!("pages={pages}: {e}"));
+            break;
+        }
+        reach_case(h, pages);
+    }
+    // SAFETY: the range is the scratch pages this benchmark mapped, which hold
+    // no Rust object.
+    let unmapped = mapped == 0
+        || unsafe { syscall::mem_unmap_reclaim(ctx.aspace_cap, REACH_VA, mapped) }.is_ok();
+    // A frame an unmap left mapped stays out of the pool rather than alias the
+    // next test's mapping.
+    if unmapped
+    {
+        // SAFETY: `frame` is from the pool, and no page maps it any more.
+        unsafe { crate::frame_pool::free(frame) };
+    }
+}
+
+/// The name of [`bench_tlb_reach`]'s lines.
+const REACH_NAME: &str = "tlb_reach";
+
+/// Map `frame` at each `tlb_reach` page from `*mapped` up to `pages`,
+/// counting each in `*mapped`; the first page's map also writes the 0 every
+/// load reads.
+fn map_reach_pages(
+    ctx: &crate::TestContext,
+    frame: u64,
+    mapped: &mut u64,
+    pages: u64,
+) -> Result<(), &'static str>
+{
+    while *mapped < pages
+    {
+        let page = reach_page(*mapped);
+        // SAFETY: the page is a scratch VA (crate docs § Scratch VAs), so it
+        // holds no Rust object or IPC page of ktest.
+        unsafe { syscall::mem_map(frame, ctx.aspace_cap, page, 0, 1, syscall::MAP_WRITABLE) }
+            .map_err(|_| "mem_map failed")?;
+        if *mapped == 0
+        {
+            // SAFETY: the page was just mapped writable at a scratch VA, where
+            // no Rust object lives.
+            unsafe { (page as *mut u64).write_volatile(0) };
+        }
+        *mapped = mapped.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// The address of `tlb_reach` page `i`; `i` is below the largest case, so the
+/// sum stays in the low scratch band.
+fn reach_page(i: u64) -> u64
+{
+    i.wrapping_mul(PAGE_SIZE).wrapping_add(REACH_VA)
+}
+
+/// One `tlb_reach` load: the word at the start of page `index`, offset by
+/// the previous load's word, kept in the page.
+#[inline]
+fn reach_load(index: u64, previous: u64) -> u64
+{
+    let address = reach_page(index).wrapping_add(previous & REACH_OFFSET_MASK);
+    // SAFETY: the address is a word-aligned offset inside a `tlb_reach` page
+    // below the case's count, which [`map_reach_pages`] mapped readable at a
+    // scratch VA, where no Rust object lives.
+    unsafe { (address as *const u64).read_volatile() }
+}
+
+/// Case `pages=pages` of `tlb_reach`, over pages already mapped: one untimed
+/// pass over every page, then [`Harness::iters`] timed samples.
+fn reach_case(h: &mut Harness, pages: u64)
+{
+    let mask = pages.wrapping_sub(1);
+    let mut index: u64 = 0;
+    let mut word: u64 = 0;
+    for _ in 0..pages
+    {
+        word = reach_load(index, word);
+        index = index.wrapping_add(REACH_STRIDE) & mask;
+    }
+    let iters = h.iters();
+    let (mut samples, counters) = h.recorder();
+    for _ in 0..iters
+    {
+        let t0 = counters.read();
+        for _ in 0..REACH_ACCESSES
+        {
+            word = reach_load(index, word);
+            index = index.wrapping_add(REACH_STRIDE) & mask;
+        }
+        samples.record(counters.read().since(&t0).cycles);
+    }
+    let summary = samples.summary();
+    h.report(
+        REACH_NAME,
+        &[("pages", Value::Num(pages))],
+        summary,
+        &[("accesses", REACH_ACCESSES)],
+    );
 }

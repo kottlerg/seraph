@@ -33,6 +33,7 @@
 mod cap;
 mod counter;
 mod event;
+mod fault;
 mod ipc;
 mod mm;
 mod notification;
@@ -109,6 +110,40 @@ impl Recorder<'_>
     }
 }
 
+/// Recorders over equal parts of the sample buffer, one per leg of a
+/// benchmark that times several legs of each operation, taken with CPU 0's
+/// idle-halt count marked where the loop began, as a [`Recorder`] is: every
+/// leg's line reports the halts of the one loop.
+pub(super) struct Legs<'a, const K: usize>
+{
+    parts: [Samples<'a>; K],
+}
+
+impl<const K: usize> Legs<'_, K>
+{
+    /// Record one sample of leg `leg`; `false` when its part is full or
+    /// there is no such leg.
+    pub(super) fn record(&mut self, leg: usize, sample: u64) -> bool
+    {
+        self.parts
+            .get_mut(leg)
+            .is_some_and(|part| part.record(sample))
+    }
+
+    /// End the measured loop: the halts of CPU 0 since the legs were taken,
+    /// read once, and each leg's summary. Call it right after the loop, as
+    /// [`Recorder::summary`].
+    pub(super) fn summaries(&mut self) -> [Measured; K]
+    {
+        let idle_halts = syscall::idle_halts().ok();
+        let mut parts = self.parts.iter_mut();
+        core::array::from_fn(|_| Measured {
+            summary: parts.next().and_then(Samples::summary),
+            idle_halts,
+        })
+    }
+}
+
 /// What a benchmark reports of its measured loop: the summary of its samples,
 /// and the halts of the measuring CPU's idle thread over the loop, reported as
 /// `idle_halts=` (`shared/bench/README.md` § Idle halts).
@@ -127,7 +162,8 @@ pub(super) struct Measured
 impl Measured
 {
     /// The summary of samples that other threads recorded on their own CPUs
-    /// (`tlb::bench_tlb_shootdown_concurrent`): no idle-halt count.
+    /// (`tlb::bench_tlb_shootdown_concurrent`, `fault_round_trip`'s
+    /// `placement=apart`): no idle-halt count.
     pub(super) const fn of_other_cpus(summary: Option<Summary>) -> Self
     {
         Self {
@@ -156,6 +192,22 @@ impl Harness
         (
             Recorder {
                 samples: Samples::new(&mut self.buf[..]),
+            },
+            &self.counters,
+        )
+    }
+
+    /// [`Harness::recorder`] for a benchmark that times `K` legs of each
+    /// operation: `K` recorders, each over `MAX_SAMPLES / K` samples of the
+    /// buffer, so such a benchmark runs at most that many iterations.
+    pub(super) fn legs<const K: usize>(&mut self) -> (Legs<'_, K>, &Counters)
+    {
+        let _ = syscall::idle_halts();
+        let per_leg = MAX_SAMPLES.checked_div(K).unwrap_or(MAX_SAMPLES).max(1);
+        let mut parts = self.buf.chunks_mut(per_leg);
+        (
+            Legs {
+                parts: core::array::from_fn(|_| Samples::new(parts.next().unwrap_or_default())),
             },
             &self.counters,
         )
@@ -373,6 +425,7 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     mm::bench_mem_map_unmap(ctx, &mut h);
     mm::bench_mem_protect(ctx, &mut h);
     mm::bench_aspace_harvest(ctx, &mut h);
+    fault::bench_fault_round_trip(ctx, &mut h);
     thread::bench_thread_lifecycle(ctx, &mut h);
     thread::bench_context_switch(ctx, &mut h);
     thread::bench_thread_read_mem(ctx, &mut h);
@@ -380,6 +433,7 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     wait_set::bench_wait_set(ctx, &mut h);
     tlb::bench_tlb_shootdown(ctx, &mut h);
     tlb::bench_tlb_shootdown_concurrent(ctx, &mut h);
+    tlb::bench_tlb_reach(ctx, &mut h);
     counter::bench_empty_window(ctx, &mut h);
 
     if syscall::thread_set_affinity(ctx.thread_cap, AFFINITY_ANY).is_err()

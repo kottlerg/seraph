@@ -1499,13 +1499,14 @@ KVM launch splits the irqchip for the offer
 also attach the test devices (`--test-devices`): QEMU's `edu` DMA test device, which svctest's DMA
 confinement and MSI forge phases drive, and five `pci-testdev` functions, which its
 on-demand-bind phase drives through the test-only test-fault driver; the ktest, svctest and
-usertest cells boot headless, so no framebuffer (the `bench` cell's ubench boots attach one,
-`--display framebuffer`); this is the main set of Driver coverage below; the no-IOMMU boot,
-`--iommu absent`,
-the framebuffer boot, `--display framebuffer`, and the debug-port boots, the `debug-port` case's
-two, are device cells (CI's `terminal` case boots, and the `shutdown` case's boots of the targets it
-kills through the GDB stub, attach the debug port too, to reach the stub over it), see Device
-surfaces, Framebuffer cell, Debug-port cell, and Release host runs below), filesystem (FAT), riscv64
+usertest cells boot headless, so no framebuffer, but for the release svctest cells, which keep QEMU
+std VGA with no window (`--display framebuffer`; Framebuffer cell below), and the `bench` cell's
+ubench boots, which attach one the same way; this is the main set of Driver coverage below; the
+no-IOMMU boot, `--iommu absent`, the framebuffer boot, `--display framebuffer`, and the
+debug-port boots, the `debug-port` case's two, are device cells (CI's `terminal` case boots, and
+the `shutdown` case's boots of the targets it kills through the GDB stub, attach the debug port
+too, to reach the stub over it), see Device surfaces, Framebuffer cell, Debug-port cell, and Release
+host runs below), filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57` are manual, same
 posture as CPU-count variations), riscv64 Zkr entropy source (on — runs without it via `cargo xtask
 run --riscv-zkr off` are manual, same posture), the idle wait (the halting idle, but for the
@@ -1530,7 +1531,7 @@ to the tiers below.
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR: the cells its change owes ([conventions.md § CI Gating](conventions.md#ci-gating)) | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof whose pass no run of the repository stored at the same inputs (the `kani` jobs, [Bounded verification](#bounded-verification)) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, the svctest boots headless in both profiles, no `cargo xtask test` case or cell boots), and every bounded proof whose pass no run of the repository stored at the same inputs (the `kani` jobs, [Bounded verification](#bounded-verification)) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation, the large-memory cell, and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
 
@@ -1545,7 +1546,7 @@ registry runs it on (its `md-test-cells` rule).
 
 | Cell | Tier | Architectures | Launch | Cases | Covers |
 |---|---|---|---|---|---|
-| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `crasher-once`, `memhog`, `reserve-creator`, `stopsrc`), crashd's test recipe and oomd's test recipe | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, the restart, out-of-memory, and stop-source paths its fixtures drive, the crash reports of its boot ([Crash reports](#crash-reports)), and the console's whole lines ([Console whole lines](#console-whole-lines)) |
+| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `crasher-once`, `memhog`, `reserve-creator`, `stopsrc`), crashd's test recipe and oomd's test recipe; in release, QEMU std VGA with no window (`--display framebuffer`), failing on `framebuffer case skipped` | none | the services harness: the main set's drivers and the test devices, in release the framebuffer driver and the framebuffer cases of svctest's drivers and `logd_sinks` phases (Framebuffer cell below), in debug the boot with no display, DMA confinement and MSI delivery, the filesystem, the restart, out-of-memory, and stop-source paths its fixtures drive, the crash reports of its boot ([Crash reports](#crash-reports)), and the console's whole lines ([Console whole lines](#console-whole-lines)) |
 | `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `storage-roles`, `shutdown` | the programs surface, a boot with no crash report ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob; on riscv64 debug with `--idle-wait on`, and on x86_64 debug a second boot, of a focused ktest with `--idle-wait on` | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), KASLR, and the monitored idle wait ([Idle wait](#idle-wait-ktest-cell)) |
 | `bench` | Canonical | x86_64, riscv64; release | the bench-only ktest bundle, then the init image with ubench staged and a framebuffer, each under icount (`--icount`), at 1 CPU (three runs) and 4 CPUs (one) | none | each kernel and userspace benchmark's instruction count against its baseline ([Benchmarks](#benchmarks-bench-cell)) |
@@ -1557,7 +1558,7 @@ registry runs it on (its `md-test-cells` rule).
 | shared-line | Local and release host runs | x86_64, riscv64; debug | as second-disk, both disks on one `INTx` line (`--second-disk-shared-line`) | none | two virtio-blk devices served on one interrupt line |
 | oversize-block | Local and release host runs | x86_64, riscv64; debug | svctest with a second disk at 8192-byte blocks (`--second-disk-block-size 8192`) | none | the refusal of a disk above virtio-blk's largest block size |
 | no-iommu | Local and release host runs | x86_64, riscv64; debug | svctest with the IOMMU detached (`--iommu absent`) | none | devmgr's unconfined path (Release host runs below) |
-| framebuffer | Local and release host runs | x86_64, riscv64; debug | svctest with QEMU std VGA and no window (`--display framebuffer`) | none | the framebuffer driver (Framebuffer cell below) |
+| framebuffer | Local and release host runs | x86_64, riscv64; debug | svctest with QEMU std VGA and no window (`--display framebuffer`) | none | the framebuffer driver in the debug profile (Framebuffer cell below) |
 | debug-port | Local and release host runs | x86_64, riscv64; debug | the debug port's `virtio-console` device | `debug-port` | the virtio-console driver, the debug port, and the GDB stub (Debug-port cell below) |
 | hotplug | Local and release host runs | x86_64, riscv64; debug | two empty PCI Express root ports | `hotplug` | PCI Express hotplug (Hotplug cell below) |
 | cet | Local and release host runs | x86_64; debug | KVM on CET shadow stacks, the ktest bundle | `cet` | CET shadow stacks (CET cell below) |
@@ -1608,19 +1609,23 @@ surface.
     which the test-only test-fault driver serves in svctest's on-demand-bind phase, and, on x86_64,
     `vmgenid`, the generation source the kernel's snapshot detection reads: the `vmgenid` case.
 
-  The canonical boots are headless, so the main set holds no framebuffer. Every code PR's CI cells
+  The main set holds no framebuffer: a system with no display is a supported configuration, which
+  the debug svctest cells and the ktest and usertest cells boot headless; the release svctest cells
+  boot QEMU std VGA beside it (Framebuffer cell below). Every code PR's CI cells
   boot the main set. A driver joins it only by replacing the main device of its type; any other
   driver adds cells to its own device surface (Device surfaces below), not to the main set.
 - **Tag set.** The main set and every driver with a QEMU-testable device, filesystem drivers
   included, each through its cells: the release host runs boot every device cell before each tag
-  (Release host runs below), and burn-in repeats the canonical cells. The framebuffer driver's
-  device, QEMU std VGA, is outside the main set because the canonical boots are headless; the
-  framebuffer cell (Framebuffer cell below) boots it. The virtio-console driver's device, the debug
-  port, is outside it because only a launch that asks for a debug port attaches it: the
-  debug-port cell (Debug-port cell below) boots it, and in CI the `terminal` case's boots and
-  the `shutdown` case's GDB-stub boots attach it to reach the stub over it. The TPM driver's
-  device, a TPM 2.0 behind QEMU's `tpm-tis` or `tpm-crb` and backed by `swtpm`, is outside it
-  because only the `tpm` case attaches it; the tpm cell (TPM cell below) boots it.
+  (Release host runs below), and burn-in repeats the canonical cells' boots, its svctest boots
+  headless in both profiles. The framebuffer driver's device, QEMU std VGA, is outside the main set
+  because the boot with no display is the one every canonical harness makes; the release svctest
+  cells boot it on every change that owes them, and the framebuffer cell (Framebuffer cell below)
+  boots it in the debug profile. The virtio-console driver's device, the debug port, is outside it
+  because only a launch that asks for a debug port attaches it: the debug-port cell (Debug-port cell
+  below) boots it, and in CI the `terminal` case's boots and the `shutdown` case's GDB-stub boots
+  attach it to reach the stub over it. The TPM driver's device, a TPM 2.0 behind QEMU's `tpm-tis` or
+  `tpm-crb` and backed by `swtpm`, is outside it because only the `tpm` case attaches it; the tpm
+  cell (TPM cell below) boots it.
 - **Hardware only.** A driver whose device QEMU cannot present has no QEMU cell in either set; its
   README documents a hardware test procedure, and it is exercised on real hardware by that
   procedure. No in-tree driver is in this tier.
@@ -2187,7 +2192,12 @@ and `logd_sinks` phases run their framebuffer cases
 `framebuffer case skipped`. The boot passes on svctest's pass marker with no
 such line: its `--fail-also 'framebuffer case skipped'` makes a boot that logs the skip a `FAIL`.
 svctest is staged as `build-test.yml` stages it, on a debug-profile sysroot, as the commands
-below spell out. Its budget, 960 s, is the larger of three times the slower of the two boots on
+below spell out. CI's release svctest cells make the same boot in the release profile, with the
+same pattern beside their own (`build-test.yml`, [build-system.md](build-system.md) § Continuous
+Integration), on every change that owes them. The framebuffer cell is still owed beside them, by a
+non-inert change to the framebuffer device surface (Device surfaces above) and at every release host
+run: it boots the debug profile, whose debug assertions and overflow checks the release boots
+compile out. Its budget, 960 s, is the larger of three times the slower of the two boots on
 the reference host (the riscv64 boot, 301 s) and that boot plus 100 s, rounded up to a minute, the
 rule the disk variations' budget follows; a change to these boots' times re-derives it. The boot
 is the framebuffer device cell (Device surfaces above).

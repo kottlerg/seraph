@@ -131,7 +131,7 @@ direct console paths remain as fallbacks for the life of the system.
    gives it ([logd handover protocol](../services/logd/docs/handover-protocol.md) § Kernel log): a
    thread of its own waits on a notification the kernel signals and retains each record as the
    kernel's `[kernel]` line in the kernel's slot, which the sinks write as any line and every
-   `logd.query` holder can read. A record is acknowledged on the
+   `logd.query` or `logd.follow` holder can read. A record is acknowledged on the
    reader's next read once its line is written or its sink stalled, so a record a failure report
    flushes is one no sink took.
 
@@ -306,8 +306,10 @@ early-kernel console; svctest's and usertest's reach serial only:
   recipe lowers its level. No harness-specific framebuffer path exists.
 
 Serial is the authoritative marker channel: CI scrapes serial and
-runs the harnesses headless, where logd's framebuffer sink writes nothing (see
-[docs/testing.md](testing.md)).
+runs the harnesses headless, where logd's framebuffer sink writes nothing, but for the release
+svctest cells, which attach a framebuffer for svctest's framebuffer cases, and the `bench` cell's
+ubench boots, which attach one for ubench's framebuffer measurements (see
+[docs/testing.md](testing.md#coverage-tiers) § Coverage tiers).
 
 Every framebuffer renderer — the bootloader, kernel, and ktest direct
 renderers and the userspace driver — shares one byte→glyph chain

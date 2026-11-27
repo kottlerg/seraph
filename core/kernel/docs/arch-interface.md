@@ -73,7 +73,10 @@ pub mod current;
 
 Each architecture's tests run with its module as `current`: `cargo xtask test` runs the host
 tests on the host and again built for riscv64 under QEMU's user-mode emulator
-([xtask/README.md](../../../xtask/README.md) § `cargo xtask test`).
+([xtask/README.md](../../../xtask/README.md) § `cargo xtask test`). The bounded proofs run on the
+host only, so `arch/mod.rs` also includes `riscv64/encoding.rs` as `riscv64_encoding` under
+`cfg(kani)` on any other architecture, which puts that module's proofs in the host's run
+([docs/testing.md](../../../docs/testing.md#bounded-verification) § Bounded verification).
 
 The sections below document the **cross-architecture contract surface** — the functions,
 types, and module-level constants architecture-neutral code depends on, plus the items every

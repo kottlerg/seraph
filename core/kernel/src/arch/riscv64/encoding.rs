@@ -1063,6 +1063,10 @@ mod proofs
                 _ => assert!(last && result == Err(SeedError::TimedOut) && asked.get() == 1),
             }
         }
+        if result.is_err()
+        {
+            assert!(read > 0 && opst(values[read - 1]) != 0b10);
+        }
         if let Ok(built) = result
         {
             assert!(read == READS && built == word && asked.get() == 0);

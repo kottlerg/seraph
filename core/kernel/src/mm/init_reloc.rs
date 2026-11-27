@@ -408,7 +408,8 @@ mod proofs
     /// address it had and only ever takes write away: a byte of the live
     /// segment lies, after it, in exactly one segment, which translates it to
     /// the same physical address with the same flags or, from `ReadWrite`,
-    /// `Read`.
+    /// `Read`, and every segment after it lies inside the live segment, so
+    /// no byte outside it is mapped.
     ///
     /// The walk judges each live segment alone against the range, reading and
     /// writing only that segment and, for a split, the next free slot, so one
@@ -457,5 +458,16 @@ mod proofs
             );
         }
         assert_eq!(found, 1);
+
+        // Nothing outside the segment is mapped after it: the head and the
+        // tail of a split are both inside it.
+        for seg in segments.iter().take(count as usize)
+        {
+            assert!(seg.virt_addr >= old.virt_addr);
+            assert!(
+                u128::from(seg.virt_addr) + u128::from(seg.size)
+                    <= u128::from(old.virt_addr) + u128::from(old.size)
+            );
+        }
     }
 }

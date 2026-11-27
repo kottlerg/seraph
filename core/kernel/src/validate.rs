@@ -322,9 +322,10 @@ mod proofs
     /// `layout::direct_map_ceiling`) fold each entry into a maximum
     /// alone, so `ENTRIES` and `IOAPICS` entries of any values cover a
     /// longer table: a further entry is one more term of the same fold. The
-    /// walks run at most `IOAPICS + 2` regions (the local APIC, the
-    /// default I/O APIC or the table's), so an unwind bound of `IOAPICS +
-    /// 3` covers every loop.
+    /// longest walk is the MMIO regions', at most `IOAPICS + 1` (the local
+    /// APIC, then the default I/O APIC or the table's), which its iterator
+    /// steps through in `IOAPICS + 2` iterations, so an unwind bound of
+    /// `IOAPICS + 3` covers every loop.
     #[kani::proof]
     #[kani::unwind(5)]
     fn any_boot_info_is_read_in_bounds_and_accepted_only_in_bounds()

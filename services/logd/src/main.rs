@@ -19,18 +19,21 @@
 //! death EQ and its registration, the wait set, the receive pool's workers
 //! (spawned behind its gate, `services/logd/docs/ipc-interface.md`
 //! § Receive pool), the output sinks' writer threads ([`Sink`]), the handover
-//! pull, the release of the self-log lines held until init-logd stops writing
-//! the UART ([`SELF_LOG_HOLD`]), the kernel log reader's thread
-//! ([`read_kernel_log`]), then the gate's opening and the control loop.
+//! pull, the opening of the sinks once init-logd stops writing the UART
+//! ([`open_output`]), the kernel log reader's thread ([`read_kernel_log`]),
+//! then the gate's opening and the control loop. logd's journal, its
+//! history, is retained from the first line logd logs about itself: the
+//! machine's RAM, read from memmgr before it, sizes it ([`history_bounds`]).
 
 mod handover;
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use death_set::OverflowWatch;
+use ipc::log_badges::LOG_BADGE_LOGD;
 use ipc::log_flush::{FLUSH_DENIED, FlushAnswer};
 use ipc::log_labels::{
     LOG_FLUSH, LOG_FLUSH_AUTHORITY, LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS,
@@ -39,22 +42,23 @@ use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal
 use ipc::log_record::{RECORD_MAX_BYTES, Record};
 use ipc::serve::Reply;
 use ipc::stream_labels::{
-    LEVEL_INFO, LEVEL_WARN, NAME_UNKNOWN, RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES,
-    STREAM_RECORD, STREAM_REGISTER_NAME, level_of, sender_named,
+    LEVEL_INFO, LEVEL_NOTICE, LEVEL_WARN, NAME_UNKNOWN, RECORD_ACCEPTED, RECORD_REJECTED,
+    STREAM_BYTES, STREAM_RECORD, STREAM_REGISTER_NAME, WINDOW_FULL, level_of, sender_named,
 };
-use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
-use logd_codec::hold::HeldLines;
-use logd_codec::kernel::{Accept, Cursor, KERNEL_NAME, KernelLine};
+use ipc::{IpcMessage, memmgr_labels, procmgr_errors, procmgr_labels};
+use logd_codec::history::ENTRY_MAX_BYTES;
+use logd_codec::kernel::{Accept, KERNEL_NAME, KernelLine};
 use logd_codec::reclaim::{Cause, ReclaimLine};
 use logd_codec::record::RENDERED_MAX_BYTES;
-use logd_codec::sink::{
-    HEADER_BYTES, LineKind, Offer, Popped, SINK_QUEUE_BYTES, SINK_STALL_MS, SinkQueue,
-};
+use logd_codec::sink::SINK_STALL_MS;
 use recv_pool::{IpcBuf, RecvPool, SpawnError};
 use std::os::seraph::startup_info;
 use syscall::RIGHTS_EQ_POST;
 
-use logd_slot_table::{Eviction, History, LINE_BUF_SIZE, MAX_NAME_LEN, Slot, SlotTable};
+use logd_slot_table::{
+    Admit, Bounds, Eviction, History, HistoryEntry, LINE_BUF_SIZE, MAX_NAME_LEN, Origin, Slot,
+    SlotTable, admit, lines_completed,
+};
 
 /// `WaitSet` badge for the death-notification event queue.
 const WS_BADGE_DEATH: u64 = 1;
@@ -170,6 +174,10 @@ fn main() -> !
         syscall::thread_exit();
     };
 
+    // The journal's bounds, before the first line logd retains.
+    let bounds = history_bounds(startup.memmgr_endpoint, ipc_buf);
+    let _ = STATE.set(Mutex::new(LogdState::new(bounds)));
+
     // logd serves the log endpoint, so it must never emit through it. Route
     // panic / alloc-error / precondition output to the serial driver (the
     // path `self_log` already uses) via the std panic sink, and drop the
@@ -180,18 +188,20 @@ fn main() -> !
 
     // Register the serial and framebuffer class watches and resolve both
     // drivers through devmgr first: a halt on any later step writes its
-    // `FATAL` line and the held self-log lines, and the panic sink its
-    // output, only to a resolved serial driver. This runs while init-logd
+    // `FATAL` line and the lines logd retained before it, and the panic sink
+    // its output, only to a resolved serial driver. This runs while init-logd
     // still drains the log endpoint: after the release the endpoint has no
     // reader until the receive pool's gate opens, and devmgr may then be
     // logging (`services/devmgr/docs/responsibilities.md`, the on-disk
-    // settle). Until a driver is resolved its sink queues the lines, up to
-    // its queue, counts those past it, and writes both to the driver resolved
-    // next (`Sink::offer`), while history still accrues; the main thread
-    // resolves it again when devmgr signals its class's watch.
+    // settle). Until a driver is resolved the journal keeps the lines for its
+    // sink's cursor, within the history's bounds; the main thread resolves it
+    // again when devmgr signals its class's watch.
     let watches = resolve_output_drivers(caps.serial_class, caps.fb_class, ipc_buf);
+    // The serial sink's class is known now: its cursor is the hold mark
+    // from here, on a restart too, where no handover install sets it.
+    state().sync_hold_mark();
 
-    let mut table = SlotTable::default();
+    let mut table = SlotTable::with_bounds(bounds);
 
     // Set up the death-notification queue + wait set and register with procmgr
     // BEFORE pulling the handover. The pull causes init-logd to exit, which
@@ -223,10 +233,6 @@ fn main() -> !
         syscall::thread_exit();
     };
     let logd: &'static Logd = Box::leak(Box::new(Logd {
-        state: Mutex::new(LogdState {
-            table: SlotTable::default(),
-            deaths: OverflowWatch::new(DEATH_EQ_CAPACITY),
-        }),
         death_eq,
         resync_note,
     }));
@@ -262,7 +268,7 @@ fn main() -> !
         }
     }
     // The sinks' writers, spawned now for the same reason as the receive
-    // workers; until each runs, its lines are written inline.
+    // workers; they write once the sinks open.
     spawn_writers();
 
     if caps.log_ep_handover_send != 0
@@ -281,17 +287,18 @@ fn main() -> !
         // SAFETY: ipc_buf is the registered IPC buffer page.
         unsafe { handover::transfer(caps.log_ep_handover_send, ipc_buf, &mut table) };
         let _ = syscall::cap_delete(caps.log_ep_handover_send);
+        let (slots, entries) = (table.slots.len(), table.history().len());
+        // The handover's entries go before logd's own lines, which are newer.
+        install_table(table);
         // Init-logd has acknowledged the release and writes no more (or no
         // release reached it, and holding longer would only lose the lines):
-        // write the held self-log lines.
-        open_self_log();
+        // the sinks write the journal from here on.
+        open_output();
 
         let mut buf = SerialFmt::new();
         let _ = write!(
             buf,
-            "handover complete: {} slots, {} history entries",
-            table.slots.len(),
-            table.history().len(),
+            "handover complete: {slots} slots, {entries} history entries"
         );
         self_log(buf.as_str());
     }
@@ -301,33 +308,52 @@ fn main() -> !
         // so there is no handover source (svcmgr serves `cap[1]` to every
         // restart before that). Serve a fresh table; in-flight history from
         // the prior instance is not recoverable. No init-logd writes the UART,
-        // so nothing needs holding.
-        open_self_log();
+        // so the sinks write at once.
+        open_output();
         self_log("started (restart); no handover source, serving fresh");
     }
 
-    logd.lock().table = table;
     start_kernel_reader(caps.kernel_log, logd);
     pool.open();
     let mut resync = Resync::new(caps.procmgr_death_auth_send, resync_note);
     control_loop(ws_cap, logd, &mut resync, watches, ipc_buf);
 }
 
-/// The state logd's receive workers and its main thread share.
+/// The caps logd's receive workers and its main thread share; the state
+/// they share is [`STATE`].
 struct Logd
 {
-    /// The badge table and the death-drain count, under one lock: every
-    /// worker's request and every drain step takes it, and none holds it
-    /// across an IPC call (`services/logd/docs/ipc-interface.md` § Receive
-    /// pool).
-    state: Mutex<LogdState>,
     /// RECV on the death-notification `EventQueue`.
     death_eq: u64,
     /// The resync notification ([`RESYNC_WALK_DONE`], [`RESYNC_REQUESTED`]).
     resync_note: u64,
 }
 
-/// What [`Logd::state`] guards.
+/// The badge table with the journal, the death-drain count, and the sinks'
+/// cursors, under one lock: every worker's request, every drain step and
+/// every sink's step takes it, and none holds it across an IPC call
+/// (`services/logd/docs/ipc-interface.md` § Receive pool). Set by `main`
+/// once the history's bounds are known, before logd retains a line.
+static STATE: OnceLock<Mutex<LogdState>> = OnceLock::new();
+
+/// Signalled when an entry is retained and when the sinks open: the writers'
+/// wake.
+static RETAINED: Condvar = Condvar::new();
+
+/// Signalled when a sink's cursor moves: the kernel log reader's wake
+/// ([`await_hold_passed`]).
+static PROGRESS: Condvar = Condvar::new();
+
+/// The state lock ([`STATE`]); the floor's bounds when `main` has not set it.
+fn state() -> MutexGuard<'static, LogdState>
+{
+    STATE
+        .get_or_init(|| Mutex::new(LogdState::new(Bounds::FLOOR)))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What [`STATE`] guards.
 struct LogdState
 {
     table: SlotTable,
@@ -335,13 +361,95 @@ struct LogdState
     /// any thread, as one thread's drain from a ready queue to an empty one
     /// would take them ([`drain_deaths`]).
     deaths: OverflowWatch,
+    /// Each device sink's place in the journal, in [`SINKS`]' order.
+    cursors: [Cursor; 2],
+    /// Whether the sinks write the journal: set once init-logd writes the
+    /// UART no more ([`open_output`]).
+    open: bool,
+}
+
+impl LogdState
+{
+    /// The state at start: an empty table whose history keeps `bounds`,
+    /// with logd's own slot named.
+    fn new(bounds: Bounds) -> Self
+    {
+        let mut table = SlotTable::with_bounds(bounds);
+        table.install_from_handover(LOG_BADGE_LOGD, b"logd");
+        let mut state = Self {
+            table,
+            deaths: OverflowWatch::new(DEATH_EQ_CAPACITY),
+            cursors: [Cursor::default(); 2],
+            open: false,
+        };
+        state.sync_hold_mark();
+        state
+    }
+
+    /// Tell the history where the `hold` sink's cursor is, so its eviction
+    /// drops written entries first and a sender's window counts from it; no
+    /// mark when the bootstrap carried no serial class.
+    fn sync_hold_mark(&mut self)
+    {
+        let held = (SERIAL.driver.class() != 0)
+            .then(|| self.cursors.get(SERIAL.index).map(|c| c.next))
+            .flatten();
+        self.table.history_mut().set_held_from(held);
+    }
 }
 
 impl Logd
 {
-    fn lock(&self) -> MutexGuard<'_, LogdState>
+    #[expect(
+        clippy::unused_self,
+        reason = "the state is a static, so it exists for the lines logd logs before `Logd`                   does; the method keeps the callers' one way to the lock"
+    )]
+    fn lock(&self) -> MutexGuard<'static, LogdState>
     {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        state()
+    }
+}
+
+/// Install `table`, the handover's, as logd's: the entries logd retained
+/// before it, which no sink has read since the sinks are not open, are
+/// retained after its own ([`SlotTable::absorb`]). A sink that passes
+/// `relayed` entries starts after the handover's, every one of which
+/// init-logd wrote to its device: the `seq` gaps among them are lines
+/// init-logd evicted after writing them, not the sink's drops.
+fn install_table(table: SlotTable)
+{
+    let mut st = state();
+    let relayed_end = table.history().next_seq();
+    let earlier = core::mem::replace(&mut st.table, table);
+    st.table.absorb(earlier);
+    for sink in SINKS
+    {
+        if sink.relayed == Relayed::Pass
+            && let Some(cursor) = st.cursors.get_mut(sink.index)
+        {
+            cursor.next = cursor.next.max(relayed_end);
+        }
+    }
+    st.sync_hold_mark();
+}
+
+/// The history's bounds for the machine's RAM, as memmgr reports it
+/// (`QUERY_POOL_STATUS` `data[0]`, `system_ram_bytes`), asked once with a
+/// call bounded by [`SINK_STALL_MS`], so logd never waits on memmgr; the
+/// floor's bounds when the call is not answered in time or is refused
+/// (`services/logd/docs/sinks.md` § The journal).
+fn history_bounds(memmgr: u64, ipc_buf: *mut u64) -> Bounds
+{
+    if memmgr == 0
+    {
+        return Bounds::FLOOR;
+    }
+    let msg = IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    match unsafe { ipc::ipc_call_timeout(memmgr, &msg, ipc_buf, SINK_STALL_MS) }
+    {
+        Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS => Bounds::for_ram(reply.word(0)),
+        _ => Bounds::FLOOR,
     }
 }
 
@@ -680,20 +788,23 @@ fn evict_missing(snapshot: &[u64], live: &[u64], logd: &Logd)
 }
 
 /// Log the reclaim line for the evicted slot of `badge`, named `name`, as a
-/// record (`logd_codec::reclaim`), so the name cannot read as a further
-/// field.
+/// record of logd's (`logd_codec::reclaim`), so the name cannot read as a
+/// further field.
 fn log_reclaim(badge: u64, cause: Cause, name: &[u8])
 {
     let w = ReclaimLine { badge, cause, name }.record();
     // A record `RecordWriter` built decodes.
     if let Ok(record) = Record::decode(w.as_bytes())
     {
-        let mut out = LineBuf::new();
-        out.push_prefix(b"logd", LEVEL_INFO);
-        logd_codec::record::render(&record, |b| out.push(b));
-        out.push(b'\r');
-        out.push(b'\n');
-        out.flush();
+        {
+            let mut st = state();
+            if let Some((slot, history)) = st.table.sender_slot(LOG_BADGE_LOGD)
+            {
+                let _ =
+                    history.push_record(slot, LOG_BADGE_LOGD, elapsed_us(), LEVEL_INFO, &record);
+            }
+        }
+        retained();
     }
 }
 
@@ -809,13 +920,11 @@ fn serve_request(logd: &Logd, msg: &IpcMessage, reply: &mut Reply)
     let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
     if label_id == STREAM_BYTES
     {
-        let status = consume_bytes(logd, msg.badge, msg, byte_len);
-        reply.set_status(status);
+        consume_bytes(logd, msg.badge, msg, byte_len).reply(reply);
     }
     else if label_id == STREAM_RECORD
     {
-        let status = consume_record(logd, msg.badge, msg, byte_len);
-        reply.set_status(status);
+        consume_record(logd, msg.badge, msg, byte_len).reply(reply);
     }
     else if label_id == STREAM_REGISTER_NAME
     {
@@ -835,6 +944,56 @@ fn serve_request(logd: &Logd, msg: &IpcMessage, reply: &mut Reply)
         // Unknown / legacy label (e.g. GET_LOG_CAP from a hypothetical
         // pre-pivot caller). Reply empty so the sender unblocks.
         reply.set_status(0);
+    }
+}
+
+/// What logd did with a sender's `STREAM_BYTES` or `STREAM_RECORD`
+/// message.
+enum Consumed
+{
+    /// Answered with this status label.
+    Status(u64),
+    /// Refused `WINDOW_FULL`, nothing consumed, with this retry hint in
+    /// milliseconds (`services/logd/docs/ipc-interface.md` § Hold window).
+    WindowFull(u32),
+}
+
+impl Consumed
+{
+    /// Leave the answer in `reply`.
+    fn reply(self, reply: &mut Reply)
+    {
+        match self
+        {
+            Self::Status(status) => reply.set_status(status),
+            Self::WindowFull(hint) => reply.set(
+                IpcMessage::builder(WINDOW_FULL)
+                    .word(0, u64::from(hint))
+                    .build(),
+            ),
+        }
+    }
+}
+
+/// The refusal of a message from `badge` at `level` that completes `lines`
+/// lines, read under the state lock `st`: `WINDOW_FULL` with its retry hint
+/// when the `hold` sink holds senders and the message would take the
+/// sender's unwritten entries past its window ([`admit`]); `None` when the
+/// message is taken. Allocates nothing and calls nothing, so a refusal costs
+/// logd no more than its reply.
+fn window_refusal(st: &LogdState, badge: u64, lines: usize, level: u64) -> Option<Consumed>
+{
+    if lines == 0 || !SERIAL.holding()
+    {
+        return None;
+    }
+    match admit(st.table.unwritten_of(badge), lines, level)
+    {
+        Admit::Accept => None,
+        Admit::Refuse { excess } => Some(Consumed::WindowFull(logd_codec::sink::hint_ms(
+            excess as u64,
+            SERIAL.entry_us.load(Ordering::Relaxed),
+        ))),
     }
 }
 
@@ -876,10 +1035,9 @@ fn answer_query(table: &SlotTable, msg: &IpcMessage) -> IpcMessage
 }
 
 /// Answer a `LOG_FLUSH` request (`services/logd/docs/ipc-interface.md`
-/// § Flush barrier) from the serial sink, the one sink that holds the log
-/// (`services/logd/docs/sinks.md`), at once: from its queue's line numbers
-/// and its writer's state, under its queue's lock alone, so a flush waits on
-/// nothing. `FLUSH_DENIED` for a badge without `LOG_FLUSH_AUTHORITY`.
+/// § Flush barrier) from the `hold` sink's cursor, at once, under the state
+/// lock, so a flush waits on nothing. `FLUSH_DENIED` for a badge without
+/// `LOG_FLUSH_AUTHORITY`.
 fn answer_flush(msg: &IpcMessage) -> IpcMessage
 {
     if msg.badge & LOG_FLUSH_AUTHORITY == 0
@@ -888,153 +1046,167 @@ fn answer_flush(msg: &IpcMessage) -> IpcMessage
     }
     match ipc::log_flush::decode_request(msg)
     {
-        Ok(token) => SERIAL.flush_answer(token).reply(),
+        Ok(token) => flush_answer(token).reply(),
         Err(status) => ipc::log_flush::refusal(status),
     }
 }
 
+/// The answer to a flush for `token`, or for a new one (`None`): the `seq`
+/// the next retained entry takes. Flushed once the `hold` sink's cursor is at
+/// or past the token, and at once while that sink holds nobody (stalled,
+/// unserved, absent, or written inline, [`Sink::holding`]), or for a token
+/// past every entry retained, one of an earlier logd instance's; pending
+/// otherwise, with the entries' expected time as the retry hint.
+fn flush_answer(token: Option<u64>) -> FlushAnswer
+{
+    let (token, next, cursor) = {
+        let st = state();
+        let next = st.table.history().next_seq();
+        let cursor = st.cursors.get(SERIAL.index).map_or(next, |c| c.next);
+        drop(st);
+        (token.unwrap_or(next), next, cursor)
+    };
+    if cursor >= token || token > next || !SERIAL.holding()
+    {
+        return FlushAnswer::Flushed { token };
+    }
+    FlushAnswer::Pending {
+        token,
+        retry_ms: logd_codec::sink::hint_ms(
+            token.saturating_sub(cursor),
+            SERIAL.entry_us.load(Ordering::Relaxed),
+        ),
+    }
+}
+
 /// Append `byte_len` bytes from the IPC payload onto the slot for
-/// `badge`, flushing complete lines (`\n`-terminated) to the serial
-/// port AND retaining them in logd's history. A line takes
-/// the level of the message carrying its first byte
-/// ([`Slot::begin_byte`]).
+/// `badge`, retaining each line it completes (`\n`-terminated) in logd's
+/// journal, from which the sinks write it. A line takes the level of the
+/// message carrying its first byte ([`Slot::begin_byte`]).
 ///
 /// Accepts up to `STREAM_CHUNK_SIZE = MSG_DATA_WORDS_MAX * 8` bytes
 /// per call (the maximum a single `STREAM_BYTES` IPC can carry); the
 /// per-line buffer is `LINE_BUF_SIZE` and force-flushes when full,
-/// so a chunk longer than `LINE_BUF_SIZE` produces multiple emitted
+/// so a chunk longer than `LINE_BUF_SIZE` produces multiple
 /// lines rather than truncated output (matches init-logd's behaviour).
 ///
-/// Each line is completed, rendered, and retained under the state lock, and
-/// written once the lock is released; the bytes after it are taken under the
-/// lock again.
+/// The message is consumed whole under the state lock, then the writers are
+/// woken; no sink's write is waited for (`services/logd/docs/ipc-interface.md`
+/// § Receive pool).
 ///
-/// Returns the reply label: 0, or `NAME_UNKNOWN` for a message that carries
-/// `SENDER_NAMED` from a sender whose name logd does not hold
-/// ([`SlotTable::name_lost`]), of which nothing is consumed, so its sender
-/// registers the name and sends the message again
-/// (`services/logd/docs/ipc-interface.md` § `stream_labels::STREAM_REGISTER_NAME`).
+/// Answers 0; `NAME_UNKNOWN` for a message that carries `SENDER_NAMED` from a
+/// sender whose name logd does not hold ([`SlotTable::name_lost`]), so its
+/// sender registers the name and sends the message again
+/// (`services/logd/docs/ipc-interface.md` § `stream_labels::STREAM_REGISTER_NAME`);
+/// or `WINDOW_FULL` for a message past the sender's window
+/// ([`window_refusal`]). Nothing is consumed of a refused message.
 #[expect(
     clippy::significant_drop_tightening,
     reason = "the sender's `slot` and the `history` borrow through the guard to the end of the \
               byte loop: the hold serialises the slot's partial line and the history"
 )]
-fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> u64
+fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> Consumed
 {
     const STREAM_CHUNK_SIZE: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
-    if sender_named(msg.label) && logd.lock().table.name_lost(badge)
-    {
-        return NAME_UNKNOWN;
-    }
     let bytes = msg.data_bytes();
     let n = byte_len.min(bytes.len()).min(STREAM_CHUNK_SIZE);
     let level = level_of(msg.label);
-    let mut rest = bytes.get(..n).unwrap_or_default();
-    while !rest.is_empty()
+    let text = bytes.get(..n).unwrap_or_default();
     {
-        let mut out = LineBuf::new();
-        let line_done = {
-            let mut state = logd.lock();
-            let Some((slot, history)) = state.table.sender_slot(badge)
-            else
+        let mut st = logd.lock();
+        if sender_named(msg.label) && st.table.name_lost(badge)
+        {
+            return Consumed::Status(NAME_UNKNOWN);
+        }
+        let lines = lines_completed(st.table.partial_len(badge), text);
+        if let Some(refused) = window_refusal(&st, badge, lines, level)
+        {
+            return refused;
+        }
+        let Some((slot, history)) = st.table.sender_slot(badge)
+        else
+        {
+            // An evicted sender's message (`SlotTable::sender_slot`):
+            // dropped, and answered as consumed.
+            return Consumed::Status(0);
+        };
+        for &b in text
+        {
+            slot.begin_byte(level);
+            if b == b'\n'
             {
-                // An evicted sender's message (`SlotTable::sender_slot`):
-                // dropped, and answered as consumed.
-                return 0;
-            };
-            let mut done = false;
-            while let Some((&b, tail)) = rest.split_first()
+                flush_partial(slot, history, badge);
+            }
+            else if slot.partial.len() < LINE_BUF_SIZE
             {
-                rest = tail;
-                slot.begin_byte(level);
-                if b == b'\n'
+                slot.partial.push(b);
+                if slot.partial.len() == LINE_BUF_SIZE
                 {
-                    flush_partial(slot, history, badge, &mut out);
-                    done = true;
-                    break;
-                }
-                if slot.partial.len() < LINE_BUF_SIZE
-                {
-                    slot.partial.push(b);
-                    if slot.partial.len() == LINE_BUF_SIZE
-                    {
-                        flush_partial(slot, history, badge, &mut out);
-                        done = true;
-                        break;
-                    }
+                    flush_partial(slot, history, badge);
                 }
             }
-            done
-        };
-        if line_done
-        {
-            out.flush();
         }
     }
-    0
+    retained();
+    Consumed::Status(0)
 }
 
-/// Render one `STREAM_RECORD` message's record as one line and retain it in
-/// the slot's history, with its field table, under the state lock, then write
-/// the line. The record does not touch the slot's partial text line. Returns
-/// the reply label: `RECORD_ACCEPTED`, or `RECORD_REJECTED` for a payload
-/// longer than a record or than the message, or one `ipc::log_record` refuses,
-/// which is neither rendered nor retained, or `NAME_UNKNOWN` for a record
-/// that carries `SENDER_NAMED` from a sender whose name logd does not hold,
-/// neither rendered nor retained either, as [`consume_bytes`] answers.
+/// Retain one `STREAM_RECORD` message's record in the slot's history, with
+/// its field table, under the state lock, then wake the writers. The record
+/// does not touch the slot's partial text line. Answers `RECORD_ACCEPTED`;
+/// `RECORD_REJECTED` for a payload longer than a record or than the message,
+/// or one `ipc::log_record` refuses, which is not retained; or
+/// `NAME_UNKNOWN` or `WINDOW_FULL`, of a record not retained either, as
+/// [`consume_bytes`] answers.
 #[expect(
     clippy::significant_drop_tightening,
     reason = "the sender's `slot` and the `history` borrow through the guard to the record's \
               retention: the hold serialises the slot's name and the history"
 )]
-fn consume_record(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> u64
+fn consume_record(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> Consumed
 {
     let bytes = msg.data_bytes();
     if byte_len > RECORD_MAX_BYTES || byte_len > bytes.len()
     {
-        return RECORD_REJECTED;
+        return Consumed::Status(RECORD_REJECTED);
     }
     let Some(Ok(record)) = bytes.get(..byte_len).map(Record::decode)
     else
     {
-        return RECORD_REJECTED;
+        return Consumed::Status(RECORD_REJECTED);
     };
     let level = level_of(msg.label);
-    let mut out = LineBuf::new();
     {
-        let mut state = logd.lock();
-        if sender_named(msg.label) && state.table.name_lost(badge)
+        let mut st = logd.lock();
+        if sender_named(msg.label) && st.table.name_lost(badge)
         {
-            return NAME_UNKNOWN;
+            return Consumed::Status(NAME_UNKNOWN);
         }
-        let Some((slot, history)) = state.table.sender_slot(badge)
+        if let Some(refused) = window_refusal(&st, badge, 1, level)
+        {
+            return refused;
+        }
+        let Some((slot, history)) = st.table.sender_slot(badge)
         else
         {
             // An evicted sender's record (`SlotTable::sender_slot`): dropped,
             // and answered as consumed, since nothing is wrong with it.
-            return RECORD_ACCEPTED;
+            return Consumed::Status(RECORD_ACCEPTED);
         };
-        let us = elapsed_us();
-        out.push_prefix_at(&slot.name, level, us);
-        logd_codec::record::render(&record, |b| out.push(b));
-        out.push(b'\r');
-        out.push(b'\n');
-        history.push_record(slot, badge, us, level, &record);
+        let _ = history.push_record(slot, badge, elapsed_us(), level, &record);
     }
-    out.flush();
-    RECORD_ACCEPTED
+    retained();
+    Consumed::Status(RECORD_ACCEPTED)
 }
 
-/// Render the in-progress line of `slot`, the slot of sender `badge`, into
-/// `out`, retain it in `history`, and clear the partial buffer.
-fn flush_partial(slot: &mut Slot, history: &mut History, badge: u64, out: &mut LineBuf)
+/// Retain the in-progress line of `slot`, the slot of sender `badge`, in
+/// `history`, and clear the partial buffer.
+fn flush_partial(slot: &mut Slot, history: &mut History, badge: u64)
 {
     let line = std::mem::take(&mut slot.partial);
     let level = slot.partial_level;
-    let us = elapsed_us();
-    out.push_text_line(&slot.name, level, us, &line);
-    history.push_text(slot, badge, us, level, &line);
+    let _ = history.push_text(slot, badge, elapsed_us(), level, &line);
 }
 
 /// Bytes of one kernel log read: several records of the longest line, within
@@ -1086,16 +1258,18 @@ fn start_kernel_reader(cap: u64, logd: &'static Logd)
 }
 
 /// The kernel log reader (`docs/console-model.md` item 4): read the records
-/// the kernel appended, write each as a `[kernel]` line through the sinks
-/// as a sender's line is written, and keep it in the kernel's slot
-/// (`LOG_BADGE_KERNEL`); then wait for the kernel's signal. Each read
-/// acknowledges the records written before it, so a record is acknowledged
-/// once its line is written or its sink stalled. A failed read ends the
-/// thread, and the kernel writes its lines itself once the records stall.
+/// the kernel appended and retain each as the kernel's lines in the kernel's
+/// slot (`LOG_BADGE_KERNEL`), which the sinks write as a sender's; then wait
+/// for the kernel's signal. Each read acknowledges the records read before
+/// it, so the reader reads again only once the `hold` sink has written their
+/// lines or holds nobody ([`await_hold_passed`]): a record is acknowledged
+/// once its line is on the wire or its sink stalled. A kernel line is never
+/// refused. A failed read ends the thread, and the kernel writes its lines
+/// itself once the records stall.
 fn read_kernel_log(cap: u64, ntf: u64, logd: &Logd)
 {
     let mut buf = std::vec![0u8; KERNEL_READ_BYTES];
-    let mut cursor = Cursor::new();
+    let mut cursor = logd_codec::kernel::Cursor::new();
     loop
     {
         match syscall::kernel_log_read(cap, 0, cursor.ack(), &mut buf)
@@ -1108,9 +1282,15 @@ fn read_kernel_log(cap: u64, ntf: u64, logd: &Logd)
             }
             Ok(n) =>
             {
+                let mut last = None;
                 for record in syscall_abi::kernel_log_records(buf.get(..n).unwrap_or_default())
                 {
-                    write_kernel_record(&record, &mut cursor, logd);
+                    last = keep_kernel_record(&record, &mut cursor, logd).or(last);
+                }
+                retained();
+                if let Some(seq) = last
+                {
+                    await_hold_passed(seq);
                 }
             }
             Err(e) =>
@@ -1123,46 +1303,42 @@ fn read_kernel_log(cap: u64, ntf: u64, logd: &Logd)
     }
 }
 
-/// Write `record` as the kernel's line, stamped with its own time, in parts
-/// of at most `LINE_BUF_SIZE` bytes, each kept in the kernel's slot and
-/// written whole; a gap before it is named in a warning line of logd's.
-fn write_kernel_record(record: &syscall_abi::KernelLogRecord<'_>, cursor: &mut Cursor, logd: &Logd)
+/// Retain `record` as the kernel's line, stamped with its own time, in parts
+/// of at most `LINE_BUF_SIZE` bytes, each kept in the kernel's slot; a gap
+/// before it is named in a warning line of logd's. The `seq` of its last
+/// part; `None` for a stale record.
+fn keep_kernel_record(
+    record: &syscall_abi::KernelLogRecord<'_>,
+    cursor: &mut logd_codec::kernel::Cursor,
+    logd: &Logd,
+) -> Option<u64>
 {
     match cursor.accept(record.seq)
     {
-        Accept::Stale => return,
+        Accept::Stale => return None,
         Accept::InOrder =>
         {}
         Accept::AfterGap { first, last } =>
         {
             let text = logd_codec::kernel::gap_text(first, last);
-            let mut out = LineBuf::new();
-            out.push_text_line(b"logd", LEVEL_WARN, elapsed_us(), text.as_str().as_bytes());
-            out.flush();
+            retain_own(LEVEL_WARN, text.as_str().as_bytes());
         }
     }
     let level = logd_codec::kernel::level(record.level);
     let line = KernelLine::new(record);
+    let badge = ipc::log_badges::LOG_BADGE_KERNEL;
+    let mut st = logd.lock();
+    let mut last = None;
     for part in line.parts()
     {
-        let mut out = LineBuf::new();
-        out.push_text_line(KERNEL_NAME, level, record.us, part);
-        keep_kernel_line(logd, record.us, level, part);
-        out.flush();
+        // The kernel's badge is no process's, so no eviction takes it and the
+        // slot is always there (`SlotTable::sender_slot`).
+        if let Some((slot, history)) = st.table.sender_slot(badge)
+        {
+            last = Some(history.push_text(slot, badge, record.us, level, part));
+        }
     }
-}
-
-/// Keep one kernel line in the kernel's slot.
-fn keep_kernel_line(logd: &Logd, us: u64, level: u64, part: &[u8])
-{
-    let badge = ipc::log_badges::LOG_BADGE_KERNEL;
-    let mut state = logd.lock();
-    // The kernel's badge is no process's, so no eviction takes it and the
-    // slot is always there (`SlotTable::sender_slot`).
-    if let Some((slot, history)) = state.table.sender_slot(badge)
-    {
-        history.push_text(slot, badge, us, level, part);
-    }
+    last
 }
 
 /// Record / update the display name for `badge`. History entries carry
@@ -1210,8 +1386,8 @@ struct OutputDriver
     /// carried none.
     class: AtomicU64,
     /// The SEND on the driver's service endpoint; 0 while none is resolved,
-    /// and the sink then queues its lines for the driver resolved next
-    /// ([`Sink::offer`]).
+    /// and the journal then keeps the sink's entries for the driver resolved
+    /// next ([`Sink::run_writer`]).
     cap: AtomicU64,
     /// The driver's instance ordinal in its class, while `cap` is nonzero.
     /// Only the main thread reads it.
@@ -1220,7 +1396,7 @@ struct OutputDriver
     /// [`Self::resolve`] before it signals [`Self::served`], so a driver
     /// resolved between the look and the wait is not missed.
     serving: Mutex<()>,
-    /// Signalled when [`Self::resolve`] has stored a driver.
+    /// Signalled when [`Self::resolve`] has stored a driver, or none.
     served: Condvar,
 }
 
@@ -1261,6 +1437,24 @@ impl OutputDriver
             if cap != 0
             {
                 return cap;
+            }
+            serving = self
+                .served
+                .wait(serving)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Wait until the resolved SEND is no longer `gone`, whose call failed:
+    /// the main thread resolves again when devmgr signals the withdrawal.
+    fn await_other(&self, gone: u64)
+    {
+        let mut serving = self.serving.lock().unwrap_or_else(PoisonError::into_inner);
+        loop
+        {
+            if self.cap() != gone
+            {
+                return;
             }
             serving = self
                 .served
@@ -1346,28 +1540,32 @@ impl OutputDriver
         {
             let _ = syscall::cap_delete(old);
         }
-        if cap != 0
-        {
-            // A writer that looked at `cap` before the store waits under the
-            // lock, so taking it here orders this signal after its wait began.
-            drop(self.serving.lock().unwrap_or_else(PoisonError::into_inner));
-            self.served.notify_all();
-        }
+        // A writer that looked at `cap` before the store waits under the
+        // lock, so taking it here orders this signal after its wait began.
+        drop(self.serving.lock().unwrap_or_else(PoisonError::into_inner));
+        self.served.notify_all();
     }
 }
 
-// A sink's queue holds two of the longest rendered lines with their headers,
-// so no line logd renders is dropped for its length alone
-// (`SinkQueue::offer`), and the writer can hold one while a producer queues
-// the next.
-const _: () = assert!(SINK_QUEUE_BYTES >= 2 * (LINE_OUT_BYTES + HEADER_BYTES));
+/// How a sink's progress holds senders back (`services/logd/docs/sinks.md`
+/// § Pace).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pace
+{
+    /// Its progress holds senders back, a flush, and the kernel reader's
+    /// acknowledgement, while it is served and not stalled; the entries it
+    /// has not written are kept from eviction while a written one is left.
+    Hold,
+    /// It holds nobody, and loses the entries the history evicts before it
+    /// reaches them.
+    Skip,
+}
 
-/// An output driver and the path every rendered line takes to it: the queue
-/// its writer thread drains ([`Sink::run_writer`]), the only thread that
+/// A device sink: an output driver and the cursor through which its writer
+/// thread reads logd's journal ([`Sink::run_writer`]), the only thread that
 /// calls the driver once it runs, so a driver that is slow, stopped by a
-/// debugger, or dead holds that thread alone, and a line's producer for at
-/// most [`SINK_STALL_MS`] (`services/logd/docs/ipc-interface.md` § Output
-/// sinks).
+/// debugger, or dead holds that thread alone
+/// (`services/logd/docs/ipc-interface.md` § Output sinks).
 struct Sink
 {
     /// The driver, as resolved through devmgr.
@@ -1375,55 +1573,152 @@ struct Sink
     /// The driver's write label without its length: the opcode
     /// (`SERIAL_WRITE_BYTES`, `FB_WRITE_BYTES`).
     op: u64,
-    /// The flag of the zero-length barrier write that ends each line, which
-    /// the driver answers once the line has left the device
+    /// The flag of the zero-length barrier write that ends each entry, which
+    /// the driver answers once the entry has left the device
     /// (`SERIAL_WRITE_SENT`); 0 for a driver that takes none ([`write_line`]).
     sent: u64,
     /// The sink's name in logd's lines about it.
     what: &'static str,
-    /// Lines waiting for the writer.
-    queue: Mutex<SinkQueue<SINK_QUEUE_BYTES>>,
-    /// Signalled when a line is queued or the tail's drop count grows.
-    queued: Condvar,
-    /// Signalled when the writer takes a line, freeing space, and when it
-    /// completes a write.
-    progress: Condvar,
+    /// The sink's pace.
+    pace: Pace,
+    /// What the sink does with `relayed` entries, which init-logd wrote to
+    /// the console before the handover.
+    relayed: Relayed,
+    /// The sink's cursor in [`LogdState::cursors`].
+    index: usize,
     /// Whether the writer thread runs; until it does, or when it could not be
-    /// spawned, a line is written by its producer ([`Self::write_inline`]).
+    /// spawned, the entries are written by the thread that retains each
+    /// ([`Self::write_inline`]).
     writer: AtomicBool,
-    /// Whether a producer is writing a line inline, so a line longer than
-    /// one call is not split by another thread's. A flag, not a lock held
-    /// across the calls: a producer waits for it, and makes its calls, only
-    /// until its line's deadline. The panic sink does not take it
-    /// ([`panic_to_serial`]).
+    /// Whether a thread is writing the sink's entries inline, so no two
+    /// write at once. A flag, not a lock held across the calls: a thread
+    /// waits for it, and makes its calls, only until its deadline. The panic
+    /// sink does not take it ([`panic_to_serial`]).
     inline_busy: Mutex<bool>,
     /// Signalled when an inline write ends and [`Self::inline_busy`] clears.
     inline_free: Condvar,
-    /// Lines an inline write did not write whole by its deadline, reported
-    /// ahead of the next line an inline write starts.
-    inline_dropped: AtomicU32,
-    /// When the writer started the write it is in, on [`elapsed_us`]'s clock;
-    /// [`NOT_WRITING`] while it writes nothing ([`Self::flush_answer`]).
+    /// When the writer started the entry it is writing, or the wait for the
+    /// driver that replaces one whose call failed, on [`elapsed_us`]'s clock;
+    /// [`NOT_WRITING`] otherwise ([`Self::holding`]).
     write_started_us: AtomicU64,
-    /// How long the writer's last completed write took, in microseconds: the
-    /// time per line of a flush's retry hint.
-    line_us: AtomicU64,
+    /// How long the writer's last written entry took, in microseconds: the
+    /// time per entry of a retry hint.
+    entry_us: AtomicU64,
+}
+
+/// What a sink does with a `relayed` entry (`services/logd/docs/sinks.md`
+/// § The record).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Relayed
+{
+    /// Writes it: the sink did not show it when init-logd wrote it.
+    Write,
+    /// Passes it: init-logd wrote it to this sink's device itself.
+    Pass,
 }
 
 /// [`Sink::write_started_us`] while the writer writes nothing.
 const NOT_WRITING: u64 = u64::MAX;
 
-/// What [`Sink::take_next`] found for the writer.
-enum Taken
+/// A sink's place in the journal, under the state lock.
+#[derive(Clone, Copy, Default)]
+struct Cursor
 {
-    /// A line, in the writer's buffer.
-    Line(Popped),
-    /// Lines dropped after every queued one, now written.
-    Drops(u32),
+    /// The `seq` of the next entry the sink writes or passes: every entry
+    /// before it is written, passed, or dropped.
+    next: u64,
+    /// Entries the sink has dropped and not yet reported.
+    dropped: u64,
+    /// A `skip` sink's drop notice the journal holds and the sink has not
+    /// reached: its `seq` and the count it names, which later drops are added
+    /// to, so the notices do not multiply.
+    notice: Option<(u64, u64)>,
 }
 
-/// [`SINK_STALL_MS`] from now: the end of one sink's share of a line's
-/// producer's time.
+/// What a sink's writer does next ([`Sink::next`]).
+enum Step
+{
+    /// Nothing is left above the cursor.
+    Idle,
+    /// Write the line naming this many dropped entries to the sink's own
+    /// output: a `hold` sink's drops, at the gap.
+    Drops(u64),
+    /// Write the entry of this `seq`, copied into the writer's [`Taken`].
+    Entry(u64),
+}
+
+/// An entry a writer copied out of the journal under the state lock, to
+/// render outside it.
+struct Taken
+{
+    us: u64,
+    level: u64,
+    record: bool,
+    bytes: [u8; ENTRY_MAX_BYTES],
+    len: usize,
+    name: [u8; MAX_NAME_LEN],
+    name_len: usize,
+}
+
+impl Taken
+{
+    const fn new() -> Self
+    {
+        Self {
+            us: 0,
+            level: 0,
+            record: false,
+            bytes: [0; ENTRY_MAX_BYTES],
+            len: 0,
+            name: [0; MAX_NAME_LEN],
+            name_len: 0,
+        }
+    }
+
+    /// Copy `entry`, to be rendered under `name`.
+    fn copy(&mut self, entry: &HistoryEntry, name: &[u8])
+    {
+        self.us = entry.us;
+        self.level = entry.level;
+        self.record = matches!(entry.kind, logd_slot_table::EntryKind::Record { .. });
+        self.len = copy_into(&mut self.bytes, &entry.bytes);
+        self.name_len = copy_into(&mut self.name, name);
+    }
+
+    /// Render the entry as its console line into `out`.
+    fn render(&self, out: &mut LineBuf)
+    {
+        let name = self.name.get(..self.name_len).unwrap_or_default();
+        let bytes = self.bytes.get(..self.len).unwrap_or_default();
+        if self.record
+        {
+            out.push_prefix_at(name, self.level, self.us);
+            // A record is retained only once it decodes.
+            if let Ok(record) = Record::decode(bytes)
+            {
+                logd_codec::record::render(&record, |b| out.push(b));
+            }
+            out.push(b'\r');
+            out.push(b'\n');
+        }
+        else
+        {
+            out.push_text_line(name, self.level, self.us, bytes);
+        }
+    }
+}
+
+/// Copy as much of `src` as fits into `dst`; the bytes copied.
+fn copy_into(dst: &mut [u8], src: &[u8]) -> usize
+{
+    for (d, s) in dst.iter_mut().zip(src)
+    {
+        *d = *s;
+    }
+    src.len().min(dst.len())
+}
+
+/// [`SINK_STALL_MS`] from now: the end of an inline write.
 fn stall_deadline() -> Instant
 {
     let now = Instant::now();
@@ -1433,189 +1728,277 @@ fn stall_deadline() -> Instant
 
 impl Sink
 {
-    #[expect(
-        clippy::large_stack_frames,
-        reason = "evaluated only at compile time, to initialise the SERIAL and FB statics; no \
-                  runtime frame holds the queue"
-    )]
-    const fn new(op: u64, sent: u64, what: &'static str) -> Self
+    const fn new(
+        op: u64,
+        sent: u64,
+        what: &'static str,
+        pace: Pace,
+        relayed: Relayed,
+        index: usize,
+    ) -> Self
     {
         Self {
             driver: OutputDriver::new(),
             op,
             sent,
             what,
-            queue: Mutex::new(SinkQueue::new()),
-            queued: Condvar::new(),
-            progress: Condvar::new(),
+            pace,
+            relayed,
+            index,
             writer: AtomicBool::new(false),
             inline_busy: Mutex::new(false),
             inline_free: Condvar::new(),
-            inline_dropped: AtomicU32::new(0),
             write_started_us: AtomicU64::new(NOT_WRITING),
-            line_us: AtomicU64::new(0),
+            entry_us: AtomicU64::new(0),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, SinkQueue<SINK_QUEUE_BYTES>>
+    /// Whether the sink holds senders, a flush and the kernel reader now: a
+    /// `hold` sink whose class the bootstrap carried, whose writer runs and
+    /// is served, and whose current write is not older than
+    /// [`SINK_STALL_MS`]. A sink that is stalled, unserved, absent, or written
+    /// inline holds nobody.
+    fn holding(&self) -> bool
     {
-        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+        if self.pace != Pace::Hold
+            || self.driver.class() == 0
+            || !self.writer.load(Ordering::Acquire)
+            || self.driver.cap() == 0
+        {
+            return false;
+        }
+        let started = self.write_started_us.load(Ordering::Relaxed);
+        !logd_codec::sink::write_overdue((started != NOT_WRITING).then_some(started), elapsed_us())
     }
 
-    /// Hand `line`, of `kind`, to the sink: queue it for the writer, waiting
-    /// while the queue is full and the writer frees space until `deadline` at
-    /// most, or
-    /// drop it, counted, once the sink is stalled
-    /// ([`logd_codec::sink::SinkQueue::offer`]). While no driver is resolved
-    /// the sink is unserved: the line is queued for the driver resolved next
-    /// without a wait, or dropped and counted when the queue is full
-    /// ([`logd_codec::sink::SinkQueue::offer_unserved`]), so a driver that
-    /// comes up late, or a restarted one, is written the lines its absence
-    /// held back, then their count. The line's number when it is queued to a
-    /// served sink that is not stalled, for [`Self::await_written`]; `None`
-    /// otherwise. Written here by [`Self::write_inline`], by `deadline`,
-    /// while no writer runs. Dropped uncounted when the bootstrap carried no
-    /// class SEND, so no driver can ever be resolved.
-    fn offer(&self, line: &[u8], kind: LineKind, deadline: Instant) -> Option<u64>
+    /// The writer's next step from its cursor, under the state lock `st`:
+    /// count the gap before the next entry as dropped, pass the entries the
+    /// sink does not write, report drops (a `hold` sink's at the gap, before
+    /// the next entry it writes, a `skip` sink's as its notice in the
+    /// journal, [`retain_notice`], which wakes the writers), and copy the
+    /// next entry into `taken`.
+    fn next(&self, st: &mut LogdState, taken: &mut Taken) -> Step
     {
-        if self.driver.class() == 0
-        {
-            return None;
-        }
-        if !self.writer.load(Ordering::Acquire)
-        {
-            self.write_inline(line, kind, deadline);
-            return None;
-        }
-        let mut queue = self.lock();
-        loop
-        {
-            let unserved = self.driver.cap() == 0;
-            let left = deadline.saturating_duration_since(Instant::now());
-            let offered = if unserved
-            {
-                queue.offer_unserved(line, kind)
-            }
-            else
-            {
-                queue.offer(line, kind, left.is_zero())
-            };
-            match offered
-            {
-                Offer::Queued(number) =>
-                {
-                    let stalled = queue.is_stalled();
-                    drop(queue);
-                    self.queued.notify_one();
-                    return (!stalled && !unserved).then_some(number);
-                }
-                Offer::Dropped =>
-                {
-                    drop(queue);
-                    // The writer reports the count once its queue drains.
-                    self.queued.notify_one();
-                    return None;
-                }
-                Offer::Wait =>
-                {
-                    queue = self
-                        .progress
-                        .wait_timeout(queue, left)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0;
-                }
-            }
-        }
-    }
-
-    /// Wait until the writer has written line `queued` ([`Self::offer`]), the
-    /// sink is stalled, or `deadline` passes, which stalls the sink.
-    fn await_written(&self, queued: Option<u64>, deadline: Instant)
-    {
-        let Some(number) = queued
+        let LogdState { table, cursors, .. } = st;
+        let Some(cursor) = cursors.get_mut(self.index)
         else
         {
-            return;
+            return Step::Idle;
         };
-        let mut queue = self.lock();
+        while let Some((seq, entry)) = table.history().entry_from(cursor.next)
+        {
+            cursor.dropped = cursor
+                .dropped
+                .saturating_add(seq.saturating_sub(cursor.next));
+            cursor.next = seq;
+            if cursor.dropped > 0 && self.pace == Pace::Hold
+            {
+                return Step::Drops(core::mem::take(&mut cursor.dropped));
+            }
+            if entry.origin == Origin::Relayed && self.relayed == Relayed::Pass
+            {
+                cursor.next = seq.saturating_add(1);
+                continue;
+            }
+            taken.copy(entry, table.name_of(entry.badge));
+            if cursor.dropped > 0
+            {
+                retain_notice(self.what, cursor, table);
+            }
+            return Step::Entry(seq);
+        }
+        if cursor.dropped > 0 && self.pace == Pace::Skip
+        {
+            retain_notice(self.what, cursor, table);
+            RETAINED.notify_all();
+        }
+        Step::Idle
+    }
+
+    /// Move the cursor past entry `seq`, counting it as dropped when the
+    /// driver did not take it whole (`wrote`), and move the hold mark with
+    /// it.
+    fn advance(&self, seq: u64, wrote: Wrote)
+    {
+        {
+            let mut st = state();
+            if let Some(cursor) = st.cursors.get_mut(self.index)
+            {
+                cursor.next = cursor.next.max(seq.saturating_add(1));
+                cursor.dropped = cursor
+                    .dropped
+                    .saturating_add(u64::from(wrote != Wrote::All));
+            }
+            st.sync_hold_mark();
+        }
+        PROGRESS.notify_all();
+    }
+
+    /// The writer thread: wait until the sinks open and a driver is served,
+    /// take each entry above the cursor in `seq` order, render it outside
+    /// every lock, and write it with calls that have no bound ([`write_line`]),
+    /// so an entry is written once, when the driver answers, however long it
+    /// is stopped. A `skip` sink's cursor starts at most its backlog behind
+    /// the newest entry each time a driver comes up ([`Self::attach`]). An
+    /// entry the driver lost with its endpoint is written again, whole, to the
+    /// driver resolved next; until one is, the sink counts as writing it, so
+    /// it stalls past [`SINK_STALL_MS`].
+    fn run_writer(&self) -> !
+    {
+        let ipc_buf = emit_ipc_buf();
+        let mut taken = Taken::new();
+        let mut held = 0u64;
         loop
         {
-            if queue.is_written(number) || queue.is_stalled()
+            let cap = self.driver.await_cap();
+            if cap != held
             {
-                return;
+                held = cap;
+                self.attach();
             }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero()
+            let step = {
+                let mut st = state();
+                loop
+                {
+                    if st.open
+                    {
+                        match self.next(&mut st, &mut taken)
+                        {
+                            Step::Idle =>
+                            {}
+                            step @ (Step::Drops(_) | Step::Entry(_)) => break step,
+                        }
+                    }
+                    st = RETAINED.wait(st).unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+            // A drop notice the step retained is another sink's to write.
+            RETAINED.notify_all();
+            match step
             {
-                queue.stall();
-                return;
+                Step::Idle =>
+                {}
+                Step::Drops(dropped) =>
+                {
+                    let line = drop_line(self.what, dropped);
+                    let _ = self.write_driver(cap, line.bytes(), ipc_buf);
+                }
+                Step::Entry(seq) =>
+                {
+                    let mut out = LineBuf::new();
+                    taken.render(&mut out);
+                    match self.write_driver(cap, out.bytes(), ipc_buf)
+                    {
+                        wrote @ (Wrote::All | Wrote::Lost) => self.advance(seq, wrote),
+                        Wrote::Gone =>
+                        {
+                            self.write_started_us.store(elapsed_us(), Ordering::Relaxed);
+                            self.driver.await_other(cap);
+                            self.write_started_us.store(NOT_WRITING, Ordering::Relaxed);
+                        }
+                    }
+                }
             }
-            queue = self
-                .progress
-                .wait_timeout(queue, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
         }
     }
 
-    /// Write `line` to the driver from the calling thread, with no other
-    /// inline write between its calls ([`Self::inline_busy`]): the wait for
-    /// that turn and every call end by `deadline`, so the caller waits on
-    /// the sink for [`SINK_STALL_MS`] at most. A line the driver did not
-    /// take whole by then ([`Wrote::Lost`]) is counted, unless it is the other
-    /// sink's drop line ([`LineKind::PeerDrops`]), and the count is written
-    /// ahead of the next line an inline write starts. A line with no driver
-    /// resolved to write it to is counted the same way.
-    fn write_inline(&self, line: &[u8], kind: LineKind, deadline: Instant)
+    /// A driver came up: a `skip` sink's cursor starts at most
+    /// [`logd_codec::sink::SKIP_BACKLOG`] entries before the newest, the
+    /// entries passed counted as dropped.
+    fn attach(&self)
     {
-        let ipc_buf = emit_ipc_buf();
-        let cap = self.driver.cap();
-        if ipc_buf.is_null() || cap == 0
+        if self.pace != Pace::Skip
         {
-            self.inline_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let mut st = state();
+        let next = st.table.history().next_seq();
+        if let Some(cursor) = st.cursors.get_mut(self.index)
         {
-            let mut busy = self
-                .inline_busy
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            while *busy
-            {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero()
-                {
-                    self.inline_dropped.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                busy = self
-                    .inline_free
-                    .wait_timeout(busy, left)
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
-            }
-            *busy = true;
+            let start = logd_codec::sink::attach_cursor(cursor.next, next);
+            cursor.dropped = cursor
+                .dropped
+                .saturating_add(start.saturating_sub(cursor.next));
+            cursor.next = start;
+        }
+    }
+
+    /// The writer's write of `bytes` to the driver behind `cap`, unbounded,
+    /// timed for [`Self::holding`] and the retry hint.
+    fn write_driver(&self, cap: u64, bytes: &[u8], ipc_buf: *mut u64) -> Wrote
+    {
+        if ipc_buf.is_null()
+        {
+            return Wrote::Lost;
+        }
+        let started = elapsed_us();
+        self.write_started_us.store(started, Ordering::Relaxed);
+        let wrote = write_line(cap, self.op, self.sent, bytes, ipc_buf, Bound::Unbounded);
+        self.write_started_us.store(NOT_WRITING, Ordering::Relaxed);
+        if wrote == Wrote::All
+        {
+            self.entry_us
+                .store(elapsed_us().saturating_sub(started), Ordering::Relaxed);
+        }
+        wrote
+    }
+
+    /// Write the entries above the cursor from the calling thread, for a sink
+    /// with no writer, with no other inline write between its calls
+    /// ([`Self::inline_busy`]): the wait for that turn and every call end
+    /// [`SINK_STALL_MS`] from now, so the caller waits on the sink for that
+    /// long at most. An entry the driver did not take whole is passed and
+    /// counted as dropped. Nothing is written before the sinks open, or while
+    /// no driver is resolved: the entries wait in the journal for the next
+    /// inline write.
+    fn write_inline(&self)
+    {
+        let ipc_buf = emit_ipc_buf();
+        if ipc_buf.is_null() || self.driver.class() == 0 || self.writer.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let deadline = stall_deadline();
+        if !self.take_inline_turn(deadline)
+        {
+            return;
         }
         let bound = Bound::By(deadline);
-        let mut lost = 0u32;
-        let dropped = self.inline_dropped.swap(0, Ordering::Relaxed);
-        if dropped > 0
+        let mut taken = Taken::new();
+        while bound.next_ms().is_some()
         {
-            let report = self.drop_report(dropped);
-            if write_line(cap, self.op, self.sent, report.bytes(), ipc_buf, bound) == Wrote::Lost
+            let cap = self.driver.cap();
+            if cap == 0
             {
-                lost = dropped;
+                break;
             }
-        }
-        let line_lost =
-            lost > 0 || write_line(cap, self.op, self.sent, line, ipc_buf, bound) == Wrote::Lost;
-        if line_lost && kind == LineKind::Logged
-        {
-            lost = lost.saturating_add(1);
-        }
-        if lost > 0
-        {
-            self.inline_dropped.fetch_add(lost, Ordering::Relaxed);
+            let step = {
+                let mut st = state();
+                if !st.open
+                {
+                    break;
+                }
+                let step = self.next(&mut st, &mut taken);
+                drop(st);
+                step
+            };
+            RETAINED.notify_all();
+            match step
+            {
+                Step::Idle => break,
+                Step::Drops(dropped) =>
+                {
+                    let line = drop_line(self.what, dropped);
+                    let _ = write_line(cap, self.op, self.sent, line.bytes(), ipc_buf, bound);
+                }
+                Step::Entry(seq) =>
+                {
+                    let mut out = LineBuf::new();
+                    taken.render(&mut out);
+                    let wrote = write_line(cap, self.op, self.sent, out.bytes(), ipc_buf, bound);
+                    self.advance(seq, wrote);
+                }
+            }
         }
         *self
             .inline_busy
@@ -1624,191 +2007,130 @@ impl Sink
         self.inline_free.notify_one();
     }
 
-    /// Wait for the next line, taken into `buf`, or for drops after every
-    /// queued line; wake producers waiting for the space a line frees.
-    fn take_next(&self, buf: &mut [u8]) -> Taken
+    /// Wait until no other thread writes the sink inline, then take the turn;
+    /// `false` when `deadline` passes first.
+    fn take_inline_turn(&self, deadline: Instant) -> bool
     {
-        let mut queue = self.lock();
-        loop
+        let mut busy = self
+            .inline_busy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *busy
         {
-            if let Some(popped) = queue.pop(buf)
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero()
             {
-                drop(queue);
-                self.progress.notify_all();
-                return Taken::Line(popped);
+                return false;
             }
-            let dropped = queue.take_tail_drops();
-            if dropped > 0
-            {
-                return Taken::Drops(dropped);
-            }
-            queue = self
-                .queued
-                .wait(queue)
-                .unwrap_or_else(PoisonError::into_inner);
+            busy = self
+                .inline_free
+                .wait_timeout(busy, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
-    }
-
-    /// The writer thread: take each line in order and write it to the driver
-    /// with calls that have no bound ([`write_line`]), so a line is written
-    /// once, when the driver answers, however long it is stopped; report lines
-    /// the sink dropped where they were dropped ([`Self::report_drops`]).
-    /// While no driver is resolved it waits for one with the line it took, so
-    /// the lines queued meanwhile are written to the next driver resolved. A
-    /// call that fails, or that the driver answers with anything but success,
-    /// ends the line, and the next line goes to the driver resolved then; a
-    /// call to a dead driver fails only once devmgr withdraws it and revokes
-    /// its endpoint. Each completed write releases the producers waiting for
-    /// it and ends a stall. A write given up releases them and leaves a stall
-    /// in place ([`logd_codec::sink::SinkQueue::not_written`]); its line is
-    /// counted as dropped when the driver did not take it ([`Wrote::Lost`]),
-    /// unless it is a drop line, which is not counted again.
-    /// `other` is the sink the drop reports are also written to.
-    fn run_writer(&self, other: &Sink) -> !
-    {
-        let ipc_buf = emit_ipc_buf();
-        let mut out = LineBuf::new();
-        loop
-        {
-            // What the driver did with this pass's write, and whether a line
-            // it did not take counts: a drop line, this sink's or the other
-            // sink's, is not counted again.
-            let (wrote, counted) = match self.take_next(&mut out.buf)
-            {
-                Taken::Line(popped) =>
-                {
-                    if popped.dropped_before > 0
-                    {
-                        let _ = self.report_drops(popped.dropped_before, other, ipc_buf);
-                    }
-                    let line = out.buf.get(..popped.len).unwrap_or_default();
-                    (
-                        self.write_driver(line, ipc_buf),
-                        popped.kind == LineKind::Logged,
-                    )
-                }
-                Taken::Drops(dropped) => (self.report_drops(dropped, other, ipc_buf), false),
-            };
-            match wrote
-            {
-                Wrote::All => self.lock().written(),
-                Wrote::Held => self.lock().not_written(0),
-                Wrote::Lost => self.lock().not_written(u32::from(counted)),
-            }
-            self.progress.notify_all();
-        }
-    }
-
-    /// The writer's write of the line `bytes` to the driver resolved now, or
-    /// to the next one resolved while none is, unbounded.
-    fn write_driver(&self, bytes: &[u8], ipc_buf: *mut u64) -> Wrote
-    {
-        if ipc_buf.is_null()
-        {
-            return Wrote::Lost;
-        }
-        let cap = self.driver.await_cap();
-        let started = elapsed_us();
-        self.write_started_us.store(started, Ordering::Relaxed);
-        let wrote = write_line(cap, self.op, self.sent, bytes, ipc_buf, Bound::Unbounded);
-        self.write_started_us.store(NOT_WRITING, Ordering::Relaxed);
-        if wrote == Wrote::All
-        {
-            self.line_us
-                .store(elapsed_us().saturating_sub(started), Ordering::Relaxed);
-        }
-        wrote
-    }
-
-    /// The answer to a flush for `token`, or for a new one (`None`): the
-    /// number of the last line queued (`services/logd/docs/ipc-interface.md`
-    /// § Flush barrier). Flushed once the writer has written or given up
-    /// every line up to the token, and at once while the sink is stalled
-    /// (the writer gave its last write up, or its current write is past
-    /// [`SINK_STALL_MS`]),
-    /// unserved, or absent (no class SEND, so no line is ever queued); pending
-    /// otherwise, with the lines' expected time as the retry hint.
-    fn flush_answer(&self, token: Option<u64>) -> FlushAnswer
-    {
-        if self.driver.class() == 0
-        {
-            return FlushAnswer::Flushed {
-                token: token.unwrap_or(0),
-            };
-        }
-        let queue = self.lock();
-        let token = token.unwrap_or_else(|| queue.last_queued());
-        let lines = queue.unwritten_through(token);
-        drop(queue);
-        let started = self.write_started_us.load(Ordering::Relaxed);
-        let overdue = logd_codec::sink::write_overdue(
-            (started != NOT_WRITING).then_some(started),
-            elapsed_us(),
-        );
-        if lines == 0 || self.driver.cap() == 0 || overdue
-        {
-            return FlushAnswer::Flushed { token };
-        }
-        FlushAnswer::Pending {
-            token,
-            retry_ms: logd_codec::sink::flush_hint_ms(lines, self.line_us.load(Ordering::Relaxed)),
-        }
-    }
-
-    /// Write one logd line naming the `dropped` lines this sink did not
-    /// take: to this sink's driver from its writer, and to `other` through its
-    /// queue, as its [`LineKind::PeerDrops`] line, without waiting for its
-    /// write. What this sink's driver did with it; a report the driver did not
-    /// take is not counted again.
-    fn report_drops(&self, dropped: u32, other: &Sink, ipc_buf: *mut u64) -> Wrote
-    {
-        let line = self.drop_report(dropped);
-        let wrote = self.write_driver(line.bytes(), ipc_buf);
-        let _ = other.offer(line.bytes(), LineKind::PeerDrops, stall_deadline());
-        wrote
-    }
-
-    /// logd's warning line naming the `dropped` lines this sink did not
-    /// write.
-    fn drop_report(&self, dropped: u32) -> LineBuf
-    {
-        let mut text = SerialFmt::new();
-        let _ = write!(
-            text,
-            "{dropped} lines dropped from the {} output: it had no driver, or its driver \
-             took none within {SINK_STALL_MS} ms",
-            self.what
-        );
-        let mut line = LineBuf::new();
-        line.push_text_line(b"logd", LEVEL_WARN, elapsed_us(), text.as_str().as_bytes());
-        line
+        *busy = true;
+        true
     }
 }
 
-/// The serial driver logd writes every line to. Each line's write ends with a
-/// barrier the driver answers once its bytes have left the UART
-/// (`SERIAL_WRITE_SENT`, [`write_line`]), so a line is on the line when it
-/// counts as written: before its caller goes on, which may be to power the
-/// machine off (`services/logd/docs/ipc-interface.md` § Output sinks).
+/// Retain a `skip` sink's drops as a notice line of logd's in the journal,
+/// so every sink and the history carry the count: add `cursor`'s count to the
+/// sink's notice while the journal still holds it ahead of the cursor, and
+/// otherwise retain a new one, carrying the count of a notice evicted before
+/// the sink reached it (`services/logd/docs/sinks.md` § Drops).
+fn retain_notice(what: &str, cursor: &mut Cursor, table: &mut SlotTable)
+{
+    let dropped = core::mem::take(&mut cursor.dropped);
+    let (pending, total) = match cursor.notice
+    {
+        Some((seq, count)) if seq >= cursor.next =>
+        {
+            let held = table
+                .history()
+                .entry_from(seq)
+                .is_some_and(|(at, _)| at == seq);
+            (held.then_some(seq), count.saturating_add(dropped))
+        }
+        _ => (None, dropped),
+    };
+    let text = logd_codec::sink::drop_text(what, total);
+    let seq = if let Some(seq) = pending
+    {
+        table
+            .history_mut()
+            .replace_text(seq, text.as_str().as_bytes());
+        seq
+    }
+    else
+    {
+        let Some((slot, history)) = table.sender_slot(LOG_BADGE_LOGD)
+        else
+        {
+            return;
+        };
+        history.push_text(
+            slot,
+            LOG_BADGE_LOGD,
+            elapsed_us(),
+            LEVEL_NOTICE,
+            text.as_str().as_bytes(),
+        )
+    };
+    cursor.notice = Some((seq, total));
+}
+
+/// The line naming `dropped` entries sink `what` did not write, as logd's
+/// notice, stamped now (`services/logd/docs/sinks.md` § Drops).
+fn drop_line(what: &str, dropped: u64) -> LineBuf
+{
+    let text = logd_codec::sink::drop_text(what, dropped);
+    let mut line = LineBuf::new();
+    line.push_text_line(
+        b"logd",
+        LEVEL_NOTICE,
+        elapsed_us(),
+        text.as_str().as_bytes(),
+    );
+    line
+}
+
+/// The serial driver: the `hold` sink. Each entry's write ends with a barrier
+/// the driver answers once its bytes have left the UART (`SERIAL_WRITE_SENT`,
+/// [`write_line`]), so its cursor passes an entry only once the entry is on
+/// the wire (`services/logd/docs/sinks.md` § Device sinks). It passes the
+/// `relayed` entries init-logd wrote to the UART itself.
 static SERIAL: Sink = Sink::new(
     ipc::serial_labels::SERIAL_WRITE_BYTES,
     ipc::serial_labels::SERIAL_WRITE_SENT,
     "serial",
+    Pace::Hold,
+    Relayed::Pass,
+    0,
 );
-/// The framebuffer driver logd mirrors every line to. A headless boot runs
-/// none, so the sink stays unserved: it queues lines up to its queue and
-/// counts the rest, and nothing is written to a screen ([`Sink::offer`]).
-static FB: Sink = Sink::new(ipc::fb_labels::FB_WRITE_BYTES, 0, "framebuffer");
+/// The framebuffer driver: a `skip` sink, which shows `relayed` entries in
+/// its backlog. A headless boot runs none, so the sink stays unserved and
+/// writes nothing.
+static FB: Sink = Sink::new(
+    ipc::fb_labels::FB_WRITE_BYTES,
+    0,
+    "framebuffer",
+    Pace::Skip,
+    Relayed::Write,
+    1,
+);
+
+/// Every device sink, in [`LogdState::cursors`]' order.
+static SINKS: [&Sink; 2] = [&SERIAL, &FB];
 
 /// Maximum payload bytes per `SERIAL_WRITE_BYTES` or `FB_WRITE_BYTES` (one
 /// full IPC data area).
 const SERIAL_CHUNK: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
 /// The calling thread's registered IPC buffer, for the sink calls: the main
-/// thread, each receive worker, the resync helper and each writer own one, so
-/// a call from any thread (the panic sink included) uses its own page
-/// (`docs/ipc-design.md` § Multi-threaded servers). Null before the thread has
-/// one; the caller then drops the bytes.
+/// thread, each receive worker, the resync helper, the kernel log reader and
+/// each writer own one, so a call from any thread (the panic sink included)
+/// uses its own page (`docs/ipc-design.md` § Multi-threaded servers). Null
+/// before the thread has one; the caller then drops the bytes.
 fn emit_ipc_buf() -> *mut u64
 {
     std::os::seraph::current_ipc_buf()
@@ -1826,19 +2148,18 @@ fn resolve_output_drivers(serial_class: u64, fb_class: u64, ipc_buf: *mut u64) -
 }
 
 /// Spawn each sink's writer thread ([`Sink::run_writer`]) for a sink whose
-/// class the bootstrap carried. A sink whose writer cannot be spawned keeps
-/// its lines' producers writing it themselves, bounded
-/// ([`Sink::write_inline`]).
+/// class the bootstrap carried. A sink whose writer cannot be spawned is
+/// written by the threads that retain entries ([`Sink::write_inline`]).
 fn spawn_writers()
 {
-    for (sink, other) in [(&SERIAL, &FB), (&FB, &SERIAL)]
+    for sink in SINKS
     {
-        if sink.driver.class.load(Ordering::Acquire) == 0
+        if sink.driver.class() == 0
         {
             continue;
         }
         let spawned = std::thread::Builder::new().spawn(move || {
-            sink.run_writer(other);
+            sink.run_writer();
         });
         if spawned.is_ok()
         {
@@ -1857,15 +2178,73 @@ fn spawn_writers()
     }
 }
 
+/// Open the sinks: from now on their writers, or the inline writes, write
+/// the journal. Called once init-logd has acknowledged the handover release
+/// and writes the UART no more, at once on a restart, and on a halt.
+fn open_output()
+{
+    state().open = true;
+    RETAINED.notify_all();
+    write_inline_sinks();
+}
+
+/// After an entry is retained: wake the writers, and write the sinks that
+/// have none inline. Called with the state lock released.
+fn retained()
+{
+    RETAINED.notify_all();
+    write_inline_sinks();
+}
+
+/// Write each sink that has no writer thread inline ([`Sink::write_inline`]).
+fn write_inline_sinks()
+{
+    for sink in SINKS
+    {
+        sink.write_inline();
+    }
+}
+
+/// Wait until every holding `hold` sink's cursor has passed entry `seq`, or
+/// the sink stops holding (stalled, unserved, absent): the kernel log
+/// reader's wait before it acknowledges the records it retained
+/// (`services/logd/docs/sinks.md` § The kernel's lines).
+fn await_hold_passed(seq: u64)
+{
+    let mut st = state();
+    loop
+    {
+        let waiting = SINKS.iter().any(|sink| {
+            sink.holding()
+                && st
+                    .cursors
+                    .get(sink.index)
+                    .is_some_and(|cursor| cursor.next <= seq)
+        });
+        if !waiting
+        {
+            return;
+        }
+        // A sink's progress wakes the wait; the bound lets a write that has
+        // run past the stall bound since be seen.
+        st = PROGRESS
+            .wait_timeout(st, Duration::from_millis(u64::from(SINK_STALL_MS)))
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+}
+
 /// How long each call of a [`write_line`] may wait for its answer.
 #[derive(Clone, Copy)]
 enum Bound
 {
-    /// No bound: the writer's calls.
+    /// No bound: the writer's calls. A `STALLED` answer is asked again.
     Unbounded,
-    /// Each call for this many milliseconds: the panic sink's calls.
+    /// Each call for this many milliseconds: the panic sink's calls. A
+    /// `STALLED` answer ends the write.
     Each(u32),
-    /// Every call ending by this instant: an inline write's calls.
+    /// Every call ending by this instant: an inline write's calls. A
+    /// `STALLED` answer is asked again until then.
     By(Instant),
 }
 
@@ -1888,68 +2267,97 @@ impl Bound
             }
         }
     }
+
+    /// Whether a step the driver answered `STALLED` is asked again.
+    const fn repeats(self) -> bool
+    {
+        !matches!(self, Self::Each(_))
+    }
 }
 
-/// What a driver did with a line [`write_line`] wrote to it.
+/// What a driver did with an entry [`write_line`] wrote to it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Wrote
 {
     /// The driver took every byte and, with a barrier, saw them leave the
-    /// device: the line is written.
+    /// device: the entry is written.
     All,
-    /// The driver took every byte, but the barrier was answered with anything
-    /// but success (the serial driver's `STALLED` on a transmitter that made
-    /// no progress) or not answered within its bound. The bytes are the
-    /// driver's, and leave the device when its transmitter moves again.
-    Held,
-    /// The driver did not take every byte: a chunk's call failed or was not
-    /// answered within its bound, or the driver answered it with anything but
-    /// success; or the barrier's call failed, so the driver is gone with the
-    /// bytes it took ([`Answer::Failed`]). The line is not written whole.
+    /// The write was given up: a call was refused with anything but
+    /// `STALLED`, interrupted after the driver may have taken its bytes, not
+    /// answered within its bound, or answered `STALLED` under a bound that
+    /// does not ask again. The entry is not written whole, and is counted.
     Lost,
+    /// A call failed: the driver's endpoint is gone, and the bytes it took
+    /// with it. The entry is written again to the next driver resolved.
+    Gone,
 }
 
-/// Write the line `bytes` to the driver behind `cap` with one plain `op`
-/// call per [`SERIAL_CHUNK`] bytes, on the calling thread's page `ipc_buf`,
-/// each call bounded by `bound`; then, when `sent` is not 0, with one
-/// zero-length `op | sent` call, a barrier the driver answers once every byte
-/// written before it has left the device. Two steps, so each of the serial
-/// driver's `STALLED` answers means one thing: a chunk refused `STALLED`
-/// was not appended to the transmit ring, and a barrier refused `STALLED`
-/// was (`services/drivers/serial/README.md` § Label 1). A chunk not taken
-/// ends the write.
+/// Write `bytes` to the driver behind `cap` with one plain `op` call per
+/// [`SERIAL_CHUNK`] bytes, on the calling thread's page `ipc_buf`, each call
+/// bounded by `bound`; then, when `sent` is not 0, with one zero-length
+/// `op | sent` call, a barrier the driver answers once every byte written
+/// before it has left the device. Two steps, so each of the serial driver's
+/// `STALLED` answers means one thing: a chunk answered `STALLED` was not
+/// appended to the transmit ring, and is written again; a barrier answered
+/// `STALLED` was, and is asked again (`services/drivers/serial/README.md`
+/// § Label 1). Neither is asked again under [`Bound::Each`].
 fn write_line(cap: u64, op: u64, sent: u64, bytes: &[u8], ipc_buf: *mut u64, bound: Bound)
 -> Wrote
 {
-    let taken = bytes.chunks(SERIAL_CHUNK).all(|chunk| {
-        bound
-            .next_ms()
-            .is_some_and(|ms| call_chunk(cap, op, chunk, ipc_buf, ms) == Answer::Taken)
-    });
-    if !taken
+    for chunk in bytes.chunks(SERIAL_CHUNK)
     {
-        return Wrote::Lost;
+        match call_step(cap, op, chunk, ipc_buf, bound, Step2::Chunk)
+        {
+            Wrote::All =>
+            {}
+            other @ (Wrote::Lost | Wrote::Gone) => return other,
+        }
     }
     if sent == 0
     {
         return Wrote::All;
     }
+    call_step(cap, op | sent, &[], ipc_buf, bound, Step2::Barrier)
+}
+
+/// Which step of a [`write_line`] a call is, which decides how an interrupted
+/// call is read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step2
+{
+    /// A chunk of the entry's bytes: an interrupted one may have been taken,
+    /// so it is not written again.
+    Chunk,
+    /// The zero-length barrier, which only waits: an interrupted one is asked
+    /// again.
+    Barrier,
+}
+
+/// One step of [`write_line`]: the call of `chunk` with `op`, made again
+/// while the driver answers `STALLED` and `bound` repeats, and, for a
+/// barrier, while the call is interrupted.
+fn call_step(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, bound: Bound, step: Step2)
+-> Wrote
+{
     loop
     {
         let Some(ms) = bound.next_ms()
         else
         {
-            return Wrote::Held;
+            return Wrote::Lost;
         };
-        match call_chunk(cap, op | sent, &[], ipc_buf, ms)
+        match call_chunk(cap, op, chunk, ipc_buf, ms)
         {
             Answer::Taken => return Wrote::All,
-            Answer::Refused | Answer::Unanswered => return Wrote::Held,
-            // The barrier only waits, so it is asked again: a live driver
-            // answers it, and a dead one's endpoint fails it.
-            Answer::Interrupted =>
+            Answer::Stalled if bound.repeats() =>
             {}
-            Answer::Failed => return Wrote::Lost,
+            Answer::Interrupted if step == Step2::Barrier =>
+            {}
+            Answer::Stalled | Answer::Refused | Answer::Unanswered | Answer::Interrupted =>
+            {
+                return Wrote::Lost;
+            }
+            Answer::Failed => return Wrote::Gone,
         }
     }
 }
@@ -1961,16 +2369,19 @@ enum Answer
     /// Success: the driver took the call's bytes, and for a barrier saw them
     /// leave.
     Taken,
-    /// Any other answer, the serial driver's `STALLED` among them.
+    /// The serial driver's `STALLED`: the transmitter made no progress for its
+    /// stall bound.
+    Stalled,
+    /// Any other answer.
     Refused,
     /// No answer within the call's bound (`WouldBlock`): the driver may
     /// still be serving the call.
     Unanswered,
     /// The call was cancelled before its answer (`Interrupted`): the calling
     /// thread was stopped, or the driver received again before it replied,
-    /// or its serving thread was freed. The driver may have taken the call's bytes, so a chunk
-    /// interrupted is not written again, and its line is counted rather than
-    /// repeated.
+    /// or its serving thread was freed. The driver may have taken the call's
+    /// bytes, so a chunk interrupted is not written again, and its entry is
+    /// counted rather than repeated.
     Interrupted,
     /// The call failed otherwise: the driver's endpoint is gone, which for a
     /// resolved driver means devmgr withdrew it.
@@ -1985,12 +2396,13 @@ fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u3
     let label = op | ((chunk.len() as u64) << 16);
     let msg = IpcMessage::builder(label).bytes(0, chunk).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer page. A
-    // worker calls here (inline) while it serves a request, which was copied
-    // out of the page as it was received, and its pending reply stays bound
-    // across this call (`docs/ipc-design.md` § Multi-threaded servers).
+    // worker calls here (inline) after it has served its request, which was
+    // copied out of the page as it was received, and its pending reply stays
+    // bound across this call (`docs/ipc-design.md` § Multi-threaded servers).
     match unsafe { ipc::ipc_call_timeout(cap, &msg, ipc_buf, timeout_ms) }
     {
         Ok(reply) if reply.label == WRITE_SUCCESS => Answer::Taken,
+        Ok(reply) if reply.label == ipc::serial_errors::STALLED => Answer::Stalled,
         Ok(_) => Answer::Refused,
         Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => Answer::Unanswered,
         Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => Answer::Interrupted,
@@ -2003,7 +2415,7 @@ fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u3
 const WRITE_SUCCESS: u64 = ipc::serial_errors::SUCCESS;
 const _: () = assert!(WRITE_SUCCESS == ipc::fb_errors::SUCCESS);
 
-/// Longest frame of a line: the prefix [`LineBuf::push_prefix`] writes
+/// Longest frame of a line: the prefix [`LineBuf::push_prefix_at`] writes
 /// (`logd_codec::prefix::PREFIX_MAX`) and the line's `\r\n`.
 const LINE_FRAME_MAX: usize = logd_codec::prefix::PREFIX_MAX + 2;
 
@@ -2054,14 +2466,8 @@ impl LineBuf
         self.push(b);
     }
 
-    /// Push a line's prefix (`logd_codec::prefix::write`) stamped now.
-    fn push_prefix(&mut self, name: &[u8], level: u64)
-    {
-        self.push_prefix_at(name, level, elapsed_us());
-    }
-
-    /// [`Self::push_prefix`], stamped `us` microseconds of the monotonic
-    /// clock.
+    /// Push a line's prefix (`logd_codec::prefix::write`), stamped `us`
+    /// microseconds of the monotonic clock.
     fn push_prefix_at(&mut self, name: &[u8], level: u64, us: u64)
     {
         logd_codec::prefix::write(us, level, name, |b| self.push(b));
@@ -2085,35 +2491,19 @@ impl LineBuf
     {
         self.buf.get(..self.len).unwrap_or_default()
     }
-
-    /// Write the line to the serial sink and the framebuffer sink, each whole:
-    /// queued to both ([`Sink::offer`]), then awaited
-    /// ([`Sink::await_written`]), so the two writes
-    /// overlap and each sink holds the caller for [`SINK_STALL_MS`] at most.
-    fn flush(&self)
-    {
-        let line = self.bytes();
-        let serial_deadline = stall_deadline();
-        let serial = SERIAL.offer(line, LineKind::Logged, serial_deadline);
-        let fb_deadline = stall_deadline();
-        let fb = FB.offer(line, LineKind::Logged, fb_deadline);
-        SERIAL.await_written(serial, serial_deadline);
-        FB.await_written(fb, fb_deadline);
-    }
 }
 
 /// Panic-output sink registered with std via `set_panic_sink`. Routes
 /// logd's own panic / alloc-error / precondition output to the serial
 /// driver — never through the log endpoint logd serves. Forwards raw bytes
-/// (std frames the panic message) straight to the driver, outside the serial
-/// sink's queue, each call bounded by [`SINK_STALL_MS`], so a stopped driver
+/// (std frames the panic message) straight to the driver, outside the
+/// journal, each call bounded by [`SINK_STALL_MS`], so a stopped driver
 /// delays a panicking thread's end by that bound per call rather than for
 /// good; drops them while no driver is resolved. Must stay non-allocating
 /// and panic-free: it runs from the panic path, and takes no lock, so a panic
-/// on a thread that holds a sink's lock or the state lock still reaches the
-/// driver. Its calls use the calling thread's own IPC buffer
-/// ([`emit_ipc_buf`]), so a panic or allocation failure on any thread never
-/// touches another's.
+/// on a thread that holds the state lock still reaches the driver. Its calls
+/// use the calling thread's own IPC buffer ([`emit_ipc_buf`]), so a panic or
+/// allocation failure on any thread never touches another's.
 fn panic_to_serial(bytes: &[u8])
 {
     let ipc_buf = emit_ipc_buf();
@@ -2135,93 +2525,37 @@ fn panic_to_serial(bytes: &[u8])
     }
 }
 
-/// Emit `[sec.usfrac] INFO   [logd] <payload>\r\n` to the serial driver, stamped
-/// when called. Used for logd's own diagnostics in place of `seraph::log!`
-/// (which would self-IPC into the endpoint logd serves). Until
-/// [`open_self_log`], the line is held in [`SELF_LOG_HOLD`] instead; a payload
-/// longer than `LINE_BUF_SIZE` bytes is cut at a character boundary.
+/// Retain `payload` as logd's own informational line, stamped when called,
+/// in logd's slot (`LOG_BADGE_LOGD`), so it reaches every sink as a sender's
+/// line does. logd's diagnostics take this path in place of `seraph::log!`,
+/// which would self-IPC into the endpoint logd serves. A payload longer than
+/// `LINE_BUF_SIZE` bytes was cut at a character boundary by its
+/// [`SerialFmt`]. Must not be called with the state lock held.
 fn self_log(payload: &str)
 {
-    let mut line = HeldLine {
-        us: elapsed_us(),
-        payload: SerialFmt::new(),
-    };
-    let _ = line.payload.write_str(payload);
-    let now = SELF_LOG_HOLD
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .hold(line);
-    if let Some(line) = now
+    retain_own(LEVEL_INFO, payload.as_bytes());
+}
+
+/// Retain the text line `text` at `level` in logd's slot, then wake the
+/// writers ([`retained`]). Never refused: logd's own lines are not held to a
+/// window.
+fn retain_own(level: u64, text: &[u8])
+{
     {
-        write_self_log(&line);
+        let mut st = state();
+        if let Some((slot, history)) = st.table.sender_slot(LOG_BADGE_LOGD)
+        {
+            let _ = history.push_text(slot, LOG_BADGE_LOGD, elapsed_us(), level, text);
+        }
     }
+    retained();
 }
 
-/// Most self-log lines [`SELF_LOG_HOLD`] keeps until init-logd stops writing
-/// the UART. A line past it is dropped and counted, and [`open_self_log`]
-/// reports the count in one line. A tuning value: logd self-logs at most nine
-/// lines before the release on a start that does not halt (a refused class
-/// watch of each output driver, the death-EQ registration's outcome, a failed
-/// wait-set add of each watch, a partial receive pool, a failed writer spawn
-/// of each sink, and the start of the pull), and a halt writes the held lines
-/// before its own.
-const SELF_LOG_HELD_MAX: usize = 12;
-
-/// One self-log line: when it was logged, and its text.
-struct HeldLine
-{
-    us: u64,
-    payload: SerialFmt,
-}
-
-/// logd's self-log lines from its start until init-logd has acknowledged
-/// `HANDOVER_RELEASE`. Until then init-logd writes each line it forwards to
-/// the UART directly, byte by byte, and the serial driver logd writes through
-/// drives the same UART under no lock the two share, so a line of each
-/// written at once interleaves byte by byte
-/// (`services/logd/docs/handover-protocol.md` § Startup ordering). The
-/// panic sink ([`panic_to_serial`]) is not held.
-static SELF_LOG_HOLD: Mutex<HeldLines<HeldLine, SELF_LOG_HELD_MAX>> = Mutex::new(HeldLines::new());
-
-/// Write one self-log line to the serial driver, stamped when it was logged.
-fn write_self_log(line: &HeldLine)
-{
-    let mut out = LineBuf::new();
-    out.push_text_line(
-        b"logd",
-        LEVEL_INFO,
-        line.us,
-        line.payload.as_str().as_bytes(),
-    );
-    out.flush();
-}
-
-/// Stop holding self-log lines: write the held ones in order, then one line
-/// for those dropped past [`SELF_LOG_HELD_MAX`], if any. A later call writes
-/// nothing.
-fn open_self_log()
-{
-    let dropped = SELF_LOG_HOLD
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .open(|line| write_self_log(&line));
-    if dropped > 0
-    {
-        let mut buf = SerialFmt::new();
-        let _ = write!(
-            buf,
-            "{dropped} self-log lines dropped before the handover release (hold of \
-             {SELF_LOG_HELD_MAX})"
-        );
-        self_log(buf.as_str());
-    }
-}
-
-/// Self-log `payload` on the way to a halt, after the held lines: a halt
-/// before the handover release writes them now, since nothing would later.
+/// Self-log `payload` on the way to a halt: open the sinks first, since
+/// nothing would later, so the line and those before it are written.
 fn fatal(payload: &str)
 {
-    open_self_log();
+    open_output();
     self_log(payload);
 }
 

@@ -24,12 +24,11 @@ document § Levels), how both render a log record and the parser that reads its 
 the rendered text (`record::render`, `record::fields`, `RENDERED_MAX_BYTES`; see the same document
 § `stream_labels::STREAM_RECORD`), the line and name widths both log
 receivers keep per sender (`LINE_BUF_SIZE`, `MAX_NAME_LEN`), `BoundedStr`, the
-fixed-capacity, UTF-8-safe formatter logd uses for its own diagnostics, and `HeldLines`, the
-bounded hold on those diagnostics until init-logd acknowledges the handover release (see
-[`docs/handover-protocol.md`](../docs/handover-protocol.md) § Startup ordering). It holds
-real-logd's output-sink queue and its rule (`SinkQueue`, `SINK_QUEUE_BYTES`, `SINK_STALL_MS`:
-when a line's producer waits, when a sink is stalled, and where its dropped lines are counted; see
-[`docs/ipc-interface.md`](../docs/ipc-interface.md) § Output sinks). It issues no
+fixed-capacity, UTF-8-safe formatter logd uses for its own diagnostics. It holds the rules of
+real-logd's output sinks that need no clock or lock of their own (`SINK_STALL_MS`, `SKIP_BACKLOG`,
+`write_overdue`, `hint_ms`, `attach_cursor`, `drop_text`: when a sink's write is overdue, the retry
+hint of a refused message, where a `skip` sink's cursor starts, and the text of a drop line; see
+[`docs/ipc-interface.md`](../docs/ipc-interface.md) § Output sinks, § Hold window). It issues no
 syscall and no IPC, so both ends keep the IPC calls and the logic stays host-reachable, per
 [coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
 
@@ -50,8 +49,6 @@ services/logd/codec/
     ├── handover.rs             # Handover wire contract: codes, encoders,
     │                           # decoder, NameResend, release retry
     ├── history.rs              # HistoryRing: init-logd's captured history
-    ├── hold.rs                 # HeldLines: logd's self-log lines held
-    │                           # until the handover release
     ├── kernel.rs               # Kernel log lines: the record cursor, the
     │                           # [kernel] line parts, the reserved name
     ├── level.rs                # The level tag a rendered line carries
@@ -62,8 +59,8 @@ services/logd/codec/
     │                           # parser
     ├── resync.rs               # Death-queue resync: candidates, live-page
     │                           # decoder, eviction set, WalkGate
-    ├── sink.rs                 # SinkQueue: an output sink's line queue,
-    │                           # stall mark, and drop count
+    ├── sink.rs                 # Sink rules: stall bound, retry hint,
+    │                           # attach cursor, drop-line text
     └── bounded_str.rs          # BoundedStr: UTF-8-safe bounded formatter
 ```
 

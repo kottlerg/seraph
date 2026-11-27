@@ -61,6 +61,10 @@ services/svctest/
         ├── logd_sinks.rs      # logd's sinks: serial and framebuffer drivers attachable; lines
         │                      #   answered with either stopped, and with the framebuffer killed
         │                      #   and restarted; and logd's flush barrier
+        ├── logd_flood.rs      # Probe lines logged between `log-flood begin` and `end` while two
+        │                      #   processes flood logd, which refuses the flooders
+        │                      #   `WINDOW_FULL` and not the probe; `run --whole-lines`
+        │                      #   checks the log
         ├── console_whole_lines.rs # Four threads log numbered lines for up to 3 s between
         │                      #   `whole-lines begin` and `whole-lines end senders=4 lines=N` while
         │                      #   `relrofault` faults in a loop and `capexhaust` wedges its CSpace;

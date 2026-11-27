@@ -600,7 +600,7 @@ path, so a count moved in the debug profile does not predict the count moved in 
 regression that exists only in the debug profile, such as a debug assertion added to a hot path,
 is therefore not gated: it costs nothing on hardware, and the functional cells still boot both
 profiles. [core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md)
-§ Profile gives the counts of both profiles per path.
+§ Profile gives the counts of both profiles per path, as of the head its account names.
 
 A one-CPU count gates only when its timed window does not idle. While every vCPU idles, the
 guest's clock follows the host's time, so a window that idles counts host time, which no band
@@ -758,8 +758,11 @@ numbered lines arrive whole, in order, none missing. A run whose check fails is 
 `QEMU-CRASH` run is not checked. svctest's `serial_transmit` phase, right after it, writes numbered
 lines to the serial driver itself between `serial-burst begin` and `serial-burst end senders=1
 lines=N` while the driver's transmitter is stopped, so their bytes wait in the driver's transmit
-ring until it is started again, and the same check reads them. The svctest cell's CI boot passes
-`--whole-lines whole-lines --whole-lines serial-burst`
+ring until it is started again, and the same check reads them. svctest's `logd_flood` phase, before
+the `logd_sinks` phases, logs probe lines `log-flood t=0 n=<n> len=<len> <payload>` between
+`log-flood begin` and `log-flood end` while two processes flood logd, and the same check reads
+them. The svctest cell's CI boot passes
+`--whole-lines whole-lines --whole-lines serial-burst --whole-lines log-flood`
 ([docs/console-model.md](console-model.md);
 [xtask/README.md](../xtask/README.md#classified-boots---runs)).
 

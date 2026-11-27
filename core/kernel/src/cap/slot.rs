@@ -558,8 +558,6 @@ define_typed_rights! {
         BASE = syscall::RIGHTS_SBI_BASE;
         /// May forward the SBI Debug Console (DBCN) extension to firmware.
         DBCN = syscall::RIGHTS_SBI_DBCN;
-        /// May forward the SBI Performance Monitoring Unit (PMU) extension.
-        PMU = syscall::RIGHTS_SBI_PMU;
     }
 }
 

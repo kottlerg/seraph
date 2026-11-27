@@ -6,9 +6,12 @@
 //! logd's sender state, as pure host-tested logic: each sender's display
 //! name and partial-line buffer, the history of completed text lines and
 //! records logd keeps for every sender under one byte bound
-//! ([`HISTORY_BYTES`]; the stored form is
-//! `services/logd/docs/ipc-interface.md` § History), and the retired slots
-//! eviction leaves (§ Retired slots), which logd's queries read (§ Queries).
+//! ([`Bounds`]; the stored form is
+//! `services/logd/docs/ipc-interface.md` § History), which is also the
+//! journal logd's sinks read through their cursors, with the window that holds
+//! a sender back while a `hold` sink has not written its entries ([`admit`];
+//! § Hold window), and the retired slots eviction leaves (§ Retired slots),
+//! which logd's queries read (§ Queries).
 //! Nothing here makes a syscall: logd's receive workers and main thread drive
 //! it under logd's state lock.
 //!
@@ -28,27 +31,92 @@ use logd_codec::history::ENTRY_MAX_BYTES;
 use logd_codec::query::SlotRow;
 pub use logd_codec::{LINE_BUF_SIZE, MAX_NAME_LEN};
 
-/// Bytes of history logd retains, every live and retired slot's entries
-/// together, each charged [`HistoryEntry::charge`]. Retaining an entry past
-/// it drops the oldest entries logd-wide until the new one fits, so what the
-/// history holds is bounded whatever the number of senders, and a logd
-/// restarted while memory is critical, whose every live sender is new to it,
-/// holds no more. logd's budget node is a system-reserve node
-/// (`services/logd/README.md` § Role), and 256 KiB is under 4% of the reserve
-/// of a 512 MiB machine (`pool_total / 64`). A retention tuning value that
-/// bounds no capacity: past it the oldest entry is dropped, never a sender
-/// or a line's output.
-pub const HISTORY_BYTES: usize = 256 * 1024;
+/// The least bytes of history logd retains ([`Bounds::bytes`]), every live
+/// and retired slot's entries together, each charged [`HistoryEntry::charge`]:
+/// the bound on a machine of 512 MiB or less, and the bound logd starts with
+/// when memmgr does not report the machine's RAM. Retaining an entry past the
+/// bound drops one entry, as [`History`] chooses, until the new one fits, so
+/// what the history holds is bounded whatever the number of senders, and a
+/// logd restarted while memory is critical, whose every live sender is new to
+/// it, holds no more. logd's budget node is a system-reserve node
+/// (`services/logd/README.md` § Role), and the bound is 1/32 of the reserve
+/// (`pool_total / 64`) at any size between the floor and the ceiling. A
+/// retention tuning value that bounds no capacity: past it an entry is
+/// dropped, never a sender.
+pub const HISTORY_BYTES_MIN: usize = 256 * 1024;
 
-/// Number of completed log entries a slot keeps at most, of those
-/// [`HISTORY_BYTES`] retains: one sender logging without pause holds this
-/// many, so it cannot drop the last lines of a quieter or a dead sender from
-/// the history alone. A retention tuning value that bounds no capacity: past
-/// it the slot's oldest entry is dropped, never a sender.
-pub const PER_SLOT_HISTORY: usize = 16;
+/// The most bytes of history logd retains, on a machine of 4 GiB or more
+/// ([`Bounds::for_ram`]).
+pub const HISTORY_BYTES_MAX: usize = 2 * 1024 * 1024;
+
+/// Bytes of RAM per byte of history between [`HISTORY_BYTES_MIN`] and
+/// [`HISTORY_BYTES_MAX`].
+pub const RAM_PER_HISTORY_BYTE: u64 = 2048;
+
+/// Entries a slot keeps at [`HISTORY_BYTES_MIN`] ([`Bounds::per_slot`]),
+/// scaled in proportion with the history's bytes: one sender logging without
+/// pause holds this many, so it cannot drop the last lines of a quieter or a
+/// dead sender from the history alone. Twice [`HOLD_WINDOW`], so a sender
+/// within its window, the error headroom included, never drops an entry of
+/// its own that a hold sink has not written. A retention tuning value that
+/// bounds no capacity: past it the slot's oldest entry is dropped, never a
+/// sender.
+pub const PER_SLOT_HISTORY_MIN: usize = 2 * HOLD_WINDOW;
+
+/// Entries of one sender a `hold` sink may have unwritten before logd
+/// refuses the sender's next message that completes a line
+/// (`ipc::stream_labels::WINDOW_FULL`, [`admit`]); twice this for a message
+/// at error or more severe. A pace tuning value that bounds no capacity: a
+/// refused message is sent again by its sender once the sink has written
+/// some of the sender's entries (`services/logd/docs/ipc-interface.md`
+/// § Hold window).
+pub const HOLD_WINDOW: usize = 16;
+
+/// The history's two retention bounds, fixed when logd starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bounds
+{
+    /// Bytes of history retained, every slot's entries together.
+    pub bytes: usize,
+    /// Entries a slot keeps at most.
+    pub per_slot: usize,
+}
+
+impl Bounds
+{
+    /// The bounds at the floor: [`HISTORY_BYTES_MIN`] and
+    /// [`PER_SLOT_HISTORY_MIN`].
+    pub const FLOOR: Self = Self {
+        bytes: HISTORY_BYTES_MIN,
+        per_slot: PER_SLOT_HISTORY_MIN,
+    };
+
+    /// The bounds of a machine of `ram_bytes` of RAM: its RAM over
+    /// [`RAM_PER_HISTORY_BYTE`], within [`HISTORY_BYTES_MIN`] and
+    /// [`HISTORY_BYTES_MAX`], and [`PER_SLOT_HISTORY_MIN`] scaled by the
+    /// same ratio to the floor, rounded down.
+    #[must_use]
+    pub fn for_ram(ram_bytes: u64) -> Self
+    {
+        let share = usize::try_from(ram_bytes / RAM_PER_HISTORY_BYTE).unwrap_or(usize::MAX);
+        let bytes = share.clamp(HISTORY_BYTES_MIN, HISTORY_BYTES_MAX);
+        Self {
+            bytes,
+            per_slot: PER_SLOT_HISTORY_MIN.saturating_mul(bytes) / HISTORY_BYTES_MIN,
+        }
+    }
+}
+
+impl Default for Bounds
+{
+    fn default() -> Self
+    {
+        Self::FLOOR
+    }
+}
 
 /// Number of evicted slots logd retains, with their names, for its queries;
-/// their history counts toward [`HISTORY_BYTES`]. A retention tuning value
+/// their history counts toward the history's byte bound ([`Bounds`]). A retention tuning value
 /// that bounds no capacity: retiring a slot into a full set drops the oldest
 /// retired slot and its history, never a live one.
 pub const RETIRED_SLOTS: usize = 64;
@@ -75,7 +143,7 @@ const ENTRY_CHARGE_MAX: usize =
     ENTRY_FIXED_BYTES + ENTRY_MAX_BYTES + RECORD_FIELDS_MAX * size_of::<FieldSpan>();
 
 // The history holds any one entry, so retaining one never drops it at once.
-const _: () = assert!(ENTRY_CHARGE_MAX <= HISTORY_BYTES);
+const _: () = assert!(ENTRY_CHARGE_MAX <= HISTORY_BYTES_MIN);
 
 /// What a retained entry holds.
 #[derive(Clone)]
@@ -127,11 +195,25 @@ pub struct HistoryEntry
     /// A text line's bytes, no trailing `\n`, at most [`LINE_BUF_SIZE`];
     /// or a record's payload, at most `ipc::log_record::RECORD_MAX_BYTES`.
     pub bytes: Box<[u8]>,
+    /// Where the entry came from.
+    pub origin: Origin,
+}
+
+/// Where a retained entry came from (`services/logd/docs/sinks.md` § The
+/// record).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin
+{
+    /// Retained by this logd instance.
+    Live,
+    /// Installed from init-logd's handover: init-logd wrote it to the console
+    /// itself.
+    Relayed,
 }
 
 impl HistoryEntry
 {
-    /// The bytes the entry counts toward [`HISTORY_BYTES`]: its key and value
+    /// The bytes the entry counts toward [`Bounds::bytes`]: its key and value
     /// in the history map, its bytes, and its field table. Fixed once the
     /// entry is built, so retaining and dropping it count the same.
     fn charge(&self) -> usize
@@ -159,8 +241,8 @@ pub struct Slot
     /// that carried its first byte. Meaningful only once that byte has
     /// arrived ([`Self::begin_byte`]).
     pub partial_level: u64,
-    /// The `seq` of each of the sender's last [`PER_SLOT_HISTORY`] entries,
-    /// oldest first. An entry [`HISTORY_BYTES`] has dropped since keeps its
+    /// The `seq` of each of the sender's last [`Bounds::per_slot`] entries,
+    /// oldest first. An entry [`Bounds::bytes`] has dropped since keeps its
     /// number here until the slot's later entries push it out.
     seqs: VecDeque<u64>,
 }
@@ -179,25 +261,117 @@ impl Slot
     }
 }
 
-/// The completed entries of every live and retired slot, by `seq`, and the
-/// bytes they are charged ([`HISTORY_BYTES`]).
+/// The number of lines a `STREAM_BYTES` message of `bytes` completes for a
+/// slot whose partial line holds `partial` bytes: one per newline, and one
+/// each time the partial line reaches [`LINE_BUF_SIZE`], as logd's
+/// consumption of the message completes them.
+#[must_use]
+pub fn lines_completed(partial: usize, bytes: &[u8]) -> usize
+{
+    let mut len = partial;
+    let mut lines = 0usize;
+    for &b in bytes
+    {
+        if b == b'\n'
+        {
+            lines = lines.saturating_add(1);
+            len = 0;
+        }
+        else if len < LINE_BUF_SIZE
+        {
+            len = len.saturating_add(1);
+            if len == LINE_BUF_SIZE
+            {
+                lines = lines.saturating_add(1);
+                len = 0;
+            }
+        }
+    }
+    lines
+}
+
+/// Whether logd takes a message of a sender's ([`admit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admit
+{
+    /// The message is consumed.
+    Accept,
+    /// The message is refused with `ipc::stream_labels::WINDOW_FULL` and
+    /// nothing of it is consumed: it would take the sender's unwritten
+    /// entries this many past its window.
+    Refuse
+    {
+        excess: usize
+    },
+}
+
+/// Whether a message at `level` that completes `lines` lines is taken from a
+/// sender with `unwritten` entries a holding `hold` sink has not written
+/// ([`History::unwritten`]): refused when it would take the count past
+/// [`HOLD_WINDOW`], or twice that at error or more severe; taken when the
+/// count stays within it, always from a sender with nothing unwritten, so a
+/// message that completes more lines than the window holds is taken from an
+/// empty window, and always when the message completes no line.
+#[must_use]
+pub fn admit(unwritten: usize, lines: usize, level: u64) -> Admit
+{
+    let window = if level <= ipc::stream_labels::LEVEL_ERROR
+    {
+        HOLD_WINDOW.saturating_mul(2)
+    }
+    else
+    {
+        HOLD_WINDOW
+    };
+    let after = unwritten.saturating_add(lines);
+    if unwritten == 0 || lines == 0 || after <= window
+    {
+        Admit::Accept
+    }
+    else
+    {
+        Admit::Refuse {
+            excess: after.saturating_sub(window),
+        }
+    }
+}
+
+/// The completed entries of every live and retired slot, by `seq`, the
+/// bytes they are charged ([`Bounds`]), and the first `seq` a `hold` sink
+/// has not written: logd's journal, which each sink reads through a cursor
+/// of its own (`services/logd/docs/sinks.md` § Cursor and order).
 #[derive(Default)]
 pub struct History
 {
     /// Entries by logd-wide arrival sequence, so the first is the oldest.
     entries: BTreeMap<u64, HistoryEntry>,
     /// The sum of the entries' [`HistoryEntry::charge`], at most
-    /// [`HISTORY_BYTES`].
+    /// [`Bounds::bytes`].
     bytes: usize,
     /// The `seq` the next retained entry takes. A `u64` counting one per
     /// retained entry does not wrap.
     next_seq: u64,
+    /// The retention bounds.
+    bounds: Bounds,
+    /// The first `seq` the `hold` sink has not written, `None` while logd
+    /// has no `hold` sink: the entries from it on are kept from the eviction
+    /// [`Bounds::bytes`] makes while a written one is left, and are the ones
+    /// a sender's window counts ([`Self::unwritten`]).
+    held_from: Option<u64>,
 }
 
 impl History
 {
-    /// Retain a completed text line of `slot`, the slot of sender `badge`.
-    pub fn push_text(&mut self, slot: &mut Slot, badge: u64, us: u64, level: u64, bytes: &[u8])
+    /// Retain a completed text line of `slot`, the slot of sender `badge`,
+    /// and return its `seq`.
+    pub fn push_text(
+        &mut self,
+        slot: &mut Slot,
+        badge: u64,
+        us: u64,
+        level: u64,
+        bytes: &[u8],
+    ) -> u64
     {
         self.push(
             slot,
@@ -207,12 +381,13 @@ impl History
                 level,
                 kind: EntryKind::Text,
                 bytes: bytes.into(),
+                origin: Origin::Live,
             },
-        );
+        )
     }
 
     /// Retain a record, with its field table, of `slot`, the slot of sender
-    /// `badge`.
+    /// `badge`, and return its `seq`.
     pub fn push_record(
         &mut self,
         slot: &mut Slot,
@@ -220,50 +395,84 @@ impl History
         us: u64,
         level: u64,
         record: &Record<'_>,
-    )
+    ) -> u64
     {
-        self.push(
-            slot,
-            HistoryEntry {
-                badge,
-                us,
-                level,
-                kind: EntryKind::Record {
-                    message: record.message_span(),
-                    fields: record.fields().map(|f| f.spans).collect(),
-                },
-                bytes: record.payload().into(),
-            },
-        );
+        self.push(slot, record_entry(badge, us, level, record, Origin::Live))
     }
 
-    /// Retain `entry` as `slot`'s newest, under the next `seq`: drop the
-    /// slot's oldest entry when it holds [`PER_SLOT_HISTORY`], then the
-    /// oldest entries logd-wide until the new one fits in [`HISTORY_BYTES`].
-    fn push(&mut self, slot: &mut Slot, entry: HistoryEntry)
+    /// Retain `entry` as `slot`'s newest, under the next `seq`, and return
+    /// that `seq`: drop the slot's oldest entries while it holds
+    /// [`Bounds::per_slot`], then entries ([`Self::victim`]) until the new
+    /// one fits in [`Bounds::bytes`]. The slot of a sender no window holds
+    /// back ([`unwindowed`]) keeps the entries the `hold` sink has not
+    /// written past [`Bounds::per_slot`], within [`Bounds::bytes`]: nothing
+    /// else paces it to the sink, and the kernel's records are acknowledged
+    /// once written.
+    fn push(&mut self, slot: &mut Slot, entry: HistoryEntry) -> u64
     {
-        if slot.seqs.len() >= PER_SLOT_HISTORY
-            && let Some(oldest) = slot.seqs.pop_front()
+        let keep_unwritten = unwindowed(entry.badge);
+        while slot.seqs.len() >= self.bounds.per_slot
+            && let Some(&oldest) = slot.seqs.front()
         {
+            let unwritten = self.held_from.is_some_and(|held| oldest >= held)
+                && self.entries.contains_key(&oldest);
+            if keep_unwritten && unwritten
+            {
+                break;
+            }
+            slot.seqs.pop_front();
             self.remove(oldest);
         }
-        let charge = entry.charge();
-        while self.bytes.saturating_add(charge) > HISTORY_BYTES
+        self.make_room(entry.charge());
+        let seq = self.next_seq;
+        self.next_seq = seq.saturating_add(1);
+        // At most `bounds.bytes` after `make_room`, which the const assert on
+        // `ENTRY_CHARGE_MAX` lets every entry reach.
+        self.bytes = self.bytes.saturating_add(entry.charge());
+        self.entries.insert(seq, entry);
+        slot.seqs.push_back(seq);
+        seq
+    }
+
+    /// Drop entries ([`Self::victim`]) until `charge` more bytes fit in
+    /// [`Bounds::bytes`], or none is left.
+    fn make_room(&mut self, charge: usize)
+    {
+        while self.bytes.saturating_add(charge) > self.bounds.bytes
         {
-            let Some((_, dropped)) = self.entries.pop_first()
+            let Some(seq) = self.victim()
             else
             {
                 break;
             };
-            self.bytes = self.bytes.saturating_sub(dropped.charge());
+            self.remove(seq);
         }
-        let seq = self.next_seq;
-        self.next_seq = seq.saturating_add(1);
-        // At most `HISTORY_BYTES` after the loop above, which the const
-        // assert on `ENTRY_CHARGE_MAX` lets every entry reach.
-        self.bytes = self.bytes.saturating_add(charge);
-        self.entries.insert(seq, entry);
-        slot.seqs.push_back(seq);
+    }
+
+    /// The entry [`Bounds::bytes`] drops next: the oldest, when the `hold`
+    /// sink has written it or there is no `hold` sink; otherwise, since then
+    /// no written entry is left, the oldest entry of the badge with the most
+    /// entries, so the sender that fills the history loses its own.
+    fn victim(&self) -> Option<u64>
+    {
+        let (&oldest, _) = self.entries.first_key_value()?;
+        match self.held_from
+        {
+            Some(held) if oldest >= held =>
+            {
+                let mut counts: HashMap<u64, (usize, u64)> = HashMap::new();
+                for (&seq, entry) in &self.entries
+                {
+                    let count = counts.entry(entry.badge).or_insert((0, seq));
+                    count.0 = count.0.saturating_add(1);
+                }
+                counts
+                    .values()
+                    .max_by_key(|&&(count, seq)| (count, core::cmp::Reverse(seq)))
+                    .map(|&(_, seq)| seq)
+            }
+            _ => Some(oldest),
+        }
     }
 
     /// Drop entry `seq`, when the history still holds it.
@@ -299,11 +508,104 @@ impl History
     }
 
     /// The bytes the retained entries are charged, at most
-    /// [`HISTORY_BYTES`].
+    /// [`Bounds::bytes`].
     #[must_use]
     pub fn bytes(&self) -> usize
     {
         self.bytes
+    }
+
+    /// The `seq` the next retained entry takes: the number of entries
+    /// retained so far.
+    #[must_use]
+    pub fn next_seq(&self) -> u64
+    {
+        self.next_seq
+    }
+
+    /// Record the first `seq` the `hold` sink has not written, `None` when
+    /// logd has no `hold` sink ([`Self::held_from`]).
+    pub fn set_held_from(&mut self, held: Option<u64>)
+    {
+        self.held_from = held;
+    }
+
+    /// The oldest entry retained at or after `seq`, with its own `seq`: a
+    /// sink's next entry from its cursor. Its `seq` less `seq` is the
+    /// number of entries dropped before the sink reached them, since `seq`
+    /// is dense.
+    #[must_use]
+    pub fn entry_from(&self, seq: u64) -> Option<(u64, &HistoryEntry)>
+    {
+        self.entries.range(seq..).next().map(|(&s, e)| (s, e))
+    }
+
+    /// Replace the bytes of the text entry `seq` with `bytes`, when the
+    /// history still holds it, then drop entries until the history is within
+    /// its bound again, which may drop this one: a skip sink's drop notice
+    /// whose count grows before the sink reaches it.
+    pub fn replace_text(&mut self, seq: u64, bytes: &[u8])
+    {
+        let Some(entry) = self.entries.get_mut(&seq)
+        else
+        {
+            return;
+        };
+        let before = entry.charge();
+        entry.bytes = bytes.into();
+        let after = entry.charge();
+        self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
+        self.make_room(0);
+    }
+
+    /// The entries of `slot` from the first one the `hold` sink has not
+    /// written on that the history still holds: what the slot's window
+    /// counts ([`admit`]). 0 while logd has no `hold` sink.
+    #[must_use]
+    pub fn unwritten(&self, slot: &Slot) -> usize
+    {
+        let Some(held) = self.held_from
+        else
+        {
+            return 0;
+        };
+        slot.seqs
+            .iter()
+            .rev()
+            .take_while(|&&seq| seq >= held)
+            .filter(|seq| self.entries.contains_key(seq))
+            .count()
+    }
+}
+
+/// Whether `badge` is a sender no window holds back, whose lines logd
+/// retains itself: the kernel's and logd's own
+/// (`services/logd/docs/ipc-interface.md` § Hold window).
+#[must_use]
+pub fn unwindowed(badge: u64) -> bool
+{
+    badge == ipc::log_badges::LOG_BADGE_KERNEL || badge == ipc::log_badges::LOG_BADGE_LOGD
+}
+
+/// The entry of a record of `badge`, with its field table.
+fn record_entry(
+    badge: u64,
+    us: u64,
+    level: u64,
+    record: &Record<'_>,
+    origin: Origin,
+) -> HistoryEntry
+{
+    HistoryEntry {
+        badge,
+        us,
+        level,
+        kind: EntryKind::Record {
+            message: record.message_span(),
+            fields: record.fields().map(|f| f.spans).collect(),
+        },
+        bytes: record.payload().into(),
+        origin,
     }
 }
 
@@ -352,6 +654,15 @@ pub struct SlotTable
 
 impl SlotTable
 {
+    /// An empty table whose history keeps `bounds`.
+    #[must_use]
+    pub fn with_bounds(bounds: Bounds) -> Self
+    {
+        let mut table = Self::default();
+        table.history.bounds = bounds;
+        table
+    }
+
     /// The slot for `badge`, created when absent, and the history it retains
     /// its entries in.
     fn slot_with_history(&mut self, badge: u64) -> (&mut Slot, &mut History)
@@ -403,6 +714,71 @@ impl SlotTable
     pub fn history(&self) -> &History
     {
         &self.history
+    }
+
+    /// The history, for a sink that moves the `hold` mark or replaces its
+    /// drop notice ([`History::set_held_from`], [`History::replace_text`]).
+    pub fn history_mut(&mut self) -> &mut History
+    {
+        &mut self.history
+    }
+
+    /// The name an entry of `badge` is rendered under now: its live slot's,
+    /// or else that of its newest retired slot; empty for a badge with
+    /// neither. A live and a retired slot of one badge render under the live
+    /// slot's name.
+    #[must_use]
+    pub fn name_of(&self, badge: u64) -> &[u8]
+    {
+        if let Some(slot) = self.slots.get(&badge)
+        {
+            return &slot.name;
+        }
+        self.retired
+            .iter()
+            .rev()
+            .find(|r| r.badge == badge)
+            .map_or(&[], |r| r.slot.name.as_slice())
+    }
+
+    /// The entries of `badge`'s live slot a `hold` sink has not written
+    /// ([`History::unwritten`]); 0 for a badge with no live slot.
+    #[must_use]
+    pub fn unwritten_of(&self, badge: u64) -> usize
+    {
+        self.slots
+            .get(&badge)
+            .map_or(0, |slot| self.history.unwritten(slot))
+    }
+
+    /// The bytes of `badge`'s live slot's partial line; 0 for a badge with
+    /// no live slot.
+    #[must_use]
+    pub fn partial_len(&self, badge: u64) -> usize
+    {
+        self.slots.get(&badge).map_or(0, |slot| slot.partial.len())
+    }
+
+    /// Retain every entry of `earlier`, a table no sink has read yet, after
+    /// this table's entries, in their order, each in the slot of its badge,
+    /// which takes `earlier`'s name when it has none: logd's own lines from
+    /// before the handover, retained after the entries the handover
+    /// installed, which are older.
+    pub fn absorb(&mut self, earlier: Self)
+    {
+        let Self {
+            slots, mut history, ..
+        } = earlier;
+        for (_, entry) in core::mem::take(&mut history.entries)
+        {
+            let (slot, history) = self.slot_with_history(entry.badge);
+            if slot.name.is_empty()
+                && let Some(named) = slots.get(&entry.badge)
+            {
+                slot.name.clone_from(&named.name);
+            }
+            history.push(slot, entry);
+        }
     }
 
     /// Evict the slot for `badge` into the retired slots and return it, for
@@ -496,24 +872,38 @@ impl SlotTable
             .extend_from_slice(name.get(..n).unwrap_or_default());
     }
 
-    /// Append one history line from the init-logd handover as an entry of
-    /// the matching slot, under the bounds a line logd receives takes.
+    /// Append one history line from the init-logd handover as a `relayed`
+    /// entry of the matching slot, under the bounds a line logd receives
+    /// takes.
     /// Creates the slot if absent (some history lines may have originated
     /// from senders whose slot was evicted from init-logd's small ring; the
     /// line itself still attributes to its badge).
     pub fn install_history_line(&mut self, badge: u64, us: u64, level: u64, bytes: &[u8])
     {
         let (slot, history) = self.slot_with_history(badge);
-        history.push_text(slot, badge, us, level, bytes);
+        history.push(
+            slot,
+            HistoryEntry {
+                badge,
+                us,
+                level,
+                kind: EntryKind::Text,
+                bytes: bytes.into(),
+                origin: Origin::Relayed,
+            },
+        );
     }
 
-    /// Append one history record from the init-logd handover as an entry of
-    /// the matching slot, creating the slot if absent, as
+    /// Append one history record from the init-logd handover as a `relayed`
+    /// entry of the matching slot, creating the slot if absent, as
     /// [`Self::install_history_line`] does.
     pub fn install_history_record(&mut self, badge: u64, us: u64, level: u64, record: &Record<'_>)
     {
         let (slot, history) = self.slot_with_history(badge);
-        history.push_record(slot, badge, us, level, record);
+        history.push(
+            slot,
+            record_entry(badge, us, level, record, Origin::Relayed),
+        );
     }
 }
 
@@ -571,13 +961,13 @@ mod tests
         let record = Record::decode(w.as_bytes()).unwrap();
         let mut table = SlotTable::default();
         let mut last = 0;
-        for round in 0..PER_SLOT_HISTORY as u64
+        for round in 0..PER_SLOT_HISTORY_MIN as u64
         {
             for badge in 1..=1000u64
             {
                 let (slot, history) = table.sender_slot(badge).unwrap();
                 history.push_record(slot, badge, round, INFO, &record);
-                assert!(history.bytes() <= HISTORY_BYTES);
+                assert!(history.bytes() <= HISTORY_BYTES_MIN);
                 last = history.next_seq - 1;
             }
         }
@@ -587,7 +977,7 @@ mod tests
         assert_eq!(kept.last(), Some(&last));
         assert_eq!(
             kept.len(),
-            HISTORY_BYTES / table.history.entries[&last].charge()
+            HISTORY_BYTES_MIN / table.history.entries[&last].charge()
         );
         assert!(kept.windows(2).all(|p| p[1] == p[0] + 1));
     }
@@ -601,7 +991,7 @@ mod tests
         // Senders 2.. fill the history past the bound, each within its own
         // slot's limit.
         let mut badge = 2;
-        while table.history.bytes() + ENTRY_FIXED_BYTES + LINE_BUF_SIZE <= HISTORY_BYTES
+        while table.history.bytes() + ENTRY_FIXED_BYTES + LINE_BUF_SIZE <= HISTORY_BYTES_MIN
         {
             table.install_history_line(badge, 0, INFO, &line);
             badge += 1;
@@ -621,7 +1011,7 @@ mod tests
     {
         let mut table = SlotTable::default();
         table.install_history_line(9, 0, INFO, b"other");
-        for i in 0..PER_SLOT_HISTORY as u64 + 4
+        for i in 0..PER_SLOT_HISTORY_MIN as u64 + 4
         {
             table.install_history_line(1, i, INFO, b"line");
         }
@@ -630,7 +1020,7 @@ mod tests
             .filter(|e| e.badge == 1)
             .map(|e| e.us)
             .collect();
-        assert_eq!(us, (4..PER_SLOT_HISTORY as u64 + 4).collect::<Vec<_>>());
+        assert_eq!(us, (4..PER_SLOT_HISTORY_MIN as u64 + 4).collect::<Vec<_>>());
         assert_eq!(seqs_of(&table, 9), [0]);
         assert_eq!(table.history.bytes(), recount(&table));
     }
@@ -728,5 +1118,206 @@ mod tests
         let mut left: Vec<u64> = table.slots.keys().copied().collect();
         left.sort_unstable();
         assert_eq!(left, [LOG_BADGE_PROCMGR, children[5]]);
+    }
+
+    // Defect caught: a message refused or taken on a line count that differs
+    // from the lines its consumption completes (a newline, a full partial
+    // line, the partial line a slot already holds).
+    #[test]
+    fn a_message_completes_a_line_per_newline_and_per_full_partial_line()
+    {
+        assert_eq!(lines_completed(0, b"no newline"), 0);
+        assert_eq!(lines_completed(0, b"a\nb\n\n"), 3);
+        assert_eq!(lines_completed(LINE_BUF_SIZE - 1, b"x"), 1);
+        assert_eq!(lines_completed(LINE_BUF_SIZE - 1, b"x\n"), 2);
+        assert_eq!(lines_completed(0, &[b'y'; 2 * LINE_BUF_SIZE]), 2);
+    }
+
+    // Defect caught: a sender held past its window, refused with an empty
+    // window, or given no error headroom; a wrong excess, and with it a wrong
+    // retry hint.
+    #[test]
+    fn the_window_refuses_only_past_its_size_and_never_an_empty_one()
+    {
+        use ipc::stream_labels::{LEVEL_DEBUG, LEVEL_ERROR, LEVEL_WARN};
+        assert_eq!(admit(0, 500, LEVEL_DEBUG), Admit::Accept);
+        assert_eq!(admit(HOLD_WINDOW - 1, 1, LEVEL_WARN), Admit::Accept);
+        assert_eq!(admit(HOLD_WINDOW, 0, LEVEL_WARN), Admit::Accept);
+        // A message that completes no line is taken past the window.
+        assert_eq!(admit(3 * HOLD_WINDOW, 0, LEVEL_WARN), Admit::Accept);
+        assert_eq!(
+            admit(HOLD_WINDOW - 1, 3, LEVEL_WARN),
+            Admit::Refuse { excess: 2 }
+        );
+        assert_eq!(admit(HOLD_WINDOW, 1, LEVEL_ERROR), Admit::Accept);
+        assert_eq!(
+            admit(2 * HOLD_WINDOW, 1, LEVEL_ERROR),
+            Admit::Refuse { excess: 1 }
+        );
+    }
+
+    // Defect caught: a history sized off the machine's RAM outside its floor
+    // or ceiling, or a slot's share not scaled with it.
+    #[test]
+    fn the_bounds_scale_with_ram_between_the_floor_and_the_ceiling()
+    {
+        assert_eq!(Bounds::for_ram(0), Bounds::FLOOR);
+        assert_eq!(Bounds::for_ram(512 << 20), Bounds::FLOOR);
+        assert_eq!(
+            Bounds::for_ram(1 << 30),
+            Bounds {
+                bytes: 512 * 1024,
+                per_slot: 2 * PER_SLOT_HISTORY_MIN
+            }
+        );
+        let top = Bounds {
+            bytes: HISTORY_BYTES_MAX,
+            per_slot: PER_SLOT_HISTORY_MIN * 8,
+        };
+        assert_eq!(Bounds::for_ram(4 << 30), top);
+        assert_eq!(Bounds::for_ram(u64::MAX), top);
+    }
+
+    // Defect caught: the byte bound evicting an entry the hold sink has not
+    // written while a written one is left, or, once none is, taking a quiet
+    // sender's line rather than the flooding sender's.
+    #[test]
+    fn the_byte_bound_keeps_unwritten_entries_while_a_written_one_is_left()
+    {
+        let mut table = SlotTable::default();
+        let line = [b'x'; LINE_BUF_SIZE];
+        // Sender 1 logs one line, then senders 2.. fill the history.
+        table.install_history_line(1, 0, INFO, &line);
+        let mut badge = 2;
+        while table.history.bytes() + ENTRY_FIXED_BYTES + LINE_BUF_SIZE <= HISTORY_BYTES_MIN
+        {
+            table.install_history_line(badge, 0, INFO, &line);
+            badge += 1;
+        }
+        // The hold sink has written entries 0 and 1 only.
+        table.history.set_held_from(Some(2));
+        table.install_history_line(badge, 0, INFO, &line);
+        table.install_history_line(badge, 0, INFO, &line);
+        assert_eq!(seqs_of(&table, 1), [0u64; 0], "written entries go first");
+        assert_eq!(seqs_of(&table, 2), [0u64; 0]);
+        assert_eq!(seqs_of(&table, 3), [2], "an unwritten one stays");
+        // None written is left: the badge with the most entries loses its
+        // oldest.
+        table.install_history_line(badge, 0, INFO, &line);
+        assert_eq!(seqs_of(&table, 3), [2]);
+        assert_eq!(seqs_of(&table, badge).len(), 2);
+        assert_eq!(table.history.bytes(), recount(&table));
+    }
+
+    // Defect caught: the per-slot bound dropping a kernel or logd line the hold
+    // sink has not written, which the kernel reader then acknowledges, or a
+    // windowed sender's slot kept past the bound.
+    #[test]
+    fn an_unwindowed_slot_keeps_its_unwritten_entries_past_the_per_slot_bound()
+    {
+        use ipc::log_badges::{LOG_BADGE_KERNEL, LOG_BADGE_LOGD};
+        let mut table = SlotTable::default();
+        table.history.set_held_from(Some(0));
+        let over = PER_SLOT_HISTORY_MIN + 8;
+        for badge in [LOG_BADGE_KERNEL, LOG_BADGE_LOGD, 7]
+        {
+            for i in 0..over as u64
+            {
+                let (slot, history) = table.sender_slot(badge).unwrap();
+                history.push_text(slot, badge, i, INFO, b"line");
+            }
+        }
+        assert_eq!(seqs_of(&table, LOG_BADGE_KERNEL).len(), over);
+        assert_eq!(seqs_of(&table, LOG_BADGE_LOGD).len(), over);
+        assert_eq!(seqs_of(&table, 7).len(), PER_SLOT_HISTORY_MIN);
+        // Once the hold sink has written them, the bound drops them again.
+        table.history.set_held_from(Some(table.history.next_seq()));
+        let (slot, history) = table.sender_slot(LOG_BADGE_KERNEL).unwrap();
+        history.push_text(slot, LOG_BADGE_KERNEL, 0, INFO, b"line");
+        assert_eq!(
+            seqs_of(&table, LOG_BADGE_KERNEL).len(),
+            PER_SLOT_HISTORY_MIN
+        );
+        assert_eq!(table.history.bytes(), recount(&table));
+    }
+
+    // Defect caught: a window counting entries the hold sink has written,
+    // entries the history no longer holds, or another sender's.
+    #[test]
+    fn a_slot_counts_its_held_entries_the_hold_sink_has_not_written()
+    {
+        let mut table = SlotTable::default();
+        for _ in 0..3
+        {
+            table.install_history_line(1, 0, INFO, b"one");
+            table.install_history_line(2, 0, INFO, b"two");
+        }
+        assert_eq!(table.unwritten_of(1), 0, "no hold sink, no window");
+        table.history.set_held_from(Some(2));
+        assert_eq!(table.unwritten_of(1), 2);
+        assert_eq!(table.unwritten_of(2), 2);
+        table.history.remove(4);
+        assert_eq!(table.unwritten_of(1), 1);
+        assert_eq!(table.unwritten_of(9), 0);
+    }
+
+    // Defect caught: a sink's cursor reading a dropped entry, skipping a held
+    // one, or miscounting the entries it missed.
+    #[test]
+    fn a_cursor_reads_the_next_held_entry_and_sees_the_gap_before_it()
+    {
+        let mut table = SlotTable::default();
+        for _ in 0..4
+        {
+            table.install_history_line(1, 0, INFO, b"line");
+        }
+        table.history.remove(1);
+        table.history.remove(2);
+        let (seq, entry) = table.history.entry_from(1).unwrap();
+        assert_eq!(seq, 3);
+        assert_eq!(entry.origin, Origin::Relayed);
+        assert!(table.history.entry_from(4).is_none());
+        assert_eq!(table.history.next_seq(), 4);
+    }
+
+    // Defect caught: logd's lines from before the handover lost, numbered
+    // ahead of the older entries the handover installed, or rendered unnamed.
+    #[test]
+    fn earlier_lines_are_retained_after_the_handover_entries_under_their_name()
+    {
+        let mut early = SlotTable::default();
+        early.install_from_handover(4, b"logd");
+        let (slot, history) = early.sender_slot(4).unwrap();
+        history.push_text(slot, 4, 5, INFO, b"started");
+        let mut table = SlotTable::default();
+        table.install_history_line(20, 1, INFO, b"relayed");
+        table.absorb(early);
+        let order: Vec<(u64, u64, Origin)> = table
+            .history
+            .entries
+            .iter()
+            .map(|(&s, e)| (s, e.badge, e.origin))
+            .collect();
+        assert_eq!(order, [(0, 20, Origin::Relayed), (1, 4, Origin::Live)]);
+        assert_eq!(table.name_of(4), b"logd");
+        assert_eq!(table.history.bytes(), recount(&table));
+    }
+
+    // Defect caught: a drop notice whose count grows leaving its charge
+    // stale, so the bound drifts.
+    #[test]
+    fn replacing_an_entrys_text_keeps_the_charge_exact()
+    {
+        let mut table = SlotTable::default();
+        let (slot, history) = table.sender_slot(4).unwrap();
+        let seq = history.push_text(slot, 4, 0, INFO, b"framebuffer: 1 lines dropped");
+        table
+            .history
+            .replace_text(seq, b"framebuffer: 1000 lines dropped");
+        assert_eq!(table.history.bytes(), recount(&table));
+        assert_eq!(
+            &*table.history.entry_from(seq).unwrap().1.bytes,
+            b"framebuffer: 1000 lines dropped"
+        );
     }
 }

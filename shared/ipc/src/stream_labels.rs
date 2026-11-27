@@ -11,8 +11,8 @@
 //! per write (chunked at `MSG_DATA_WORDS_MAX * 8` per call). The receiver
 //! reads `byte_len.div_ceil(8)` data words from its IPC buffer and unpacks
 //! `byte_len` bytes. The receiver replies with label 0 and no payload to
-//! unblock the writer, or with [`stream_labels::NAME_UNKNOWN`](crate::stream_labels::NAME_UNKNOWN) to a message
-//! it did not consume (bit 36 below).
+//! unblock the writer, or with [`stream_labels::NAME_UNKNOWN`](crate::stream_labels::NAME_UNKNOWN) (bit 36 below)
+//! or [`stream_labels::WINDOW_FULL`](crate::stream_labels::WINDOW_FULL) to a message it did not consume.
 //! No multi-chunk reassembly framing on the wire — line buffering
 //! (e.g. logd's `[name]` per-newline prefix) lives in the receiver.
 //!
@@ -133,6 +133,14 @@ pub const fn sender_named(label: u64) -> bool
 /// sender's badge, so it consumed nothing. The sender registers its name
 /// again and sends the message once more without the bit.
 pub const NAME_UNKNOWN: u64 = 2;
+/// [`STREAM_BYTES`] and [`STREAM_RECORD`] reply label: the message would
+/// take the sender's entries that logd's `hold` sink has not written past
+/// the sender's window, so logd consumed nothing of it. `data[0]` is the
+/// retry hint in milliseconds, 1 to logd's stall bound: the sender sleeps
+/// it and sends the same message again
+/// (`services/logd/docs/ipc-interface.md` § Hold window). init-logd never
+/// answers it.
+pub const WINDOW_FULL: u64 = 3;
 /// Register (or update) the display name for the sender's log stream.
 ///
 /// Payload: name bytes via `.bytes(0, name)` with byte length in bits

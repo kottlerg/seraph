@@ -79,6 +79,7 @@ pub fn dispatch(role: &str)
     phases::unmount::reentry_main(role);
     phases::pwrmgr::reentry_main(role);
     phases::logd_restart::reentry_main(role);
+    phases::logd_flood::reentry_main(role);
     phases::critical_creates::reentry_main(role);
     phases::pipestress::reentry_main(role);
 }

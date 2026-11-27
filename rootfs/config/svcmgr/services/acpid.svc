@@ -15,6 +15,11 @@
 # devmgr grants it and each configuration-space access, and pushes each PCI
 # host bridge's _OSC grant, windows and interrupt routes
 # (services/acpid/README.md). acpid is the only recipe seeding it.
+# `logd.flush` delivers cap[2], the LOG_FLUSH_AUTHORITY-badged SEND on the
+# master log endpoint, whose only authority is logd's flush barrier: acpid
+# waits on it, bounded, between its line naming a reset or sleep register
+# write and the write, which ends the machine and the lines logd holds
+# unwritten with it (services/logd/docs/ipc-interface.md § Flush barrier).
 #
 # `restart = on_failure`: svcmgr re-creates acpid and re-serves a fresh RECV
 # on the persistent endpoint, so pwrmgr's acpid.power SEND survives a
@@ -31,4 +36,4 @@ restart   = on_failure
 critical  = no
 namespace = none
 provides  = acpid.power:auth acpid.deny:deny
-seed      = devmgr.acpi
+seed      = devmgr.acpi logd.flush

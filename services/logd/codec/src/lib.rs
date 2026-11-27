@@ -9,12 +9,10 @@
 //! reply, chunk-kind, and release-status codes, the sender's chunk encoders,
 //! tracker of names that change after their slot was sent, and release-retry
 //! deadline, and the receiver's chunk decoder; init-logd's captured-history
-//! byte ring ([`history`]); logd's hold on its own serial lines until
-//! init-logd acknowledges the handover release ([`hold`]); logd's death-queue
-//! resync decisions
+//! byte ring ([`history`]); logd's death-queue resync decisions
 //! ([`resync`]); the line logd logs when it evicts a slot ([`reclaim`]);
-//! which entries a query page carries ([`query`]); logd's output-sink queue
-//! and its stall rule ([`sink`]);
+//! which entries a query page carries ([`query`]); logd's sinks' stall
+//! bound, retry hint, backlog and drop line ([`sink`]);
 //! the level tag both log receivers render ([`level`]) and the console-line
 //! prefix both write ([`prefix`]); how both write and
 //! keep the kernel's log records ([`kernel`]); and the line and
@@ -31,7 +29,6 @@
 
 pub mod handover;
 pub mod history;
-pub mod hold;
 pub mod kernel;
 pub mod level;
 pub mod prefix;

@@ -675,7 +675,8 @@ framebuffer driver. Each is a sink with a cursor, the `seq` of the next entry it
 writer thread that writes from the history at its own pace (`services/logd/src/main.rs` `Sink`;
 the contract is [sinks.md](sinks.md) § Sinks). Each sink's settings, its level, format, pace,
 backlog, `relayed` and colour, come from logd's recipe over the defaults of
-[sinks.md](sinks.md) § Device sinks, and live in logd's state (`LogdState::settings`,
+[sinks.md](sinks.md) § Device sinks, a `SINK_SET` (§ Sink control) changes them while logd
+runs, and they live in logd's state (`LogdState::settings`,
 [sinks.md](sinks.md) § Settings); a sink writes the entries at or above its level and passes the
 others. No receive worker, and no other thread of logd's,
 waits on a driver: a driver that is slow, stopped by a debugger, or dead costs logd its own

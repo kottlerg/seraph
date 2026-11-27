@@ -871,3 +871,201 @@ mod tests
         );
     }
 }
+
+/// Bounded proofs of the register-map and encoding arithmetic
+/// (docs/testing.md § Bounded verification), compiled on every host by the
+/// `cfg(kani)` include in `arch/mod.rs`. Every register value and hart ID
+/// is symbolic over every value its type holds; the one loop is
+/// `seed_word`'s, bounded in its harness.
+///
+/// The timer conversions (`ticks_for_period`, `ticks_to_us`) are not proved
+/// here: their exactness is an identity of 64-bit products and quotients of a
+/// symbolic frequency, which the solver does not settle within the harness
+/// time limit (docs/testing.md § Bounded verification), and their unit tests
+/// hold it at the boundary frequencies and counts.
+#[cfg(kani)]
+mod proofs
+{
+    use core::cell::Cell;
+
+    use super::{
+        KernelAccess, PTE_EXECUTE, PTE_GRANT_EXECUTE, PTE_GRANT_WRITE, PTE_PBMT_MASK, PTE_READ,
+        PTE_USER, PTE_VALID, PTE_WRITE, SSTATUS_FS_MASK, SeedError, SeedPoll, decode_seed,
+        grant_bits, is_first_use_trap, kernel_leaf_permits, page_round_up, protected_leaf,
+        sbi_hart_mask, seed_word, user_leaf_flags, user_leaf_grant,
+    };
+    use crate::mm::paging::{LeafGrant, PagingError};
+
+    /// The `OPST` field of a `seed` CSR value.
+    fn opst(value: u64) -> u64
+    {
+        (value >> 30) & 0b11
+    }
+
+    /// The SBI window of any hart ID names that hart alone: one bit of the
+    /// mask, at the hart's offset from a 64-aligned base.
+    #[kani::proof]
+    fn the_hart_mask_window_names_its_hart_alone()
+    {
+        let hart: u32 = kani::any();
+        let (mask, base) = sbi_hart_mask(hart);
+        assert!(mask.is_power_of_two() && base.is_multiple_of(64));
+        assert_eq!(base + u64::from(mask.trailing_zeros()), u64::from(hart));
+    }
+
+    /// Rounding up gives the least page boundary at or above `n`, and fails
+    /// exactly when that boundary passes the end of the address space.
+    #[kani::proof]
+    fn page_round_up_gives_the_least_boundary_at_or_above()
+    {
+        let n: u64 = kani::any();
+        match page_round_up(n)
+        {
+            Some(up) =>
+            {
+                assert!(up >= n && up - n < 0x1000 && up.is_multiple_of(0x1000));
+            }
+            None => assert!(n > u64::MAX - 0xFFF),
+        }
+    }
+
+    /// The first-use trap needs the F/D unit Off and a nonzero instruction,
+    /// and a `seed` value decodes by its `OPST` field alone, `ES16`
+    /// carrying the low 16 bits; the leaf decodes read their bits: a kernel
+    /// leaf permits an access only when valid and granting it, and a user
+    /// leaf decodes only when valid and user-accessible.
+    #[kani::proof]
+    fn every_trap_seed_and_leaf_decode_reads_its_own_bits()
+    {
+        let sstatus: u64 = kani::any();
+        let stval: u64 = kani::any();
+        if is_first_use_trap(sstatus, stval)
+        {
+            assert!(sstatus & SSTATUS_FS_MASK == 0 && stval != 0);
+        }
+
+        let value: u64 = kani::any();
+        match decode_seed(value)
+        {
+            SeedPoll::Es16(sample) =>
+            {
+                assert!(opst(value) == 0b10 && u64::from(sample) == value & 0xFFFF)
+            }
+            SeedPoll::Dead => assert_eq!(opst(value), 0b11),
+            SeedPoll::NotReady => assert!(opst(value) < 0b10),
+        }
+
+        let pte: u64 = kani::any();
+        assert_eq!(
+            kernel_leaf_permits(pte, KernelAccess::Load),
+            pte & PTE_VALID != 0 && pte & PTE_READ != 0
+        );
+        assert_eq!(
+            kernel_leaf_permits(pte, KernelAccess::Store),
+            pte & PTE_VALID != 0 && pte & PTE_WRITE != 0
+        );
+        match user_leaf_flags(pte)
+        {
+            Some(flags) =>
+            {
+                assert!(pte & PTE_VALID != 0 && pte & PTE_USER != 0);
+                assert_eq!(flags.readable, pte & PTE_READ != 0);
+                assert_eq!(flags.writable, pte & PTE_WRITE != 0);
+                assert_eq!(flags.executable, pte & PTE_EXECUTE != 0);
+                assert_eq!(flags.uncacheable, pte & PTE_PBMT_MASK != 0);
+            }
+            None => assert!(pte & PTE_VALID == 0 || pte & PTE_USER == 0),
+        }
+    }
+
+    /// A leaf's grant decodes to the grant its bits encoded, whatever the
+    /// leaf's other bits hold.
+    #[kani::proof]
+    fn a_grant_round_trips_through_its_leaf_bits()
+    {
+        let grant = LeafGrant {
+            writable: kani::any(),
+            executable: kani::any(),
+        };
+        let other: u64 = kani::any();
+        let pte = (other & !(PTE_GRANT_WRITE | PTE_GRANT_EXECUTE)) | grant_bits(grant);
+        assert_eq!(user_leaf_grant(pte), grant);
+    }
+
+    /// A permission change refuses exactly the write or execute the prior
+    /// leaf's grant lacks, and the leaf it installs holds no W or X beyond
+    /// that grant, keeps the prior memory type and grant, and takes every
+    /// other bit from the new leaf.
+    #[kani::proof]
+    fn a_permission_change_never_exceeds_the_grant_or_changes_the_memory_type()
+    {
+        let prior: u64 = kani::any();
+        let new: u64 = kani::any();
+        let kept = PTE_PBMT_MASK | PTE_GRANT_WRITE | PTE_GRANT_EXECUTE;
+        let grant = user_leaf_grant(prior);
+        let exceeds = (new & PTE_WRITE != 0 && !grant.writable)
+            || (new & PTE_EXECUTE != 0 && !grant.executable);
+        match protected_leaf(prior, new)
+        {
+            Ok(leaf) =>
+            {
+                assert!(!exceeds);
+                assert!(leaf & PTE_WRITE == 0 || grant.writable);
+                assert!(leaf & PTE_EXECUTE == 0 || grant.executable);
+                assert_eq!(leaf & kept, prior & kept);
+                assert_eq!(leaf & !kept, new & !kept);
+            }
+            Err(e) => assert!(exceeds && e == PagingError::NotGranted),
+        }
+    }
+
+    /// Reads a harness gives `seed_word`.
+    const READS: usize = 4;
+
+    /// A word is built only from four `ES16` reads, its 16-bit lanes their
+    /// samples in read order; `DEAD` is reported at the first `DEAD` read,
+    /// and a timeout at a not-ready read on which the budget is spent. The
+    /// reads are any `READS` values, so four `ES16` reads and every early
+    /// end among them are covered, each read being judged alone.
+    ///
+    /// The budget is spent at every ask: a not-ready read with budget left
+    /// runs `core::hint::spin_loop`, an x86_64 `pause` on the host, which Kani
+    /// cannot compile, and then the same read again, which the unit tests
+    /// cover. The loops run at most `READS` reads, so an unwind bound of
+    /// `READS + 1` covers them.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn a_seed_word_holds_four_es16_samples_in_read_order()
+    {
+        let values: [u64; READS] = kani::any();
+        let reads = Cell::new(0usize);
+        let asked = Cell::new(0usize);
+        let result = seed_word(
+            || {
+                let i = reads.get();
+                reads.set(i + 1);
+                values[i]
+            },
+            || {
+                asked.set(asked.get() + 1);
+                true
+            },
+        );
+        let read = reads.get();
+        let mut word = 0u64;
+        for (lane, &value) in values.iter().take(read).enumerate()
+        {
+            let last = lane + 1 == read;
+            match opst(value)
+            {
+                0b10 => word |= (value & 0xFFFF) << (16 * lane),
+                0b11 => assert!(last && result == Err(SeedError::Dead)),
+                _ => assert!(last && result == Err(SeedError::TimedOut) && asked.get() == 1),
+            }
+        }
+        if let Ok(built) = result
+        {
+            assert!(read == READS && built == word && asked.get() == 0);
+        }
+    }
+}

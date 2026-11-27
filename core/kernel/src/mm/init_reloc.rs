@@ -335,3 +335,127 @@ mod tests
         assert_eq!(resolve_target(&segs, 0x3000), None);
     }
 }
+
+/// Bounded proofs of the relocation target and RELRO arithmetic
+/// (docs/testing.md § Bounded verification). Every segment's addresses,
+/// size and flags, the target, the bias and the RELRO range are symbolic over
+/// every value.
+#[cfg(kani)]
+mod proofs
+{
+    use boot_protocol::{INIT_MAX_SEGMENTS, InitSegment, SegmentFlags};
+
+    use super::{apply_relro, resolve_target};
+
+    /// Segments the relocation harness gives `resolve_target`.
+    const LIVE: usize = 3;
+
+    /// Any segment.
+    fn any_segment() -> InitSegment
+    {
+        let flags = match kani::any::<u8>()
+        {
+            0 => SegmentFlags::Read,
+            1 => SegmentFlags::ReadWrite,
+            _ => SegmentFlags::ReadExecute,
+        };
+        InitSegment {
+            phys_addr: kani::any(),
+            virt_addr: kani::any(),
+            size: kani::any(),
+            flags,
+        }
+    }
+
+    /// Whether `seg` maps the byte at `virt`, in exact arithmetic.
+    fn maps(seg: &InitSegment, virt: u64) -> bool
+    {
+        seg.virt_addr <= virt && u128::from(virt) < u128::from(seg.virt_addr) + u128::from(seg.size)
+    }
+
+    /// Every relocation `apply` writes goes to the physical address
+    /// `resolve_target` returns, so its whole 8-byte write lands inside one
+    /// `ReadWrite` segment, at the target's offset within it, for any segment
+    /// table and any target (the class of #282). The table's walk judges each
+    /// segment alone, so `LIVE` segments of any values cover every step: one
+    /// not writable, one that does not hold the target, and one that does, in
+    /// any order. The walks are the
+    /// code's and the harness's, each over `LIVE` segments, so an unwind
+    /// bound of `LIVE + 1` covers them.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn a_resolved_relocation_lands_inside_one_writable_segment()
+    {
+        let segments = [any_segment(), any_segment(), any_segment()];
+        let offset: u64 = kani::any();
+        let Some(phys) = resolve_target(&segments, offset)
+        else
+        {
+            return;
+        };
+        let lands = |seg: &InitSegment| {
+            let last = u128::from(offset) + 7;
+            matches!(seg.flags, SegmentFlags::ReadWrite)
+                && maps(seg, offset)
+                && last < u128::from(seg.virt_addr) + u128::from(seg.size)
+                && u128::from(phys)
+                    == u128::from(seg.phys_addr) + u128::from(offset - seg.virt_addr)
+        };
+        assert!(segments.iter().any(lands));
+    }
+
+    /// RELRO sealing keeps every byte of a segment mapped at the physical
+    /// address it had and only ever takes write away: a byte of the live
+    /// segment lies, after it, in exactly one segment, which translates it to
+    /// the same physical address with the same flags or, from `ReadWrite`,
+    /// `Read`.
+    ///
+    /// The walk judges each live segment alone against the range, reading and
+    /// writing only that segment and, for a split, the next free slot, so one
+    /// live segment of any values covers every step a longer table repeats:
+    /// the segment lies outside the range, inside it, or across its end, where
+    /// the split cuts it. The walks are the code's over the one live segment
+    /// and the harness's over the at most two segments after it, so an unwind
+    /// bound of 3 covers them.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn relro_sealing_keeps_each_byte_at_its_address_and_only_drops_write()
+    {
+        let old = any_segment();
+        kani::assume(old.virt_addr.checked_add(old.size).is_some());
+        let mut segments = [old; INIT_MAX_SEGMENTS];
+        let mut count = 1;
+        let sealed = apply_relro(
+            &mut segments,
+            &mut count,
+            kani::any(),
+            kani::any(),
+            kani::any(),
+        );
+        if sealed.is_err()
+        {
+            return;
+        }
+        assert!(count == 1 || count == 2);
+
+        let virt: u64 = kani::any();
+        kani::assume(maps(&old, virt));
+        let mut found = 0usize;
+        for seg in segments
+            .iter()
+            .take(count as usize)
+            .filter(|seg| maps(seg, virt))
+        {
+            found += 1;
+            assert_eq!(
+                u128::from(seg.phys_addr) + u128::from(virt - seg.virt_addr),
+                u128::from(old.phys_addr) + u128::from(virt - old.virt_addr)
+            );
+            assert!(
+                seg.flags == old.flags
+                    || (old.flags == SegmentFlags::ReadWrite && seg.flags == SegmentFlags::Read)
+            );
+        }
+        assert_eq!(found, 1);
+    }
+}

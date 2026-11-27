@@ -230,3 +230,141 @@ mod tests
         assert!(unsafe { validate_boot_info(&raw const info) });
     }
 }
+
+/// Bounded proofs of the boot-info validation (docs/testing.md § Bounded
+/// verification). Every field `validate_boot_info` reads is symbolic over
+/// every value of its type, the pointer among null, misaligned and aligned,
+/// the memory map any `ENTRIES` or fewer entries of any type, base and
+/// size, and the I/O APIC table any `IOAPICS` or fewer entries; the fields it
+/// does not read are zero.
+#[cfg(kani)]
+mod proofs
+{
+    use boot_protocol::{
+        BOOT_PROTOCOL_VERSION, BootInfo, KASLR_IMAGE_RANDOMIZED, MemoryMapEntry, MemoryType, layout,
+    };
+
+    use super::validate_boot_info;
+
+    /// Memory-map entries a harness gives the validation.
+    const ENTRIES: usize = 2;
+
+    /// I/O APIC entries a harness gives the validation.
+    const IOAPICS: u32 = 2;
+
+    /// Any memory-map entry.
+    fn any_entry() -> MemoryMapEntry
+    {
+        let memory_type = match kani::any::<u8>()
+        {
+            0 => MemoryType::Usable,
+            1 => MemoryType::Loaded,
+            2 => MemoryType::Reserved,
+            3 => MemoryType::AcpiReclaimable,
+            _ => MemoryType::Persistent,
+        };
+        MemoryMapEntry {
+            physical_base: kani::any(),
+            size: kani::any(),
+            memory_type,
+        }
+    }
+
+    /// A `BootInfo` whose read fields hold any values over the map `map`.
+    fn any_info(map: &[MemoryMapEntry; ENTRIES]) -> BootInfo
+    {
+        // SAFETY: every `BootInfo` field is an integer, a raw pointer, an
+        // array of those, or a `repr(u32)` enum with a 0 variant, so the
+        // all-zero bit pattern is a valid value.
+        let mut info: BootInfo = unsafe { core::mem::zeroed() };
+        info.version = kani::any();
+        let count: u64 = kani::any();
+        kani::assume(count <= ENTRIES as u64);
+        info.memory_map.count = count;
+        info.memory_map.entries = if kani::any()
+        {
+            map.as_ptr()
+        }
+        else
+        {
+            core::ptr::null()
+        };
+        info.init_image.segment_count = kani::any();
+        info.init_image.entry_point = kani::any();
+        info.kernel_virtual_base = kani::any();
+        info.kernel_size = kani::any();
+        info.direct_map_base = kani::any();
+        info.framebuffer.physical_base = kani::any();
+        info.framebuffer.stride = kani::any();
+        info.framebuffer.height = kani::any();
+        info.kernel_mmio.lapic_base = kani::any();
+        info.kernel_mmio.ioapic_count = kani::any();
+        kani::assume(info.kernel_mmio.ioapic_count <= IOAPICS);
+        info.kernel_mmio.ioapics[0].phys_base = kani::any();
+        info.kernel_mmio.ioapics[1].phys_base = kani::any();
+        info.kaslr_flags = kani::any();
+        info.cpu_ids = core::ptr::without_provenance(kani::any());
+        info.cpu_count = kani::any();
+        info
+    }
+
+    /// No pointer and no field values make the validation panic, overflow,
+    /// or read outside the `BootInfo` and the map it names: a null or
+    /// misaligned pointer and an empty or null map are refused before they
+    /// are read. When it accepts, every range it hands on lies inside its
+    /// bounds: the map is non-empty, the image span from
+    /// `kernel_virtual_base` does not wrap and sits a whole number of slide
+    /// steps above the link base, the direct map is in the kernel half and
+    /// ends at or below the image, a slid image is reported randomized, and
+    /// the CPU-id array the kernel reads ends at or below the top of RAM.
+    ///
+    /// The map's and the I/O APIC table's walks (`layout::max_ram_address`,
+    /// `layout::direct_map_ceiling`) fold each entry into a maximum
+    /// alone, so `ENTRIES` and `IOAPICS` entries of any values cover a
+    /// longer table: a further entry is one more term of the same fold. The
+    /// walks run at most `IOAPICS + 2` regions (the local APIC, the
+    /// default I/O APIC or the table's), so an unwind bound of `IOAPICS +
+    /// 3` covers every loop.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn any_boot_info_is_read_in_bounds_and_accepted_only_in_bounds()
+    {
+        let map = [any_entry(), any_entry()];
+        let info = any_info(&map);
+        let aligned = &raw const info;
+        let offset: usize = kani::any();
+        kani::assume(offset < core::mem::align_of::<BootInfo>());
+        let pointer = match kani::any::<u8>()
+        {
+            0 => core::ptr::null(),
+            _ => aligned.cast::<u8>().wrapping_add(offset).cast::<BootInfo>(),
+        };
+
+        // SAFETY: a non-null, aligned `pointer` is `info`, live for the
+        // call, whose map pointer, when not null, names `map`, live too.
+        let accepted = unsafe { validate_boot_info(pointer) };
+        if !accepted
+        {
+            return;
+        }
+        assert!(pointer == aligned && info.version == BOOT_PROTOCOL_VERSION);
+        assert!(info.memory_map.count > 0 && !info.memory_map.entries.is_null());
+        assert!(info.init_image.segment_count > 0 && info.init_image.entry_point != 0);
+        let kvb = info.kernel_virtual_base;
+        let slide = kvb - layout::KERNEL_LINK_BASE;
+        assert!(slide.is_multiple_of(layout::IMAGE_SLIDE_ALIGN));
+        assert!(kvb.checked_add(info.kernel_size).is_some());
+        assert!(slide == 0 || info.kaslr_flags & KASLR_IMAGE_RANDOMIZED != 0);
+        let entries = &map[..info.memory_map.count as usize];
+        let ceiling = layout::direct_map_ceiling(entries, &info.framebuffer, &info.kernel_mmio);
+        let dm_base = info.direct_map_base;
+        assert!(dm_base >= 1 << 63 && dm_base.is_multiple_of(1 << 30));
+        assert!(dm_base.checked_add(ceiling).is_some_and(|end| end <= kvb));
+        let ids = info.cpu_ids as u64;
+        let read = (info.cpu_count as usize).clamp(1, boot_protocol::MAX_CPUS) as u64;
+        assert!(ids != 0);
+        assert!(
+            u128::from(ids) + u128::from(read) * 4 <= u128::from(layout::max_ram_address(entries))
+        );
+    }
+}

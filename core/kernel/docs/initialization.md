@@ -363,7 +363,10 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    where CPUID reports RDTSCP or RDPID, CPUID faulting off where the CPU has it, and
    IA32_U_CET = 0 where it has CET (each AP repeats this in interrupts::init_ap)
 5. Switch to x2APIC mode where CPUID advertises it, software-enable the BSP local APIC
-   with every LVT masked, and mask every I/O APIC entry
+   with every LVT masked, and mask every I/O APIC entry; then allocate the kept low dword
+   of each discovered GSI's entry (`ioapic::init_entry_storage`, 4 B per GSI, one
+   zero-filled run of pages through `sched::alloc_zeroed_slab`; its failure is fatal),
+   which `ioapic::route` keeps and `ioapic::mask` and `ioapic::unmask` write
 6. When Phase 4 decided the kernel runs on shadow stacks, give the handoff stack a shadow
    stack (one buddy page with the shadow-stack encoding), point IA32_PL0_SSP at it and
    IA32_INTERRUPT_SSP_TABLE_ADDR at the BSP's interrupt SSP table, set CR4.CET, then

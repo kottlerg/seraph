@@ -371,11 +371,13 @@ vCPUs and any timing-sensitive measurement take the exclusive grant:
   and `orch grant clear` removes it. For a list with a timing-sensitive measurement, set a timing
   grant (`orch grant set --timing`): the lock then holds every other worker's builds as well as its
   boots, and the command returns once nothing else holds the host. Two things it cannot hold:
-  cargo's compile of xtask itself, which comes before any admission, and a worker whose branch
-  predates the timing grant, which runs its own branch's older xtask. Before `host free`, tell each
-  worker whose branch lacks the timing grant, and each whose scope edits `xtask/`, to launch
-  nothing until the grant ends, and say `master quiet` to no one while it runs; no other worker
-  needs a message. Grant nothing beside an exclusive grant. Never grant on an idle
+  cargo's compile of xtask itself, which any `cargo xtask` command (a status line and the Bash
+  hook included) runs before any admission when its checkout's build of xtask is not current (its
+  sources changed, or a new worktree), and a worker whose branch predates the timing grant, which
+  runs its own branch's older xtask. Before `host free`, tell each worker whose branch lacks the
+  timing grant, and each whose scope edits `xtask/`, to run no `cargo` command until the grant
+  ends; while it runs, say `master quiet` to no one and spawn no worker into a new worktree. No
+  other worker needs a message. Grant nothing beside an exclusive grant. Never grant on an idle
   observation while a grant is outstanding: the holder may be between steps. A grant ends when the
   holder reports its results.
 - Grant a speculative set (a run at a head that a sync still owed will change) only when the

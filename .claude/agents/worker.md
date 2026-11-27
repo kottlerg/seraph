@@ -310,14 +310,15 @@ what the run is:
 `--host-override` is the maintainer's, for interactive use; a worker does not pass it. While another
 worker holds the grant, the commands refuse your boots, and under a timing grant your builds too,
 until the grant ends; with `--wait-host` they wait for that, so a run in flight finishes and the
-next one waits. The lock cannot hold cargo's compile of xtask itself, which a `cargo xtask` command
-runs before it reaches the lock when xtask's sources changed, nor a branch whose xtask predates the
-timing grant: the orchestrator tells such a worker to launch nothing until the grant ends, and
-otherwise no message from it is needed. Run one QEMU of your own at a time.
-A timeout or timing failure of a boot that ran beside another QEMU, owed by § Coverage tiers or not,
-is re-run once with `--alone`, and the re-run's outcome is the one that counts (docs/testing.md §
-Coverage tiers, When the runs are owed); `--alone` admits the re-run only with no other QEMU
-running.
+next one waits. The lock cannot hold cargo's compile of xtask itself, which any `cargo xtask`
+command (a status line and the Bash hook included) runs before it reaches the lock when the
+checkout's build of xtask is not current, its sources changed or the worktree new, nor a branch
+whose xtask predates the timing grant: the orchestrator tells such a worker to run no `cargo`
+command until the grant ends, and otherwise no message from it is needed. Run one QEMU of your own
+at a time. A timeout or timing failure of a boot that ran beside another QEMU, owed by § Coverage
+tiers or not, is re-run once with `--alone`, and the re-run's outcome is the one that counts
+(docs/testing.md § Coverage tiers, When the runs are owed); `--alone` admits the re-run only with
+no other QEMU running.
 
 A boot that fails, hangs, or shows a kill you did not expect is evidence. Before any re-run,
 copy its saved log, and its `.crash.txt` when there is one, to a name that says what it is (the

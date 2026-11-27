@@ -2894,7 +2894,8 @@ shares (in `target/xtask/host/` outside a git checkout):
   nested builds, so a command admitted before the grant finishes. Any other grant leaves builds
   alone. With `--wait-host` a refused command waits for the grant to end; without it, it fails at
   once naming the holder. The lock holds only what the host admits: cargo's compile of xtask
-  itself, which a `cargo xtask` command runs first when xtask's sources changed, comes before any
+  itself, which any `cargo xtask` command runs first when the checkout's build of xtask is not
+  current (its sources changed, or a worktree that has not built it yet), comes before any
   admission, and an xtask built from a branch without the timing grant neither registers its
   builds nor refuses them.
 

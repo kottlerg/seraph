@@ -559,7 +559,8 @@ impl Server
         // through this driver (see the module doc). The kernel's rate-limited
         // recv-failure line and the guard's exit remain the signal.
         let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
-        let mut reply = Reply::new();
+        // The other service threads receive on this endpoint too.
+        let mut reply = Reply::pooled();
         loop
         {
             // SAFETY: ipc_buf is this thread's registered IPC buffer page.

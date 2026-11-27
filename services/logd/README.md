@@ -235,10 +235,11 @@ logd/
 
 ## Bootstrap caps
 
-svcmgr's bootstrap rounds (four slots fit a round, the last marked `done`) fill six positional
+svcmgr's bootstrap rounds (four slots fit a round, the last marked `done`) fill seven positional
 slots, carrying only the present caps and a presence word naming the slot each fills (an absent slot
 reads as `0`), minted from the reserved log-sink sources svcmgr holds (master-log endpoint, procmgr
-`SEND|GRANT`, `KernelLog`, `devmgr.class.serial` and `devmgr.class.framebuffer` publications; see
+`SEND|GRANT`, `KernelLog`) and from the `devmgr.class.serial`, `devmgr.class.framebuffer` and
+`timed` publications; see
 [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md) and
 [`docs/ipc-interface.md`](docs/ipc-interface.md)):
 
@@ -250,9 +251,10 @@ reads as `0`), minted from the reserved log-sink sources svcmgr holds (master-lo
 | 3 | The `serial` class SEND, derived from the `devmgr.class.serial` publication (to resolve the serial driver via `QUERY_DEVICE`) |
 | 4 | The `framebuffer` class SEND, derived from the `devmgr.class.framebuffer` publication (to resolve the framebuffer driver via `QUERY_DEVICE`) |
 | 5 | A `KernelLog` cap carrying `Read`, derived with `RIGHTS_KLOG_READ` from the `KernelLog` source svcmgr holds (to read the kernel's console lines; see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Kernel log). Absent when svcmgr holds none |
+| 6 | The `timed` SEND, derived from the `timed` publication (to read the wall clock once; see [`docs/sinks.md`](docs/sinks.md) § Wall time). Absent when no recipe provides `timed` |
 
-logd registers its death-EQ with procmgr before the handover pull and keeps
-the two class SENDs for its lifetime (see
+logd registers its death-EQ with procmgr before the handover pull and keeps the two class SENDs for
+its lifetime, and deletes the `timed` SEND once it has read the wall clock (see
 [`docs/handover-protocol.md`](docs/handover-protocol.md) § Startup ordering and
 [`docs/ipc-interface.md`](docs/ipc-interface.md) § Bootstrap caps).
 

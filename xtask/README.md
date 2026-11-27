@@ -678,7 +678,10 @@ layer (`/programs/`, `/tests/programs/`, `/tests/usertest`, and every recipe tha
 staged recipe names a test feature (usertest's, a case's fixture's), it writes a test image, the
 whole system with its test features. Otherwise it writes the default image, the whole system without
 any test feature: nothing under `/tests/`, and neither `test-dma`, nor the test recipes, class files
-and data files, nor the ktest bundle's list. A file no install row places fails the pack.
+and data files, nor the ktest bundle's list. A file no install row places fails the pack, and so
+does a staging whose services hold the recipes of two harnesses (`svctest.svc`, `ubench.svc`,
+`usertest.svc`): an image boots one harness, so the pack names each recipe and how it is staged
+rather than leave one out, and the way back is a full `mkdisk`, then the one harness's staging.
 `--svctest` and `--ubench` remove from `config/svcmgr/services/` every recipe that names a file of
 the programs layer (the autostarted `terminal` and the default sessiond among them) or another
 services-layer harness, and stage sessiond's test recipe (`config/svcmgr/tests/sessiond.svc`, whose

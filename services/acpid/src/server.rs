@@ -701,7 +701,8 @@ fn receive(service: u64, mailbox: &Mailbox, work: &Sender<Work>) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
-    let mut slot = Reply::new();
+    // The other receiver threads (`RECEIVERS`) receive on `service` too.
+    let mut slot = Reply::pooled();
     loop
     {
         // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer.

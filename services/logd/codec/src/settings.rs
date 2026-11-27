@@ -79,6 +79,7 @@ impl SinkKind
                 level: Some(LEVEL_INFO),
                 format: Format::Console,
                 fields: Fields::DEFAULT,
+                time: Time::Uptime,
                 pace: Pace::Hold,
                 backlog: 0,
                 relayed: Relayed::Pass,
@@ -89,6 +90,7 @@ impl SinkKind
                 level: Some(LEVEL_CRITICAL),
                 format: Format::Console,
                 fields: Fields::DEFAULT,
+                time: Time::Uptime,
                 pace: Pace::Skip,
                 backlog: FRAMEBUFFER_BACKLOG,
                 relayed: Relayed::Show,
@@ -103,6 +105,18 @@ impl SinkKind
     {
         matches!(self, Self::Framebuffer)
     }
+}
+
+/// What the console format's `time` field shows
+/// ([sinks.md](../../docs/sinks.md) § The console format).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Time
+{
+    /// The uptime, `[sec.usfrac]`.
+    Uptime,
+    /// The wall time, an RFC 3339 UTC time with microseconds, once the boot
+    /// wall offset is known; the uptime before it.
+    Wall,
 }
 
 /// A sink's output format.
@@ -270,6 +284,8 @@ pub struct SinkSettings
     pub format: Format,
     /// The console format's fields.
     pub fields: Fields,
+    /// What the console format's `time` field shows.
+    pub time: Time,
     /// How the sink's progress holds senders back.
     pub pace: Pace,
     /// For a `skip` sink, how many entries before the newest its cursor
@@ -398,6 +414,15 @@ impl SinkSettings
                 };
                 self.fields = fields;
             }
+            Key::Time =>
+            {
+                self.time = match value
+                {
+                    "uptime" => Time::Uptime,
+                    "wall" => Time::Wall,
+                    _ => return false,
+                };
+            }
             Key::Pace =>
             {
                 self.pace = match value
@@ -463,6 +488,7 @@ enum Key
     Level,
     Format,
     Fields,
+    Time,
     Pace,
     Backlog,
     Relayed,
@@ -480,6 +506,7 @@ impl Key
             "level" => Self::Level,
             "format" => Self::Format,
             "fields" => Self::Fields,
+            "time" => Self::Time,
             "pace" => Self::Pace,
             "backlog" => Self::Backlog,
             "relayed" => Self::Relayed,
@@ -502,6 +529,7 @@ impl Key
             Self::Relayed => 1 << 5,
             Self::Colour => 1 << 6,
             Self::Facility => 1 << 7,
+            Self::Time => 1 << 8,
         }
     }
 }
@@ -609,7 +637,7 @@ mod tests
     {
         let s = serial(
             "level=warn,format=rfc5424,fields=msg:name,pace=skip,backlog=256,\
-             relayed=yes,colour=no,facility=23",
+             relayed=yes,colour=no,facility=23,time=wall",
         )
         .unwrap();
         assert_eq!(s.level, Some(LEVEL_WARN));
@@ -620,6 +648,8 @@ mod tests
         assert_eq!(s.relayed, Relayed::Show);
         assert_eq!(s.colour, Colour::Off);
         assert_eq!(s.facility, 23);
+        assert_eq!(s.time, Time::Wall);
+        assert_eq!(serial("time=uptime").unwrap().time, Time::Uptime);
     }
 
     // Defect caught: a key a string does not name moved off its default, or
@@ -640,6 +670,10 @@ mod tests
         assert_eq!((fb.pace, fb.backlog), (Pace::Skip, FRAMEBUFFER_BACKLOG));
         assert_eq!((fb.relayed, fb.colour), (Relayed::Show, Colour::On));
         assert_eq!(SinkKind::Serial.defaults().pace, Pace::Hold);
+        assert_eq!(
+            (SinkKind::Serial.defaults().time, fb.time),
+            (Time::Uptime, Time::Uptime)
+        );
     }
 
     // Defect caught: an off sink, or a level keyword, read wrong, so a quiet
@@ -720,6 +754,7 @@ mod tests
             ("relayed=maybe", "relayed", "maybe"),
             ("facility=24", "facility", "24"),
             ("facility=+3", "facility", "+3"),
+            ("time=utc", "time", "utc"),
         ]
         {
             assert_eq!(serial(text), Err(SettingsError::BadValue { key, value }));

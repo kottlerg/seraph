@@ -611,7 +611,9 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
     }
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
-    let mut reply = Reply::new();
+    // The other service threads (`SERVICE_THREAD_COUNT`) receive on the
+    // service endpoint too.
+    let mut reply = Reply::pooled();
     loop
     {
         // SAFETY: ipc_buf is the thread-registered IPC buffer page.

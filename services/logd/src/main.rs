@@ -112,6 +112,10 @@ struct BootCaps
     /// kernel's console lines ([`read_kernel_log`]). Zero leaves the kernel
     /// writing its lines itself.
     kernel_log: u64,
+    /// The SEND of the `timed` publication, through which logd reads the
+    /// wall clock once ([`read_wall_clock`]). Zero leaves the boot wall
+    /// offset unknown.
+    timed: u64,
 }
 
 fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
@@ -131,7 +135,8 @@ fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
         serial_class,
         fb_class,
         kernel_log,
-    ] = unsafe { ipc::bootstrap::request_slots::<6>(creator_endpoint, ipc_buf) }.ok()?;
+        timed,
+    ] = unsafe { ipc::bootstrap::request_slots::<7>(creator_endpoint, ipc_buf) }.ok()?;
     if log_ep_recv == 0
     {
         return None;
@@ -143,6 +148,7 @@ fn bootstrap_caps(creator_endpoint: u64, ipc_buf: *mut u64) -> Option<BootCaps>
         serial_class,
         fb_class,
         kernel_log,
+        timed,
     })
 }
 
@@ -322,6 +328,7 @@ fn main() -> !
 
     start_kernel_reader(caps.kernel_log, logd);
     pool.open();
+    start_wall_clock_reader(caps.timed);
     let mut resync = Resync::new(caps.procmgr_death_auth_send, resync_note);
     control_loop(ws_cap, logd, &mut resync, watches, ipc_buf);
 }
@@ -1373,6 +1380,80 @@ fn start_kernel_reader(cap: u64, logd: &'static Logd)
     }
 }
 
+/// The boot wall offset (`services/logd/docs/sinks.md` § Wall time): the
+/// wall time, microseconds since 1970-01-01T00:00:00Z, less the uptime of
+/// the same instant; `u64::MAX` while it is not known. Set once, by
+/// [`read_wall_clock`].
+static WALL_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// The wall time of uptime `us`, `None` while the boot wall offset is not
+/// known.
+fn wall_of(us: u64) -> Option<u64>
+{
+    let offset = WALL_OFFSET.load(Ordering::Acquire);
+    (offset != u64::MAX).then(|| offset.saturating_add(us))
+}
+
+/// Start the thread that reads the wall clock ([`read_wall_clock`])
+/// through `timed`, the SEND of the `timed` publication. With no cap, or
+/// when the thread cannot be had, the offset stays unknown and the sinks
+/// show uptime.
+fn start_wall_clock_reader(timed: u64)
+{
+    if timed == 0
+    {
+        return;
+    }
+    let spawned = std::thread::Builder::new().spawn(move || read_wall_clock(timed));
+    if spawned.is_err()
+    {
+        let _ = syscall::cap_delete(timed);
+        retain_own(LEVEL_WARN, b"wall clock reader spawn failed");
+    }
+}
+
+/// Read the wall clock once through `timed` (`timed_labels::GET_WALL_TIME`,
+/// with no bound), store the boot wall offset, and retain the notice that
+/// names the wall time and its uptime; `WALL_CLOCK_UNAVAILABLE` leaves the
+/// offset unknown and is retained at notice too. Its own thread: timed's log
+/// calls are served by the receive workers, which wait on no call of
+/// logd's, so the call cannot deadlock (`services/logd/docs/sinks.md`
+/// § Wall time).
+fn read_wall_clock(timed: u64)
+{
+    let ipc_buf = emit_ipc_buf();
+    let msg = IpcMessage::new(ipc::timed_labels::GET_WALL_TIME);
+    // SAFETY: ipc_buf is this thread's registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(timed, &msg, ipc_buf) };
+    let uptime = elapsed_us();
+    let _ = syscall::cap_delete(timed);
+    let mut buf = SerialFmt::new();
+    match reply
+    {
+        Ok(reply) if reply.label == ipc::timed_errors::SUCCESS =>
+        {
+            let wall = reply.word(0);
+            WALL_OFFSET.store(wall.saturating_sub(uptime), Ordering::Release);
+            let text = logd_codec::wall::wall_clock_text(wall, uptime);
+            retain_own(LEVEL_NOTICE, text.as_str().as_bytes());
+        }
+        Ok(reply) if reply.label == ipc::timed_errors::WALL_CLOCK_UNAVAILABLE =>
+        {
+            retain_own(LEVEL_NOTICE, b"wall clock unavailable");
+        }
+        Ok(reply) =>
+        {
+            let _ = write!(buf, "wall clock query failed err={:#x}", reply.label);
+            retain_own(LEVEL_WARN, buf.as_str().as_bytes());
+        }
+        Err(e) =>
+        {
+            let _ = write!(buf, "wall clock query failed err={e:#x}");
+            retain_own(LEVEL_WARN, buf.as_str().as_bytes());
+        }
+    }
+}
+
 /// The kernel log reader (`docs/console-model.md` item 4): read the records
 /// the kernel appended and retain each as the kernel's lines in the kernel's
 /// slot (`LOG_BADGE_KERNEL`), which the sinks write as a sender's; then wait
@@ -1804,6 +1885,7 @@ impl Taken
         out.clear();
         let entry = logd_codec::console::Entry {
             us: self.us,
+            wall: wall_of(self.us),
             level: self.level,
             badge: self.badge,
             name: self.name.get(..self.name_len).unwrap_or_default(),
@@ -1934,12 +2016,15 @@ fn render_line(
 {
     let span = match settings.format
     {
-        Format::Console =>
-        {
-            logd_codec::console::write(&settings.fields, entry, &mut |b| out.push(b), |w| {
+        Format::Console => logd_codec::console::write(
+            &settings.fields,
+            settings.time,
+            entry,
+            &mut |b| out.push(b),
+            |w| {
                 body.write(w);
-            })
-        }
+            },
+        ),
         Format::Rfc5424 =>
         {
             logd_codec::rfc5424::write(entry, settings.facility, &mut |b| out.push(b), |w| {
@@ -2554,8 +2639,10 @@ fn drop_line(what: &str, dropped: u64, settings: &SinkSettings, line: &mut LineB
 {
     let text = logd_codec::sink::drop_text(what, dropped);
     line.clear();
+    let us = elapsed_us();
     let entry = logd_codec::console::Entry {
-        us: elapsed_us(),
+        us,
+        wall: wall_of(us),
         level: LEVEL_NOTICE,
         badge: LOG_BADGE_LOGD,
         name: b"logd",

@@ -12,9 +12,13 @@
 //! (`docs/ipc-design.md` § The Call/Reply Model). A handler with work after
 //! its reply, or one that must answer before something it does next, and a
 //! loop with work before its next receive, send the slot's reply first
-//! ([`Reply::flush`]), with a receive that does not wait, and the call that
-//! receive binds is the one the next [`next_request`] returns; a thread
-//! about to exit sends its last reply alone ([`Reply::send_last`]). With the slot
+//! ([`Reply::flush`]). On the slot of a loop that is its endpoint's one
+//! receiving thread ([`Reply::new`]) the flush sends with a receive that
+//! does not wait, and the call that receive binds is the one the next
+//! [`next_request`] returns; on the slot of a thread that shares its
+//! endpoint with other receiving threads ([`Reply::pooled`]) it sends the
+//! reply alone, so a waiting call stays queued for the next free thread. A
+//! thread about to exit sends its last reply alone ([`Reply::send_last`]). With the slot
 //! empty, [`next_request`] is [`crate::ipc_recv`]. A loop whose receive
 //! waits a bounded time uses [`next_request_timeout`], and one that undoes a
 //! request's effect when its reply does not reach the caller reads
@@ -34,10 +38,12 @@ use crate::IpcMessage;
 
 /// The reply a server thread's handler leaves for the loop's next receive.
 ///
-/// One per receiving thread, owned by its loop. It holds at most one reply,
-/// to the caller the thread's last receive bound, or, after a
-/// [`Reply::flush`] whose receive bound a call, that call, for the next
-/// receive to return.
+/// One per receiving thread, owned by its loop, which builds it for the
+/// endpoint's receivers: [`Reply::new`] when the loop is the endpoint's one
+/// receiving thread, [`Reply::pooled`] when other threads receive on it too.
+/// It holds at most one reply, to the caller the thread's last receive bound,
+/// or, after a [`Reply::flush`] whose receive bound a call, that call, for
+/// the next receive to return.
 pub struct Reply
 {
     /// The reply, valid while [`Slot::Pending`] and only up to its counts. It
@@ -49,6 +55,9 @@ pub struct Reply
     /// Delete the reply's caps from this thread's `CSpace` when the reply is
     /// not delivered ([`Self::set_or_delete_caps`]).
     delete_caps: bool,
+    /// Other threads receive on the loop's endpoint ([`Self::pooled`]): a
+    /// flush sends the reply alone.
+    pooled: bool,
 }
 
 /// What a [`Reply`] holds. One field carries both whether a reply waits and
@@ -96,7 +105,7 @@ enum Next<G>
 
 impl Reply
 {
-    /// An empty slot.
+    /// An empty slot, for a loop that is its endpoint's one receiving thread.
     #[must_use]
     pub const fn new() -> Self
     {
@@ -104,6 +113,22 @@ impl Reply
             msg: IpcMessage::new(0),
             state: Slot::Empty,
             delete_caps: false,
+            pooled: false,
+        }
+    }
+
+    /// An empty slot, for a thread that shares its endpoint with other
+    /// receiving threads (a receive pool): its [`Self::flush`] sends the
+    /// reply alone, with no receive. A receive there finds a call only when
+    /// every other thread is busy, so it would bind exactly the call that is
+    /// waiting to the thread doing work, for as long as that work lasts, and
+    /// a call that work needs served could not be.
+    #[must_use]
+    pub const fn pooled() -> Self
+    {
+        Self {
+            pooled: true,
+            ..Self::new()
         }
     }
 
@@ -210,22 +235,31 @@ impl Reply
     }
 
     /// Send the reply now, when one is set, for a loop with work before its
-    /// next receive, which the reply would otherwise wait behind: with a
-    /// receive that does not wait (`SYS_IPC_REPLY_RECV` on `ep` at
-    /// `syscall::WAIT_TRY_ONCE`). A server that outranks its caller and last
-    /// received through `SYS_IPC_REPLY_RECV` may run on the caller's CPU, where
-    /// a plain `SYS_IPC_REPLY` would leave the caller's wake queued behind the
-    /// server until it parks, while the wake of a `SYS_IPC_REPLY_RECV` whose
-    /// receive does not park goes to another CPU
+    /// next receive, which the reply would otherwise wait behind.
+    ///
+    /// From the slot of a loop that is its endpoint's one receiving thread
+    /// ([`Self::new`]), the reply goes with a receive that does not wait
+    /// (`SYS_IPC_REPLY_RECV` on `ep` at `syscall::WAIT_TRY_ONCE`). A server that
+    /// outranks its caller and last received through `SYS_IPC_REPLY_RECV` may
+    /// run on the caller's CPU, where a plain `SYS_IPC_REPLY` would leave the
+    /// caller's wake queued behind the server until it parks, while the wake of
+    /// a `SYS_IPC_REPLY_RECV` whose receive does not park goes to another CPU
     /// (`core/kernel/docs/scheduler.md` § Thread Assignment). A call that
     /// receive binds is held in the slot, and the next [`next_request`] or
     /// [`next_request_timeout`] returns it with no syscall, so it is served
-    /// once the loop's work is done, as it would have been from the
-    /// endpoint's queue. A receive that finds no call, or fails, holds none,
-    /// and leaves the next receive to report a failure that lasts. The send's
-    /// fallbacks are those of [`next_request_timeout`], and its outcome is
-    /// [`Self::undelivered`]'s; the caps of an undelivered reply set with
-    /// [`Self::set_or_delete_caps`] are deleted.
+    /// once the loop's work is done, as the loop's one thread would have
+    /// served it from the endpoint's queue. A receive that finds no call, or
+    /// fails, holds none, and leaves the next receive to report a failure that
+    /// lasts. The send's fallbacks are those of [`next_request_timeout`].
+    ///
+    /// From the slot of a thread that shares its endpoint with other receiving
+    /// threads ([`Self::pooled`]), the reply goes alone (`SYS_IPC_REPLY`) and
+    /// `ep` is not used, so a waiting call stays in the endpoint's queue for
+    /// the next free thread. The caller's wake may then wait behind this
+    /// thread's work, the cost of leaving that call to the others.
+    ///
+    /// Either way the outcome is [`Self::undelivered`]'s, and the caps of an
+    /// undelivered reply set with [`Self::set_or_delete_caps`] are deleted.
     ///
     /// # Safety
     /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer
@@ -287,6 +321,12 @@ impl Reply
             let _ = kernel.reply(&IpcMessage::new(code));
             return;
         }
+        self.send_alone(kernel);
+    }
+
+    /// Send a set reply alone (`SYS_IPC_REPLY`) and record its outcome.
+    fn send_alone<T: Transport>(&mut self, kernel: &mut T)
+    {
         if self.state != Slot::Pending
         {
             return;
@@ -302,6 +342,11 @@ impl Reply
     {
         if self.state != Slot::Pending
         {
+            return;
+        }
+        if self.pooled
+        {
+            self.send_alone(kernel);
             return;
         }
         if let Ok(Next::Received(got)) = next_with(kernel, ep, self)
@@ -835,6 +880,58 @@ mod tests
         );
         Reply::new().flush_with(&mut kernel, EP);
         assert_eq!(kernel.count, 2, "an empty slot's flush sends nothing");
+    }
+
+    // The defect caught: a pool thread's flush that receives, binding a call
+    // that waits in the queue to the thread doing work, or that sends twice,
+    // or holds a call, or sends from an empty slot.
+    #[test]
+    fn a_pooled_flush_sends_alone_and_holds_no_call()
+    {
+        let mut kernel = Script::new();
+        let mut reply = Reply::pooled();
+        reply.set(reply_msg());
+        reply.flush_with(&mut kernel, EP);
+        assert!(!reply.is_set());
+        assert!(!reply.undelivered());
+        reply.flush_with(&mut kernel, EP);
+        assert_eq!(kernel.calls(), &[Some(Call::Reply(REPLY))]);
+        let got = next_with(&mut kernel, EP, &mut reply);
+        assert_eq!(got, Ok(Next::Received(NEXT)));
+        assert_eq!(
+            kernel.calls(),
+            &[Some(Call::Reply(REPLY)), Some(Call::Recv)]
+        );
+        Reply::pooled().flush_with(&mut kernel, EP);
+        assert_eq!(kernel.count, 2, "an empty slot's flush sends nothing");
+    }
+
+    // The defect caught: a pool thread's slot whose turn reply does not ride
+    // the receive (a free thread may take a waiting call), or an undelivered
+    // flushed reply that is not reported or keeps the caps it was set to
+    // delete.
+    #[test]
+    fn a_pooled_slot_rides_the_receive_and_reports_a_lost_flush()
+    {
+        let mut kernel = Script::new();
+        let mut reply = Reply::pooled();
+        reply.set(reply_msg());
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut reply),
+            Ok(Next::Received(NEXT))
+        );
+        assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))]);
+
+        let mut kernel = Script::new();
+        kernel.reply = Err(err(SyscallError::QuotaExceeded));
+        let mut reply = Reply::pooled();
+        reply.set_or_delete_caps(reply_msg());
+        reply.flush_with(&mut kernel, EP);
+        assert!(reply.undelivered());
+        assert_eq!(
+            kernel.calls(),
+            &[Some(Call::Reply(REPLY)), Some(Call::Delete(CAP))]
+        );
     }
 
     // The defect caught: a last send that receives (binding a call the exit

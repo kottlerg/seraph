@@ -20,7 +20,8 @@
 # the logd_restart and logd_sinks phases read logd's history through.
 # logd.flush is the LOG_FLUSH_AUTHORITY SEND on the same endpoint, on which
 # the logd_flush phase checks logd's flush barrier, the one pwrmgr waits on
-# before it powers off.
+# before it powers off, and the logd_sinks phase waits on it before its
+# framebuffer cases and before it stops the serial driver.
 # devmgr.class.serial and devmgr.class.input are the class SENDs the
 # drivers stray-cap phase and the devmgr ordinal phase query devices on.
 # devmgr.class.test-dma and devmgr.class.test-fault reach the test-only

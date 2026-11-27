@@ -510,8 +510,9 @@ these apart: it counts the threads linked on the CPU, not the level of the one i
 running an RT thread reads as loaded as one running a fair thread, and the load rule would keep
 an RT thread behind the first while the second could take it at once. A fair thread is placed by
 load alone, every fair level sharing one queue. The ranks are sampled without the CPUs' locks, so
-a dispatch or a link after the sample can leave the thread behind a thread it does not outrank
-(§ Wake Preemption, "Latency bound").
+a dispatch or a link after the sample can leave the thread behind a thread it does not outrank,
+whence the RT push of that CPU's tick moves it (§ Load Balancing, "RT push"; § Wake Preemption,
+"Latency bound").
 
 A synchronous wake places its thread by its waker. A call that finds a receiver parked, and a
 fault delivery that finds a handler parked, wake it with `WakeHint::Sync` when the caller's park
@@ -754,6 +755,68 @@ the victim as the candidate, rather than try its locks a second time. So neither
 keeps reading a transient nor a CPU whose pinned threads keep its load past the threshold
 hides a backlog beyond the ticks the bound above counts for deferred pulls.
 
+**RT push.** The balancer above counts threads, so it does not move an RT thread that waits behind a
+thread of its own level or above on its CPU while another CPU runs a lower level: the wake that
+placed it may have read ranks gone stale, or the other CPU's dispatch may have lowered its level
+since. The CPU the thread waits on moves it, at its own busy tick (`timer_tick`), to a CPU where it
+runs at once:
+
+1. Under its own run-queue lock, the tick reads its waiting RT queues,
+   `PerCpuScheduler::waiting_rt`: the RT queues that link a thread and that the running thread is
+   not outranked by, `non_empty & RT_QUEUES & !outranking`. That is one AND of words the CPU
+   already reads, and it is exact, since only this CPU records its running level and its tick runs
+   with interrupts masked; a level that a priority change of the running thread marked stale
+   reads no waiting queue until the CPU's next return to user mode re-records it, which the tick's
+   own return does. A hit walks those queues from the highest for the first thread a pull
+   may take (unpinned, `context_saved == 1`; `find_runnable` over that mask), whose level is the
+   push's. So a CPU whose waiting threads are all pinned scans no other CPU.
+2. With the lock released, `try_push_waiting_rt` reads the other CPUs' ranks lock-free
+   (`PerCpuScheduler::ranks`), at most `RT_PUSH_SCAN_CPUS` (128) of them, in index order from the
+   CPU's `rt_push_cursor`, wrapping, and picks as an RT wake's placement does (§ Thread
+   Assignment): of the CPUs whose effective rank is below the level, the lowest rank, then the
+   lower load, then the fewest busy SMT siblings, then the first read. A scan that finds none moves
+   the cursor past the CPUs it read.
+3. On a target, `pull_unpinned_ready(this CPU, target, PullRule::Waiting)` moves the thread: the
+   same try-locks in the same order as every pull, and the rule decided again under both run-queue
+   locks. The pick is the highest movable thread of the push window, `run_queue::push_window`: the
+   source's waiting RT queues, read again under its lock, that are above the target's effective
+   rank, read under the target's. An empty window fails the rule (`PullOutcome::RuleFailed`), so a
+   push never moves a thread that outranks its source's running thread, which runs there at the
+   next return to user mode, nor one to a CPU whose ranks, read under its lock, it does not
+   outrank. The pull's wake IPI then
+   preempts at the target (§ Wake Preemption).
+
+The scan is a window so that the cost a push adds to the tick of the running thread, which is the
+higher RT thread the waiting one is queued behind, does not grow with the CPU count. A full scan
+reads two words per CPU, 16382 Relaxed loads at the 8192 CPUs of `MAX_CPUS`, at every tick of
+every CPU holding a movable waiting thread while every other CPU runs at or above its level. A
+back-off after a miss, rather than a window, would break the bound below: a CPU whose level drops
+during the back-off would not be read until it ended. The window keeps the bound and caps the cost.
+
+The bound for a movable waiting thread is one tick of the CPU it waits on in a boot of up to
+`RT_PUSH_SCAN_CPUS + 1` (129) CPUs, since the window then reads every other CPU. In a boot of n
+CPUs above that it is ceil((n - 1) / 128) ticks: successive misses read successive windows, so a CPU
+whose level is below the thread's at all of those ticks is read by one of them; that is 64 ticks at
+8192 CPUs. Each push that a contended try-lock defers (`PullOutcome::Deferred`) adds a tick, and so
+does one that a dispatch on the target overtakes: a dispatch records its level after it releases
+its run-queue lock (`mark_dispatched`), so a push can read a level the target is leaving, move the
+thread there, and find it waiting again, where that CPU's tick pushes it on. A tick pushes one
+thread, so each movable waiting thread that the pushes take first adds a tick too, and so does a
+priority change of the running thread, whose stale level hides the waiting queues until the
+tick's return to user mode records it again. A thread pinned
+by hard affinity is never pushed; it waits for the thread above it, as before.
+
+What a push adds to the worst-case tick of the thread it interrupts, beyond the balancer's work
+below: the waiting test, two Relaxed loads; on a hit, the walk of the waiting queues under the CPU's
+own lock, two loads per thread linked there up to the first movable one; the scan, one `ranks`
+sample (two Relaxed loads) per CPU of the window at or above the level, and for a CPU below it a
+second sample, its load, and on a tie the `has_no_work` reads of its SMT siblings; and, on a
+target, the two CPU try-locks, the re-decision under them (the source's waiting mask, the target's
+ranks, and the walk of the window), the thread's `sched_lock` try-lock, the relocation (one
+`remove_from_queue` and one `enqueue`), and the wake IPI to the target. A miss stores the cursor,
+a field only this CPU writes. The push takes no lock on a miss, and every lock it takes is
+try-acquired, so it waits on no other CPU.
+
 Migration goes through `pull_unpinned_ready(src_cpu, dst_cpu, rule)`, which shares the
 validate-then-move core `relocate_ready_thread` with `migrate_ready_thread`:
 
@@ -764,7 +827,9 @@ pull_unpinned_ready(src, dst, rule):
         unlock(min); return
     if !rule.passes(src.current_load(), src.backlog(), dst.current_load()):
         unlock both; return RuleFailed                   // the caller's reading no longer holds
-    (tcb, prio) = src.find_runnable(|t| t.cpu_affinity == AFFINITY_ANY
+    within = rule.queues(src.waiting_rt(), dst.ranks()) // every queue; the push window for Waiting
+    if within == 0: unlock both; return RuleFailed
+    (tcb, prio) = src.find_runnable(within, |t| t.cpu_affinity == AFFINITY_ANY
                                         && t.context_saved.load(Acquire) == 1)
     if tcb is None: unlock both; return NothingPullable  // pinned or mid-handoff only
     if !try_lock(tcb.sched_lock): unlock both; return  // taken after run-queue locks
@@ -817,7 +882,9 @@ Hot-path cost per CPU per tick:
 - Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick
   after an idle one) and one of its own load, plus, with an empty queue, one Relaxed load
   per remote CPU, or, with queued threads, one Relaxed increment + one Relaxed load for the
-  victim.
+  victim. Before the balancer, the RT push's waiting test makes two Relaxed loads of its own
+  run-queue mask and `outranking` under the lock the tick already holds; only a hit costs more
+  (above, "RT push").
 - Scheduler locks are try-acquired: by a busy CPU only when an imbalance above
   `LOAD_BALANCE_IMBALANCE_THRESHOLD` is observed, and by an idle CPU when the idle rule
   above decides a pull (a second time in the tick when a pull above the threshold moves
@@ -845,7 +912,7 @@ of another ([core/ktest/README.md](../../ktest/README.md)).
 | `remote_wakes` | Wakes (`enqueue_and_wake`) that linked the thread on a CPU other than the waker's, each of which sent that CPU a wake IPI ([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol Invariants) |
 | `idle_wakes` | Of those, the wakes whose CPU ran its idle thread at the link, which halts while it has no work, so that the thread waited for the CPU to leave its halt |
 | `wake_moves` | Wakes that linked the thread on a CPU other than its `preferred_cpu` |
-| `pulls` | Load-balancer pulls that moved the thread (`pull_unpinned_ready`, § Load Balancing) |
+| `pulls` | Load-balancer pulls and RT pushes that moved the thread (`pull_unpinned_ready`, § Load Balancing) |
 | `sync_wakes` | Synchronous-hint wakes that reached the synchronous wake rule (§ Thread Assignment) |
 | `sync_local` | Of those, the wakes the rule placed on the waker's CPU |
 
@@ -958,6 +1025,8 @@ timer_tick():
             current.slice_remaining = remaining; reschedule = false
         Expired:
             current.slice_remaining = quantum_ticks(current_level); reschedule = true
+    if a movable RT thread waits on this CPU:  // waiting_rt + find_runnable, under its lock
+        try_push_waiting_rt(cpu, its level)   // § Load Balancing, "RT push"
     try_pull_balance(cpu)
     if !reschedule: return
     if preemption_disabled(): return          // see § Kernel-Mode Preemption Points
@@ -1084,12 +1153,20 @@ and the sleep batch's claims ahead of it
 ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants) § Sleep List
 Invariants, invariant 6). The bound holds for the CPU the wake's placement chose, which for an RT
 thread is one it outranks whenever an eligible CPU runs and queues only lower levels (§ Thread
-Assignment). An RT wake is still placed behind a running thread of its own or a higher level, and
-waits for it to block, yield or expire, when every eligible CPU runs or queues such a thread, when
-hard affinity, the save-window pin or a synchronous wake's guard places it, and when the levels its
-placement sampled went stale before its link: two wakes placed on one CPU at once leave the lower
-waiting until the higher blocks or expires. Closing that residual needs an RT pull (a CPU running a
-lower level taking a waiting RT thread at its tick), which is not implemented.
+Assignment). An RT wake is placed behind a running thread of its own or a higher level when every
+eligible CPU runs or queues such a thread, when hard affinity, the save-window pin or a synchronous
+wake's guard places it, and when the levels its placement sampled went stale before its link (two
+wakes placed on one CPU at once). An unpinned thread so waiting, or one left waiting when another
+CPU's dispatch lowers that CPU's level, is moved by the RT push of the CPU it waits on (§ Load
+Balancing, "RT push") to a CPU whose running and queued threads it outranks, where the wake IPI
+preempts as above: within one tick of the CPU it waits on in a boot of up to 129 CPUs, and within
+ceil((n - 1) / 128) such ticks in a boot of n CPUs above that (64 at the 8192 of `MAX_CPUS`), plus
+one tick per push that a contended try-lock defers or that a dispatch on the target, raising its
+level after the push read it, refuses or overtakes, one per movable waiting thread that the
+CPU's pushes take ahead of it, since a tick pushes one thread, and one after a priority change of
+the thread it waits behind. A thread waits for the higher one to block,
+yield or expire only while no CPU it may run on runs and queues only lower levels: when every such
+CPU runs or queues its level or above, or when hard affinity pins it.
 
 **Timed wakes** stay on CPU 0's tick (§ Timer-Driven Preemption): every ABI timeout is in
 milliseconds and the tick is 1 ms, so a one-shot timer buys no resolution the ABI can ask for, and

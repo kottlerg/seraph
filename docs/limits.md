@@ -269,6 +269,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `WATCHDOG_SLEEP_ENTRIES` | `core/kernel/src/sched/mod.rs` | 8 | diagnostic output cap | about 128 B stack | correct as is | None |
 | `CS_SPIN_WARN_US` | `core/kernel/src/sched/mod.rs` | 100 000 us | diagnostic threshold | none | correct as is | None |
 | `LOAD_BALANCE_IMBALANCE_THRESHOLD` | `core/kernel/src/sched/mod.rs` | 2 | tuning | none | correct as is | None |
+| `RT_PUSH_SCAN_CPUS` | `core/kernel/src/sched/mod.rs` | 128 CPUs | per-tick bound (the CPUs one RT push scan reads, so the cost a push adds to the running thread's tick does not grow with the CPU count; the push's bound is one tick up to 129 CPUs and one tick per window above, 64 at `MAX_CPUS`) | 8 B per CPU (the scan's cursor) | correct as is | None |
 | `PerCpuScheduler.load`, `non_empty` | `core/kernel/src/sched/run_queue.rs` | `AtomicU32` | provably unreachable (load at most threads, mask 32 bits for 13 queues) | per CPU | correct as is | None |
 | `ThreadControlBlock.death_observers` | `core/kernel/src/sched/thread.rs` | unbounded chain of queue-funded nodes | none (each node is funded by the observing queue) | 8 B per TCB | correct as is | None |
 | `EventQueueState.observer_count` | `core/kernel/src/ipc/event_queue.rs` | caller-chosen, at most `EVENT_QUEUE_MAX_CAPACITY` | caller-funded per queue (40 B per node) | none up front | correct as is | Bindings past the pool return `OutOfMemory` until a bound owner is destroyed |
@@ -1062,6 +1063,7 @@ production value is raised.
 | `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/cpu_sample.rs` | 16 / 8 | test fixture | none | correct as is | None |
 | `MIGRATION_GUARD_MAX_CPUS` | `core/ktest/src/stress/load_balance_handoff_steal.rs` | 32 | ABI width (one-hot `u32` witness) | none | correct as is | None |
 | `ROUNDS`, `PULL_BUDGET_US`, `LOW_EXIT_POLLS`, `SPINNER_START_MS`, `SPINNER_DRAIN_WINDOWS` | `core/ktest/src/integration/idle_pull_starved_ready.rs` | 8 / 50 ms, scaled / 1000 x 1 ms, scaled / 5 s / 4 x 5 s | test fixture (rounds enough that a pull by the threshold rule's transient alone passes them all rarely; budgets far past the idle pull's few ms) | none | correct as is | None |
+| `ROUNDS`, `PUSH_BUDGET_US`, `LOW_EXIT_POLLS`, `SPINNER_START_MS`, `MAX_YIELDS`, `SPINNER_DRAIN_WINDOWS` | `core/ktest/src/integration/rt_push_waiting.rs` | 8 / 50 ms, scaled / 1000 x 1 ms, scaled / 5 s / 64 yields / 4 x 5 s | test fixture (rounds enough that a move by a slice-expiry transient alone passes them all rarely; budgets far past the push's one tick) | none | correct as is | None |
 | `fund_boot_aspace_pt` budgets | `core/ktest/src/main.rs` | 256 KiB / 64 / 16 pages | test fixture | none | correct as is | None |
 | `DEPTH` | `core/ktest/src/integration/cspace_nested_teardown.rs` | 256 | test fixture (past the kernel-stack recursion depth) | none | correct as is | None |
 | `CHILDREN` | `core/ktest/src/integration/cap_transfer_large.rs` | 300 | test fixture (more than one reparent batch) | none | correct as is | None |

@@ -8045,9 +8045,11 @@ unsafe fn mark_dispatched(
         unsafe { crate::percpu::post_return_work(upcall) };
     }
     // A user thread's counter-read grant takes effect on this CPU, read under
-    // the held sched_lock that `perfmon::bind` stores it under.
-    // SAFETY: tcb is a valid TCB; is_user is immutable.
-    if unsafe { (*tcb).is_user }
+    // the held sched_lock that `perfmon::bind` stores it under. A CPU with no
+    // user configuration grants none, so its test is one per-CPU load.
+    // SAFETY: this CPU's per-CPU pointer is installed and interrupts are
+    // disabled (contract).
+    if unsafe { crate::perfmon::armed() }
     {
         // SAFETY: tcb is a valid TCB whose sched_lock this CPU holds; this
         // CPU's per-CPU pointer is installed and interrupts are disabled

@@ -15,9 +15,12 @@
 //! unsupported; that a child never bound faults on its first counter read
 //! (`#GP(0)` on x86-64, an illegal instruction on riscv64) at the read; that
 //! this thread, bound, reads both counters of a `Cycles`, `Instructions` configuration
-//! and each advances across a counted loop; and, from two CPUs, that unbinding a
-//! child that reads in a loop on another CPU makes its next read fault. A
-//! CPU with no counters (x86-64 under TCG) skips the case after the info call.
+//! and each advances across a counted loop; that once the counters are released
+//! a bound child's read faults the same way; and, from two CPUs, that unbinding a
+//! child that reads in a loop on another CPU makes its next read fault. On a
+//! CPU with no counters (x86-64 under TCG) the case checks what holds there
+//! instead: the same refusals, with `NotSupported` where a call reaches the
+//! counters, and the unbound read's fault ([`no_counters`]).
 //!
 //! **No fault dump.** The handler resumes each faulted child at [`exit_entry`], so it
 //! exits voluntarily and the kernel prints no kill dump.
@@ -86,8 +89,8 @@ const READ_FAULT_CODE: Option<u64> = Some(0);
 #[cfg(target_arch = "riscv64")]
 const READ_FAULT_CODE: Option<u64> = None;
 
-/// Address of the counter read the unbound child is about to execute.
-static UNBOUND_IP: AtomicU64 = AtomicU64::new(0);
+/// Address of the counter read the child of [`read_faults`] is about to execute.
+static READ_IP: AtomicU64 = AtomicU64::new(0);
 
 /// Address of the counter read the revoke child last began.
 static REVOKE_IP: AtomicU64 = AtomicU64::new(0);
@@ -112,8 +115,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         {
             if cfg!(target_arch = "x86_64")
             {
-                crate::log("ktest: integration::pmu SKIP (no PMU on this CPU)");
-                return Ok(());
+                return no_counters(ctx, pmu);
             }
             return Err("integration::pmu: SYS_PMU_INFO reports no counters on riscv64");
         }
@@ -127,7 +129,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         return Err("integration::pmu: info lacks two counters, a width, Cycles or Instructions");
     }
-    refusals(ctx)?;
+    refusals(ctx, SyscallError::InvalidState)?;
 
     pin(ctx, CPU_A)?;
     let result = measure(ctx, pmu, info);
@@ -143,6 +145,50 @@ pub fn run(ctx: &TestContext) -> TestResult
     restored.map_err(|_| "integration::pmu: restoring this thread's affinity failed")?;
     crate::log("ktest: integration::pmu PASS");
     Ok(())
+}
+
+/// A CPU with no counters: the refusals, the unpinned configure refused
+/// `NotSupported` since the kernel checks for counters before the affinity,
+/// then, pinned to [`CPU_A`], a configure, a release and a bind each refused
+/// `NotSupported`, and a child's counter read (handle 0) faulting as it does
+/// where counters exist.
+fn no_counters(ctx: &TestContext, pmu: Pmu) -> TestResult
+{
+    crate::log("ktest: integration::pmu no counters");
+    refusals(ctx, SyscallError::NotSupported)?;
+    pin(ctx, CPU_A)?;
+    let result = no_counters_pinned(ctx, pmu);
+    let restored = thread_set_affinity(ctx.thread_cap, AFFINITY_ANY);
+    result?;
+    restored.map_err(|_| "integration::pmu: restoring this thread's affinity failed")?;
+    crate::log("ktest: integration::pmu PASS");
+    Ok(())
+}
+
+/// The body of [`no_counters`], pinned to [`CPU_A`].
+fn no_counters_pinned(ctx: &TestContext, pmu: Pmu) -> TestResult
+{
+    expect_err(
+        pmu.configure(&[PmuEvent::Cycles], PmuMode::User),
+        SyscallError::NotSupported,
+        "integration::pmu: configure with no counters was not refused NotSupported",
+    )?;
+    expect_err(
+        pmu.release(),
+        SyscallError::NotSupported,
+        "integration::pmu: release with no counters was not refused NotSupported",
+    )?;
+    expect_err(
+        pmu.bind(ctx.thread_cap),
+        SyscallError::NotSupported,
+        "integration::pmu: bind with no counters was not refused NotSupported",
+    )?;
+    read_faults(
+        ctx,
+        0,
+        None,
+        "integration::pmu: an unbound counter read did not fault",
+    )
 }
 
 /// Pin this thread to `cpu` and yield once, so that it runs there.
@@ -166,15 +212,17 @@ fn expect_err<T>(got: Result<T, i64>, want: SyscallError, msg: &'static str) -> 
     }
 }
 
-/// The refusals that need no counters and no pinning, except the first.
-fn refusals(ctx: &TestContext) -> TestResult
+/// The refusals that need no pinning: the first, a configure with no affinity
+/// set, is refused `unpinned` (`InvalidState` where the CPU has counters,
+/// `NotSupported` where it has none); the others precede the counter check.
+fn refusals(ctx: &TestContext, unpinned: SyscallError) -> TestResult
 {
     let cap = ctx.pmu_control_cap;
     let user = PmuMode::User.raw();
     expect_err(
         pmu_configure(cap, 0, 1, user),
-        SyscallError::InvalidState,
-        "integration::pmu: configure with no affinity set was not refused InvalidState",
+        unpinned,
+        "integration::pmu: configure with no affinity set was not refused",
     )?;
     expect_err(
         pmu_configure(cap, 0, 9, user),
@@ -228,8 +276,8 @@ fn refusals(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// The pinned part: every event, the unbound read, the bound reads, and the
-/// revoke. Runs with this thread pinned to [`CPU_A`].
+/// The pinned part: every event, the unbound read, the bound reads, the bound
+/// read with no configuration, and the revoke. Runs with this thread pinned to [`CPU_A`].
 fn measure(ctx: &TestContext, pmu: Pmu, info: Info) -> TestResult
 {
     for event in PmuEvent::ALL
@@ -260,7 +308,12 @@ fn measure(ctx: &TestContext, pmu: Pmu, info: Info) -> TestResult
         .copied()
         .ok_or("integration::pmu: configure returned no handle")?;
 
-    unbound_read_faults(ctx, first)?;
+    read_faults(
+        ctx,
+        first,
+        None,
+        "integration::pmu: an unbound counter read did not fault",
+    )?;
 
     counters
         .bind(ctx.thread_cap)
@@ -288,6 +341,16 @@ fn measure(ctx: &TestContext, pmu: Pmu, info: Info) -> TestResult
     pmu.unbind(ctx.thread_cap)
         .map_err(|_| "integration::pmu: unbind of this thread failed")?;
 
+    // A CPU with no configuration grants no reader.
+    pmu.release()
+        .map_err(|_| "integration::pmu: release of CPU A's counters failed")?;
+    read_faults(
+        ctx,
+        first,
+        Some(&pmu),
+        "integration::pmu: a bound read on a CPU with no configuration did not fault",
+    )?;
+
     revoke(ctx, pmu)
 }
 
@@ -303,8 +366,15 @@ fn counted_loop(n: u64) -> u64
     acc
 }
 
-/// A child never bound, pinned to [`CPU_A`], faults at its first counter read.
-fn unbound_read_faults(ctx: &TestContext, handle: u8) -> TestResult
+/// A child pinned to [`CPU_A`] faults at its first read of counter `handle`:
+/// never bound when `bound_by` is `None`, else bound by it before it starts.
+/// `missing` is the failure when no fault arrives.
+fn read_faults(
+    ctx: &TestContext,
+    handle: u8,
+    bound_by: Option<&Pmu>,
+    missing: &'static str,
+) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "integration::pmu: cap_create_endpoint failed")?;
@@ -313,7 +383,12 @@ fn unbound_read_faults(ctx: &TestContext, handle: u8) -> TestResult
             .map_err(|_| "integration::pmu: spawn::new_child failed")?;
         crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
             .map_err(|_| "integration::pmu: thread_set_fault_handler failed")?;
-        UNBOUND_IP.store(0, Ordering::Release);
+        if let Some(pmu) = bound_by
+        {
+            pmu.bind(child.th)
+                .map_err(|_| "integration::pmu: bind of the child failed")?;
+        }
+        READ_IP.store(0, Ordering::Release);
         // SAFETY: `UNBOUND_STACK` is a static stack, reached only through `addr_of!`.
         let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(UNBOUND_STACK)) };
         // SAFETY: the stack is `UNBOUND_STACK`, this case's own `ChildStack`, on which no
@@ -321,20 +396,14 @@ fn unbound_read_faults(ctx: &TestContext, handle: u8) -> TestResult
         unsafe {
             crate::spawn::configure_and_start_pinned(
                 &child,
-                unbound_reader,
+                faulting_reader,
                 stack_top,
                 u64::from(handle),
                 CPU_A,
             )
         }
         .map_err(|_| "integration::pmu: configure_and_start_pinned failed")?;
-        expect_fault(
-            ctx,
-            ep,
-            &child,
-            &UNBOUND_IP,
-            "integration::pmu: an unbound counter read did not fault",
-        )?;
+        expect_fault(ctx, ep, &child, &READ_IP, missing)?;
         reap(&mut child)
     })();
     cap_delete(ep).ok();
@@ -492,10 +561,11 @@ fn expect_fault(
     Ok(())
 }
 
-/// Child entry: read counter `handle`, never bound, so the read faults.
-extern "C" fn unbound_reader(handle: u64) -> !
+/// Child entry: read counter `handle`, which faults: the child is never bound,
+/// or bound on a CPU with no configuration.
+extern "C" fn faulting_reader(handle: u64) -> !
 {
-    core::hint::black_box(read_recording(handle_byte(handle), &UNBOUND_IP));
+    core::hint::black_box(read_recording(handle_byte(handle), &READ_IP));
     syscall::thread_exit()
 }
 

@@ -62,6 +62,13 @@ impl ArchPmu
             grant: 0,
         }
     }
+
+    /// Whether a configuration holds counters on this hart.
+    #[cfg(not(test))]
+    pub const fn configured(&self) -> bool
+    {
+        self.configured != 0
+    }
 }
 
 /// The SBI description of counter `index`, or `None` where the firmware

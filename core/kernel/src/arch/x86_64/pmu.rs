@@ -70,6 +70,13 @@ impl ArchPmu
             intel: [None; PMU_EVENT_COUNT as usize],
         }
     }
+
+    /// Whether a configuration holds counters on this CPU.
+    #[cfg(not(test))]
+    pub const fn configured(&self) -> bool
+    {
+        self.configured != 0
+    }
 }
 
 /// Describe this CPU's counters into `state` and leave every user counter

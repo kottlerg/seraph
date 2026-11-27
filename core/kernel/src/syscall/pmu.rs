@@ -151,8 +151,10 @@ pub fn sys_pmu_configure(tf: UserFrame) -> Result<u64, SyscallError>
 ///
 /// Returns 0. The grant holds until a bind revokes it or the thread exits;
 /// revoking the `PmuControl` capability does not end it. It takes effect
-/// before the thread's next instruction when the thread is the caller, and
-/// at the thread's next entry to the kernel otherwise.
+/// only on a CPU with a user configuration; on a CPU with none the thread's
+/// read faults. It takes effect before the thread's next instruction when the
+/// thread is the caller, and at the thread's next entry to the kernel
+/// otherwise.
 ///
 /// # Errors
 /// - `InvalidCapability` — arg0 names no `PmuControl` capability, or arg1 no

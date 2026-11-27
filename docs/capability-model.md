@@ -94,8 +94,8 @@ scaling, and DRAM rows. The system draws the line as follows.
   an `hpmcounter` raises an illegal-instruction exception. On x86-64 it clears `CR4.TSD` and
   `CR4.PCE`: ring 3 reads the timestamp counter (`RDTSC`, `RDTSCP`), and `RDPMC` raises `#GP`
   there. The performance counters are granted only to a thread a `PmuControl` holder binds
-  (§ `PmuControl`), and while it runs; they count all work on the CPU, not the bound thread's
-  alone. The kernel sets every other
+  (§ `PmuControl`), and only while it runs on a CPU with a user configuration; they count all work
+  on the CPU, not the bound thread's alone. The kernel sets every other
   user-mode control on every CPU the same way (§ User-mode hardware controls of
   [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)),
   and user code relies on what they give it: on x86-64 `RDTSCP` and `RDPID` return 0 as the
@@ -613,7 +613,8 @@ counters and to grant a thread their direct reads, with `SYS_PMU_INFO`, `SYS_PMU
 
 The counters are per CPU, and one configuration of a CPU replaces another, whoever made it. A
 bound thread reads them from user mode (`RDPMC` on x86-64, `csrr hpmcounterN` on riscv64) while
-it runs, and an unbound thread's read raises the CPU's fault. A counter counts all work on its CPU
+it runs on a CPU with a configuration, and an unbound thread's read, or a bound thread's on a CPU
+with none, raises the CPU's fault. A counter counts all work on its CPU
 in the configured mode, other processes' and the kernel's included, so the grant is a
 cross-process observation channel and is authority-bearing
 ([core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)

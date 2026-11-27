@@ -82,8 +82,8 @@ let mut start = [0; 2];
 counters.read(&mut start);
 ```
 
-`read_counter` executes `RDPMC` on x86-64 and `csrr hpmcounterN` on riscv64; an unbound thread's
-read takes the CPU's fault.
+`read_counter` executes `RDPMC` on x86-64 and `csrr hpmcounterN` on riscv64; a read by an
+unbound thread, or by a bound one on a CPU with no configuration, takes the CPU's fault.
 
 ---
 

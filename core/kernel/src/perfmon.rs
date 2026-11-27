@@ -13,13 +13,17 @@
 //! mode reads the counters directly while that thread runs: `CR4.PCE` on
 //! x86-64, the configured counters' `scounteren` bits on riscv64.
 //!
-//! The grant in effect on a CPU follows the user thread that runs there. The
-//! dispatch of a user thread applies its flag ([`switch_in`]), and a bind
-//! posts `percpu::return_work::PMU_GRANT` to the CPU running the thread, whose
-//! next return to user mode applies the flag again ([`sync_grant`]). A CPU
-//! writes the grant only when the flag it applies differs from the one in
-//! effect, so a switch between two threads of the same flag writes nothing.
+//! The grant in effect on a CPU follows the user thread that runs there, and
+//! holds only while the CPU has a user configuration: a CPU with none grants
+//! no thread, so its dispatch pays one per-CPU load of [`CpuPmu::armed`] and a
+//! not-taken branch ([`armed`]). On a configured CPU the dispatch of a user
+//! thread applies its flag ([`switch_in`]), and a bind posts
+//! `percpu::return_work::PMU_GRANT` to the CPU running the thread, whose next
+//! return to user mode applies the flag again ([`sync_grant`]). A CPU writes
+//! the grant only when the one it applies differs from the one in effect, so a
+//! switch between two threads of the same flag writes nothing.
 
+use core::sync::atomic::AtomicU32;
 #[cfg(not(test))]
 use core::sync::atomic::Ordering;
 
@@ -39,6 +43,12 @@ use crate::sched::thread::{ThreadControlBlock, ThreadState};
 /// `SYS_PMU_CONFIGURE`.
 pub struct CpuPmu
 {
+    /// 1 while the CPU has a user configuration, else 0: the word a dispatch
+    /// tests ([`armed`]) before it reads anything else of the grant. 0 implies
+    /// no grant in effect. Written only by this CPU with interrupts disabled,
+    /// in [`configure`]; an atomic since [`armed`] reads it with one
+    /// GS- or `tp`-relative load, outside any reference to this struct.
+    armed: AtomicU32,
     /// What the counters offer; [`Info::NONE`] for a CPU with none.
     info: Info,
     /// Whether the grant in effect is a reader's.
@@ -53,11 +63,33 @@ impl CpuPmu
     pub const fn new() -> Self
     {
         Self {
+            armed: AtomicU32::new(0),
             info: Info::NONE,
             reader: false,
             arch: ArchPmu::new(),
         }
     }
+}
+
+/// The offset of [`CpuPmu::armed`] in `PerCpuData`.
+#[cfg(not(test))]
+const ARMED_OFFSET: usize =
+    core::mem::offset_of!(crate::percpu::PerCpuData, pmu) + core::mem::offset_of!(CpuPmu, armed);
+
+/// Whether this CPU has a user configuration, so that a dispatch applies the
+/// incoming thread's grant ([`switch_in`]): one per-CPU load.
+///
+/// # Safety
+/// This CPU's per-CPU pointer is installed and interrupts are disabled.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn armed() -> bool
+{
+    // SAFETY: the per-CPU pointer is installed (contract); ARMED_OFFSET is
+    // that of the aligned AtomicU32 `armed` of this CPU's PerCpuData, below
+    // the 2 KiB reach of a riscv64 load's immediate (`PerCpuData` is far
+    // smaller), which only this CPU writes, with interrupts disabled.
+    unsafe { crate::arch::current::cpu::read_percpu_u32::<ARMED_OFFSET>() != 0 }
 }
 
 /// This CPU's [`CpuPmu`].
@@ -167,17 +199,25 @@ unsafe fn write_grant(pmu: &CpuPmu)
     }
 }
 
-/// Apply the reader flag of `tcb`, the user thread this CPU dispatches, under
-/// its held `sched_lock`, which orders the read after every `SYS_PMU_BIND`
-/// whose post does not reach this CPU.
+/// Apply the reader flag of `tcb`, the thread this CPU dispatches, when it is
+/// a user thread, under its held `sched_lock`, which orders the read after
+/// every `SYS_PMU_BIND` whose post does not reach this CPU. Called only on a
+/// CPU [`armed`] reports configured; a kernel thread leaves the grant as it
+/// is, since it runs no user code.
 ///
 /// # Safety
 /// `tcb` is a valid TCB whose `sched_lock` this CPU holds; this CPU's
 /// per-CPU pointer is installed and interrupts are disabled.
 #[cfg(not(test))]
-#[inline]
+#[cold]
+#[inline(never)]
 pub unsafe fn switch_in(tcb: *const ThreadControlBlock)
 {
+    // SAFETY: tcb valid (contract); is_user is immutable.
+    if !unsafe { (*tcb).is_user }
+    {
+        return;
+    }
     // SAFETY: tcb valid (contract); the flag is an atomic.
     let reader = unsafe { (*tcb).pmu_reader.load(Ordering::Relaxed) };
     // SAFETY: the per-CPU pointer is installed and interrupts are disabled
@@ -187,9 +227,10 @@ pub unsafe fn switch_in(tcb: *const ThreadControlBlock)
     unsafe { apply(pmu, reader) };
 }
 
-/// Apply the reader flag of this CPU's running thread: the return to user
-/// mode that took a `PMU_GRANT` bit. The take's Acquire orders the read
-/// after the bind's store, which the post's Release follows.
+/// Apply the reader flag of this CPU's running thread, on a CPU with a user
+/// configuration: the return to user mode that took a `PMU_GRANT` bit. The
+/// take's Acquire orders the read after the bind's store, which the post's
+/// Release follows.
 ///
 /// # Safety
 /// A return to user mode on this CPU with interrupts disabled, no lock held.
@@ -209,14 +250,17 @@ pub unsafe fn sync_grant()
     // SAFETY: the per-CPU pointer is installed and interrupts are disabled
     // (contract).
     let pmu = unsafe { this_cpu_pmu() };
+    let armed = *pmu.armed.get_mut() != 0;
     // SAFETY: pmu is this CPU's; interrupts are disabled (contract).
-    unsafe { apply(pmu, reader) };
+    unsafe { apply(pmu, armed && reader) };
 }
 
 /// Program this CPU's user counters with `events` counting in `mode`, or
-/// release them for an empty list, then write the grant in effect again,
-/// whose counters the configuration changed. Returns the read handles, one
-/// per byte in the order of the events.
+/// release them for an empty list, then record whether the CPU holds a
+/// configuration ([`armed`]) and write the caller's grant again, whose
+/// counters the call changed, whether it succeeded or not: on riscv64 a
+/// failed configuration leaves none. Returns the read handles, one per byte
+/// in the order of the events.
 ///
 /// # Errors
 /// `NotSupported` for a CPU with no counters, more events than it has, or an
@@ -238,11 +282,21 @@ pub unsafe fn configure(events: &EventList, mode: PmuMode) -> Result<u64, Syscal
     let mut handles = [0u8; PMU_CONFIGURE_MAX];
     // SAFETY: ring 0 or S-mode on this CPU with interrupts disabled
     // (contract); the state and info are this CPU's.
-    unsafe {
+    let result = unsafe {
         crate::arch::current::pmu::configure(&mut pmu.arch, info, events, mode, &mut handles)
-    }?;
+    };
+    let armed = pmu.arch.configured();
+    *pmu.armed.get_mut() = u32::from(armed);
+    // SAFETY: syscall context on a CPU whose per-CPU pointer is installed
+    // (contract).
+    let caller = unsafe { crate::percpu::current_thread() };
+    // SAFETY: in syscall context this CPU's running thread is the caller, a
+    // valid TCB; the flag is an atomic.
+    let reader = unsafe { (*caller).pmu_reader.load(Ordering::Relaxed) };
+    pmu.reader = armed && reader;
     // SAFETY: pmu is this CPU's; interrupts are disabled (contract).
     unsafe { write_grant(pmu) };
+    result?;
     Ok(pack_handles(handles.get(..events.len()).unwrap_or(&[])))
 }
 

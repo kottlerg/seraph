@@ -381,8 +381,8 @@ jobs:
 
       - name: Report the runner's performance counters
         # Reported only: CI boots x86-64 under TCG, which offers the guest no
-        # PMU, so the x86-64 case of ktest's integration::pmu skips here
-        # (core/kernel/docs/perfmon.md § Testing).
+        # PMU, so ktest's integration::pmu checks the x86-64 case of a CPU
+        # with no counters here (core/kernel/docs/perfmon.md § Testing).
         run: |
           echo "arch_perfmon CPUs: $(grep -c arch_perfmon /proc/cpuinfo || true)"
           echo "perfctr_core CPUs: $(grep -c perfctr_core /proc/cpuinfo || true)"

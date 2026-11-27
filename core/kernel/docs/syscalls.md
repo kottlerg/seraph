@@ -4140,7 +4140,10 @@ Program the calling CPU's user counters, or release them.
 The configuration replaces the CPU's previous one, whoever made it, and its counters start from
 zero. The caller's hard affinity must name the CPU it runs on: a thread that set its affinity
 moves there at its next schedule, so it yields once before configuring. A counter counts all work
-on the CPU in the mode, not the caller's alone ([perfmon.md](perfmon.md) § What a value means).
+on the CPU in the mode, not the caller's alone ([perfmon.md](perfmon.md) § What a value means). A
+thread's grant is in effect only while the CPU holds a configuration, so a release ends it on the
+CPU and a configuration that holds counters starts it for the bound threads that run there
+([perfmon.md](perfmon.md) § The grant).
 
 **Return:** `rax`/`a0`: the read handles on success, one per byte in the order of the events (the
 `RDPMC` index on x86-64, the counter CSR's offset from `cycle` on riscv64), `0` for a release;
@@ -4170,12 +4173,13 @@ on.
 | 1 | `thread_cap` | Thread capability carrying `Control` |
 | 2 | `on` | `1` to grant, `0` to revoke |
 
-A thread without the grant that reads a counter takes the CPU's fault (`#GP(0)` on x86-64, an
-illegal-instruction exception on riscv64), delivered as its own fault. The change holds before
-the caller's next instruction when the thread is the caller; from the thread's first return to
-user mode after the kernel's interrupt reaches its CPU when it runs on another; and from its next
-dispatch otherwise ([perfmon.md](perfmon.md) § The grant). The grant holds until a bind revokes it
-or the thread exits: revoking the `PmuControl` capability does not end it.
+A thread without the grant, or one with it on a CPU that has no user configuration, that reads a
+counter takes the CPU's fault (`#GP(0)` on x86-64, an illegal-instruction exception on riscv64),
+delivered as its own fault. The change holds before the caller's next instruction when the thread is
+the caller; from the thread's first return to user mode after the kernel's interrupt reaches its
+CPU when it runs on another; and from its next dispatch otherwise ([perfmon.md](perfmon.md)
+§ The grant). The grant holds until a bind revokes it or the thread exits: revoking the
+`PmuControl` capability does not end it.
 
 **Return:** `rax`/`a0`: 0 on success; negative `SyscallError` on failure.
 

@@ -1064,6 +1064,12 @@ pub unsafe fn configure(
 /// counters (x86-64 `CR4.PCE`; riscv64 the counters' bits in `scounteren`), for the thread
 /// about to run: `reader` is whether it holds the grant of `SYS_PMU_BIND`.
 pub unsafe fn apply_grant(state: &ArchPmu, reader: bool);
+
+impl ArchPmu
+{
+    /// Whether a configuration holds counters on this CPU.
+    pub const fn configured(&self) -> bool;
+}
 ```
 
 ---

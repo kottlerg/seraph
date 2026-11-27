@@ -1046,15 +1046,6 @@ mod tests
             PERCPU_PREEMPT_COUNT_OFFSET
         );
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
-        // The PMU state is the architecture's: x86-64 keeps an encoding per event.
-        let size = if cfg!(target_arch = "x86_64")
-        {
-            288
-        }
-        else
-        {
-            280
-        };
-        assert_eq!(core::mem::size_of::<PerCpuData>(), size);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 288);
     }
 }

@@ -336,7 +336,8 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear every CR4
    control ring 3 reaches that the kernel does not grant (VME, PVI, TSD, PCE, FSGSBASE, KL,
    PKE, UINTR) and PKS, so ring 3 reads the timestamp counter and no performance counter
-   (a thread `SYS_PMU_BIND` granted reads them while it runs; perfmon.md § The grant), and has no
+   (a thread `SYS_PMU_BIND` granted reads them while it runs on a CPU with a user configuration;
+   perfmon.md § The grant), and has no
    virtual interrupts, Key Locker, protection keys or user interrupts (each AP repeats this step in
    interrupts::init_ap)
 2. Enable XSAVE (x87 | SSE | AVX in XCR0), set CR0.MP and CR0.NE and clear CR0.EM and
@@ -401,7 +402,8 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Write scounteren whole with CY alone, whatever the firmware left, so U-mode reads the
    cycle counter and no other (a thread `SYS_PMU_BIND` granted also reads the configured counters
-   while it runs; perfmon.md § The grant; each AP writes the same in interrupts::init_ap)
+   while it runs on a CPU with a user configuration; perfmon.md § The grant; each AP writes the
+   same in interrupts::init_ap)
 5. Initialise AIA (`aia::init_bsp`): halt unless every hart advertises Ssaia
    (`HART_CAP_SSAIA`) and the bootloader reported a supervisor-level APLIC domain
    (`BootInfo.kernel_mmio.aplic`) of 1..=1023 sources with a register window of at least

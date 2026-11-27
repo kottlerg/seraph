@@ -923,10 +923,12 @@ const fn empty_slab() -> ObjectSlab {
     SpinMutex::new(empty_pool())
 }
 
-/// Slab serving sub-page requests `<= 128 B` (Endpoint, Notification).
+/// Slab serving sub-page requests `<= 128 B` (Notification, and Endpoint up to
+/// 224 CPUs).
 // restore: rebound
 static SLAB_BIN_128: ObjectSlab = empty_slab();
-/// Slab serving sub-page requests `> 128 B && <= 512 B` (WaitSet).
+/// Slab serving sub-page requests `> 128 B && <= 512 B` (WaitSet, and Endpoint
+/// from 225 to 1760 CPUs).
 // restore: rebound
 static SLAB_BIN_512: ObjectSlab = empty_slab();
 /// Slab serving Endpoints when the boot's endpoint debit is page-sized
@@ -1493,8 +1495,8 @@ pub fn slab_release_fresh(region_id: u64) {
 /// Retype one kernel object out of the slab machinery.
 ///
 /// `min_bytes` is the full raw debit the kernel charges for the upcoming
-/// retype, the object wrapper plus its state ([`endpoint_retype_bytes`],
-/// `syscall_abi::NOTIFICATION_RETYPE_BYTES`, `wait_set_retype_bytes(capacity)`,
+/// retype, the object wrapper plus its state
+/// (`syscall_abi::NOTIFICATION_RETYPE_BYTES`, `wait_set_retype_bytes(capacity)`,
 /// `event_queue_retype_bytes(capacity, observers)`, or a
 /// page-granular object's byte size); it is rounded up to the kernel's size
 /// class, so the request covers the debit. `retype` is

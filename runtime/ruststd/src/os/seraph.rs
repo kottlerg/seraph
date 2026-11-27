@@ -1333,9 +1333,11 @@ pub fn endpoint_retype_bytes() -> Option<u64> {
 }
 
 /// Create one `Endpoint` out of the runtime's object-slab machinery:
-/// [`object_slab_retype`] of [`endpoint_retype_bytes`] with
-/// `cap_create_endpoint`. Returns the new endpoint's cap slot, which holds
-/// every endpoint right.
+/// `cap_create_endpoint` against a slab pool of the size class
+/// [`endpoint_retype_bytes`] takes, at every class the boot's CPU count gives
+/// it (a page above 1760 CPUs included), so an endpoint deleted mid-life
+/// returns its bytes to the pool. Returns the new endpoint's cap slot, which
+/// holds every endpoint right.
 ///
 /// Returns `None` if the debit query fails, memmgr is unreachable or refuses
 /// the request, or the retype fails.
@@ -1370,14 +1372,15 @@ pub fn event_queue_retype_bytes(capacity: u64, observers: u64) -> u64 {
 ///
 /// `min_bytes` is the full raw debit the kernel charges for the object the
 /// caller is about to create, the object wrapper plus its state:
-/// [`endpoint_retype_bytes`], [`NOTIFICATION_RETYPE_BYTES`],
+/// [`NOTIFICATION_RETYPE_BYTES`],
 /// [`wait_set_retype_bytes`]`(capacity)`, or
 /// [`event_queue_retype_bytes`]`(capacity, observers)`, or
 /// the byte size of a page-granular object. The runtime rounds it up to the
-/// kernel's size class, so the request covers the kernel's debit. `retype` is
-/// called at most once with a Memory-cap slot whose `available_bytes` covers
-/// that class and must perform exactly one `cap_create_*` syscall against the
-/// slot, returning `Some` on success.
+/// kernel's size class, so the request covers the kernel's debit. An
+/// `Endpoint` is created with [`create_endpoint`] instead, which pools its
+/// class at every CPU count. `retype` is called at most once with a Memory-cap
+/// slot whose `available_bytes` covers that class and must perform exactly one
+/// `cap_create_*` syscall against the slot, returning `Some` on success.
 ///
 /// # Closure contract
 ///

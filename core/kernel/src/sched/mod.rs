@@ -3459,7 +3459,7 @@ pub unsafe fn init(_cpu_count: u32) -> u32
 ///
 /// Called from `kernel_entry_ap` after per-CPU hardware initialisation is
 /// complete. The AP has an empty run queue at this point; it idles until
-/// `enqueue_and_wake` places work on this CPU and sends a wakeup IPI.
+/// `enqueue_and_wake` places work on this CPU and wakes it (`wake_idle_cpu`).
 ///
 /// This function never returns.
 ///
@@ -5382,9 +5382,12 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
     Some(core::ptr::null_mut())
 }
 
-/// Send a wakeup IPI to `target_cpu` without enqueueing anything.
+/// Wake `target_cpu` (`wake_idle_cpu`) without enqueueing anything: the
+/// wakeup IPI, or, for a CPU waiting idle on its monitored wake word, the
+/// clear of its idle wake flag, which ends the wait with no trap. A CPU
+/// running a thread has its flag clear, so it always takes the IPI's trap.
 ///
-/// Used wherever a path needs a remote CPU to take a trap: the
+/// Used wherever a path needs a remote CPU running a thread to take a trap: the
 /// `sys_thread_stop` and `sys_thread_start` drains and the object-teardown
 /// stop (`stop_threads_bound_to`) on a CPU running a target they marked
 /// `Stopped` or `Exited`, and `sys_thread_set_affinity` on a CPU running a
@@ -5394,8 +5397,8 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// the target's preemption by an outranking thread at a return to user mode)
 /// or the target's own park or yield, where the requeue denylist drops a
 /// `Stopped` or `Exited` target and the affinity check relocates a moved one.
-/// The callers' drains wait for that; the prod itself only exits a `hlt` on an
-/// idle CPU. `sys_thread_set_affinity` also uses it as the wake-protocol prod
+/// The callers' drains wait for that; the prod itself only ends the halt or
+/// wait of an idle CPU. `sys_thread_set_affinity` also uses it as the wake-protocol prod
 /// of the destination CPU after `migrate_ready_thread` moved a `Ready` thread
 /// there (the move linked the thread on that CPU's run queue; the prod wakes it
 /// from idle to dispatch the thread), and `sys_thread_set_priority` as the
@@ -7022,8 +7025,8 @@ unsafe fn count_wake_placement(
     }
     thread::PlacementCounts::count(&counts.remote_wakes);
     // A snapshot under the target's run-queue lock, held: the target runs its
-    // idle thread, and so halts or is about to, until the wake IPI that
-    // `enqueue_and_wake` sends after the unlock.
+    // idle thread, and so halts or waits or is about to, until the wake that
+    // `enqueue_and_wake` makes after the unlock.
     if core::ptr::eq(target.current(), target.idle())
     {
         thread::PlacementCounts::count(&counts.idle_wakes);

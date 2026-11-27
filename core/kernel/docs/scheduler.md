@@ -1088,7 +1088,8 @@ load of that pointer, the loads of `non_empty` and `outranking`, an AND and a br
 a syscall on x86-64 and 5 on riscv64 in the release profile, 10 and 8 in the debug profile, whose
 checks of the pointer's alignment and nullness the release profile drops. Both words are read
 Relaxed: a link the CPU made itself precedes the test in program order, and a link from another
-CPU is followed by its wake IPI, whose own return tests again
+CPU is followed by its wake IPI, whose own return tests again, or, when it cleared the CPU's idle
+wake flag, precedes the idle loop's dispatch
 ([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
 Invariants).
 
@@ -1365,8 +1366,9 @@ Otherwise, by target state:
   [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 4) and revalidates
   `Ready`, `context_saved == 1`, and the affinity under them (`relocate_ready_thread`). It
   then moves the TCB from the source CPU's run queue to the destination's; on a committed
-  move the syscall sends a wakeup IPI to the destination once it has released
-  `sched_lock`. A lost race leaves the thread where it is.
+  move the syscall wakes the destination (`prod_remote_cpu`: the wakeup IPI, or the clear of
+  its idle wake flag when it waits idle) once it has released `sched_lock`. A lost race leaves the
+  thread where it is.
 - **Running** thread on a different CPU: the syscall sends a wakeup IPI to
   the **source** CPU (where the thread is currently running). The IPI itself
   does not call `schedule()`; the running thread observes the new

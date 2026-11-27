@@ -810,8 +810,9 @@ of its own to a thread's lifecycle:
    the thread then waits on the target, whose ticks' waiting test finds it and whose pushes move
    it on from the target's own cursor, within the push's bound again (one tick up to 129 CPUs,
    ceil((n - 1) / 128) ticks above;
-   [scheduler.md § Load Balancing](scheduler.md#load-balancing), "RT push"). The pull's wake IPI
-   to the target (always sent, § Wake Protocol Invariants) makes the target's next return to user
+   [scheduler.md § Load Balancing](scheduler.md#load-balancing), "RT push"). The pull's wake of
+   the target, the wake IPI to a CPU running a thread, whose idle wake flag is clear (§ Wake
+   Protocol Invariants, invariant 4), makes the target's next return to user
    mode decide the preemption under its lock.
 4. **Lock-free reads.** The waiting test reads the source's own `non_empty` and `outranking`
    under its lock with interrupts masked. Only that CPU records its level in `outranking`, so the
@@ -1270,9 +1271,11 @@ Rules:
    posts `PREEMPT` when it leaves `non_empty & outranking` nonzero, under the linked CPU's
    `scheduler.lock`. For a link the CPU makes itself that test is exact. A link another CPU makes
    can read `outranking` before a dispatch on the linked CPU rewrites it, since the dispatch
-   records the level without that lock; every such link is followed by a wake IPI (§ Wake Protocol
-   Invariants), whose handler posts `PREEMPT` on arrival, so the return after it takes the full
-   decision with the link visible, as the IPI's return did when the test ran at every return.
+   records the level without that lock; every such link is followed by a wake IPI, or, when it
+   cleared the CPU's idle wake flag, precedes the idle loop's dispatch (§ Wake Protocol
+   Invariants, invariant 4), and the IPI's handler posts `PREEMPT` on arrival, so the return after
+   it takes the full decision with the link visible, as the IPI's return did when the test ran at
+   every return.
 7. A sole-reference mark posts its own CPU's bit, a pass that leaves work posts the bit of the CPU
    that made it, and each CPU's timer tick posts its own bit while the table has work. Every mark
    and every leftover is therefore drained by a later return or the idle loop of the CPU that made
@@ -1958,8 +1961,9 @@ Four invariants make their samples sound:
 4. **What a sample decides.** The readers that gate on queued work act on a sample only where a
    later step closes it. The idle loop's masked check is closed by program order for the CPU's
    own links and, for a link on another CPU, by the wake IPI that invariant 1 of § Wake Protocol
-   Invariants orders after it; `outranked` is closed the same way, the IPI's own return to user
-   mode reading again, and `schedule()` decides under the lock; the idle pull re-reads the
+   Invariants orders after it, or by the idle wake flag's clear (invariant 4); `outranked` is closed
+   the same way, the IPI's own return to user mode reading again, and `schedule()` decides under the
+   lock; the idle pull re-reads the
    episode and both loads under both CPUs' locks. A stale sample costs them a halt the IPI ends,
    a return to user mode the IPI's return re-decides, a futile lock round, or one pull the idle
    pull's bound allows, never a lost thread. `has_no_work`'s consumers act on one sample with no

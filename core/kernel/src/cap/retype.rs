@@ -1620,6 +1620,37 @@ mod tests
         assert_eq!(round_to_class(5 * p), 5 * p);
     }
 
+    // Defect guarded: userspace sizes the Memory it retypes from with
+    // `syscall::retype_class_bytes`; a class that differs from the kernel's
+    // underfunds every retype at that size.
+    #[test]
+    fn round_to_class_matches_the_abi_class()
+    {
+        let p = PAGE_SIZE as u64;
+        let edges = [
+            0,
+            1,
+            BIN_128,
+            BIN_128 + 1,
+            BIN_512,
+            BIN_512 + 1,
+            p,
+            p + 1,
+            5 * p,
+            u64::MAX - p + 1,
+            u64::MAX - p + 2,
+            u64::MAX,
+        ];
+        for bytes in edges
+        {
+            assert_eq!(
+                round_to_class(bytes),
+                syscall::retype_class_bytes(bytes),
+                "bytes {bytes}"
+            );
+        }
+    }
+
     // Defect guarded: a size within a page of `u64::MAX` wraps to 0 when
     // rounded up to a page, which reads as no size at all.
     #[test]

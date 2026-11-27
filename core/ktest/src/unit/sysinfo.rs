@@ -342,12 +342,7 @@ pub fn endpoint_retype_bytes_funds_one_endpoint(ctx: &TestContext) -> TestResult
     crate::log_u64("ktest: EndpointRetypeBytes=", bytes);
     // The kernel's size classes: the 128- and 512-byte bins, whole pages
     // above.
-    let class = match bytes
-    {
-        0..=128 => 128,
-        129..=512 => 512,
-        _ => bytes.next_multiple_of(PAGE_SIZE),
-    };
+    let class = syscall_abi::retype_class_bytes(bytes);
     let pages = class.div_ceil(PAGE_SIZE);
     let fits = pages
         .saturating_mul(PAGE_SIZE)

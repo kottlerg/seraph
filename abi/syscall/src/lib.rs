@@ -141,6 +141,38 @@ pub const fn cap_handle_gen(handle: u64) -> u32
 // depends on the boot's CPU count and is read at run time
 // (`SystemInfoType::EndpointRetypeBytes`).
 
+/// Bytes a retype whose raw debit is `bytes` takes from a Memory cap's
+/// `available_bytes`: the kernel's size class for it (`cap::retype::round_to_class`
+/// in core/kernel/src/cap/retype.rs, which a kernel test pins to this function).
+/// A raw debit up to 128 bytes takes the 128-byte class, one up to 512 the
+/// 512-byte class, and a larger one whole pages; zero takes nothing. A debit
+/// within a page of `u64::MAX`, which no page multiple holds, yields
+/// `u64::MAX`, which no retype budget funds.
+#[must_use]
+pub const fn retype_class_bytes(bytes: u64) -> u64
+{
+    if bytes == 0
+    {
+        0
+    }
+    else if bytes <= 128
+    {
+        128
+    }
+    else if bytes <= 512
+    {
+        512
+    }
+    else
+    {
+        match bytes.checked_next_multiple_of(PAGE_SIZE)
+        {
+            Some(class) => class,
+            None => u64::MAX,
+        }
+    }
+}
+
 /// Raw retype debit of one `Notification`, in bytes.
 pub const NOTIFICATION_RETYPE_BYTES: u64 = 64;
 

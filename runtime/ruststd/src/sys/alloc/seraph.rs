@@ -872,8 +872,11 @@ pub fn heap_in_regions() -> bool {
 // Two pools (one per BIN_128 / BIN_512 size class) prevent a 512-byte
 // request from blocking a 128-byte request that could otherwise have been
 // served from the same slab without refresh. Page-aligned requests bypass
-// the cache entirely — every retype consumes ≥ 1 page so caching offers
-// nothing.
+// the cache — every retype consumes ≥ 1 page — except an Endpoint's: its
+// class follows the boot's CPU count and is page-sized above 1760 CPUs, and a
+// third pool serves it then, so endpoints made and deleted per unit of work
+// reuse the pool's pages at every class instead of each drawing a dedicated
+// grant that deleting the endpoint leaves charged to the process.
 
 /// Retired pool pages a pool can park before evicting (per pool).
 const SLAB_SHELF_SIZE: usize = 4;
@@ -926,6 +929,10 @@ static SLAB_BIN_128: ObjectSlab = empty_slab();
 /// Slab serving sub-page requests `> 128 B && <= 512 B` (WaitSet).
 // restore: rebound
 static SLAB_BIN_512: ObjectSlab = empty_slab();
+/// Slab serving Endpoints when the boot's endpoint debit is page-sized
+/// (above 1760 CPUs; [`create_endpoint`]).
+// restore: rebound
+static SLAB_ENDPOINT_PAGES: ObjectSlab = empty_slab();
 
 /// memmgr endpoint shared by every slab path. Set once at process start.
 // restore: rebound
@@ -948,7 +955,7 @@ pub fn object_slab_init(memmgr_ep: u64) {
 /// restore holds its regions. Runs on the restore entry's one thread.
 // restore: reset
 pub fn rebind_alloc(memmgr_ep: u64, self_aspace: u64) {
-    for slab in [&SLAB_BIN_128, &SLAB_BIN_512] {
+    for slab in [&SLAB_BIN_128, &SLAB_BIN_512, &SLAB_ENDPOINT_PAGES] {
         slab.with(|pool| *pool = empty_pool());
     }
     CSPACE_RESERVE.with(|reserve| *reserve = None);
@@ -960,20 +967,11 @@ pub fn rebind_alloc(memmgr_ep: u64, self_aspace: u64) {
     });
 }
 
-/// Round `bytes` up to the same size class the kernel's retype primitive
-/// uses (`core::kernel::cap::retype::round_to_class`). Keeps the local
-/// ledger in sync with the kernel ledger without a syscall.
+/// Round `bytes` up to the size class the kernel's retype primitive debits
+/// (`syscall_abi::retype_class_bytes`). Keeps the local ledger in sync with
+/// the kernel ledger without a syscall.
 fn slab_round_to_class(bytes: u64) -> u64 {
-    if bytes == 0 {
-        0
-    } else if bytes <= 128 {
-        128
-    } else if bytes <= 512 {
-        512
-    } else {
-        let p = PAGE_SIZE;
-        bytes.div_ceil(p) * p
-    }
+    syscall_abi::retype_class_bytes(bytes)
 }
 
 /// Request one Memory cap from memmgr covering a single contiguous run of at
@@ -1541,12 +1539,22 @@ pub fn endpoint_retype_bytes() -> Option<u64> {
     Some(bytes)
 }
 
-/// Create one Endpoint out of the slab machinery: [`object_slab_retype`] of
-/// [`endpoint_retype_bytes`] with `cap_create_endpoint`. Returns the new
+/// Create one Endpoint out of the slab machinery: `cap_create_endpoint` with
+/// [`endpoint_retype_bytes`] rounded to its class, from a pool at every class.
+/// A sub-page class takes [`object_slab_retype`]'s pool; a page-sized one
+/// (above 1760 CPUs) takes [`SLAB_ENDPOINT_PAGES`], so an endpoint deleted
+/// mid-life gives its page back to the pool as a sub-page one does, rather
+/// than leaving a dedicated grant charged to the process. Returns the new
 /// endpoint's cap slot, which holds every endpoint right; `None` if the debit
 /// query, memmgr or the retype fails.
 pub fn create_endpoint() -> Option<u64> {
-    object_slab_retype(endpoint_retype_bytes()?, |slab| syscall::cap_create_endpoint(slab).ok())
+    let need = slab_round_to_class(endpoint_retype_bytes()?);
+    let retype = |slab| syscall::cap_create_endpoint(slab).ok();
+    if need < PAGE_SIZE {
+        object_slab_retype(need, retype)
+    } else {
+        slab_retype_pooled(&SLAB_ENDPOINT_PAGES, need, slab_want_pages(need), retype)
+    }
 }
 
 /// [`object_slab_retype`], also returning the `region_id` of the dedicated

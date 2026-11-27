@@ -100,14 +100,15 @@ whose cycles fall short of its elapsed time, because the counter stopped or the 
 between a clock read and a counter read, is left out of the samples and counted in
 `clock_stopped=`, and a line all of whose windows were left out is the benchmark's FAIL line, which
 names `window_us=`. Each line's extras, after its summary: `window_ops=`, the items a sample holds;
-`remote_wakes=`, `idle_wakes=`, `wake_moves=` and `pulls=`, how much the two threads' placement
-counters grew over the timed windows, summed, as ktest's round-trip lines report them, from the
-counters [core/kernel/docs/scheduler.md § Placement
-Counters](../../core/kernel/docs/scheduler.md#placement-counters) names; `apart=`, the timed
-windows at whose end the two threads were last on different CPUs; `clock_stopped=`; and
-`window_us=`, the mean elapsed microseconds of a timed window, over every one, which gives the
-throughput even where every window was left out. The line at one CPU gates like every other; the
-lines at more report.
+`apart=`, the timed windows at whose end the two threads were last on different CPUs;
+`clock_stopped=`; and `window_us=`, the mean elapsed microseconds of a timed window, over every
+one, which gives the throughput even where every window was left out. The line at one CPU gates
+like every other; the lines at more report. After each result line ubench logs `pipeline placement:
+work=<n> cpus=<k>` with `remote_wakes=`, `idle_wakes=`, `wake_moves=` and `pulls=`: how much the
+two threads' placement counters grew over the timed windows, summed, from the counters
+[core/kernel/docs/scheduler.md § Placement
+Counters](../../core/kernel/docs/scheduler.md#placement-counters) names. They take a line of their
+own so that the result line stays within the bytes the log carries whole (below).
 
 ---
 
@@ -130,7 +131,9 @@ logs one of:
 - `bench <name> SKIP (<why>)` for a case the boot cannot run (a thread count above the CPUs
   online, or no framebuffer), beside the lines of the cases it ran;
 - `bench <name> FAIL (<why>)` when the benchmark failed: a failed call, a reply of the wrong
-  size, data that did not round-trip, or an unsuccessful exit of fsbench.
+  size, data that did not round-trip, an unsuccessful exit of fsbench, or a result line longer
+  than `LOG_LINE_BYTES` (256), the longest line logd carries whole (`LINE_BUF_SIZE`,
+  [logd IPC Interface](../logd/docs/ipc-interface.md)), which the log would split.
 
 The run ends with `ALL TESTS PASSED` when no benchmark failed and `SOME TESTS FAILED` after a
 `failed=<n>` line otherwise

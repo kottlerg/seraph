@@ -75,7 +75,7 @@ const CONSUMER_READY: u64 = 1 << 2;
 /// The bit every notification is sent when a thread of the pipeline fails.
 const FAILED: u64 = 1 << 3;
 
-/// The placement counts a line reports, in its extras' order
+/// The placement counts a work value's placement line reports, in its order
 /// (core/kernel/docs/scheduler.md § Placement Counters).
 const COUNT_VIEWS: [(&str, u64); 4] = [
     ("remote_wakes", THREAD_PLACEMENT_REMOTE_WAKES),
@@ -181,13 +181,12 @@ fn line(counters: &Counters, cpus: u32, work: u64) -> Outcome
             measured.clock_stopped, measured.window_us
         ));
     }
-    let mut extras = vec![(WINDOW_OPS_KEY, WINDOW_ITEMS)];
-    extras.extend(measured.placement);
-    extras.extend([
+    let extras = [
+        (WINDOW_OPS_KEY, WINDOW_ITEMS),
         ("apart", measured.apart),
         ("clock_stopped", measured.clock_stopped),
         ("window_us", measured.window_us),
-    ]);
+    ];
     report(
         "pipeline",
         &[("work", Value::Num(work))],
@@ -195,7 +194,19 @@ fn line(counters: &Counters, cpus: u32, work: u64) -> Outcome
         &mut measured.samples,
         &extras,
         measured.idle_halts,
-    )
+    )?;
+    // The placement counts take a line of their own: with them the result
+    // line could pass the length the log carries whole (harness::LOG_LINE_BYTES).
+    let counts: Vec<String> = measured
+        .placement
+        .iter()
+        .map(|(key, count)| format!("{key}={count}"))
+        .collect();
+    std::os::seraph::log!(
+        "pipeline placement: work={work} cpus={cpus} {}",
+        counts.join(" ")
+    );
+    Ok(())
 }
 
 /// The notifications of one pipeline and what its threads share besides the

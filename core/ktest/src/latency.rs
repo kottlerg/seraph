@@ -524,8 +524,10 @@ pub fn measure_call(ctx: &TestContext, call: Call) -> Result<Measured, &'static 
 }
 
 /// [`measure_call`], judged by `bracket`: acknowledged inside when a probe
-/// was acknowledged inside its stretch, inconclusive when no probe was issued
-/// inside it.
+/// was acknowledged inside its stretch; otherwise inconclusive when no probe
+/// was issued inside it, or when the first one issued inside it took longer,
+/// from its read of the bracket to its acknowledgement, than the whole call
+/// ([`Bracket`]).
 pub fn measure_bracketed(
     ctx: &TestContext,
     call: Call,

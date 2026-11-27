@@ -90,11 +90,17 @@ pub struct Caps
     /// `LOG_FLUSH_AUTHORITY`-badged SEND on the master log endpoint
     /// (`logd.flush`), in slot 22.
     pub logd_flush: u64,
+    /// `LOG_FOLLOW_AUTHORITY`-badged `SEND|GRANT` on the master log endpoint
+    /// (`logd.follow`), in slot 23.
+    pub logd_follow: u64,
+    /// `LOG_CONTROL_AUTHORITY`-badged SEND on the master log endpoint
+    /// (`logd.control`), in slot 24.
+    pub logd_control: u64,
     /// `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which the recipe's
-    /// `debug_authority = yes` delivers in slot 23, after the seeds.
+    /// `debug_authority = yes` delivers in slot 25, after the seeds.
     pub debug_authority: u64,
     /// `STOP_AUTHORITY`-badged SEND on svcmgr's service endpoint, which the
-    /// recipe's `stop_authority = yes` delivers in slot 24, after the
+    /// recipe's `stop_authority = yes` delivers in slot 26, after the
     /// debug-authority slot.
     pub stop_authority: u64,
 }
@@ -124,7 +130,7 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    // Twenty-three seeds, the debug-authority slot and the stop-authority slot take seven rounds; an
+    // Twenty-five seeds, the debug-authority slot and the stop-authority slot take seven rounds; an
     // absent slot decodes as `0`, and a round that does not decode leaves every slot `0`.
     let Ok(
         [
@@ -151,10 +157,12 @@ fn request_round() -> Caps
             svcmgr_grant,
             crashd_core,
             logd_flush,
+            logd_follow,
+            logd_control,
             debug_authority,
             stop_authority,
         ],
-    ) = (unsafe { ipc::bootstrap::request_slots::<25>(info.creator_endpoint, ipc_buf) })
+    ) = (unsafe { ipc::bootstrap::request_slots::<27>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
@@ -182,6 +190,8 @@ fn request_round() -> Caps
     caps.svcmgr_grant = svcmgr_grant;
     caps.crashd_core = crashd_core;
     caps.logd_flush = logd_flush;
+    caps.logd_follow = logd_follow;
+    caps.logd_control = logd_control;
     caps.debug_authority = debug_authority;
     caps.stop_authority = stop_authority;
 

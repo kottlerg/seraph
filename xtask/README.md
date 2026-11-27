@@ -2893,7 +2893,10 @@ shares (in `target/xtask/host/` outside a git checkout):
   ancestor of it as `/proc` reports them, holds a live record), as `compare-images` starts its
   nested builds, so a command admitted before the grant finishes. Any other grant leaves builds
   alone. With `--wait-host` a refused command waits for the grant to end; without it, it fails at
-  once naming the holder.
+  once naming the holder. The lock holds only what the host admits: cargo's compile of xtask
+  itself, which a `cargo xtask` command runs first when xtask's sources changed, comes before any
+  admission, and an xtask built from a branch without the timing grant neither registers its
+  builds nor refuses them.
 
 The options:
 

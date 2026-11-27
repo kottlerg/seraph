@@ -847,15 +847,11 @@ fn register(dir: &Path, request: &Request, claim: &Claim) -> Result<Admission>
     })
 }
 
-/// One admission attempt in `dir`: under the admission lock, read the live
-/// holders and the grant, take `probe`'s reading, decide, and register when
-/// admitted (or when the claim overrides the refusal, which is printed).
-pub fn try_admit(
-    dir: &Path,
-    request: &Request,
-    claim: &Claim,
-    probe: &dyn Fn() -> Probe,
-) -> Result<Admission, Attempt>
+/// Take the admission lock of `dir`, held until the returned file drops: an
+/// admission holds it from its read of the host to its record's lock, so a
+/// reader that holds it sees every admission either finished, its record
+/// locked, or not yet begun.
+fn admission_gate(dir: &Path) -> Result<File>
 {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let gate_path = dir.join(ADMISSION_LOCK);
@@ -867,6 +863,20 @@ pub fn try_admit(
         .with_context(|| format!("opening {}", gate_path.display()))?;
     gate.lock()
         .with_context(|| format!("locking {}", gate_path.display()))?;
+    Ok(gate)
+}
+
+/// One admission attempt in `dir`: under the admission lock, read the live
+/// holders and the grant, take `probe`'s reading, decide, and register when
+/// admitted (or when the claim overrides the refusal, which is printed).
+pub fn try_admit(
+    dir: &Path,
+    request: &Request,
+    claim: &Claim,
+    probe: &dyn Fn() -> Probe,
+) -> Result<Admission, Attempt>
+{
+    let _gate = admission_gate(dir)?;
     let holders = live_holders(dir, DeadRecords::Remove);
     let grant = read_grant(dir)?;
     match decide(request, &holders, &probe(), grant.as_ref())
@@ -1094,7 +1104,9 @@ fn not_quiet(dir: &Path, holder: &str, probe: &Probe) -> Vec<String>
 /// (`cargo xtask orch grant set --timing`). Reads every `poll`, `report`ing
 /// what still holds the host each time that changes, for at most `wait`; at
 /// the bound, or when `interrupted` reports Ctrl+C, it fails naming what still
-/// holds the host.
+/// holds the host. Each read is made under the admission lock, so an admission
+/// that read the host before the grant was written is seen with its record,
+/// and every later one sees the grant.
 pub fn wait_quiet(
     dir: &Path,
     holder: &str,
@@ -1109,7 +1121,10 @@ pub fn wait_quiet(
     let mut last: Option<Vec<String>> = None;
     loop
     {
-        let left = not_quiet(dir, holder, &probe());
+        let left = {
+            let _gate = admission_gate(dir)?;
+            not_quiet(dir, holder, &probe())
+        };
         if left.is_empty()
         {
             return Ok(());
@@ -1864,6 +1879,45 @@ mod tests
         .unwrap_err();
         assert!(format!("{err:#}").contains("1 QEMU(s) that no record names"));
         drop(own);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Defect caught: the quiet wait read the holders outside the admission
+    // lock, so an admission that had read no grant but not yet registered was
+    // missed, and the wait reported a quiet host the admission then loaded.
+    #[test]
+    fn the_quiet_wait_sees_an_admission_in_progress_when_the_grant_is_set()
+    {
+        let dir = scratch("quiet-race");
+        let deciding = Arc::new(Barrier::new(2));
+        let admitting = {
+            let dir = dir.clone();
+            let deciding = Arc::clone(&deciding);
+            std::thread::spawn(move || {
+                // An admission between its decision and its record's lock.
+                let gate = admission_gate(&dir).unwrap();
+                deciding.wait();
+                std::thread::sleep(Duration::from_millis(100));
+                let admitted = register(&dir, &build(), &claim()).unwrap();
+                drop(gate);
+                std::thread::sleep(Duration::from_millis(300));
+                drop(admitted);
+            })
+        };
+        deciding.wait();
+        write_grant(&dir, &grant("W3", GrantKind::Timing), "run --timing").unwrap();
+        let err = wait_quiet(
+            &dir,
+            "W3",
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            &|| quiet(),
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("(build)"), "{err:#}");
+        admitting.join().unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 

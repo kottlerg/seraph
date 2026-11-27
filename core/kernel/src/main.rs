@@ -636,7 +636,7 @@ unsafe fn kernel_entry_post_rebase(
     // active; called once during initialization; dependencies (Phases 2-4)
     // completed.
     unsafe {
-        arch::current::interrupts::init();
+        arch::current::interrupts::init(allocator);
     }
     kprintln!("interrupts ok");
     // Size the IRQ routing table from the interrupt controllers the init above

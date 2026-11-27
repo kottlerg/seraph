@@ -85,8 +85,9 @@ Allocation Contract").
   `SHRINK_REGION` or `DISCARD_RANGE` for a demand-paged region) from a live
   process, return the named grant to the
   free pool so a per-unit-of-work retype loop holds a bounded footprint without
-  waiting for process death. Best-fit best-effort selection (reuse a freed run
-  of the requested size rather than re-split a larger one) plus a coalesce after
+  waiting for process death. Size-class selection (a freed run goes to the head of
+  its size class, where the next request of its size takes it rather than
+  re-split a larger one) plus a coalesce after
   every reclamation bound this on both sides: the caller's pool footprint *and*
   memmgr's own per-run tracking-anchor (CSpace) footprint. A high-volume
   spawn/free churn — e.g. ruststd thread creation, which grants and frees a

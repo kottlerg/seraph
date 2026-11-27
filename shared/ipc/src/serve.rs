@@ -36,17 +36,26 @@ use crate::IpcMessage;
 /// to the caller the thread's last receive bound.
 pub struct Reply
 {
-    /// The reply, valid while [`Self::pending`] and only up to its counts. It
+    /// The reply, valid while [`Slot::Pending`] and only up to its counts. It
     /// stays in place from its set to its send, so no turn copies the message.
     msg: IpcMessage,
-    /// A reply is set and not yet sent.
-    pending: bool,
+    state: Slot,
     /// Delete the reply's caps from this thread's `CSpace` when the reply is
     /// not delivered ([`Self::set_or_delete_caps`]).
     delete_caps: bool,
-    /// The last call that sends from the slot ([`next_request_timeout`],
-    /// [`Self::flush`]) sent a reply that was not delivered.
-    lost: bool,
+}
+
+/// What a [`Reply`] holds. One field carries both whether a reply waits and
+/// how the last one sent went, so a send clears the one with a single store.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot
+{
+    /// No reply is set, and the last one sent, if any, was delivered.
+    Empty,
+    /// A reply is set and not yet sent.
+    Pending,
+    /// No reply is set, and the last one sent was not delivered.
+    Lost,
 }
 
 impl Reply
@@ -57,29 +66,29 @@ impl Reply
     {
         Self {
             msg: IpcMessage::new(0),
-            pending: false,
+            state: Slot::Empty,
             delete_caps: false,
-            lost: false,
         }
     }
 
-    /// Whether the reply the last [`next_request_timeout`] (or
-    /// [`next_request`], or [`Self::flush`]) sent did not reach the caller:
-    /// the caller is gone, or its `CSpace` could not take the reply's caps,
-    /// and the kernel woke it with a transfer failure instead. `false` when
-    /// that call had no reply to send. A server that undoes a request's effect
-    /// when its caller never learns of it reads this after each such call.
+    /// Whether the last reply sent from the slot, by [`next_request_timeout`],
+    /// [`next_request`] or [`Self::flush`], did not reach the caller: the
+    /// caller is gone, or its `CSpace` could not take the reply's caps, and the
+    /// kernel woke it with a transfer failure instead. It holds until the next
+    /// reply is sent; a call with no reply to send leaves it. A server that
+    /// undoes a request's effect when its caller never learns of it reads this
+    /// after the call that sent that request's reply.
     #[must_use]
     pub const fn undelivered(&self) -> bool
     {
-        self.lost
+        matches!(self.state, Slot::Lost)
     }
 
     /// Whether a reply is set and not yet sent.
     #[must_use]
     pub const fn is_set(&self) -> bool
     {
-        self.pending
+        matches!(self.state, Slot::Pending)
     }
 
     /// Leave `msg` as the reply to this thread's pending caller, for the
@@ -87,9 +96,9 @@ impl Reply
     /// sets at most one reply.
     pub fn set(&mut self, msg: IpcMessage)
     {
-        debug_assert!(!self.pending, "a turn sets at most one reply");
+        debug_assert!(!self.is_set(), "a turn sets at most one reply");
         self.store(&msg);
-        self.pending = true;
+        self.state = Slot::Pending;
         self.delete_caps = false;
     }
 
@@ -98,11 +107,11 @@ impl Reply
     /// so a handler with many such replies holds none of them in its frame.
     pub fn set_status(&mut self, status: u64)
     {
-        debug_assert!(!self.pending, "a turn sets at most one reply");
+        debug_assert!(!self.is_set(), "a turn sets at most one reply");
         self.msg.label = status;
         self.msg.data_len = 0;
         self.msg.cap_count = 0;
-        self.pending = true;
+        self.state = Slot::Pending;
         self.delete_caps = false;
     }
 
@@ -112,9 +121,9 @@ impl Reply
     /// and the send deletes them there.
     pub fn set_or_delete_caps(&mut self, msg: IpcMessage)
     {
-        debug_assert!(!self.pending, "a turn sets at most one reply");
+        debug_assert!(!self.is_set(), "a turn sets at most one reply");
         self.store(&msg);
-        self.pending = true;
+        self.state = Slot::Pending;
         self.delete_caps = true;
     }
 
@@ -172,12 +181,11 @@ impl Reply
 
     fn flush_with<T: Transport>(&mut self, kernel: &mut T) -> Result<(), i64>
     {
-        self.lost = false;
-        if !self.pending
+        if self.state != Slot::Pending
         {
             return Ok(());
         }
-        self.pending = false;
+        self.state = Slot::Empty;
         let sent = kernel.reply(&self.msg);
         if sent.is_err()
         {
@@ -190,7 +198,7 @@ impl Reply
     /// [`Self::undelivered`], and delete its caps when it was set to.
     fn lose<T: Transport>(&mut self, kernel: &mut T)
     {
-        self.lost = true;
+        self.state = Slot::Lost;
         if self.delete_caps
         {
             for &cap in self.msg.caps()
@@ -394,14 +402,13 @@ impl<W: Wait> Transport for Kernel<W>
 fn next_with<T: Transport>(kernel: &mut T, ep: u64, reply: &mut Reply) -> Result<T::Got, i64>
 {
     let timeout_ms = kernel.timeout_ms();
-    reply.lost = false;
-    if !reply.pending
+    if reply.state != Slot::Pending
     {
         return kernel.recv(ep, timeout_ms);
     }
     // The reply is sent from the slot and only the flag is cleared: no turn
     // copies the message.
-    reply.pending = false;
+    reply.state = Slot::Empty;
     let got = kernel.reply_recv(ep, &reply.msg, timeout_ms);
     match got
     {
@@ -778,7 +785,10 @@ mod tests
         assert!(reply.undelivered());
         assert!(!reply.is_set());
         assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
-        assert!(!reply.undelivered());
+        assert!(
+            reply.undelivered(),
+            "a call with no reply leaves the outcome"
+        );
 
         reply.set(reply_msg());
         assert!(reply.is_set());
@@ -788,7 +798,14 @@ mod tests
         );
         assert!(reply.undelivered());
         assert_eq!(reply.flush_with(&mut kernel), Ok(()));
-        assert!(!reply.undelivered());
+        assert!(
+            reply.undelivered(),
+            "a flush with no reply leaves the outcome"
+        );
+        kernel.reply = Ok(());
+        reply.set(reply_msg());
+        assert_eq!(reply.flush_with(&mut kernel), Ok(()));
+        assert!(!reply.undelivered(), "a delivered send clears the outcome");
 
         let mut kernel = Script::new();
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));

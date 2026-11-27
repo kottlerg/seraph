@@ -786,8 +786,10 @@ runs at once:
    rank, read under the target's. An empty window fails the rule (`PullOutcome::RuleFailed`), so a
    push never moves a thread that outranks its source's running thread, which runs there at the
    next return to user mode, nor one to a CPU whose ranks, read under its lock, it does not
-   outrank. The pull's wake IPI then
-   preempts at the target (§ Wake Preemption).
+   outrank. The pull's wake then
+   preempts at the target (§ Wake Preemption): the wake IPI to a target running a thread, or,
+   for an idle one waiting on its idle wake word, the clear of its flag, on which its idle loop
+   dispatches the thread (§ Idle Thread).
 
 The scan is a window so that the cost a push adds to the tick of the running thread, which is the
 higher RT thread the waiting one is queued behind, does not grow with the CPU count. A full scan
@@ -852,7 +854,7 @@ pull_unpinned_ready(src, dst, rule):
         tcb.preferred_cpu = dst
         moved = true
     unlock tcb.sched_lock; unlock both
-    if moved: wake_idle_cpu(dst)               // always-IPI
+    if moved: wake_idle_cpu(dst)               // IPI unless the idle wake flag was set
 ```
 
 The `context_saved == 1` predicate is the load-balancer liveness gate of
@@ -921,8 +923,8 @@ a producer and a consumer thread, neither pinned
 
 | Counter | Counts |
 |---|---|
-| `remote_wakes` | Wakes (`enqueue_and_wake`) that linked the thread on a CPU other than the waker's, each of which sent that CPU a wake IPI ([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol Invariants) |
-| `idle_wakes` | Of those, the wakes whose CPU ran its idle thread at the link, which halts while it has no work, so that the thread waited for the CPU to leave its halt |
+| `remote_wakes` | Wakes (`enqueue_and_wake`) that linked the thread on a CPU other than the waker's, each of which cleared that CPU's idle wake flag or sent it a wake IPI ([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol Invariants) |
+| `idle_wakes` | Of those, the wakes whose CPU ran its idle thread at the link, which halts or waits while it has no work, so that the thread waited for the CPU to leave its halt or wait |
 | `wake_moves` | Wakes that linked the thread on a CPU other than its `preferred_cpu` |
 | `pulls` | Load-balancer pulls and RT pushes that moved the thread (`pull_unpinned_ready`, § Load Balancing) |
 | `sync_wakes` | Synchronous-hint wakes that reached the synchronous wake rule (§ Thread Assignment) |
@@ -1088,7 +1090,8 @@ load of that pointer, the loads of `non_empty` and `outranking`, an AND and a br
 a syscall on x86-64 and 5 on riscv64 in the release profile, 10 and 8 in the debug profile, whose
 checks of the pointer's alignment and nullness the release profile drops. Both words are read
 Relaxed: a link the CPU made itself precedes the test in program order, and a link from another
-CPU is followed by its wake IPI, whose own return tests again
+CPU is followed by its wake IPI, whose own return tests again, or, when it cleared the CPU's idle
+wake flag, precedes the idle loop's dispatch
 ([scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
 Invariants).
 
@@ -1170,7 +1173,7 @@ eligible CPU runs or queues such a thread, when hard affinity, the save-window p
 wake's guard places it, and when the levels its placement sampled went stale before its link (two
 wakes placed on one CPU at once). An unpinned thread so waiting, or one left waiting when another
 CPU's dispatch lowers that CPU's level, is moved by the RT push of the CPU it waits on (§ Load
-Balancing, "RT push") to a CPU whose running and queued threads it outranks, where the wake IPI
+Balancing, "RT push") to a CPU whose running and queued threads it outranks, where the pull's wake
 preempts as above: within one tick of the CPU it waits on in a boot of up to 129 CPUs, and within
 ceil((n - 1) / 128) such ticks in a boot of n CPUs above that (64 at the 8192 of `MAX_CPUS`). Each
 push that a contended try-lock defers, or that the re-check under the locks refuses (a thread linked
@@ -1278,12 +1281,34 @@ and the sole-reference table still has work, it runs further drain passes
 ([capability-internals.md](capability-internals.md#sole-reference-observers) § Sole-Reference
 Observers). It then masks interrupts
 and checks `has_runnable`. If the run queues hold work, it re-enables interrupts and calls
-`schedule(Requeue::Always)`, then loops. Otherwise it halts through the atomic enable-and-halt
-`arch::current::cpu::halt_until_interrupt`.
-Masking before the check means a wake IPI that lands between the check and the halt stays
-pending and ends the halt. The protocol is specified in
-[scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
-Invariants.
+`schedule(Requeue::Always)`, then loops. Otherwise it waits, with interrupts enabled
+atomically at the wait, until an interrupt or a waker ends the wait, and loops.
+Masking before the check means a wake IPI that lands between the check and the wait stays
+pending and ends the wait.
+
+The wait is a monitored wait on the CPU's idle wake word where every CPU has one: x86-64
+`MONITOR`/`MWAIT` (CPUID.01H:ECX.MONITOR), riscv64 Zawrs `WRS.NTO` (the bootloader's
+`HART_CAP_ZAWRS`, [docs/platform-requirements.md](../../../docs/platform-requirements.md)).
+The boot CPU chooses it once, before any other CPU starts
+(`arch::current::cpu::init_idle_wait`, which logs `idle: wait mwait`, `hlt`, `wrs.nto` or
+`wfi`). The word (an `IdleWake`, alone in its cache line in a per-CPU slab beside the scheduler)
+holds a polling flag:
+
+- With interrupts masked, the idle thread sets the flag before its run-queue check. Finding work,
+  it clears the flag before it runs anything else. Finding none, it arms the wait on the word
+  (x86-64 `MONITOR`, riscv64 an `lr.w` reservation), re-reads the flag, and unless a waker has
+  cleared it waits (`sti; mwait` with the C1 hint, the state `hlt` enters; riscv64 `wrs.nto`
+  then `csrsi sstatus, SIE`). It clears the flag when the wait ends.
+- `wake_idle_cpu` clears the target's flag with one read-modify-write and sends no IPI when the
+  flag was set: its store ends the wait, or the re-read after the arm sees it. When the flag was
+  clear it sends the wakeup IPI. An interrupt ends the wait as it ends a halt.
+
+Without the monitored wait the idle loop halts through the atomic enable-and-halt
+`arch::current::cpu::halt_until_interrupt` (`sti; hlt`, `wfi`), and every remote wake sends the
+IPI. Neither wait enters a state deeper than `hlt`'s. The protocol and its ordering are specified
+in [scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
+Invariants. Under QEMU the monitored wait is offered only to a boot with `cargo xtask run
+--idle-wait on` ([xtask/README.md](../../../xtask/README.md#cargo-xtask-run)).
 
 The idle thread makes no wake-preemption decision of its own (§ Wake Preemption): for the idle
 level every queued thread outranks the running one, so the loop's `has_runnable` check is that
@@ -1343,8 +1368,9 @@ Otherwise, by target state:
   [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 4) and revalidates
   `Ready`, `context_saved == 1`, and the affinity under them (`relocate_ready_thread`). It
   then moves the TCB from the source CPU's run queue to the destination's; on a committed
-  move the syscall sends a wakeup IPI to the destination once it has released
-  `sched_lock`. A lost race leaves the thread where it is.
+  move the syscall wakes the destination (`prod_remote_cpu`: the wakeup IPI, or the clear of
+  its idle wake flag when it waits idle) once it has released `sched_lock`. A lost race leaves the
+  thread where it is.
 - **Running** thread on a different CPU: the syscall sends a wakeup IPI to
   the **source** CPU (where the thread is currently running). The IPI itself
   does not call `schedule()`; the running thread observes the new
@@ -1352,8 +1378,8 @@ Otherwise, by target state:
   a preemption by an outranking thread (§ Wake Preemption), voluntary
   yield, or IPC block. The re-enqueue site in `schedule()`
   checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU —
-  linking the thread directly on the destination's run queue and IPIing
-  it — instead of doing a local enqueue
+  linking the thread directly on the destination's run queue and waking it (`wake_idle_cpu`: the
+  wake IPI, or the clear of its idle wake flag) — instead of doing a local enqueue
   (see [scheduling-internals.md](scheduling-internals.md) § ThreadState Transitions).
   Worst-case latency is therefore one time slice of the thread (its slice
   length × tick period: `TIME_SLICE_TICKS` for a thread dispatched at an

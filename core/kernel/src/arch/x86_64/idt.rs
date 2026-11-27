@@ -1844,7 +1844,10 @@ extern "C" fn ipi_tlb_shootdown_handler()
 ///
 /// The interrupt itself breaks `hlt`, and the idle loop checks for runnable
 /// threads immediately after it returns. A wake IPI follows every link another
-/// CPU makes on this one, so the handler posts this CPU's
+/// CPU makes on this one while it runs a thread (a link that clears its idle
+/// wake flag instead precedes its idle loop's dispatch;
+/// core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
+/// invariant 4), so the handler posts this CPU's
 /// `percpu::return_work::PREEMPT`: the return to user mode that follows takes
 /// the full preemption decision, with the sender's link visible, even when the
 /// sender's own test of the link read this CPU's level before a dispatch here

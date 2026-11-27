@@ -421,7 +421,9 @@ fn handle_software_interrupt()
         crate::mm::tlb_shootdown::service_shootdowns(hart_id);
     }
 
-    // A wakeup IPI follows every link another hart makes on this one: the
+    // A wakeup IPI follows every link another hart makes on this one while
+    // it runs a thread (a link that clears its idle wake flag instead
+    // precedes its idle loop's dispatch, invariant 4 of the section below): the
     // wake's correctness rests on the producer linking its thread before it
     // sends the IPI and on the idle loop's masked check-and-halt
     // (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants).

@@ -279,6 +279,7 @@ fn run_waves(
             let mem_mib = args.launch.mem;
             let riscv_mmu = args.launch.riscv_mmu;
             let riscv_zkr = args.launch.riscv_zkr;
+            let idle_wait = args.launch.idle_wait;
             let x86_paging = args.launch.x86_paging;
             let x86_shadow_stack = args.launch.x86_shadow_stack;
             let iommu = args.launch.iommu;
@@ -355,6 +356,7 @@ fn run_waves(
                     incoming: None,
                     riscv_mmu,
                     riscv_zkr,
+                    idle_wait,
                     x86_paging,
                     x86_shadow_stack,
                     iommu,

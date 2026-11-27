@@ -151,6 +151,7 @@ fn boot_qemu(
         incoming: None,
         riscv_mmu: launch.riscv_mmu,
         riscv_zkr: launch.riscv_zkr,
+        idle_wait: launch.idle_wait,
         x86_paging: launch.x86_paging,
         x86_shadow_stack: launch.x86_shadow_stack,
         iommu: launch.iommu,

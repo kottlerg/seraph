@@ -230,6 +230,7 @@ fn boot(ctx: &Context, args: &CaseArgs, gdb: &Path, layout: DiskLayout) -> Resul
         incoming: None,
         riscv_mmu: RiscvMmu::Sv48,
         riscv_zkr: RiscvZkr::On,
+        idle_wait: crate::qemu::IdleWait::Off,
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,

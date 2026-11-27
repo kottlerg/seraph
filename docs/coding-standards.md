@@ -551,9 +551,9 @@ boot ([xtask/README.md](../xtask/README.md#cargo-xtask-run) § `cargo xtask run`
 
 Each example shows a line before and after these rules. The after line is in the default console
 layout of the logging design. init-logd and logd render a line as
-`[sec.usfrac] LEVEL  [name] <line>`, the tag padded to six columns, as ipc-interface.md § Levels
-states; the seconds right-aligned to five columns, and the kernel's own lines in the same layout,
-are design intent, not yet implemented. A line longer than the column limit continues on an
+`[sec.usfrac] LEVEL  [name] <line>`, the seconds right-aligned to five columns and the tag padded
+to six columns, as ipc-interface.md § Levels states; the kernel's own lines in the same layout are
+design intent, not yet implemented. A line longer than the column limit continues on an
 indented line.
 
 ```

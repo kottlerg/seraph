@@ -27,8 +27,10 @@ use ipc::log_query::{
     ENTRY_RECORD, ENTRY_TEXT, HistoryEntryView, SLOT_EVICTED_DEATH, SLOT_EVICTED_RESYNC, SLOT_LIVE,
 };
 use ipc::log_record::{FieldSpan, RECORD_MAX_BYTES, Record, Span};
+use ipc::stream_labels::level_or_info;
 use logd_codec::history::ENTRY_MAX_BYTES;
 use logd_codec::query::SlotRow;
+use logd_codec::settings::{Pace, Relayed};
 pub use logd_codec::{LINE_BUF_SIZE, MAX_NAME_LEN};
 
 /// The least bytes of history logd retains ([`Bounds::bytes`]), every live
@@ -290,6 +292,51 @@ pub fn lines_completed(partial: usize, bytes: &[u8]) -> usize
     lines
 }
 
+/// The most sinks the history keeps a [`Mark`] for: logd's device sinks.
+pub const MARKS: usize = 2;
+
+/// A sink's place in the history and what of it the sink shows, which the
+/// history reads to keep the entries a `hold` sink has not written, to count
+/// the entries a sender's window holds, and to count each sink's drops
+/// (`services/logd/docs/sinks.md` § Pace, § Drops). A sink whose level is
+/// `off`, or that the bootstrap carried no class for, has none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mark
+{
+    /// The `seq` of the next entry the sink writes or passes.
+    pub from: u64,
+    /// The entry the sink's writer has copied and is writing, whose
+    /// eviction is no drop of the sink's.
+    pub taken: Option<u64>,
+    /// The least severe level the sink shows, an
+    /// `ipc::stream_labels::LEVEL_*` code.
+    pub least: u64,
+    /// Whether the sink shows `relayed` entries.
+    pub relayed: Relayed,
+    /// The sink's pace: a `hold` sink's mark keeps the entries it shows and
+    /// has not written.
+    pub pace: Pace,
+}
+
+impl Mark
+{
+    /// Whether the sink shows `entry`: at or above its level, and, for a
+    /// `relayed` entry, only when it shows those.
+    #[must_use]
+    pub fn shows(&self, entry: &HistoryEntry) -> bool
+    {
+        level_or_info(entry.level) <= self.least
+            && (entry.origin != Origin::Relayed || self.relayed == Relayed::Show)
+    }
+
+    /// Whether the sink still owes entry `seq`: it shows it and has not
+    /// reached it.
+    fn owes(&self, seq: u64, entry: &HistoryEntry) -> bool
+    {
+        seq >= self.from && self.shows(entry)
+    }
+}
+
 /// Whether logd takes a message of a sender's ([`admit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admit
@@ -337,9 +384,9 @@ pub fn admit(unwritten: usize, lines: usize, level: u64) -> Admit
 }
 
 /// The completed entries of every live and retired slot, by `seq`, the
-/// bytes they are charged ([`Bounds`]), and the first `seq` a `hold` sink
-/// has not written: logd's journal, which each sink reads through a cursor
-/// of its own (`services/logd/docs/sinks.md` § Cursor and order).
+/// bytes they are charged ([`Bounds`]), and each sink's [`Mark`]: logd's
+/// journal, which each sink reads through a cursor of its own
+/// (`services/logd/docs/sinks.md` § Cursor and order).
 #[derive(Default)]
 pub struct History
 {
@@ -353,11 +400,15 @@ pub struct History
     next_seq: u64,
     /// The retention bounds.
     bounds: Bounds,
-    /// The first `seq` the `hold` sink has not written, `None` while logd
-    /// has no `hold` sink: the entries from it on are kept from the eviction
-    /// [`Bounds::bytes`] makes while a written one is left, and are the ones
-    /// a sender's window counts ([`Self::unwritten`]).
-    held_from: Option<u64>,
+    /// Each sink's mark, by the sink's index; `None` for a sink with none.
+    /// A `hold` sink's keeps the entries it shows from its `from` on from
+    /// the eviction [`Bounds::bytes`] makes while another is left
+    /// ([`Self::victim`]), and those are the ones a sender's window counts
+    /// ([`Self::unwritten`]).
+    marks: [Option<Mark>; MARKS],
+    /// The entries each sink owed that the history evicted since the sink
+    /// last took the count ([`Self::take_evicted`]): its drops.
+    evicted: [u64; MARKS],
 }
 
 impl History
@@ -401,27 +452,39 @@ impl History
     }
 
     /// Retain `entry` as `slot`'s newest, under the next `seq`, and return
-    /// that `seq`: drop the slot's oldest entries while it holds
-    /// [`Bounds::per_slot`], then entries ([`Self::victim`]) until the new
-    /// one fits in [`Bounds::bytes`]. The slot of a sender no window holds
-    /// back ([`unwindowed`]) keeps the entries the `hold` sink has not
-    /// written past [`Bounds::per_slot`], within [`Bounds::bytes`]: nothing
-    /// else paces it to the sink, and the kernel's records are acknowledged
-    /// once written.
+    /// that `seq`: while the slot holds [`Bounds::per_slot`], drop its
+    /// oldest entry no `hold` sink keeps ([`Self::kept`]), then entries
+    /// ([`Self::victim`]) until the new one fits in [`Bounds::bytes`]. A
+    /// window counts only the entries a holding sink shows, so a sender's
+    /// lines below every `hold` sink's level are not paced, and they must not
+    /// push out its own lines a sink has still to write; when every entry of
+    /// the slot is kept, its oldest goes. The slot of a sender no window holds
+    /// back ([`unwindowed`]) instead keeps the entries a `hold` sink shows
+    /// and has not written past [`Bounds::per_slot`], within
+    /// [`Bounds::bytes`]: nothing else paces it to the sink, and the kernel's
+    /// records are acknowledged once written.
     fn push(&mut self, slot: &mut Slot, entry: HistoryEntry) -> u64
     {
         let keep_unwritten = unwindowed(entry.badge);
         while slot.seqs.len() >= self.bounds.per_slot
-            && let Some(&oldest) = slot.seqs.front()
         {
-            let unwritten = self.held_from.is_some_and(|held| oldest >= held)
-                && self.entries.contains_key(&oldest);
-            if keep_unwritten && unwritten
+            let free = slot.seqs.iter().position(|&seq| {
+                self.entries
+                    .get(&seq)
+                    .is_none_or(|held| !self.kept(seq, held))
+            });
+            let index = match free
+            {
+                Some(index) => index,
+                None if keep_unwritten => break,
+                None => 0,
+            };
+            let Some(seq) = slot.seqs.remove(index)
+            else
             {
                 break;
-            }
-            slot.seqs.pop_front();
-            self.remove(oldest);
+            };
+            self.remove(seq);
         }
         self.make_room(entry.charge());
         let seq = self.next_seq;
@@ -449,38 +512,58 @@ impl History
         }
     }
 
-    /// The entry [`Bounds::bytes`] drops next: the oldest, when the `hold`
-    /// sink has written it or there is no `hold` sink; otherwise, since then
-    /// no written entry is left, the oldest entry of the badge with the most
-    /// entries, so the sender that fills the history loses its own.
+    /// The entry [`Bounds::bytes`] drops next: the oldest no `hold` sink
+    /// keeps ([`Self::kept`]); when every entry is kept, the oldest entry of
+    /// the badge with the most entries, so the sender that fills the history
+    /// loses its own.
     fn victim(&self) -> Option<u64>
     {
-        let (&oldest, _) = self.entries.first_key_value()?;
-        match self.held_from
+        if let Some((&seq, _)) = self
+            .entries
+            .iter()
+            .find(|&(&seq, entry)| !self.kept(seq, entry))
         {
-            Some(held) if oldest >= held =>
-            {
-                let mut counts: HashMap<u64, (usize, u64)> = HashMap::new();
-                for (&seq, entry) in &self.entries
-                {
-                    let count = counts.entry(entry.badge).or_insert((0, seq));
-                    count.0 = count.0.saturating_add(1);
-                }
-                counts
-                    .values()
-                    .max_by_key(|&&(count, seq)| (count, core::cmp::Reverse(seq)))
-                    .map(|&(_, seq)| seq)
-            }
-            _ => Some(oldest),
+            return Some(seq);
         }
+        let mut counts: HashMap<u64, (usize, u64)> = HashMap::new();
+        for (&seq, entry) in &self.entries
+        {
+            let count = counts.entry(entry.badge).or_insert((0, seq));
+            count.0 = count.0.saturating_add(1);
+        }
+        counts
+            .values()
+            .max_by_key(|&&(count, seq)| (count, core::cmp::Reverse(seq)))
+            .map(|&(_, seq)| seq)
     }
 
-    /// Drop entry `seq`, when the history still holds it.
+    /// Whether a `hold` sink keeps entry `seq` from eviction: it shows it
+    /// and has not written it.
+    fn kept(&self, seq: u64, entry: &HistoryEntry) -> bool
+    {
+        self.marks
+            .iter()
+            .flatten()
+            .any(|mark| mark.pace == Pace::Hold && mark.owes(seq, entry))
+    }
+
+    /// Drop entry `seq`, when the history still holds it, counting it as
+    /// dropped for each sink that owed it but for the one writing it
+    /// ([`Mark::taken`]).
     fn remove(&mut self, seq: u64)
     {
         if let Some(entry) = self.entries.remove(&seq)
         {
             self.bytes = self.bytes.saturating_sub(entry.charge());
+            for (mark, evicted) in self.marks.iter().zip(&mut self.evicted)
+            {
+                if let Some(mark) = mark
+                    && mark.taken != Some(seq)
+                    && mark.owes(seq, &entry)
+                {
+                    *evicted = evicted.saturating_add(1);
+                }
+            }
         }
     }
 
@@ -523,11 +606,33 @@ impl History
         self.next_seq
     }
 
-    /// Record the first `seq` the `hold` sink has not written, `None` when
-    /// logd has no `hold` sink ([`Self::held_from`]).
-    pub fn set_held_from(&mut self, held: Option<u64>)
+    /// Set sink `index`'s mark, `None` for a sink with none, which also
+    /// forgets the drops it has not taken: a sink turned `off` counts none.
+    pub fn set_mark(&mut self, index: usize, mark: Option<Mark>)
     {
-        self.held_from = held;
+        if let Some(slot) = self.marks.get_mut(index)
+        {
+            *slot = mark;
+        }
+        if mark.is_none()
+            && let Some(evicted) = self.evicted.get_mut(index)
+        {
+            *evicted = 0;
+        }
+    }
+
+    /// Sink `index`'s mark.
+    #[must_use]
+    pub fn mark(&self, index: usize) -> Option<Mark>
+    {
+        self.marks.get(index).copied().flatten()
+    }
+
+    /// The entries sink `index` owed that the history evicted since the sink
+    /// last took the count, its drops; the count starts again from 0.
+    pub fn take_evicted(&mut self, index: usize) -> u64
+    {
+        self.evicted.get_mut(index).map_or(0, core::mem::take)
     }
 
     /// The oldest entry retained at or after `seq`, with its own `seq`: a
@@ -538,6 +643,54 @@ impl History
     pub fn entry_from(&self, seq: u64) -> Option<(u64, &HistoryEntry)>
     {
         self.entries.range(seq..).next().map(|(&s, e)| (s, e))
+    }
+
+    /// The entries retained before `seq`, newest first: the walk back from an
+    /// emergency entry (`services/logd/docs/sinks.md` § Device sinks).
+    pub fn before(&self, seq: u64) -> impl Iterator<Item = (u64, &HistoryEntry)>
+    {
+        self.entries.range(..seq).rev().map(|(&s, e)| (s, e))
+    }
+
+    /// The emergency walk back from entry `seq` (`services/logd/docs/sinks.md`
+    /// § Device sinks): into `out`, oldest first, the `seq`s of the newest
+    /// `out.len()` entries before `seq`, and at or after `from`, that
+    /// `walks` accepts, the entries the sink has not written and writes
+    /// before the emergency entry. The number written.
+    pub fn walk_back(
+        &self,
+        seq: u64,
+        from: u64,
+        walks: impl Fn(&HistoryEntry) -> bool,
+        out: &mut [u64],
+    ) -> usize
+    {
+        let mut len = 0usize;
+        for (at, entry) in self.before(seq)
+        {
+            if at < from || len >= out.len()
+            {
+                break;
+            }
+            if walks(entry)
+                && let Some(slot) = out.get_mut(len)
+            {
+                *slot = at;
+                len = len.saturating_add(1);
+            }
+        }
+        if let Some(found) = out.get_mut(..len)
+        {
+            found.reverse();
+        }
+        len
+    }
+
+    /// The entries retained from `from` on and before `to`, oldest first;
+    /// none when `to` is not past `from`.
+    pub fn between(&self, from: u64, to: u64) -> impl Iterator<Item = (u64, &HistoryEntry)>
+    {
+        self.entries.range(from..to.max(from)).map(|(&s, e)| (s, e))
     }
 
     /// Replace the bytes of the text entry `seq` with `bytes`, when the
@@ -558,23 +711,27 @@ impl History
         self.make_room(0);
     }
 
-    /// The entries of `slot` from the first one the `hold` sink has not
-    /// written on that the history still holds: what the slot's window
-    /// counts ([`admit`]). 0 while logd has no `hold` sink.
+    /// The most entries of `slot` that one `hold` sink among those
+    /// `holding` names (by index) shows and has not written, of those the
+    /// history still holds: what the slot's window counts ([`admit`]). 0
+    /// while no `hold` sink holds.
     #[must_use]
-    pub fn unwritten(&self, slot: &Slot) -> usize
+    pub fn unwritten(&self, slot: &Slot, holding: &[bool; MARKS]) -> usize
     {
-        let Some(held) = self.held_from
-        else
-        {
-            return 0;
-        };
-        slot.seqs
+        self.marks
             .iter()
-            .rev()
-            .take_while(|&&seq| seq >= held)
-            .filter(|seq| self.entries.contains_key(seq))
-            .count()
+            .zip(holding)
+            .filter_map(|(mark, &holds)| mark.filter(|m| holds && m.pace == Pace::Hold))
+            .map(|mark| {
+                slot.seqs
+                    .iter()
+                    .rev()
+                    .take_while(|&&seq| seq >= mark.from)
+                    .filter(|&&seq| self.entries.get(&seq).is_some_and(|e| mark.shows(e)))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -716,8 +873,9 @@ impl SlotTable
         &self.history
     }
 
-    /// The history, for a sink that moves the `hold` mark or replaces its
-    /// drop notice ([`History::set_held_from`], [`History::replace_text`]).
+    /// The history, for a sink that moves its mark, takes its drops or
+    /// replaces its drop notice ([`History::set_mark`],
+    /// [`History::take_evicted`], [`History::replace_text`]).
     pub fn history_mut(&mut self) -> &mut History
     {
         &mut self.history
@@ -741,14 +899,15 @@ impl SlotTable
             .map_or(&[], |r| r.slot.name.as_slice())
     }
 
-    /// The entries of `badge`'s live slot a `hold` sink has not written
-    /// ([`History::unwritten`]); 0 for a badge with no live slot.
+    /// The entries of `badge`'s live slot a `hold` sink among those
+    /// `holding` names has not written ([`History::unwritten`]); 0 for a
+    /// badge with no live slot.
     #[must_use]
-    pub fn unwritten_of(&self, badge: u64) -> usize
+    pub fn unwritten_of(&self, badge: u64, holding: &[bool; MARKS]) -> usize
     {
         self.slots
             .get(&badge)
-            .map_or(0, |slot| self.history.unwritten(slot))
+            .map_or(0, |slot| self.history.unwritten(slot, holding))
     }
 
     /// The bytes of `badge`'s live slot's partial line; 0 for a badge with
@@ -912,7 +1071,44 @@ mod tests
 {
     use super::*;
     use ipc::log_record::RecordWriter;
+    use ipc::stream_labels::LEVEL_CRITICAL as CRIT;
+    use ipc::stream_labels::LEVEL_DEBUG as DEBUG;
     use ipc::stream_labels::LEVEL_INFO as INFO;
+
+    /// Both sinks holding.
+    const ALL: [bool; MARKS] = [true; MARKS];
+
+    /// A `hold` sink's mark at `from` that shows every entry.
+    fn hold(from: u64) -> Mark
+    {
+        Mark {
+            from,
+            taken: None,
+            least: DEBUG,
+            relayed: Relayed::Show,
+            pace: Pace::Hold,
+        }
+    }
+
+    /// A mark at `from` of a sink of `pace` that shows `least` and more
+    /// severe, and no `relayed` entry.
+    fn mark(from: u64, least: u64, pace: Pace) -> Mark
+    {
+        Mark {
+            from,
+            taken: None,
+            least,
+            relayed: Relayed::Pass,
+            pace,
+        }
+    }
+
+    /// Retain a live text line of `badge` at `level`.
+    fn push(table: &mut SlotTable, badge: u64, level: u64, line: &[u8]) -> u64
+    {
+        let (slot, history) = table.sender_slot(badge).unwrap();
+        history.push_text(slot, badge, 0, level, line)
+    }
 
     /// A record of `RECORD_MAX_BYTES` with `RECORD_FIELDS_MAX` fields, so the
     /// largest entry charge.
@@ -1195,7 +1391,7 @@ mod tests
             badge += 1;
         }
         // The hold sink has written entries 0 and 1 only.
-        table.history.set_held_from(Some(2));
+        table.history.set_mark(0, Some(hold(2)));
         table.install_history_line(badge, 0, INFO, &line);
         table.install_history_line(badge, 0, INFO, &line);
         assert_eq!(seqs_of(&table, 1), [0u64; 0], "written entries go first");
@@ -1217,7 +1413,7 @@ mod tests
     {
         use ipc::log_badges::{LOG_BADGE_KERNEL, LOG_BADGE_LOGD};
         let mut table = SlotTable::default();
-        table.history.set_held_from(Some(0));
+        table.history.set_mark(0, Some(hold(0)));
         let over = PER_SLOT_HISTORY_MIN + 8;
         for badge in [LOG_BADGE_KERNEL, LOG_BADGE_LOGD, 7]
         {
@@ -1231,7 +1427,9 @@ mod tests
         assert_eq!(seqs_of(&table, LOG_BADGE_LOGD).len(), over);
         assert_eq!(seqs_of(&table, 7).len(), PER_SLOT_HISTORY_MIN);
         // Once the hold sink has written them, the bound drops them again.
-        table.history.set_held_from(Some(table.history.next_seq()));
+        table
+            .history
+            .set_mark(0, Some(hold(table.history.next_seq())));
         let (slot, history) = table.sender_slot(LOG_BADGE_KERNEL).unwrap();
         history.push_text(slot, LOG_BADGE_KERNEL, 0, INFO, b"line");
         assert_eq!(
@@ -1252,13 +1450,223 @@ mod tests
             table.install_history_line(1, 0, INFO, b"one");
             table.install_history_line(2, 0, INFO, b"two");
         }
-        assert_eq!(table.unwritten_of(1), 0, "no hold sink, no window");
-        table.history.set_held_from(Some(2));
-        assert_eq!(table.unwritten_of(1), 2);
-        assert_eq!(table.unwritten_of(2), 2);
+        assert_eq!(table.unwritten_of(1, &ALL), 0, "no hold sink, no window");
+        table.history.set_mark(0, Some(hold(2)));
+        assert_eq!(table.unwritten_of(1, &ALL), 2);
+        assert_eq!(table.unwritten_of(2, &ALL), 2);
         table.history.remove(4);
-        assert_eq!(table.unwritten_of(1), 1);
-        assert_eq!(table.unwritten_of(9), 0);
+        assert_eq!(table.unwritten_of(1, &ALL), 1);
+        assert_eq!(table.unwritten_of(9, &ALL), 0);
+    }
+
+    // Defect caught: a window counting entries the hold sink does not show (a
+    // debug flood holding a sender back from a sink at info), counting while
+    // the sink holds nobody, or taking the smaller of two hold sinks' counts.
+    #[test]
+    fn a_window_counts_only_the_entries_a_holding_hold_sink_shows()
+    {
+        let mut table = SlotTable::default();
+        for _ in 0..3
+        {
+            push(&mut table, 1, DEBUG, b"debug");
+            push(&mut table, 1, INFO, b"info");
+        }
+        table.history.set_mark(0, Some(mark(0, INFO, Pace::Hold)));
+        assert_eq!(table.unwritten_of(1, &ALL), 3);
+        assert_eq!(
+            table.unwritten_of(1, &[false, true]),
+            0,
+            "a stalled sink holds nobody"
+        );
+        table.history.set_mark(1, Some(hold(4)));
+        assert_eq!(
+            table.unwritten_of(1, &ALL),
+            3,
+            "the larger count of the two"
+        );
+        table.history.set_mark(0, Some(mark(4, INFO, Pace::Skip)));
+        assert_eq!(
+            table.unwritten_of(1, &ALL),
+            2,
+            "a skip sink counts toward no window"
+        );
+    }
+
+    // Defect caught: a sender's burst of lines below the hold sink's level,
+    // which no window paces, pushing its own unwritten info line out of the
+    // per-slot bound; and, with every entry kept, the bound not holding.
+    #[test]
+    fn the_per_slot_bound_drops_a_senders_unshown_lines_before_its_unwritten_ones()
+    {
+        let mut table = SlotTable::default();
+        table.history.set_mark(0, Some(mark(0, INFO, Pace::Hold)));
+        let info = push(&mut table, 1, INFO, b"info");
+        for _ in 0..PER_SLOT_HISTORY_MIN + 4
+        {
+            push(&mut table, 1, DEBUG, b"debug");
+        }
+        let seqs = seqs_of(&table, 1);
+        assert_eq!(seqs.len(), PER_SLOT_HISTORY_MIN);
+        assert_eq!(seqs[0], info, "the unwritten info line stays");
+        let mut kept_all = SlotTable::default();
+        kept_all
+            .history
+            .set_mark(0, Some(mark(0, INFO, Pace::Hold)));
+        for _ in 0..PER_SLOT_HISTORY_MIN + 4
+        {
+            push(&mut kept_all, 1, INFO, b"info");
+        }
+        assert_eq!(seqs_of(&kept_all, 1).len(), PER_SLOT_HISTORY_MIN);
+        assert_eq!(
+            seqs_of(&kept_all, 1)[0],
+            4,
+            "the oldest goes when all are kept"
+        );
+        assert_eq!(table.history.bytes(), recount(&table));
+    }
+
+    // Defect caught: the byte bound evicting an entry a hold sink shows and has
+    // not written while one it does not show is left, so a debug flood costs
+    // the console its info lines.
+    #[test]
+    fn the_byte_bound_evicts_what_no_hold_sink_shows_first()
+    {
+        let mut table = SlotTable::default();
+        let line = [b'x'; LINE_BUF_SIZE];
+        table.history.set_mark(0, Some(mark(0, INFO, Pace::Hold)));
+        let mut badge = 1;
+        while table.history.bytes() + 3 * (ENTRY_FIXED_BYTES + LINE_BUF_SIZE) <= HISTORY_BYTES_MIN
+        {
+            push(&mut table, badge, INFO, &line);
+            badge += 1;
+        }
+        let debug = push(&mut table, badge, DEBUG, &line);
+        badge += 1;
+        let first = push(&mut table, badge, INFO, &line);
+        assert!(
+            table
+                .history
+                .entry_from(debug)
+                .is_some_and(|(s, _)| s == debug)
+        );
+        push(&mut table, badge + 1, INFO, &line);
+        assert!(
+            table
+                .history
+                .entry_from(debug)
+                .is_none_or(|(s, _)| s != debug),
+            "the debug line is evicted"
+        );
+        assert!(
+            table.history.entry_from(0).is_some_and(|(s, _)| s == 0),
+            "info kept"
+        );
+        assert!(table.history.entry_from(first).is_some());
+        assert_eq!(table.history.take_evicted(0), 0, "the sink did not show it");
+        assert_eq!(table.history.bytes(), recount(&table));
+    }
+
+    // Defect caught: a sink charged drops for entries below its level (a
+    // critical-level framebuffer reporting every evicted info line), for the
+    // entry its writer is writing, for entries it has passed, or for relayed
+    // entries it does not show; or an off sink keeping a count.
+    #[test]
+    fn each_sink_counts_as_dropped_only_the_evicted_entries_it_owed()
+    {
+        let mut table = SlotTable::default();
+        table.history.set_mark(0, Some(mark(0, INFO, Pace::Hold)));
+        table.history.set_mark(1, Some(mark(0, CRIT, Pace::Skip)));
+        table.install_history_line(9, 0, CRIT, b"relayed");
+        for i in 0..PER_SLOT_HISTORY_MIN as u64 + 4
+        {
+            push(&mut table, 7, if i % 2 == 0 { INFO } else { CRIT }, b"line");
+        }
+        // The per-slot bound dropped badge 7's four oldest: two info, two
+        // critical; neither sink showed the relayed line, which stays.
+        assert_eq!(table.history.take_evicted(0), 4);
+        assert_eq!(table.history.take_evicted(1), 2);
+        assert_eq!(
+            table.history.take_evicted(0),
+            0,
+            "taking the count clears it"
+        );
+        // Sink 1's writer is writing entry 6 (critical); entry 5 is info.
+        table.history.set_mark(
+            1,
+            Some(Mark {
+                taken: Some(6),
+                ..table.history.mark(1).unwrap()
+            }),
+        );
+        push(&mut table, 7, INFO, b"line");
+        push(&mut table, 7, INFO, b"line");
+        assert_eq!(table.history.take_evicted(0), 2);
+        assert_eq!(table.history.take_evicted(1), 0);
+        // A sink past the entries counts none; one turned off forgets its
+        // count.
+        table
+            .history
+            .set_mark(0, Some(mark(table.history.next_seq(), INFO, Pace::Hold)));
+        push(&mut table, 7, INFO, b"line");
+        assert_eq!(table.history.take_evicted(0), 0);
+        push(&mut table, 7, CRIT, b"line");
+        table.history.set_mark(1, None);
+        assert_eq!(table.history.take_evicted(1), 0);
+    }
+
+    // Defect caught: the walk back from an entry starting at or after it, or a
+    // range read past its end, or one whose end is before its start
+    // panicking.
+    #[test]
+    fn the_history_walks_back_from_an_entry_and_reads_a_range()
+    {
+        let mut table = SlotTable::default();
+        for _ in 0..5
+        {
+            push(&mut table, 1, INFO, b"line");
+        }
+        let back: Vec<u64> = table.history.before(3).map(|(s, _)| s).collect();
+        assert_eq!(back, [2, 1, 0]);
+        let range: Vec<u64> = table.history.between(1, 4).map(|(s, _)| s).collect();
+        assert_eq!(range, [1, 2, 3]);
+        assert_eq!(table.history.between(4, 1).count(), 0);
+    }
+
+    // Defect caught: an emergency walk that writes an entry its predicate
+    // refuses, one before the last walk's end, more than its backlog, or its
+    // entries out of order, or that keeps the oldest of more than its backlog
+    // in place of the newest.
+    #[test]
+    fn the_emergency_walk_takes_the_newest_entries_it_walks_within_its_bounds()
+    {
+        let mut table = SlotTable::default();
+        let levels = [INFO, DEBUG, CRIT, INFO, DEBUG, INFO, INFO];
+        for level in levels
+        {
+            push(&mut table, 1, level, b"line");
+        }
+        let emergency = push(&mut table, 1, ipc::stream_labels::LEVEL_EMERGENCY, b"down");
+        // A sink at critical walks what it would show at info and does not.
+        let walks = |entry: &HistoryEntry| (CRIT + 1..=INFO).contains(&level_or_info(entry.level));
+        let mut out = [u64::MAX; 8];
+        let n = table.history.walk_back(emergency, 0, walks, &mut out);
+        assert_eq!(out.get(..n), Some(&[0, 3, 5, 6][..]));
+        let mut two = [0; 2];
+        let n = table.history.walk_back(emergency, 0, walks, &mut two);
+        assert_eq!(
+            two.get(..n),
+            Some(&[5, 6][..]),
+            "the newest within the backlog"
+        );
+        let n = table.history.walk_back(emergency, 4, walks, &mut out);
+        assert_eq!(
+            out.get(..n),
+            Some(&[5, 6][..]),
+            "none before the last walk's end"
+        );
+        assert_eq!(table.history.walk_back(emergency, 0, walks, &mut []), 0);
+        let n = table.history.walk_back(emergency, 0, |_| false, &mut out);
+        assert_eq!(n, 0, "nothing the predicate takes");
     }
 
     // Defect caught: a sink's cursor reading a dropped entry, skipping a held

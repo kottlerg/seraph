@@ -505,6 +505,7 @@ dependencies = [
 name = "logd"
 version = "0.1.5"
 dependencies = [
+ "ansi",
  "death-set",
  "ipc",
  "logd-codec",
@@ -519,6 +520,7 @@ name = "logd-codec"
 version = "0.1.5"
 dependencies = [
  "ipc",
+ "log",
  "syscall-abi",
 ]
 

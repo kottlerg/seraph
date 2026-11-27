@@ -30,6 +30,12 @@ the directory, as the directory-growth row says: the directory entry
 step of `FS_CREATE` and `FS_MKDIR` and the destination insert of
 `FS_RENAME`. The growth's states come before the operation's own.
 
+An insert whose run of free slots crosses the end-of-directory marker
+first writes a `0x00` marker into the slot after the run, when the
+directory has one without growing. That slot lies past the old marker,
+so the write changes nothing a reader sees until the entry's own slots
+land; a crash after it leaves the directory as it was.
+
 The FAT mirror copies (`num_fats == 2` on the default xtask-formatted
 image) are written in `0..num_fats` order. A crash between them
 leaves an inconsistent FAT pair; `fsck.vfat` reports a discrepancy

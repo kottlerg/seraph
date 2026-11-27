@@ -3821,14 +3821,16 @@ Query a scalar system value. Returns a single `u64` in `rax`/`a0` — no buffer 
 | # | Name | Description |
 |---|---|---|
 | 0 | `info_type` | Which value to query (see `SystemInfoType` below) |
-| 1 | `class`, `view` or `cpu` | `StackHighWater`: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2). `SpeculationControls`: the view (`SPECULATION_VIEW_INPUTS` 0, `SPECULATION_VIEW_SELECTED` 1, `SPECULATION_VIEW_IN_EFFECT` 2). `SmtSibling`: the CPU index. Ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
+| 1 | `class`, `view`, `cpu` or `word` | `StackHighWater`: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2). `SpeculationControls`: the view (`SPECULATION_VIEW_INPUTS` 0, `SPECULATION_VIEW_SELECTED` 1, `SPECULATION_VIEW_IN_EFFECT` 2). `SmtSibling`: the CPU index. `SchedStages`: the word (`SCHED_STAGE_LOCK` 0 to `SCHED_STAGE_SWITCH` 8, `SCHED_STAGES_SWITCHES` 9, `SCHED_STAGES_RESUMES` 10, `SCHED_STAGES_ARM` 11). Ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
 
 **Return:** `rax`/`a0`: the queried value on success; negative `SyscallError` on failure.
 
 **Capability requirement:** None.
 
 **Errors:** `InvalidArgument` (unknown `info_type`, unknown `class` for `StackHighWater`,
-unknown `view` for `SpeculationControls`, or a `SmtSibling` index at or past `CpuCount`);
+unknown `view` for `SpeculationControls`, a `SmtSibling` index at or past `CpuCount`, an
+unknown `word` for `SchedStages`, or `SchedStages` from a kernel built without its
+`sched-stages` feature);
 `NotSupported` (`StackHighWater` handoff class, when the kernel could not locate the handoff
 stack; `SpeculationControls` on riscv64); `InvalidState` (`IdleHalts`, when the calling
 thread has made no `IdleHalts` call, or made its previous one on another CPU).
@@ -3971,6 +3973,19 @@ pub enum SystemInfoType
     /// ruststd sizes every endpoint's slab request from it
     /// (`std::os::seraph::create_endpoint`).
     EndpointRetypeBytes = 16,
+
+    /// One word of the `schedule()` stage breakdown of a kernel built with its
+    /// `sched-stages` feature, the word arg1 names: a stage's cycles summed
+    /// over the context switches made on the collecting CPU (`SCHED_STAGE_*`),
+    /// the number of switches those sums cover (`SCHED_STAGES_SWITCHES`,
+    /// `SCHED_STAGES_RESUMES`), or, for `SCHED_STAGES_ARM`, a reset that
+    /// zeroes every sum and count and makes the calling CPU the collecting CPU,
+    /// returning 0; no CPU collects before the first reset. The cycles are the
+    /// cycle counter's (`rdtsc` on x86-64, `cycle` on riscv64), the counter
+    /// the benchmarks read. A measurement aid for a benchmark pinned to one
+    /// CPU (scheduler.md § Stage Breakdown): a kernel built without
+    /// the feature answers `InvalidArgument`, as it does for an unknown word.
+    SchedStages         = 17,
 }
 ```
 

@@ -470,9 +470,11 @@ pub fn wait_memory_baseline(memory: u64, baseline: u64, max_polls: u32)
 const STUB_SCRATCH_VA: u64 = 0x3E_6100_0000;
 
 /// Write the machine-code stub `code` into a fresh frame-pool page and map it
-/// executable at `va` in `aspace`, an address space the test created, not
-/// ktest's own. Returns the frame's Memory cap, which the caller frees to the
-/// pool once `aspace` is deleted.
+/// executable at `va` in `aspace`: an address space the test created, or
+/// ktest's own when `va` is a scratch VA (crate docs § Scratch VAs) other than
+/// [`STUB_SCRATCH_VA`]. Returns the frame's Memory cap, which the caller frees
+/// to the pool once the mapping is gone: `aspace` deleted, or `va` unmapped
+/// from ktest's own.
 ///
 /// The page is written through a temporary writable mapping in ktest's own
 /// address space and unmapped before the executable mapping is made (W^X).
@@ -533,8 +535,9 @@ pub fn install_stub(
     let syncs =
         || syscall::system_info(syscall_abi::SystemInfoType::InstructionCacheSyncs as u64).ok();
     let before = syncs();
-    // SAFETY: `aspace` is not ktest's own (the caller's contract above), so
-    // the mapping touches nothing ktest runs on.
+    // SAFETY: `aspace` is not ktest's own, or `va` is one of its scratch VAs
+    // (the caller's contract above), so the mapping touches nothing ktest
+    // runs on.
     if unsafe { syscall::mem_map(frame, aspace, va, 0, 1, syscall::MAP_EXECUTABLE) }.is_err()
     {
         // SAFETY: `frame` came from `alloc` above; the scratch mapping is

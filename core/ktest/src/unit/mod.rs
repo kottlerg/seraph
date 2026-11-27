@@ -1066,6 +1066,10 @@ pub fn run_all(ctx: &TestContext)
         "sysinfo::idle_halts_mark_per_thread_and_cpu",
         sysinfo::idle_halts_mark_per_thread_and_cpu(ctx)
     );
+    run_test!(
+        "sysinfo::sched_stages_words",
+        sysinfo::sched_stages_words(ctx)
+    );
 
     // ── Entropy syscalls ──────────────────────────────────────────────────────
     run_test!(

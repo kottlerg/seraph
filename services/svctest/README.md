@@ -63,6 +63,9 @@ services/svctest/
         │                      #   answered with either stopped, and with the framebuffer killed
         │                      #   and restarted; a debug line retained and not on serial; and
         │                      #   logd's flush barrier
+        ├── logd_follow.rs     # Following logd's journal and steering its sinks: a subscription's
+        │                      #   signalled lines read oldest first, with and without the severity
+        │                      #   filter; the subscription pools; `SINK_LIST` and `SINK_SET`
         ├── logd_flood.rs      # Probe lines logged between `log-flood begin` and `end` while two
         │                      #   processes flood logd, which refuses the flooders
         │                      #   `WINDOW_FULL` and not the probe; `run --whole-lines`
@@ -271,7 +274,7 @@ phase (`caps[2]` and `caps[3]`), the bind-deny phase (`caps[2]`), the input-ordi
 (`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement
 and MSI delivery, forge, churn, and release phases (`caps[9]`), the drivers stray-cap phases
 (`caps[7]`, `caps[8]`, `caps[13]`, `caps[16]`, and `caps[19]`), the drivers hwrng read phase
-(`caps[16]`), the drivers hwrng restart phase (`caps[16]` and `caps[23]`), the drivers deny phase
+(`caps[16]`), the drivers hwrng restart phase (`caps[16]` and `caps[25]`), the drivers deny phase
 (`caps[11]` to `caps[13]` and `caps[17]`), the `logd_sinks` phase's framebuffer-killed and
 framebuffer-restarted cases (`caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the
 public `svcmgr`, `pwrmgr.deny` and `acpid.deny` names it resolves), the svcmgr second-seed-round
@@ -279,16 +282,17 @@ phase (`caps[4]` and `caps[5]`), the svcmgr stray-cap phase (`caps[20]`), the vf
 phases (`caps[4]`, `caps[5]`), the `vfsd_namespace_stray_caps` phase (`caps[4]`), the
 `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`,
 `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry`,
-`oom_policy`, and `memmgr_swap_commit` phases (`caps[6]`), the `rtc_create_retry` phase
-(`caps[19]`), the vfsd swap-partition phase (`caps[14]`), the `memmgr_swap_client`,
-`memmgr_swap_raw` and `swapd` phases (`caps[18]`), the `sessiond_operator` phase and the
-`oom_policy` phase's session case (`caps[15]` and `caps[24]`), the `crash_endpoint`, `logd_reserve`,
-`logd_restart`, `logd_sinks`, `logd_flush`, `memmgr_swap`, `memmgr_node_reclaim`,
+`oom_policy`, and `memmgr_swap_commit` phases (`caps[6]`), the `logd_follow` phase (`caps[6]`,
+`caps[23]`, and `caps[24]`), the `logd_control` phase (`caps[6]` and `caps[24]`), the
+`rtc_create_retry` phase (`caps[19]`), the vfsd swap-partition phase (`caps[14]`), the
+`memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases (`caps[18]`), the `sessiond_operator`
+phase and the `oom_policy` phase's session case (`caps[15]` and `caps[26]`), the `crash_endpoint`,
+`logd_reserve`, `logd_restart`, `logd_sinks`, `logd_flush`, `memmgr_swap`, `memmgr_node_reclaim`,
 `memmgr_swap_client`,
 `memmgr_swap_raw`, `swapd`, `vfsd_driver_death`, `rtc_create_retry`, `procmgr_snapshot`, and
-`timed_rtc_restart` phases, and the drivers hwrng restart phase (`caps[23]`), the
-`svcmgr_stop_service` phase (`caps[24]`, and `caps[23]` with `stopsrc` staged), and the no-stop
-cases of the `oom_policy`, `logd_reserve` and `rtc_create_retry` phases (`caps[24]`), instead fail
+`timed_rtc_restart` phases, and the drivers hwrng restart phase (`caps[25]`), the
+`svcmgr_stop_service` phase (`caps[26]`, and `caps[25]` with `stopsrc` staged), and the no-stop
+cases of the `oom_policy`, `logd_reserve` and `rtc_create_retry` phases (`caps[26]`), instead fail
 their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before the terminal
 pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached; the panic hook's `SHUTDOWN`
 is then skipped for the same zero cap, and the run ends idle.
@@ -303,11 +307,12 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 
 The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, four slots
 to a round (`caps[0]` to `caps[3]`, `caps[4]` to `caps[7]`, `caps[8]` to `caps[11]`,
-`caps[12]` to `caps[15]`, `caps[16]` to `caps[19]`, `caps[20]` to `caps[23]`, and `caps[24]`), the
-last two being the debug-authority cap the recipe's `debug_authority = yes` grants and the
-stop-authority cap its `stop_authority = yes` grants; [service-definitions.md §
-`seed`](../svcmgr/docs/service-definitions.md#seed) defines each name's cap shape and the zero slot
-an unresolved name leaves. With no creator endpoint, every slot stays zero.
+`caps[12]` to `caps[15]`, `caps[16]` to `caps[19]`, `caps[20]` to `caps[23]`, and `caps[24]` to
+`caps[26]`), the last two (`caps[25]` and `caps[26]`) being the debug-authority cap the recipe's
+`debug_authority = yes` grants and the stop-authority cap its `stop_authority = yes` grants;
+[service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed) defines each name's
+cap shape and the zero slot an unresolved name leaves. With no creator endpoint, every slot stays
+zero.
 
 | Slot      | Seed              | Use in svctest                         |
 |-----------|-------------------|----------------------------------------|
@@ -317,7 +322,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT`, the remounts, and the fs-driver death phase's remount; `vfsd_namespace_stray_caps` phase: its `UNMOUNT` and both its `MOUNT`s |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
-| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry`, `oom_policy`, `memmgr_swap_commit`, `vfsd_driver_death` phases: read logd's slots and history; `logd_flush` phase: the `logd.query` SEND `LOG_FLUSH` must refuse |
+| `caps[6]` | `logd.query` (`SEND\|GRANT`) | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry`, `oom_policy`, `memmgr_swap_commit`, `vfsd_driver_death` phases: read logd's slots and history; `logd_flush` phase: the `logd.query` SEND `LOG_FLUSH` must refuse; `logd_follow` phase: `LOG_SUBSCRIBE` from the interactive pool, the signalled lines read oldest first with and without the severity filter, and `QUERY_STALE` on another epoch; `logd_control` phase: `SINK_LIST` and `SINK_SET` must refuse `QUERY_DENIED` |
 | `caps[7]` | `devmgr.class.serial` | device-location and drivers stray-cap phases, and the `serial_transmit` phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal, device-location, and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
@@ -333,12 +338,15 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[19]` | `devmgr.class.rtc` | `rtc_create_retry` phase: the `rtc` class SEND, on which it waits for devmgr to serve the RTC driver its create retry started; drivers stray-cap phase: the SEND its RTC cases flood |
 | `caps[20]` | `svcmgr.grant` | svcmgr stray-cap phase: the `SEND\|GRANT` on svcmgr's service endpoint, under the published `svcmgr` SEND's badge, on which it sends requests that carry caps |
 | `caps[21]` | `crashd.core` (`SEND\|GRANT`) | `crashd_live_core` phase: `LIVE_CORE` of `crashme live`, `crashme live-no-core` and `crashme live-declare`; zero in a boot that stages no crashd |
-| `caps[22]` | `logd.flush`      | `logd_flush` phase: checks logd's flush barrier; `logd_sinks` phase: waits on it before its framebuffer cases and before its serial case |
-| `caps[23]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_flush` phase: finds, attaches to, stops, and starts the serial driver; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; `serial_transmit` phase: finds and attaches to the serial driver, and stops and starts its transmitter thread; drivers hwrng restart phase: kills the virtio-rng driver; `rtc_create_retry` phase: finds devmgr and the RTC driver, attaches to devmgr, stops and starts its main thread, and kills the RTC driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times, the first time by pointing two of its threads at exit syscalls; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_node_reclaim` phase: sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `memmgr_swap_raw` phase: the same, and `MAKE_RESIDENT` of one chunk of its fixture child; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; `memmgr_memory_object_text` phase: finds its child and svctest itself, and sends `MAKE_PRIVATE` for each; `procmgr_image_sharing` phase: finds its children, and sends `MAKE_RESIDENT` and `MAKE_PRIVATE` for them; `procmgr_snapshot` phase: finds its child and sends `SNAPSHOT` for it, and for its badge once it has exited; `memmgr_swap` and `swapd` phases: send `SNAPSHOT` for the fixture child; svctest declares itself undebuggable at startup |
-| `caps[24]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy`, `logd_reserve` and `rtc_create_retry` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
+| `caps[22]` | `logd.flush`      | `logd_flush` phase: checks logd's flush barrier; `logd_sinks` phase: waits on it before its framebuffer cases and before its serial case; svcmgr seed-only check |
+| `caps[23]` | `logd.follow` (`SEND\|GRANT`) | `logd_follow` phase: `LOG_FOLLOW_AUTHORITY`-badged cap on the master log endpoint; fills the external sinks' subscription pool, requires one more refused `QUERY_FULL`, and a subscription again once a token is deleted; svcmgr seed-only check |
+| `caps[24]` | `logd.control` (`SEND`) | `logd_control` phase: `SINK_LIST` and `SINK_SET`, which sets the framebuffer sink's level and back and turns it off and on again; `logd_follow` phase: `LOG_SUBSCRIBE` on it must refuse `QUERY_DENIED`; svcmgr seed-only check |
+| `caps[25]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_flush` phase: finds, attaches to, stops, and starts the serial driver; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; `serial_transmit` phase: finds and attaches to the serial driver, and stops and starts its transmitter thread; drivers hwrng restart phase: kills the virtio-rng driver; `rtc_create_retry` phase: finds devmgr and the RTC driver, attaches to devmgr, stops and starts its main thread, and kills the RTC driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times, the first time by pointing two of its threads at exit syscalls; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_node_reclaim` phase: sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `memmgr_swap_raw` phase: the same, and `MAKE_RESIDENT` of one chunk of its fixture child; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; `memmgr_memory_object_text` phase: finds its child and svctest itself, and sends `MAKE_PRIVATE` for each; `procmgr_image_sharing` phase: finds its children, and sends `MAKE_RESIDENT` and `MAKE_PRIVATE` for them; `procmgr_snapshot` phase: finds its child and sends `SNAPSHOT` for it, and for its badge once it has exited; `memmgr_swap` and `swapd` phases: send `SNAPSHOT` for the fixture child; svctest declares itself undebuggable at startup |
+| `caps[26]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy`, `logd_reserve` and `rtc_create_retry` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
-that its name is published, the ten `devmgr.class.*` names among them. `caps[2]` carries
+that its name is published, the ten `devmgr.class.*` names, `logd.follow`, `logd.control` and
+`logd.flush` among them. `caps[2]` carries
 `REGISTRY_QUERY_AUTHORITY` alone, so it drives the devmgr deny phases, which require an
 `UNAUTHORIZED` reply to `QUERY_DEVICE`, `QUERY_DEVICE_LOCATION`, `WATCH_CLASS`, and
 `MINT_CLASS_SEND` (on `caps[2]` and `caps[3]`, neither of whose badges carries a class slot),
@@ -386,37 +394,47 @@ framebuffer. The
 waits (bounded by `DEVICE_WAIT_MS`) for a granted SEND from `caps[16]`, then requires two `READ`
 calls of `MAX_READ_BYTES` (504) each to answer `SUCCESS` with at least 16 and at most 504 bytes, the
 two answers to differ, and `READ(0)` to answer zero bytes. The drivers hwrng restart phase kills the
-virtio-rng driver through `caps[23]`, requires its ordinal on `caps[16]` to answer `WITHDRAWN` and
+virtio-rng driver through `caps[25]`, requires its ordinal on `caps[16]` to answer `WITHDRAWN` and
 the class's next ordinal to answer with a new instance, and requires a `READ` through that instance
 to answer with bytes. The `rtc_create_retry` phase runs just before `timed_rtc_restart`; it skips
 when the staged fixture set does not declare it, and logs the skip line ([docs/testing.md §
 Gating](../../docs/testing.md#gating)). It stops devmgr's main thread, which runs every driver
-restart, through `caps[23]`, kills the RTC driver and waits until procmgr no longer lists it, then
+restart, through `caps[25]`, kills the RTC driver and waits until procmgr no longer lists it, then
 has [memhog](../fixtures/service-modes/README.md#memhog) fill the pool down to the growth floor and,
 once the level reads `CRITICAL`, starts devmgr's main thread again, so devmgr's restart of the
 driver makes its create while no page is left to a driver outside the system reserve, and procmgr
 refuses it. It requires devmgr's line for the refusal and its first retry in logd's history through
-`caps[6]`, stamped after the kill; once oomd's stop of memhog, or svctest's own through `caps[24]`
+`caps[6]`, stamped after the kill; once oomd's stop of memhog, or svctest's own through `caps[26]`
 when no oomd stops it, has ended the window, devmgr serving the retried driver at the `rtc` class's
 next ordinal on `caps[19]` within 90 s, before the next phase kills it, since devmgr restarts no
 driver that dies before its batch settles and serves it, and that driver a new process; and devmgr's
 line for a retry of its create ([devmgr
 responsibilities](../devmgr/docs/responsibilities.md#create-retry)). The `timed_rtc_restart` phase
-kills the RTC driver (`cmos-rtc` on x86-64, `goldfish-rtc` on riscv64) through `caps[23]` and waits
+kills the RTC driver (`cmos-rtc` on x86-64, `goldfish-rtc` on riscv64) through `caps[25]` and waits
 for devmgr's restart of it, then kills timed (its recipe's `argv = timed` names it), and requires
 `SystemTime::now()` to give a time between 2024 and 2100 again within 30 s: the restarted timed
 resolves the RTC past the withdrawn ordinal ([services/timed/README.md](../timed/README.md)).
 
 The `logd_sinks` phase's framebuffer-restarted case queries the framebuffer class's ordinal 1
-through `caps[13]`, finds, attaches to, and stops the instance devmgr restarted through `caps[23]`,
+through `caps[13]`, finds, attaches to, and stops the instance devmgr restarted through `caps[25]`,
 sends as many lines at critical as the stopped case, each answered within half logd's stall bound,
 starts the instance, and requires through `caps[6]` a notice of the framebuffer's drops that logd's
 history did not hold before the stop: a new one, or one logd updated in place with a new count.
 
+The `logd_follow` and `logd_control` phases ([`logd_follow.rs`](src/phases/logd_follow.rs) states
+their cases) run right after `logd_sinks`'s phases. `logd_follow` subscribes through `caps[6]`,
+reads the signalled lines oldest first with and without the severity filter, requires `QUERY_STALE`
+on another epoch, fills the `caps[23]` pool and requires one more subscription refused `QUERY_FULL`
+and one accepted once a token is deleted. `logd_control` requires `SINK_LIST` and `SINK_SET` on
+`caps[6]` refused `QUERY_DENIED`, lists the sinks through `caps[24]`, and sets the framebuffer
+sink's level and back, and turns it `off` and on again, which must start its cursor past a line
+logged while it was off. `logd_follow` also requires a subscription whose signal lacks the notify
+right, or whose request moves two capabilities, refused `QUERY_INVALID` with logd keeping neither.
+
 The `logd_flush` phase ([`logd_sinks.rs`](src/phases/logd_sinks.rs) states its cases) checks logd's
 flush barrier through `caps[22]`: `LOG_FLUSH` on `caps[6]` and `QUERY_SLOTS` on `caps[22]` are
 refused, and a flush is answered `FLUSHED` with the serial driver running. With the serial driver
-stopped through `caps[23]`, a flush is answered `FLUSH_PENDING` before the stall bound has passed
+stopped through `caps[25]`, a flush is answered `FLUSH_PENDING` before the stall bound has passed
 and `FLUSHED` within twice it.
 
 `caps[4]` and `caps[5]` are SENDs on vfsd's service endpoint, badged `MOUNT_AUTHORITY` and the
@@ -447,11 +465,11 @@ an unpublished name (`UNKNOWN_NAME`). It requires each call's reply, with no cap
 leave svctest's `CSpace`. A svcmgr that kept the caps exhausts its `CSpace` within one case, its
 failing receive ends it, and its death is a system death, so the boot ends without the pass
 marker.
-`caps[6]` is a SEND on the master log endpoint badged `LOG_QUERY_AUTHORITY` ([logd IPC
+`caps[6]` is a `SEND|GRANT` on the master log endpoint badged `LOG_QUERY_AUTHORITY` ([logd IPC
 interface](../logd/docs/ipc-interface.md) § Queries); the `logd_death_forward` phase reads its dead
 child's retired slot and history through it, and requires `QUERY_DENIED` for a query on svctest's
 own log cap.
-The `logd_restart` phase kills logd through `caps[23]`: it finds logd by name
+The `logd_restart` phase kills logd through `caps[25]`: it finds logd by name
 (`LIST_PROCESSES`), attaches to it, requires the attach to report logd on the core path
 (`ATTACH_FLAG_NO_CORE`), stops its main thread, sets the thread's instruction pointer to
 0, and starts it, so the thread faults and the fault takes the path any fault of logd takes, to
@@ -482,7 +500,7 @@ pool, except from the frames the kill frees until memhog's next tick takes them 
 flags, not the timing, are what fail for a logd outside the reserve. It attaches to logd before the
 fill, has memhog fill the pool, faults logd's main thread as soon as the level reads `CRITICAL`, and
 waits for the level to fall: oomd's stop of memhog ends the window when oomd is staged in its stop
-mode, and svctest's own stop through `caps[24]`, 5 s after the fill, otherwise. It then requires,
+mode, and svctest's own stop through `caps[26]`, 5 s after the fill, otherwise. It then requires,
 through `caps[6]`, svcmgr's `service restarted: logd` line in the new instance's history stamped
 before svcmgr's `stop memhog` line, the first of each after the kill, and memhog's next instance to
 answer `PROBE` with a new nonce and no pages. svcmgr writes the stop line once procmgr has destroyed
@@ -546,7 +564,7 @@ protocol](../svcmgr/docs/restart-protocol.md)).
 The `svcmgr_stop_service` phase checks the stop authority ([svcmgr IPC
 Interface](../svcmgr/docs/ipc-interface.md) § Stop authority). Through the per-process
 `service_registry_cap`, `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES` must reply
-`UNAUTHORIZED`. Through `caps[24]`, the whole `LIST_CANDIDATES` walk must list exactly the staged
+`UNAUTHORIZED`. Through `caps[26]`, the whole `LIST_CANDIDATES` walk must list exactly the staged
 fixtures whose recipes set `oom_stop = yes` (`crasher-worker` and `memhog`, each when the staged set
 declares it), each with a non-zero usage and the service rank, and nothing when it declares neither;
 `STOP_CANDIDATE` must reply `NO_CANDIDATE` for the first instance's key of every svcmgr table slot
@@ -558,7 +576,7 @@ the staged set declares it, both with the program class; through the SEND it car
 `LIST_CANDIDATES` must reply `SUCCESS`, `STOP_CANDIDATE` of a key it never gave `NO_CANDIDATE`, and
 stopsrc's `PROBE` `SUCCESS`, and through the fixture's `:deny` SEND, which `QUERY_ENDPOINT`
 resolves, both must reply `UNAUTHORIZED`. With `stopsrc` declared, the phase also checks that svcmgr
-creates the source contained: through `caps[23]`, `LIST_PROCESSES` must list one new process named
+creates the source contained: through `caps[25]`, `LIST_PROCESSES` must list one new process named
 `/tests/fixtures/service-modes`, the job's first argv word, after `START_JOB`; once the fixture has
 exited (`EXIT`, which leaves the job running) and its next instance answers `PROBE` with a new
 nonce, the job's badge must leave the list within 2 s. With `crasher-worker` declared,
@@ -588,7 +606,7 @@ child's writes spend them, so one write is always declined. The phase first chec
 stall outlasts what oomd takes from the write to memhog's stop: a cooldown. With `OOMD_STOP=no`, it
 checks that memhog stays running and the level stays `CRITICAL` past the grace, the cooldown and
 2000 ms, that oomd logged at least one `would stop ` line, which names the operator session while
-one is open, and no stop, and then stops memhog itself through `caps[24]`, by the key svcmgr listed
+one is open, and no stop, and then stops memhog itself through `caps[26]`, by the key svcmgr listed
 it under before the fill. In every case memhog's next instance answers `PROBE` with a new nonce and
 0 pages ([oomd](../oomd/README.md)).
 
@@ -631,6 +649,7 @@ through to the normal run.
 | `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
 | `open-reclaim-child`        | `fs_opens`     | `fs_reclaims_dead_opens` (killed client)    |
 | `session-undeliverable-child` | `fs_opens` | `fs_reclaims_dead_opens` (failed session reply) |
+| `read-undeliverable-child` | `fs_opens` | `fs_reclaims_dead_opens` (failed memory-cap read replies) |
 | `fs-session-client`         | `fs_sessions`  | `fs_sessions` (exits holding a session)     |
 | `fs-create-open-full`       | `fs_create_open` | `fs_create_open` (session full at its max) |
 | `fs-create-open-cwd`        | `fs_create_open` | `fs_create_open` (create in the cwd at its max) |

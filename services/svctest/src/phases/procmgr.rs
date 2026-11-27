@@ -254,6 +254,46 @@ pub(crate) fn logd_slots(query: u64) -> Vec<(u64, u8, u64, Vec<u8>)>
     }
 }
 
+/// The slot serials of `badge`'s live slot and its retired slot, either
+/// `None` when it has none, read across the `QUERY_SLOTS` pages without
+/// allocating.
+fn logd_serials_of(query: u64, badge: u64) -> [Option<u64>; 2]
+{
+    use ipc::log_query::{
+        QUERY_OK, SLOT_LIVE, reply_more, reply_status, slot_entry, slots_request,
+    };
+
+    let mut serials = [None; 2];
+    let mut after = None;
+    loop
+    {
+        let reply = logd_query_call(query, &slots_request(after));
+        assert_eq!(
+            reply_status(reply.label),
+            QUERY_OK,
+            "logd_death_forward: QUERY_SLOTS refused ({:#x})",
+            reply.label
+        );
+        let mut index = 0usize;
+        while let Some(entry) = slot_entry(&reply, index)
+        {
+            if entry.badge == badge
+                && let Some(slot) = serials.get_mut(usize::from(entry.state != SLOT_LIVE))
+            {
+                *slot = Some(entry.serial);
+            }
+            after = Some(entry.cursor());
+            index = index
+                .checked_add(1)
+                .expect("QUERY_SLOTS entry count overflowed");
+        }
+        if !reply_more(reply.label) || index == 0
+        {
+            return serials;
+        }
+    }
+}
+
 /// Poll logd's slots until the child's slot is retired by a death, check that
 /// it is the one slot of that name, retired with [`LOGD_RECLAIM_EXIT_CODE`],
 /// and return its badge.
@@ -336,11 +376,16 @@ pub(crate) fn logd_history_each(
     mut each: impl FnMut(&ipc::log_query::HistoryEntryView<'_>) -> bool,
 )
 {
-    use ipc::log_query::{HistoryEntries, HistoryRequest, QUERY_OK, reply_more, reply_status};
+    use ipc::log_query::{
+        HistoryEntries, HistoryRequest, QUERY_OK, Walk, reply_more, reply_status,
+    };
 
+    // An entry names its slot by serial: the badge's slots, live and retired,
+    // are the ones a one-badge walk may return.
+    let serials = badge.map(|b| logd_serials_of(query, b));
     let mut req = HistoryRequest {
         badge,
-        before: None,
+        ..HistoryRequest::default()
     };
     loop
     {
@@ -355,7 +400,7 @@ pub(crate) fn logd_history_each(
         for entry in HistoryEntries::new(&reply)
         {
             assert!(
-                badge.is_none_or(|b| b == entry.badge),
+                serials.is_none_or(|s| s.contains(&Some(entry.serial))),
                 "logd_death_forward: another badge's entry"
             );
             if !each(&entry)
@@ -363,7 +408,9 @@ pub(crate) fn logd_history_each(
                 return;
             }
             read = true;
-            req.before = Some(entry.seq);
+            req.walk = Walk::Down {
+                before: Some(entry.seq),
+            };
         }
         if !reply_more(reply.label)
         {

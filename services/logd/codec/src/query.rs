@@ -5,15 +5,14 @@
 
 //! Which entries a logd query page carries (`services/logd/docs/ipc-interface.md`
 //! § Queries): [`slot_page`] for `QUERY_SLOTS`, [`history_page`] for
-//! `QUERY_HISTORY`. Both take a closure that walks logd's state afresh, in
-//! any order, and select from it the page after the request's resume point,
-//! without allocating, so a logd receive worker answers a query from the state
-//! logd owns. The pages are built with `ipc::log_query`, the wire format the
-//! client reads.
+//! `QUERY_HISTORY`. Each selects from logd's state, without allocating, the
+//! page after the request's resume point, so a logd receive worker answers a
+//! query from the state logd owns. The pages are built with `ipc::log_query`,
+//! the wire format the client reads.
 
 use ipc::log_query::{
     HISTORY_BYTES_MAX, HistoryEntryView, HistoryPage, HistoryRequest, SLOT_NAME_MAX, SlotCursor,
-    SlotPage,
+    SlotFields, SlotPage,
 };
 use ipc::log_record::RECORD_MAX_BYTES;
 
@@ -24,90 +23,76 @@ use crate::{LINE_BUF_SIZE, MAX_NAME_LEN};
 const _: () = assert!(MAX_NAME_LEN == SLOT_NAME_MAX);
 const _: () = assert!(HISTORY_BYTES_MAX >= LINE_BUF_SIZE && HISTORY_BYTES_MAX >= RECORD_MAX_BYTES);
 
-/// One slot as [`slot_page`] reads it.
-#[derive(Clone, Copy, Debug)]
-pub struct SlotRow<'a>
-{
-    pub badge: u64,
-    /// `ipc::log_query::SLOT_*`.
-    pub state: u8,
-    pub exit_reason: u64,
-    pub name: &'a [u8],
-}
-
-impl SlotRow<'_>
-{
-    const fn key(&self) -> (u64, u8)
-    {
-        (self.badge, self.state)
-    }
-}
-
 /// The `QUERY_SLOTS` page after `after` (from the first entry when `None`):
 /// the rows `rows()` yields, ascending by badge and then state, as many as one
-/// page holds, and whether any row follows them. `rows` is called once per
-/// entry the page takes, and once more.
+/// page holds, and whether any row follows them. `rows` walks logd's slots
+/// afresh, in any order; it is called once per entry the page takes, and once
+/// more.
 pub fn slot_page<'a, F, I>(rows: F, after: Option<SlotCursor>) -> (SlotPage, bool)
 where
     F: Fn() -> I,
-    I: Iterator<Item = SlotRow<'a>>,
+    I: Iterator<Item = SlotFields<'a>>,
 {
+    let key = |r: &SlotFields<'_>| (r.badge, r.state);
     let mut page = SlotPage::default();
     let mut cursor = after.map(|c| (c.badge, c.state));
     loop
     {
         let next = rows()
-            .filter(|r| cursor.is_none_or(|c| r.key() > c))
-            .min_by_key(SlotRow::key);
+            .filter(|r| cursor.is_none_or(|c| key(r) > c))
+            .min_by_key(key);
         let Some(row) = next
         else
         {
             return (page, false);
         };
-        if !page.push(row.badge, row.state, row.exit_reason, row.name)
+        if !page.push(&row)
         {
             return (page, true);
         }
-        cursor = Some(row.key());
+        cursor = Some(key(&row));
     }
 }
 
-/// The `QUERY_HISTORY` page for `req`: the entries `entries()` yields that
-/// match its badge and are older than its `before`, newest first (by `seq`),
-/// as many whole entries as one reply holds, and whether any entry follows
-/// them. `entries` is called once per entry the page takes, and once more.
-pub fn history_page<'a, F, I>(entries: F, req: &HistoryRequest) -> (HistoryPage, bool)
-where
-    F: Fn() -> I,
-    I: Iterator<Item = HistoryEntryView<'a>>,
+/// One history entry as [`history_page`] reads it: the entry, and its
+/// sender's badge, which the entry's wire form names by its slot serial.
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryRow<'a>
+{
+    pub badge: u64,
+    pub entry: HistoryEntryView<'a>,
+}
+
+/// The `QUERY_HISTORY` page for `req`: of `walk`, logd's entries in the
+/// order of `req`'s walk from its start (newest first from before its
+/// `before`, or oldest first from its `from`), those that match its badge
+/// and its level, as many whole entries as one reply holds, and whether a
+/// matching entry follows them.
+pub fn history_page<'a>(
+    walk: impl Iterator<Item = HistoryRow<'a>>,
+    req: &HistoryRequest,
+) -> (HistoryPage, bool)
 {
     let mut page = HistoryPage::default();
-    let mut before = req.before;
-    loop
+    let matching = walk
+        .filter(|r| req.badge.is_none_or(|b| r.badge == b))
+        .filter(|r| req.least.is_none_or(|least| r.entry.level <= least));
+    for row in matching
     {
-        let next = entries()
-            .filter(|e| req.badge.is_none_or(|b| e.badge == b))
-            .filter(|e| before.is_none_or(|s| e.seq < s))
-            .max_by_key(|e| e.seq);
-        let Some(entry) = next
-        else
-        {
-            return (page, false);
-        };
-        if !page.push(&entry)
+        if !page.push(&row.entry)
         {
             return (page, true);
         }
-        before = Some(entry.seq);
     }
+    (page, false)
 }
 
 #[cfg(test)]
 mod tests
 {
     use ipc::log_query::{
-        ENTRY_RECORD, ENTRY_TEXT, HistoryEntries, SLOT_EVICTED_DEATH, SLOT_EVICTED_RESYNC,
-        SLOT_LIVE, SLOTS_PAGE, reply_count, reply_more, slot_entry,
+        ENTRY_RECORD, ENTRY_TEXT, HistoryEntries, ORIGIN_LIVE, SLOT_EVICTED_DEATH,
+        SLOT_EVICTED_RESYNC, SLOT_LIVE, SLOTS_PAGE, Walk, reply_count, reply_more, slot_entry,
     };
 
     use super::*;
@@ -133,10 +118,12 @@ mod tests
         let rows = || {
             table
                 .iter()
-                .map(|(badge, state, exit_reason, name)| SlotRow {
+                .map(|(badge, state, exit_reason, name)| SlotFields {
                     badge: *badge,
                     state: *state,
                     exit_reason: *exit_reason,
+                    serial: badge.wrapping_add(1),
+                    generation: 0,
                     name,
                 })
         };
@@ -188,10 +175,12 @@ mod tests
         let rows = || {
             table
                 .iter()
-                .map(|(badge, state, exit_reason, name)| SlotRow {
+                .map(|(badge, state, exit_reason, name)| SlotFields {
                     badge: *badge,
                     state: *state,
                     exit_reason: *exit_reason,
+                    serial: badge.wrapping_add(1),
+                    generation: 0,
                     name,
                 })
         };
@@ -204,14 +193,16 @@ mod tests
     {
         seq: u64,
         badge: u64,
+        level: u8,
         kind: u8,
         bytes: Vec<u8>,
     }
 
     fn history() -> Vec<Entry>
     {
-        // Two senders interleaved, stored per sender (not in seq order), with
-        // entries long enough that a page holds few of them.
+        // Two senders interleaved, with entries long enough that a page holds
+        // few of them, at levels 0 to 7 by seq; the store is in seq order, as
+        // logd's history is.
         let mut v = Vec::new();
         for (badge, seqs) in [(7u64, [1u64, 4, 5, 9]), (8, [2, 3, 6, 8])]
         {
@@ -221,6 +212,7 @@ mod tests
                 v.push(Entry {
                     seq,
                     badge,
+                    level: u8::try_from(seq % 8).unwrap(),
                     kind: if seq == 9 { ENTRY_RECORD } else { ENTRY_TEXT },
                     bytes: vec![u8::try_from(seq).unwrap(); len],
                 });
@@ -229,32 +221,60 @@ mod tests
         v.push(Entry {
             seq: 7,
             badge: 7,
+            level: 7,
             kind: ENTRY_RECORD,
             bytes: vec![0xEE; RECORD_MAX_BYTES],
         });
+        v.sort_by_key(|e| e.seq);
         v
     }
 
-    fn walk_history(store: &[Entry], badge: Option<u64>) -> Vec<(u64, u64, u8, usize)>
+    fn row(e: &Entry) -> HistoryRow<'_>
     {
-        let entries = || {
-            store.iter().map(|e| HistoryEntryView {
+        HistoryRow {
+            badge: e.badge,
+            entry: HistoryEntryView {
                 seq: e.seq,
                 us: e.seq * 1000,
-                badge: e.badge,
-                level: 3,
+                serial: e.badge * 10,
+                generation: 1,
+                level: e.level,
                 kind: e.kind,
+                origin: ORIGIN_LIVE,
                 bytes: &e.bytes,
-            })
-        };
+            },
+        }
+    }
+
+    /// The walk logd's history gives `history_page` for `walk`.
+    fn walk_of(store: &[Entry], walk: Walk) -> Vec<HistoryRow<'_>>
+    {
+        match walk
+        {
+            Walk::Down { before } => store
+                .iter()
+                .rev()
+                .filter(|e| before.is_none_or(|b| e.seq < b))
+                .map(row)
+                .collect(),
+            Walk::Up { from, .. } => store.iter().filter(|e| e.seq >= from).map(row).collect(),
+        }
+    }
+
+    /// Walk `store` page by page as a client does: the seq, badge (by
+    /// serial), kind and length of each entry read.
+    fn walk_history(
+        store: &[Entry],
+        badge: Option<u64>,
+        least: Option<u8>,
+        mut walk: Walk,
+    ) -> Vec<(u64, u64, u8, usize)>
+    {
         let mut out = Vec::new();
-        let mut req = HistoryRequest {
-            badge,
-            before: None,
-        };
         loop
         {
-            let (page, more) = history_page(entries, &req);
+            let req = HistoryRequest { badge, walk, least };
+            let (page, more) = history_page(walk_of(store, walk).into_iter(), &req);
             let reply = page.reply(more);
             let read: Vec<_> = HistoryEntries::new(&reply).collect();
             assert_eq!(read.len(), reply_count(reply.label));
@@ -263,8 +283,18 @@ mod tests
             {
                 assert_eq!(e.us, e.seq * 1000);
                 assert!(e.bytes.iter().all(|&b| b == e.bytes[0]));
-                out.push((e.seq, e.badge, e.kind, e.bytes.len()));
-                req.before = Some(e.seq);
+                assert!(least.is_none_or(|l| e.level <= l));
+                out.push((e.seq, e.serial / 10, e.kind, e.bytes.len()));
+                walk = match walk
+                {
+                    Walk::Down { .. } => Walk::Down {
+                        before: Some(e.seq),
+                    },
+                    Walk::Up { epoch, .. } => Walk::Up {
+                        from: e.seq + 1,
+                        epoch,
+                    },
+                };
             }
             if !more
             {
@@ -273,24 +303,30 @@ mod tests
         }
     }
 
+    const DOWN: Walk = Walk::Down { before: None };
+    const UP: Walk = Walk::Up { from: 0, epoch: 0 };
+
+    fn seqs(out: &[(u64, u64, u8, usize)]) -> Vec<u64>
+    {
+        out.iter().map(|e| e.0).collect()
+    }
+
     #[test]
     fn history_walk_is_newest_first_across_senders()
     {
-        let out = walk_history(&history(), None);
-        let seqs: Vec<u64> = out.iter().map(|e| e.0).collect();
-        assert_eq!(seqs, [9, 8, 7, 6, 5, 4, 3, 2, 1]);
+        let out = walk_history(&history(), None, None, DOWN);
+        assert_eq!(seqs(&out), [9, 8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(out[2], (7, 7, ENTRY_RECORD, RECORD_MAX_BYTES));
     }
 
     #[test]
     fn history_walk_of_one_badge()
     {
-        let out = walk_history(&history(), Some(8));
-        let seqs: Vec<u64> = out.iter().map(|e| e.0).collect();
-        assert_eq!(seqs, [8, 6, 3, 2]);
+        let out = walk_history(&history(), Some(8), None, DOWN);
+        assert_eq!(seqs(&out), [8, 6, 3, 2]);
         assert!(out.iter().all(|e| e.1 == 8));
         assert_eq!(
-            walk_history(&history(), Some(99)),
+            walk_history(&history(), Some(99), None, DOWN),
             [] as [(u64, u64, u8, usize); 0]
         );
     }
@@ -299,24 +335,72 @@ mod tests
     fn history_walk_resumes_before_a_seq()
     {
         let store = history();
-        let entries = || {
-            store.iter().map(|e| HistoryEntryView {
-                seq: e.seq,
-                us: 0,
-                badge: e.badge,
-                level: 1,
-                kind: e.kind,
-                bytes: &e.bytes,
-            })
-        };
         let req = HistoryRequest {
-            badge: None,
-            before: Some(3),
+            walk: Walk::Down { before: Some(3) },
+            ..HistoryRequest::default()
         };
-        let (page, more) = history_page(entries, &req);
+        let (page, more) = history_page(walk_of(&store, req.walk).into_iter(), &req);
         assert!(!more);
         let reply = page.reply(more);
         let seqs: Vec<u64> = HistoryEntries::new(&reply).map(|e| e.seq).collect();
         assert_eq!(seqs, [2, 1]);
+    }
+
+    // Defect caught: a follower's ascending walk that skips, repeats or
+    // reorders entries across its pages, or loses the entry it resumes from.
+    #[test]
+    fn ascending_walk_is_oldest_first_and_resumes_at_its_from()
+    {
+        let store = history();
+        let out = walk_history(&store, None, None, UP);
+        assert_eq!(seqs(&out), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(out[6], (7, 7, ENTRY_RECORD, RECORD_MAX_BYTES));
+        let from_7 = walk_history(&store, None, None, Walk::Up { from: 7, epoch: 5 });
+        assert_eq!(seqs(&from_7), [7, 8, 9]);
+        let past = walk_history(&store, None, None, Walk::Up { from: 10, epoch: 5 });
+        assert_eq!(past, [] as [(u64, u64, u8, usize); 0]);
+        let one = walk_history(&store, Some(7), None, UP);
+        assert_eq!(seqs(&one), [1, 4, 5, 7, 9]);
+    }
+
+    // Defect caught: the severity filter letting a less severe entry through,
+    // dropping a more severe one, or ending a walk early at a filtered entry.
+    #[test]
+    fn severity_filter_keeps_the_level_and_the_more_severe_both_ways()
+    {
+        let store = history();
+        // Levels by seq: seq % 8, and 7 for the record at seq 7.
+        let up = walk_history(&store, None, Some(3), UP);
+        assert_eq!(seqs(&up), [1, 2, 3, 8, 9]);
+        let down = walk_history(&store, None, Some(3), DOWN);
+        assert_eq!(seqs(&down), [9, 8, 3, 2, 1]);
+        let emerg = walk_history(&store, Some(8), Some(0), DOWN);
+        assert_eq!(seqs(&emerg), [8]);
+        let all = walk_history(&store, None, Some(7), UP);
+        assert_eq!(all.len(), store.len());
+    }
+
+    #[test]
+    fn page_ends_with_more_only_when_a_matching_entry_is_left()
+    {
+        // A page that fills on the last matching entry says no more, though
+        // entries the filter drops follow it.
+        let store: Vec<Entry> = (1..=4)
+            .map(|seq| Entry {
+                seq,
+                badge: 1,
+                level: if seq == 1 { 0 } else { 7 },
+                kind: ENTRY_TEXT,
+                bytes: vec![1; HISTORY_BYTES_MAX],
+            })
+            .collect();
+        let req = HistoryRequest {
+            least: Some(0),
+            walk: UP,
+            ..HistoryRequest::default()
+        };
+        let (page, more) = history_page(walk_of(&store, UP).into_iter(), &req);
+        assert!(!more);
+        assert_eq!(reply_count(page.reply(more).label), 1);
     }
 }

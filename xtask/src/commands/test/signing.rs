@@ -482,6 +482,7 @@ pub(super) fn bootloader_under(
         skip_lints: true,
         ktest_bench_only: false,
         ktest_only: None,
+        sched_stages: false,
         host: args.host.common.clone(),
     };
     // The case boots, so `main` admitted no build: the compile is admitted

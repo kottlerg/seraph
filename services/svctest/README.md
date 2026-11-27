@@ -56,12 +56,13 @@ services/svctest/
         │                      # spawned IPC buffers in the arena; stack note parse
         ├── log_client.rs      # Log-call bounds against a log receiver that never answers
         ├── logd_restart.rs    # logd killed through an attach and restarted: svcmgr's lines,
-        │                      #   names restored by refusal, a death forward on the new instance;
-        │                      #   and restarted while memory is critical (logd in the reserve)
+        │                      #   names restored by refusal, the new instance's wall clock notice,
+        │                      #   a death forward on the new instance; and restarted while memory
+        │                      #   is critical (logd in the reserve)
         ├── logd_sinks.rs      # logd's sinks: serial and framebuffer drivers attachable; lines
         │                      #   answered with either stopped, and with the framebuffer killed
-        │                      #   and restarted; logd's wall clock notice; a debug line retained
-        │                      #   and not on serial; and logd's flush barrier
+        │                      #   and restarted; a debug line retained and not on serial; and
+        │                      #   logd's flush barrier
         ├── logd_flood.rs      # Probe lines logged between `log-flood begin` and `end` while two
         │                      #   processes flood logd, which refuses the flooders
         │                      #   `WINDOW_FULL` and not the probe; `run --whole-lines`

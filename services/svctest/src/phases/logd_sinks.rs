@@ -30,13 +30,6 @@
 //!   must be in logd's history. The lines stay within svctest's share of the
 //!   history (`PER_SLOT_HISTORY_MIN` at the least), so none is dropped from the console CI
 //!   reads; they are written once the phase starts the driver again.
-//! - **Wall clock.** logd's history holds its notice of the wall clock,
-//!   `wall clock <RFC 3339 UTC to the second> at uptime <sec.usfrac>`
-//!   (`services/logd/docs/sinks.md` § Wall time), and the wall time it names
-//!   is the one `SystemTime::now()` gives for that uptime, within
-//!   [`WALL_CLOCK_SLACK_US`]. The `logd_restart` phase runs before, so the
-//!   notice is the restarted logd's: a logd reads the offset again on
-//!   restart.
 //! - **Below serial's level.** A line at debug, below the serial sink's
 //!   default level of info, is retained in logd's history, which keeps every
 //!   entry whatever the sinks show. The serial sink must not write it, which
@@ -47,12 +40,15 @@
 //!   framebuffer sink is `skip` and holds nobody, and shows critical and more
 //!   severe by default, so the framebuffer cases send their lines at
 //!   critical. While its driver is stopped the phase sends more lines than
-//!   svctest's share of the history holds at its largest, so the history drops svctest's oldest before the sink
-//!   writes them. A line logd refuses for the running serial sink's window
-//!   is sent again after its hint, as the log client does. Once the driver
-//!   is started again, logd must retain its notice counting the
-//!   framebuffer's drops (`framebuffer: <n> lines dropped`,
-//!   `services/logd/docs/sinks.md` § Drops) after the last line.
+//!   svctest's share of the history holds at its largest ([`FLOOD_LINES`]),
+//!   so the history drops svctest's oldest before the sink writes them. A
+//!   line logd refuses for the running serial sink's window is sent again
+//!   after its hint, as the log client does. Once the driver is started
+//!   again, logd must retain a notice counting the framebuffer's drops
+//!   (`framebuffer: <n> lines dropped`, `services/logd/docs/sinks.md`
+//!   § Drops) that its history did not hold before the stop: a new one, or
+//!   one logd updated in place with a new count while the sink had not
+//!   written it.
 //! - **Framebuffer killed.** The phase then makes the framebuffer driver's main
 //!   thread fault at an unmapped address, waits until procmgr no longer lists
 //!   the driver and devmgr answers its ordinal `WITHDRAWN`, and sends as many
@@ -64,9 +60,9 @@
 //!   within milliseconds, before the lines sent after the kill, so the
 //!   writer may have dropped none of those. The phase therefore stops the new
 //!   instance and sends as many lines again, so the history drops svctest's
-//!   oldest before the sink writes them, and starts it: logd must retain its
-//!   notice of the framebuffer's drops after the last line, which only a
-//!   writer serving the new instance retains.
+//!   oldest before the sink writes them, and starts it: logd must retain or
+//!   update its notice of the framebuffer's drops, as for the stopped
+//!   driver, which only a writer serving the new instance does.
 //!
 //! The serial driver is only stopped, since a kill would end the console the
 //! boot is judged on.
@@ -92,7 +88,7 @@
 //!   driver is still stopped, once the sink is stalled, within twice the
 //!   stall bound: logd does not hold a flush on a sink that writes nothing.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ipc::log_badges::LOG_BADGE_LOGD;
 use ipc::log_flush::{FLUSH_DENIED, FLUSH_VERSION_MISMATCH, FlushAnswer};
@@ -145,11 +141,12 @@ const SERIAL_STOP_LINES: usize = 9;
 /// than the hold window, so none is refused.
 const RUNNING_BURST: usize = 8;
 
-/// Lines of each framebuffer case: more than a slot's share of the history
-/// at its largest, so svctest's oldest are dropped before the stopped
-/// framebuffer sink writes them whatever logd's bounds, and more than the
-/// sink's backlog on a new driver.
-const FLOOD_LINES: usize = PER_SLOT_HISTORY_MIN * (HISTORY_BYTES_MAX / HISTORY_BYTES_MIN) + 1;
+/// Lines of each framebuffer case: two more than a slot's share of the
+/// history at its largest, so the history evicts svctest's oldest before the
+/// stopped framebuffer sink writes them whatever logd's bounds, and counts at
+/// least one dropped, since the entry the sink's writer has taken is not
+/// counted; and more than the sink's backlog on a new driver.
+const FLOOD_LINES: usize = PER_SLOT_HISTORY_MIN * (HISTORY_BYTES_MAX / HISTORY_BYTES_MIN) + 2;
 
 /// The log client's bound on a log call.
 const LOG_CALL_BOUND: Duration = Duration::from_millis(log::LOG_CALL_TIMEOUT_MS as u64);
@@ -157,17 +154,6 @@ const LOG_CALL_BOUND: Duration = Duration::from_millis(log::LOG_CALL_TIMEOUT_MS 
 /// logd's bound on what one sink costs: the age of a write past which its
 /// sink is stalled.
 const STALL_BOUND: Duration = Duration::from_millis(SINK_STALL_MS as u64);
-
-/// The text every wall clock notice of logd's starts with.
-const WALL_CLOCK_PREFIX: &[u8] = b"wall clock ";
-
-/// How far the wall time of logd's notice may be from the one svctest
-/// reckons for its uptime: the notice is to the second, and the timed that
-/// answered logd may be an earlier instance than the one that answers
-/// svctest, whose offset it read from the RTC to the second. An offset read
-/// wrong, or a notice whose uptime is not its wall time's, is off by the
-/// uptime, minutes by this phase.
-const WALL_CLOCK_SLACK_US: u64 = 2_000_000;
 
 /// The longest a line's call may take: half the stall bound. A line answered
 /// once retained takes well under a millisecond; one that waited on a
@@ -214,9 +200,6 @@ pub fn logd_sinks_phase(caps: &Caps)
         lines.len()
     );
 
-    check_wall_clock_notice(caps.logd_query);
-    std::os::seraph::log!("logd_sinks: logd's wall clock notice agrees with timed");
-
     let hidden = HIDDEN_LINE.as_bytes().to_vec();
     send_taken(&hidden, LEVEL_DEBUG, "below serial's level", 0).unwrap_or_else(|e| panic!("{e}"));
     retained_seq(caps.logd_query, &[hidden], "below serial's level");
@@ -229,13 +212,14 @@ pub fn logd_sinks_phase(caps: &Caps)
         return;
     };
     let threads = attach(authority, fb, "framebuffer");
+    let notices = fb_notices(caps.logd_query);
     stop(&threads, "framebuffer");
     let sent = send_lines("framebuffer stopped", FLOOD_LINES, LEVEL_CRITICAL);
     start(&threads, "framebuffer");
     detach(authority, fb, threads, "framebuffer");
     let lines = sent.unwrap_or_else(|e| panic!("{e}"));
-    let last = retained_seq(caps.logd_query, &lines, "framebuffer stopped");
-    let dropped = await_fb_notice(caps.logd_query, last, "the stopped driver's start");
+    retained_seq(caps.logd_query, &lines, "framebuffer stopped");
+    let dropped = await_fb_notice(caps.logd_query, &notices, "the stopped driver's start");
     std::os::seraph::log!(
         "logd_sinks: {FLOOD_LINES} lines taken while the framebuffer driver was stopped, \
          {dropped} counted dropped"
@@ -259,61 +243,17 @@ pub fn logd_sinks_phase(caps: &Caps)
     let restarted = super::crash::badge_named(authority, FRAMEBUFFER_NAME)
         .unwrap_or_else(|| panic!("logd_sinks: procmgr lists no restarted framebuffer driver"));
     let threads = attach(authority, restarted, "restarted framebuffer");
+    let notices = fb_notices(caps.logd_query);
     stop(&threads, "restarted framebuffer");
     let sent = send_lines("restarted framebuffer stopped", FLOOD_LINES, LEVEL_CRITICAL);
     start(&threads, "restarted framebuffer");
     detach(authority, restarted, threads, "restarted framebuffer");
     let lines = sent.unwrap_or_else(|e| panic!("{e}"));
-    let last = retained_seq(caps.logd_query, &lines, "restarted framebuffer stopped");
-    let dropped = await_fb_notice(caps.logd_query, last, "the restarted driver's start");
+    retained_seq(caps.logd_query, &lines, "restarted framebuffer stopped");
+    let dropped = await_fb_notice(caps.logd_query, &notices, "the restarted driver's start");
     std::os::seraph::log!(
         "logd_sinks: logd's framebuffer writer took up the restarted driver, {dropped} lines \
          counted dropped"
-    );
-}
-
-/// Check logd's newest wall clock notice, read through `query`, against the
-/// wall time `SystemTime::now()` gives for the uptime it names (see the
-/// module documentation).
-fn check_wall_clock_notice(query: u64)
-{
-    let mut notice = None;
-    super::procmgr::logd_history_each(query, Some(LOG_BADGE_LOGD), |entry| {
-        if entry.bytes.starts_with(WALL_CLOCK_PREFIX)
-        {
-            notice = Some(String::from_utf8_lossy(entry.bytes).trim_end().to_owned());
-            return false;
-        }
-        true
-    });
-    let notice = notice.expect("logd_sinks: logd's history holds no wall clock notice");
-    let uptime = notice
-        .rsplit_once(" at uptime ")
-        .and_then(|(_, up)| up.split_once('.'))
-        .and_then(|(secs, frac)| {
-            let secs = secs.parse::<u64>().ok()?;
-            let frac = frac.parse::<u64>().ok().filter(|_| frac.len() == 6)?;
-            secs.checked_mul(1_000_000)?.checked_add(frac)
-        })
-        .unwrap_or_else(|| panic!("logd_sinks: logd's notice {notice:?} names no uptime"));
-    let up_now = super::oom::elapsed_us();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_micros()).ok())
-        .filter(|&us| us > up_now)
-        .expect("logd_sinks: SystemTime::now() gives no wall time");
-    // The wall time svctest reckons for the notice's uptime.
-    let reckoned = now.saturating_sub(up_now).saturating_add(uptime);
-    let lowest = reckoned.saturating_sub(WALL_CLOCK_SLACK_US);
-    let agrees = (0..=2 * WALL_CLOCK_SLACK_US / 1_000_000).any(|s| {
-        let wall = lowest.saturating_add(s.saturating_mul(1_000_000));
-        logd_codec::wall::wall_clock_text(wall, uptime).as_str() == notice
-    });
-    assert!(
-        agrees,
-        "logd_sinks: logd's notice {notice:?} is not {:?} within {WALL_CLOCK_SLACK_US} us",
-        logd_codec::wall::wall_clock_text(reckoned, uptime).as_str()
     );
 }
 
@@ -481,22 +421,32 @@ fn retained_seq(query: u64, lines: &[Vec<u8>], case: &str) -> u64
     })
 }
 
-/// Wait until logd's history holds its notice counting lines its
-/// framebuffer sink dropped, retained after the entry `after`, within
-/// [`DEATH_TIMEOUT`]; `what` names the event that lets the sink's writer go
-/// on. The count it names.
-fn await_fb_notice(query: u64, after: u64, what: &str) -> u64
+/// logd's notices counting lines its framebuffer sink dropped, in its
+/// history now, as (`seq`, count).
+fn fb_notices(query: u64) -> Vec<(u64, u64)>
+{
+    super::procmgr::logd_history_with(query, Some(LOG_BADGE_LOGD), |entry| {
+        fb_drop_count(entry.bytes).map(|count| (entry.seq, count))
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Wait until logd's history holds a notice counting lines its framebuffer
+/// sink dropped that is not among `before` ([`fb_notices`] before the case),
+/// within [`DEATH_TIMEOUT`]: a new notice, or one logd updated in place with
+/// a new count, since logd adds the sink's drops to its notice while the
+/// sink has not written it (`services/logd/docs/sinks.md` § Drops). `what`
+/// names the event that lets the sink's writer go on. The count it names.
+fn await_fb_notice(query: u64, before: &[(u64, u64)], what: &str) -> u64
 {
     let start_at = Instant::now();
     loop
     {
         let mut count = None;
         super::procmgr::logd_history_each(query, Some(LOG_BADGE_LOGD), |entry| {
-            if entry.seq <= after
-            {
-                return false;
-            }
-            count = count.or_else(|| fb_drop_count(entry.bytes));
+            count = fb_drop_count(entry.bytes).filter(|&n| !before.contains(&(entry.seq, n)));
             count.is_none()
         });
         if let Some(count) = count

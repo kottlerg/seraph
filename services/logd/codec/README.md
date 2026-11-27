@@ -31,8 +31,10 @@ message, where a `skip` sink's cursor starts, and the text of a drop line; see
 [`docs/ipc-interface.md`](../docs/ipc-interface.md) § Output sinks, § Hold window), a device sink's
 settings and the parser of the recipe syntax that sets them (`settings::SinkSettings`,
 `SinkKind::defaults`), and the two formats a sink renders an entry in, the console format with its
-field list (`console::write`) and the rfc5424 format (`rfc5424::write`; see
-[`docs/sinks.md`](../docs/sinks.md) § Settings, § The console format, § The rfc5424 format). It
+field list (`console::write`) and the rfc5424 format (`rfc5424::write`), and the RFC 3339 writer
+of an entry's wall time and the text of logd's notice of the wall clock (`wall::write_rfc3339`,
+`wall::WALL_MAX_US`, `wall::wall_clock_text`; see [`docs/sinks.md`](../docs/sinks.md) § Settings,
+§ The console format, § The rfc5424 format, § Wall time). It
 issues no syscall and no IPC, so both ends keep the IPC calls and the logic stays host-reachable,
 per [coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
 
@@ -73,6 +75,8 @@ services/logd/codec/
     ├── settings.rs             # A device sink's settings and their parser
     ├── sink.rs                 # Sink rules: stall bound, retry hint,
     │                           # attach cursor, drop-line text
+    ├── wall.rs                 # RFC 3339 wall time and the wall clock
+    │                           # notice's text
     └── bounded_str.rs          # BoundedStr: UTF-8-safe bounded formatter
 ```
 

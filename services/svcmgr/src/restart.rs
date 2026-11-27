@@ -13,7 +13,7 @@
 //! `sched_max`), its create flags (`reserve`, the node handle an
 //! `oom_stop` service is created with, and the containment of a
 //! `stop_source` service), its log-sink flag and its
-//! debug-, stop- and entropy-authority caps, binds the new instance's death observers
+//! debug-, stop-, entropy- and PMU-authority caps, binds the new instance's death observers
 //! before it starts, and serves its bootstrap.
 //!
 //! Bootstrap delivery re-resolves the recipe's `seed` caps (the log-sink

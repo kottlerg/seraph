@@ -173,8 +173,8 @@ to teardown), then runs
      memmgr's and procmgr's observers are already on the core-death
      queue), record the
      recipe's fixed fields on the `ServiceEntry` and its argv/env/cwd/seed,
-     log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`, `reserve` and
-     `private_image` flags, `stop_source` class, and scheduling fields in the parallel
+     log-sink, debug-authority, stop-authority, entropy-authority, PMU-authority, `oom_stop`,
+     `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel
      `RestartRecipe` table.
    * **defined only** — launch via [`definitions::launch`](../src/definitions/launch.rs).
    * **parked without definition** — log `registered without

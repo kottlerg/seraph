@@ -420,7 +420,7 @@ Pager](../../../docs/fault-handling.md#default-system-pager)); the role sets the
 recipe key does. On each launch it also serves the actuator a derivation carrying only the receive
 right of the core-death queue, which the death observers of svcmgr's, memmgr's and procmgr's main
 threads and address spaces post to, in the bootstrap slot after the `seed` caps and after any
-debug-authority, stop-authority and entropy-authority slots (`cap[4]` for pwrmgr). A derive that
+debug-, stop-, entropy- and PMU-authority slots (`cap[4]` for pwrmgr). A derive that
 fails, or a queue svcmgr could not make, leaves the slot absent. A recipe that declares the key but
 is not recognised is created demand-paged and gets no such slot.
 
@@ -701,7 +701,7 @@ At `HANDOVER_COMPLETE` svcmgr reads the recipes of `/config/svcmgr/services/`, p
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`, `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
+| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, PMU-authority, `oom_stop`, `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop`, `stop_source` and `private_image` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`, `CREATE_PRIVATE_IMAGE`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (whatever the `restart` policy, so they are in place before the thread runs; a bind that fails destroys the child and the launch fails), `START_PROCESS`, serve the seed bootstrap rounds, and record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 

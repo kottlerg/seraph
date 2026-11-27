@@ -350,6 +350,10 @@ pub fn run_all(ctx: &TestContext)
         teardown_windows::observer_release_takes_interrupts(ctx)
     );
     run_test!(
+        "teardown_windows::observer_release_held_probe_is_inconclusive",
+        teardown_windows::observer_release_held_probe_is_inconclusive(ctx)
+    );
+    run_test!(
         "teardown_windows::frame_release_takes_interrupts",
         teardown_windows::frame_release_takes_interrupts(ctx)
     );
@@ -360,6 +364,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "teardown_windows::death_post_takes_interrupts",
         teardown_windows::death_post_takes_interrupts(ctx)
+    );
+    run_test!(
+        "teardown_windows::death_post_held_probe_is_inconclusive",
+        teardown_windows::death_post_held_probe_is_inconclusive(ctx)
     );
     run_test!(
         "locked_windows::notification_drain_takes_interrupts",

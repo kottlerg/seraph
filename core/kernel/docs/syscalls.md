@@ -245,10 +245,13 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  76  SYS_KERNEL_LOG_BIND
                                  77  SYS_IPC_REPLY_RECV
                                  78  SYS_THREAD_SET_RUN_LIMIT
+                                 79  SYS_PMU_INFO
+                                 80  SYS_PMU_CONFIGURE
+                                 81  SYS_PMU_BIND
 ```
 
-**Implementation status.** Every number 0–78 has a handler; every number at or past
-`SYSCALL_NR_BOUND` (79) returns `UnknownSyscall`. The kernel refuses a number at or past the
+**Implementation status.** Every number 0–81 has a handler; every number at or past
+`SYSCALL_NR_BOUND` (82) returns `UnknownSyscall`. The kernel refuses a number at or past the
 bound, then selects the handler with one `match` on the number, clamped as data
 ([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and calls
 it directly. The `match` and a build-time check of its numbers come from one list
@@ -4084,6 +4087,103 @@ cap); `InsufficientRights` (it lacks `Read`); `InvalidCapability` (a non-zero `n
 no Notification); `InsufficientRights` (the Notification cap lacks `Notify`);
 `InvalidArgument` (a Notification with `bits == 0`).
 
+## Performance Counter Syscalls
+
+The counters, the grant and the per-CPU state behind these calls are specified in
+[perfmon.md](perfmon.md). Each call takes a `PmuControl` capability carrying `Configure`
+([capability-model.md](../../../docs/capability-model.md) § `PmuControl`) and acts on the calling
+CPU's counters. The register packing is stated once in `abi/syscall` (the `PMU_*` constants) and
+read and written by [shared/pmu](../../../shared/pmu/README.md). A configuration takes at most
+`PMU_CONFIGURE_MAX` (8) events and returns 8-bit read handles: both are limits of this version of
+the calls, whose event and handle words carry one byte per entry.
+
+The events are portable ids (`PMU_EVENT_*`): `Cycles` (0), `Instructions` (1),
+`LlcReferences` (2), `LlcMisses` (3), `BranchInstructions` (4), `BranchMisses` (5),
+`DtlbMisses` (6) and `ItlbMisses` (7). Which of them a CPU counts is its own; `SYS_PMU_INFO`
+reports it.
+
+### `SYS_PMU_INFO` (79)
+
+Describe the calling CPU's performance counters.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `pmu_cap` | `PmuControl` capability carrying `Configure` |
+
+**Return:** `rax`/`a0`: the description on success, packed at the `PMU_INFO_*` shifts: the user
+counters a configuration may take (bits 0-7), their width in bits (bits 8-15), and the events the
+CPU counts, bit `i` for event id `i` (bits 16-31); negative `SyscallError` on failure. CPUs of a
+hybrid part can answer differently.
+
+**Errors**, checked in this order: `InvalidCapability` (the handle names no `PmuControl` cap);
+`InsufficientRights` (it lacks `Configure`); `NotSupported` (the CPU has no counters the kernel
+drives: x86-64 other than Intel architectural performance monitoring or AMD family 17h and later,
+QEMU's TCG among them; riscv64 without the SBI PMU extension or a programmable counter).
+
+---
+
+### `SYS_PMU_CONFIGURE` (80)
+
+Program the calling CPU's user counters, or release them.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `pmu_cap` | `PmuControl` capability carrying `Configure` |
+| 1 | `events` | Event ids, one per byte from the low byte up; the bytes past the `n`th are ignored |
+| 2 | `n` | Number of events, `0..=PMU_CONFIGURE_MAX`; `0` releases the counters |
+| 3 | `mode` | `PMU_MODE_USER`, `PMU_MODE_KERNEL`, or both; read only when `n > 0` |
+
+The configuration replaces the CPU's previous one, whoever made it, and its counters start from
+zero. The caller's hard affinity must name the CPU it runs on: a thread that set its affinity
+moves there at its next schedule, so it yields once before configuring. A counter counts all work
+on the CPU in the mode, not the caller's alone ([perfmon.md](perfmon.md) § What a value means).
+
+**Return:** `rax`/`a0`: the read handles on success, one per byte in the order of the events (the
+`RDPMC` index on x86-64, the counter CSR's offset from `cycle` on riscv64), `0` for a release;
+negative `SyscallError` on failure.
+
+**Errors**, checked in this order: `InvalidCapability`, `InsufficientRights` (as for
+`SYS_PMU_INFO`); `InvalidArgument` (`n` past `PMU_CONFIGURE_MAX`, an id that names no event, an
+event named twice, or, with `n > 0`, a `mode` that is not one of the three); `NotSupported` (the CPU
+has no counters); `InvalidState` (the caller's hard affinity does not name the CPU it runs on);
+`NotSupported` (the CPU has fewer than `n` user counters, or does not count one of the events). A
+refused configuration leaves the previous one in place, except on riscv64 when the firmware claims
+no counter for an event the CPU reports, which leaves the CPU with none ([perfmon.md](perfmon.md)
+§ Counters).
+
+---
+
+### `SYS_PMU_BIND` (81)
+
+Grant or revoke a thread's direct user-mode reads of the configured counters of the CPU it runs
+on.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `pmu_cap` | `PmuControl` capability carrying `Configure` |
+| 1 | `thread_cap` | Thread capability carrying `Control` |
+| 2 | `on` | `1` to grant, `0` to revoke |
+
+A thread without the grant that reads a counter takes the CPU's fault (`#GP(0)` on x86-64, an
+illegal-instruction exception on riscv64), delivered as its own fault. The change holds before
+the caller's next instruction when the thread is the caller; from the thread's first return to
+user mode after the kernel's interrupt reaches its CPU when it runs on another; and from its next
+dispatch otherwise ([perfmon.md](perfmon.md) § The grant). The grant holds until a bind revokes it
+or the thread exits: revoking the `PmuControl` capability does not end it.
+
+**Return:** `rax`/`a0`: 0 on success; negative `SyscallError` on failure.
+
+**Errors**, checked in this order: `InvalidCapability`, `InsufficientRights` (as for
+`SYS_PMU_INFO`); `InvalidCapability` (`thread_cap` names no Thread); `InsufficientRights` (the
+Thread cap lacks `Control`); `InvalidArgument` (`on` is neither 0 nor 1); `NotSupported` (the
+calling CPU has no counters).
+
 ---
 
 ## Revocation Notes
@@ -4198,6 +4298,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `KLOG_RECORD_MAX` | 536 | Bytes of a kernel log record at its longest: the 24-byte header and `KLOG_LINE_MAX` |
 | `KLOG_READ_MAX` | 16384 | Most bytes one `SYS_KERNEL_LOG_READ` writes |
 | `KLOG_STALL_MS` | 1000 | Milliseconds an attached kernel log reader may leave a record unread, measured from its append or from the reader's last read of a new record when that came later, before the kernel writes its lines directly |
+| `PMU_CONFIGURE_MAX` | 8 | Most events one `SYS_PMU_CONFIGURE` takes |
 | `BOOT_PROTOCOL_VERSION` | 24 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
@@ -4213,7 +4314,8 @@ source of truth.
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
 [Kernel Entropy Subsystem](entropy.md), [IPC Subsystem Internals](ipc-internals.md),
-[Memory Subsystem Internals](memory-internals.md), [Scheduler Internals](scheduler.md),
+[Memory Subsystem Internals](memory-internals.md), [Kernel Performance Counters](perfmon.md),
+[Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),
 [core/ktest/README.md](../../ktest/README.md),

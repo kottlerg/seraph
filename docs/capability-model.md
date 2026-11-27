@@ -93,8 +93,9 @@ scaling, and DRAM rows. The system draws the line as follows.
   with `CY` alone: U-mode reads the cycle counter, and a U-mode read of `time`, `instret` or
   an `hpmcounter` raises an illegal-instruction exception. On x86-64 it clears `CR4.TSD` and
   `CR4.PCE`: ring 3 reads the timestamp counter (`RDTSC`, `RDTSCP`), and `RDPMC` raises `#GP`
-  there. Capability-mediated performance-counter access is design intent, not yet implemented
-  ([#265](https://github.com/kottlerg/seraph/issues/265)). The kernel sets every other
+  there. The performance counters are granted only to a thread a `PmuControl` holder binds
+  (§ `PmuControl`), and while it runs; they count all work on the CPU, not the bound thread's
+  alone. The kernel sets every other
   user-mode control on every CPU the same way (§ User-mode hardware controls of
   [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)),
   and user code relies on what they give it: on x86-64 `RDTSCP` and `RDPID` return 0 as the
@@ -483,8 +484,8 @@ set includes the extensions it manages internally — TIME (scheduler timer), IP
 shootdown / wakeups), RFENCE (remote fences), HSM (hart lifecycle) — whose forwarding
 would break a kernel invariant, and PMU (the Performance Monitoring Unit): a counter counts
 everything that runs on its hart, so programming one is an authority over every process there,
-not a firmware call an `SbiControl` right carries. Capability-mediated counter access is design
-intent, not yet implemented ([#265](https://github.com/kottlerg/seraph/issues/265)). Bit 5 of
+not a firmware call an `SbiControl` right carries; the counters are reached through a
+`PmuControl` capability instead (§ `PmuControl`). Bit 5 of
 the `SbiControl` rights space is reserved, and no right takes it. Sanctioning a further extension
 adds one entry to the kernel's extension-to-right map and one `SbiControl` right.
 
@@ -600,6 +601,38 @@ default image is entropyd, the contributor of the `hwrng` class drivers' bytes
 ([services/entropyd/README.md](../services/entropyd/README.md)). The root stays in init's CSpace and
 is released when the reap frees it; a copy init has not derived by then is never made, and no
 process can contribute until the next boot (see [process-lifecycle.md § Init
+reap](process-lifecycle.md#init-reap)).
+
+### PmuControl
+
+A capability authorising the holder to describe and program the calling CPU's performance
+counters and to grant a thread their direct reads, with `SYS_PMU_INFO`, `SYS_PMU_CONFIGURE` and
+`SYS_PMU_BIND`, on both architectures. Rights:
+- **Configure** — may describe the counters, program and release them, and bind and unbind a
+  reader
+
+The counters are per CPU, and one configuration of a CPU replaces another, whoever made it. A
+bound thread reads them from user mode (`RDPMC` on x86-64, `csrr hpmcounterN` on riscv64) while
+it runs, and an unbound thread's read raises the CPU's fault. A counter counts all work on its CPU
+in the configured mode, other processes' and the kernel's included, so the grant is a
+cross-process observation channel and is authority-bearing
+([core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
+§ User-mode hardware controls). A measuring thread pins itself to one CPU and yields once, so it
+runs there, then configures and binds itself
+([core/kernel/docs/perfmon.md](../core/kernel/docs/perfmon.md)).
+
+A binding is the thread's, not the capability's: it ends by `SYS_PMU_BIND` off or by the thread's
+exit, and revoking the `PmuControl` capability that made it does not end it. A bind or unbind of
+a thread running on another CPU holds from that thread's first return to user mode after the
+kernel's interrupt reaches the CPU ([core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md)
+§ `SYS_PMU_BIND` (81)).
+
+`PmuControlObject` carries no fields, and its init descriptor has `aux0 = aux1 = 0`; there is no
+split or merge. The kernel mints the one root cap at boot into init's CSpace, carrying
+**Configure**, and init finds it by its descriptor's type. `PmuControl` capabilities are not
+creatable at runtime. Which process holds it after init is userspace policy. ktest, loaded as
+init, tests the counters through the root. In the default image no process holds it: the root
+stays in init's CSpace and is released when the reap frees it (see [process-lifecycle.md § Init
 reap](process-lifecycle.md#init-reap)).
 
 ---
@@ -1082,6 +1115,7 @@ The kernel mints these during Phases 7–9 of
 - One SchedControl capability spanning the full userspace priority range `[1, PRIORITY_MAX]`
 - One EntropyControl capability carrying Contribute
 - One KernelLog capability carrying Read
+- One PmuControl capability carrying Configure
 - Thread, AddressSpace, and CSpace capabilities for init itself
 - Memory capabilities for each boot module image (raw ELF images for early services)
 - Reclaimable Memory capabilities, one per `BootInfo.reclaim_ranges` entry (bootloader

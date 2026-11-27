@@ -476,6 +476,50 @@ context_switch(current_tcb, next_tcb):
     // Execution continues in next_tcb from here.
 ```
 
+### Stage Breakdown
+
+A kernel built with its `sched-stages` Cargo feature (`cargo xtask build --sched-stages`) times
+the stages of `schedule()` on one CPU, for a benchmark pinned to that CPU to read
+(`core/kernel/src/sched/stages.rs`). `schedule()` reads the cycle counter at its entry and at the
+end of each stage: `rdtsc` on x86-64 and the `cycle` CSR on riscv64, the counter the benchmarks
+read through `shared/bench`. When the switch commits to another thread, each stage's cycles are
+added to that stage's sum, which `SYS_SYSTEM_INFO(SchedStages)` returns by its word
+([syscalls.md](syscalls.md#sys_system_info-43) § `SYS_SYSTEM_INFO` (43)):
+
+| Stage | Word | From the previous stamp until |
+|---|---|---|
+| lock | `SCHED_STAGE_LOCK` (0) | `schedule()` holds the outgoing thread's `sched_lock` and its CPU's run-queue lock |
+| pick | `SCHED_STAGE_PICK` (1) | the outgoing thread is requeued and the next chosen |
+| release | `SCHED_STAGE_RELEASE` (2) | the next thread is claimed as current and both locks are released |
+| flip | `SCHED_STAGE_FLIP` (3) | the next thread's `sched_lock` is held and the thread is marked `Running` |
+| iopb | `SCHED_STAGE_IOPB` (4) | the next thread's I/O permission bitmap is loaded (x86-64; riscv64 loads none) |
+| guard | `SCHED_STAGE_GUARD` (5) | the next thread's `sched_lock` is released, its trap stack set and its stack-guard flush made (steps 1 and 1b of § Switch Sequence) |
+| aspace | `SCHED_STAGE_ASPACE` (6) | the address-space switch (step 2) |
+| fpu | `SCHED_STAGE_FPU` (7) | the extended-state save, the wait for the next thread's saved registers, the run-limit check and the extended-state restore (step 2b) |
+| switch | `SCHED_STAGE_SWITCH` (8) | the incoming thread resumes in `schedule()` after the register switch (step 3) |
+
+A stage a switch's path skips (the flip and the bitmap of a switch to the idle thread) adds
+nothing, and its time falls in the next stage stamped. A pass of `schedule()` that keeps its
+outgoing thread commits nothing. The register switch ends only where the incoming thread resumes
+inside `schedule()`, and a thread's first run starts elsewhere, so `SCHED_STAGES_RESUMES` counts
+the switches the switch stage's sum covers and `SCHED_STAGES_SWITCHES` those the other stages'
+sums cover; a stage's mean is its sum over its count.
+
+The word `SCHED_STAGES_ARM` zeroes every sum and count and makes the calling CPU the collecting
+CPU, and `schedule()` on any other CPU adds nothing. One CPU's sums serve because a benchmark
+measures on the CPU it is pinned to; a structure per CPU would be sized by the CPU count for sums
+no reader takes. Only the collecting CPU writes the sums, from `schedule()` with interrupts
+disabled, so each update is a `Relaxed` load and store: a reader on another CPU may see one
+switch's sums partly added, and an arm made while another CPU collects may let that CPU's switch
+in progress add to the zeroed sums. ktest's `context_switch_pair` arms on CPU 0 before its
+measured loop and reports each stage's mean as an extra
+([core/ktest/README.md](../../ktest/README.md) § Tier 3).
+
+The stamps add their own cycles to every switch they time, so a line of a `sched-stages` image
+says where a switch's cycles go, not how many a plain image's switch takes. Without the feature
+each stamp is an empty inline function and no sums exist: the kernel's image holds nothing of
+them.
+
 ---
 
 ## SMP Scheduling

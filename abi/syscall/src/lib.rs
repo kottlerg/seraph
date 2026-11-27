@@ -2298,7 +2298,61 @@ pub enum SystemInfoType
     /// above). A process sizes the Memory cap it retypes an endpoint from with
     /// it.
     EndpointRetypeBytes = 16,
+    /// One word of the `schedule()` stage breakdown of a kernel built with its
+    /// `sched-stages` feature, the word arg1 names: a stage's cycles summed
+    /// over the context switches made on the collecting CPU (`SCHED_STAGE_*`),
+    /// the number of switches those sums cover (`SCHED_STAGES_SWITCHES`,
+    /// `SCHED_STAGES_RESUMES`), or, for `SCHED_STAGES_ARM`, a reset that
+    /// zeroes every sum and count and makes the calling CPU the collecting CPU,
+    /// returning 0; no CPU collects before the first reset. The cycles are the
+    /// cycle counter's (`rdtsc` on x86-64, `cycle` on riscv64), the counter
+    /// the benchmarks read. A measurement aid for a benchmark pinned to one
+    /// CPU (core/kernel/docs/scheduler.md § Stage Breakdown): a
+    /// kernel built without the feature answers `InvalidArgument`, as it does
+    /// for an unknown word.
+    SchedStages = 17,
 }
+
+/// `SystemInfoType::SchedStages` word: from `schedule()`'s entry until it
+/// holds the outgoing thread's `sched_lock` and its CPU's run-queue lock.
+pub const SCHED_STAGE_LOCK: u64 = 0;
+/// `SystemInfoType::SchedStages` word: requeueing the outgoing thread and
+/// choosing the next.
+pub const SCHED_STAGE_PICK: u64 = 1;
+/// `SystemInfoType::SchedStages` word: claiming the next thread as current
+/// and releasing both locks.
+pub const SCHED_STAGE_RELEASE: u64 = 2;
+/// `SystemInfoType::SchedStages` word: taking the next thread's
+/// `sched_lock` and marking it `Running`.
+pub const SCHED_STAGE_FLIP: u64 = 3;
+/// `SystemInfoType::SchedStages` word: loading the next thread's I/O
+/// permission bitmap (x86-64; nothing on riscv64).
+pub const SCHED_STAGE_IOPB: u64 = 4;
+/// `SystemInfoType::SchedStages` word: releasing the next thread's
+/// `sched_lock`, setting the trap stack and the stack-guard flush.
+pub const SCHED_STAGE_GUARD: u64 = 5;
+/// `SystemInfoType::SchedStages` word: the address-space switch.
+pub const SCHED_STAGE_ASPACE: u64 = 6;
+/// `SystemInfoType::SchedStages` word: the extended-state save, the wait for
+/// the next thread's saved registers, the run-limit check and the
+/// extended-state restore.
+pub const SCHED_STAGE_FPU: u64 = 7;
+/// `SystemInfoType::SchedStages` word: the register switch, from the call of
+/// `switch()` until the incoming thread resumes in `schedule()`.
+pub const SCHED_STAGE_SWITCH: u64 = 8;
+/// Number of `SCHED_STAGE_*` words: the stages run from `SCHED_STAGE_LOCK`
+/// to `SCHED_STAGE_SWITCH` in this order.
+pub const SCHED_STAGE_COUNT: u64 = 9;
+/// `SystemInfoType::SchedStages` word: the switches whose stages
+/// `SCHED_STAGE_LOCK` to `SCHED_STAGE_FPU` the sums cover.
+pub const SCHED_STAGES_SWITCHES: u64 = 9;
+/// `SystemInfoType::SchedStages` word: the switches whose
+/// `SCHED_STAGE_SWITCH` the sum covers, those whose incoming thread resumed
+/// inside `schedule()` (a thread's first run starts elsewhere).
+pub const SCHED_STAGES_RESUMES: u64 = 10;
+/// `SystemInfoType::SchedStages` word: zero every sum and count and collect
+/// on the calling CPU.
+pub const SCHED_STAGES_ARM: u64 = 11;
 
 /// `SystemInfoType::SpeculationControls` view: the selection's inputs, a
 /// `SPECULATION_INPUT_*` set.

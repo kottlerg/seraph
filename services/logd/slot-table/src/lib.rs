@@ -401,14 +401,26 @@ impl History
     }
 
     /// Retain `entry` as `slot`'s newest, under the next `seq`, and return
-    /// that `seq`: drop the slot's oldest entry when it holds
+    /// that `seq`: drop the slot's oldest entries while it holds
     /// [`Bounds::per_slot`], then entries ([`Self::victim`]) until the new
-    /// one fits in [`Bounds::bytes`].
+    /// one fits in [`Bounds::bytes`]. The slot of a sender no window holds
+    /// back ([`unwindowed`]) keeps the entries the `hold` sink has not
+    /// written past [`Bounds::per_slot`], within [`Bounds::bytes`]: nothing
+    /// else paces it to the sink, and the kernel's records are acknowledged
+    /// once written.
     fn push(&mut self, slot: &mut Slot, entry: HistoryEntry) -> u64
     {
-        if slot.seqs.len() >= self.bounds.per_slot
-            && let Some(oldest) = slot.seqs.pop_front()
+        let keep_unwritten = unwindowed(entry.badge);
+        while slot.seqs.len() >= self.bounds.per_slot
+            && let Some(&oldest) = slot.seqs.front()
         {
+            let unwritten = self.held_from.is_some_and(|held| oldest >= held)
+                && self.entries.contains_key(&oldest);
+            if keep_unwritten && unwritten
+            {
+                break;
+            }
+            slot.seqs.pop_front();
             self.remove(oldest);
         }
         self.make_room(entry.charge());
@@ -564,6 +576,15 @@ impl History
             .filter(|seq| self.entries.contains_key(seq))
             .count()
     }
+}
+
+/// Whether `badge` is a sender no window holds back, whose lines logd
+/// retains itself: the kernel's and logd's own
+/// (`services/logd/docs/ipc-interface.md` § Hold window).
+#[must_use]
+pub fn unwindowed(badge: u64) -> bool
+{
+    badge == ipc::log_badges::LOG_BADGE_KERNEL || badge == ipc::log_badges::LOG_BADGE_LOGD
 }
 
 /// The entry of a record of `badge`, with its field table.
@@ -1185,6 +1206,38 @@ mod tests
         table.install_history_line(badge, 0, INFO, &line);
         assert_eq!(seqs_of(&table, 3), [2]);
         assert_eq!(seqs_of(&table, badge).len(), 2);
+        assert_eq!(table.history.bytes(), recount(&table));
+    }
+
+    // Defect caught: the per-slot bound dropping a kernel or logd line the hold
+    // sink has not written, which the kernel reader then acknowledges, or a
+    // windowed sender's slot kept past the bound.
+    #[test]
+    fn an_unwindowed_slot_keeps_its_unwritten_entries_past_the_per_slot_bound()
+    {
+        use ipc::log_badges::{LOG_BADGE_KERNEL, LOG_BADGE_LOGD};
+        let mut table = SlotTable::default();
+        table.history.set_held_from(Some(0));
+        let over = PER_SLOT_HISTORY_MIN + 8;
+        for badge in [LOG_BADGE_KERNEL, LOG_BADGE_LOGD, 7]
+        {
+            for i in 0..over as u64
+            {
+                let (slot, history) = table.sender_slot(badge).unwrap();
+                history.push_text(slot, badge, i, INFO, b"line");
+            }
+        }
+        assert_eq!(seqs_of(&table, LOG_BADGE_KERNEL).len(), over);
+        assert_eq!(seqs_of(&table, LOG_BADGE_LOGD).len(), over);
+        assert_eq!(seqs_of(&table, 7).len(), PER_SLOT_HISTORY_MIN);
+        // Once the hold sink has written them, the bound drops them again.
+        table.history.set_held_from(Some(table.history.next_seq()));
+        let (slot, history) = table.sender_slot(LOG_BADGE_KERNEL).unwrap();
+        history.push_text(slot, LOG_BADGE_KERNEL, 0, INFO, b"line");
+        assert_eq!(
+            seqs_of(&table, LOG_BADGE_KERNEL).len(),
+            PER_SLOT_HISTORY_MIN
+        );
         assert_eq!(table.history.bytes(), recount(&table));
     }
 

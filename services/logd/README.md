@@ -125,7 +125,8 @@ under its sender's name, the first after the restart included
   the lines logd had taken when the barrier was first asked, `FLUSHED` at once when no sink holds it
   or that sink is stalled, unserved or off, and `FLUSH_PENDING` with a retry hint otherwise. It is
   served only on a SEND badged `LOG_FLUSH_AUTHORITY`, which svcmgr mints from its master-log source
-  and publishes seed-only as `logd.flush`; pwrmgr waits on it before every power-off and reset (see
+  and publishes seed-only as `logd.flush`; pwrmgr and acpid wait on it before every power-off and
+  reset, and crashd before it declines a fault (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Flush barrier).
 
 * **Per-sender slot reclamation.** logd creates an `EventQueue` and

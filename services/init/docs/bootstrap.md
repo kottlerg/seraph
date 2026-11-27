@@ -285,8 +285,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     svctest is the only recipe seeding it.
   - `logd.flush` — `LOG_FLUSH_AUTHORITY`-badged SEND minted from the endowed master-log source,
     gating logd's `LOG_FLUSH` barrier ([logd IPC
-    interface](../../logd/docs/ipc-interface.md#flush-barrier)); pwrmgr's and svctest's recipes seed
-    it.
+    interface](../../logd/docs/ipc-interface.md#flush-barrier)); pwrmgr's, acpid's, crashd's and
+    svctest's recipes seed it.
   - `SET_DRIVERS_DIR` — svcmgr walks its universal root to `/services/drivers/` at `LOOKUP | READ |
     READDIR` and hands devmgr the subtree cap, with the directory's absolute path as a name block,
     on a `DRIVERS_DIR_AUTHORITY`-badged copy of the devmgr-registry source, and, when the walk finds

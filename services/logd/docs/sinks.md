@@ -183,7 +183,8 @@ each in its format, and writes it to its output.
   holds no sender.
 - Past the history's byte bound ([ipc-interface.md](ipc-interface.md) § History), the history
   evicts an entry a `hold` sink has not written only when no written one is left. The per-slot
-  bound drops a slot's own oldest entry whatever the sinks have written.
+  bound drops a slot's own oldest entry whatever the sinks have written, but for the kernel's slot
+  and logd's own, which no window paces: those keep the entries a `hold` sink has not written.
 - A `skip` sink holds no sender and keeps no entry: what the history evicts before it is read is
   counted as dropped.
 - A sink whose level is `off` takes part in none of the above, whatever its pace: it counts toward

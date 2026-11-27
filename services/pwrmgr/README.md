@@ -16,7 +16,6 @@ pwrmgr/
     ├── guard.rs      # The allocation guard the core-death power-off runs under
     ├── core_death.rs # The core-death queue's entries: the member and the exit reason
     ├── power_off.rs  # The register the x86-64 core-death power-off writes, from QUERY_SLEEP
-    ├── log_flush.rs  # The steps of the wait on logd's flush barrier before a power-off
     ├── caps.rs       # svcmgr bootstrap: the service endpoint, three seeds, the core-death queue
     └── arch/
         ├── mod.rs         # Arch dispatch: `arch::current` (Actuator, resolve,

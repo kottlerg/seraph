@@ -27,6 +27,8 @@ ipc = { path = "../../shared/ipc" }
 # The binary alone uses these, and it builds for the Seraph targets only, so the
 # host-tested library does not pull them into a host build.
 [target.'cfg(target_os = "seraph")'.dependencies]
+# A log call's bound, which bounds acpid's wait on logd's flush barrier.
+log = { path = "../../shared/log" }
 # The barrier that orders the firmware's register writes to mapped memory.
 mmio = { path = "../../shared/mmio" }
 syscall = { path = "../../shared/syscall" }

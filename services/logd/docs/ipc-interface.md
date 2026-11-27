@@ -351,12 +351,14 @@ the RAM read from memmgr's `QUERY_POOL_STATUS` and the floor when memmgr does no
 the history map. Retaining an entry past the bound drops the oldest entry the serial sink has
 written, or, when it has written none of them, the oldest entry of the slot with the most entries
 it has not written, until the new one fits. A slot keeps at most its last
-`PER_SLOT_HISTORY_MIN` (32) entries, scaled by the byte bound's ratio to the floor, a further
-entry dropping its own oldest, so one sender logging without pause does not push a quieter or a
-dead sender's last lines out alone. An entry dropped before a sink reached it is counted as that
-sink's drop. The bound holds whatever the number of senders, so a logd restarted while memory is
-critical, to which every live sender is new, holds no more history than any other
-([README](../README.md) § Role, Reserve service).
+`PER_SLOT_HISTORY_MIN` (32) entries, scaled by the byte bound's ratio to the floor, a further entry
+dropping its own oldest, so one sender logging without pause does not push a quieter or a dead
+sender's last lines out alone. The kernel's slot and logd's own are the exception: no window paces
+them (§ Hold window), so a further entry of theirs drops their oldest entry the `hold` sinks have
+written, and keeps the ones they have not, which the byte bound alone then limits. An entry dropped
+before a sink reached it is counted as that sink's drop. The bound holds whatever the number of
+senders, so a logd restarted while memory is critical, to which every live sender is new, holds no
+more history than any other ([README](../README.md) § Role, Reserve service).
 
 ### Retired slots
 
@@ -577,20 +579,29 @@ history's bounds (§ History) do not depend on it.
 
 ## Flush barrier
 
-`log_labels::LOG_FLUSH` (18) lets a process that is about to stop the machine, or to end logd,
-wait until the lines logd has taken are on the console. pwrmgr waits on it before every power-off
-and reset ([pwrmgr](../../pwrmgr/README.md)), so the lines logged just before, a test's pass
-marker and crash reports among them, are not cut off; crashd waits on it before it declines a
-fault ([crashd operation](../../crashd/docs/operation.md) § Per Fault), since the decline can end
-logd itself. The serial sink is the one sink that holds the log ([sinks.md](sinks.md) § Device
-sinks): a flush waits on it alone, never on the framebuffer. `ipc::log_flush::wait` holds a
-client's steps.
+A log call returns once logd has retained its line, before any sink writes it (§ Hold window). So
+a process whose next act makes the log unwritable, by stopping or resetting the machine or by
+ending logd, first waits on `log_labels::LOG_FLUSH` (18) until the lines logd has taken are on
+the console, for at most a bound of its own, and goes on with the act when the wait ends, however
+it ends: flushed, timed out, refused or failed. The flush only orders the act after the console;
+it never keeps the act from happening. `ipc::log_flush::wait` holds a client's steps, and every
+holder calls it. The serial sink is the one sink that holds the log ([sinks.md](sinks.md) § Device
+sinks): a flush waits on it alone, never on the framebuffer.
+
+Each holder of the barrier's authority holds it for one such act:
+
+| Holder | The act it waits before | The lines the wait keeps |
+|---|---|---|
+| pwrmgr | every power-off and reset it acts on, and its power-off on a core service's death ([pwrmgr](../../pwrmgr/README.md)) | the lines logged before the request or the death, a test's pass marker and crash reports among them |
+| acpid | on x86-64, its write of the sleep or reset register (`SLEEP`, `RESET`; [acpid](../../acpid/README.md) § Power requests) | its own line naming the write, which it logs after pwrmgr's flush and right before the write |
+| crashd | its decline of a fault ([crashd operation](../../crashd/docs/operation.md) § Per Fault) | the fault's report, since the decline can end logd itself |
+| svctest | none: its `logd_flush` phase tests the barrier | none |
 
 The label is served only on a badge carrying `log_labels::LOG_FLUSH_AUTHORITY` (`1 << 62`, a
 [verb bit](../../../docs/capability-model.md#verb-bit-authority-pattern)). svcmgr mints a SEND on
 the master log endpoint with that badge from its master-log source and publishes it seed-only as
 `logd.flush` ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `seed`).
-pwrmgr's recipe seeds it, crashd's, and svctest's. A request on any other badge, `logd.query`'s
+The recipes of the holders above seed it, and no other. A request on any other badge, `logd.query`'s
 included, is refused `FLUSH_DENIED`, and a query on `logd.flush` is refused `QUERY_DENIED`
 (§ Queries).
 
@@ -634,7 +645,8 @@ The reply's label is its status:
   milliseconds, clamped to 1 ms and `SINK_STALL_MS`. A client sleeps it, then asks again with the
   token. Its own bound on the whole wait is its own. pwrmgr uses a log call's bound
   (`log::LOG_CALL_TIMEOUT_MS`) before a requested power-off or reset, and `SINK_STALL_MS` before
-  its core-death power-off; crashd what is left of a fault's 2 s bound.
+  its core-death power-off; acpid a log call's bound before its register write; crashd what is
+  left of a fault's 2 s bound.
 - **Coverage.** A flush covers every entry retained before it: senders' lines, logd's own lines and
   the kernel's. A line whose message is still being served when the flush is answered is not
   covered, nor is one refused `WINDOW_FULL` and not yet sent again, nor one sent after. Such a
@@ -651,10 +663,11 @@ both are decisions, not defects:
   or more severe, and all the entries the serial sink was behind when it last stalled. pstore,
   which keeps the history across a reset, is #1498 ([sinks.md](sinks.md) § pstore).
 - **logd's own death.** The entries logd holds unwritten die with it; a restarted logd starts with
-  a history of its own. The processes that end logd, or the machine, wait on the flush barrier
-  first: pwrmgr before a power-off or reset, crashd before it declines a fault, a fault of logd's
-  own included. A fault in a thread of logd that holds its state lock leaves logd unable to answer
-  the flush: crashd's wait ends at its bound, and the report's unwritten lines are lost with logd.
+  a history of its own. The processes that end logd, or the machine, wait on the flush barrier first
+  (§ Flush barrier): pwrmgr before a power-off or reset, acpid before the register write that enacts
+  one, crashd before it declines a fault, a fault of logd's own included. A fault in a thread of
+  logd that holds its state lock leaves logd unable to answer the flush: crashd's wait ends at its
+  bound, and the report's unwritten lines are lost with logd.
 
 ## Wait-set
 

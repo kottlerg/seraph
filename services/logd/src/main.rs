@@ -197,6 +197,9 @@ fn main() -> !
     // sink's cursor, within the history's bounds; the main thread resolves it
     // again when devmgr signals its class's watch.
     let watches = resolve_output_drivers(caps.serial_class, caps.fb_class, ipc_buf);
+    // The serial sink's class is known now: its cursor is the hold mark
+    // from here, on a restart too, where no handover install sets it.
+    state().sync_hold_mark();
 
     let mut table = SlotTable::with_bounds(bounds);
 
@@ -1770,9 +1773,10 @@ impl Sink
 
     /// The writer's next step from its cursor, under the state lock `st`:
     /// count the gap before the next entry as dropped, pass the entries the
-    /// sink does not write, report drops (a `hold` sink's at the gap, a
-    /// `skip` sink's as its notice in the journal, [`retain_notice`]), and
-    /// copy the next entry into `taken`.
+    /// sink does not write, report drops (a `hold` sink's at the gap, before
+    /// the next entry it writes, a `skip` sink's as its notice in the
+    /// journal, [`retain_notice`], which wakes the writers), and copy the
+    /// next entry into `taken`.
     fn next(&self, st: &mut LogdState, taken: &mut Taken) -> Step
     {
         let LogdState { table, cursors, .. } = st;
@@ -1803,9 +1807,10 @@ impl Sink
             }
             return Step::Entry(seq);
         }
-        if cursor.dropped > 0
+        if cursor.dropped > 0 && self.pace == Pace::Skip
         {
             retain_notice(self.what, cursor, table);
+            RETAINED.notify_all();
         }
         Step::Idle
     }

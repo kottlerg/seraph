@@ -110,26 +110,28 @@ direct console paths remain as fallbacks for the life of the system.
    signals it, and it emits both received log lines and its own diagnostics through it — including
    its own panic / alloc-error output, routed here via a `std::os::seraph::set_panic_sink` sink
    rather than the log endpoint logd serves (logd deletes its seeded `log_send_cap` at startup so a
-   fault cannot self-IPC into it). Every line reaches the driver through logd's serial sink: a
-   bounded queue drained by one writer thread, the only logd thread that waits on the driver. The
-   writer writes each line's bytes, then a zero-length `serial_labels::SERIAL_WRITE_SENT` write,
-   which the driver answers once the line's bytes have left the UART, so a line counts as written
-   when it is on the wire, before
-   its sender goes on, a power-off included; a write without the flag, such as the terminal's, is
-   answered once its bytes are in the driver's transmit ring. A
-   line's producer waits for its write for at most `SINK_STALL_MS`, so a driver that is stopped
-   or dead holds the log stream for that bound once and then costs it nothing until it writes
-   again. A sink whose writer logd could not spawn is written by each line's producer instead, and
-   a stopped driver then costs every line up to that bound. The panic sink's direct calls are
-   bounded the same way
+   fault cannot self-IPC into it). A log call returns once logd has retained its line in its
+   history, the journal every sink writes from, not once the line is written. The serial sink is a
+   cursor into the journal and one writer thread, the only logd thread that waits on the driver.
+   The writer writes each line's bytes, then a zero-length `serial_labels::SERIAL_WRITE_SENT`
+   write, which the driver answers once the line's bytes have left the UART, and moves its cursor
+   only then, so a line counts as written when it is on the wire; a write without the flag, such
+   as the terminal's, is answered once its bytes are in the driver's transmit ring. A sender that
+   must know its lines are on the wire before it goes on, a power-off or a reset included, waits on
+   logd's flush barrier (`LOG_FLUSH`). A sender holding a full window of lines the serial sink has
+   not written is refused `WINDOW_FULL` and sends again after a hint, within its call's bound, so a
+   flood paces its own sender only; a driver that is stopped or dead stalls the sink after
+   `SINK_STALL_MS`, and a stalled sink holds no sender. A sink whose writer logd could not spawn is
+   written by the thread that retains each line instead, and a stopped driver then costs every line
+   up to that bound. The panic sink's direct calls are bounded the same way
    ([services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md#output-sinks)
-   § Output sinks).
+   § Output sinks, § Hold window, § Flush barrier).
 
    real-logd reads the kernel log from the release on, through the `KernelLog` capability svcmgr
    gives it ([logd handover protocol](../services/logd/docs/handover-protocol.md) § Kernel log): a
-   thread of its own waits on a notification the kernel signals, writes each record through the
-   sinks as the kernel's `[kernel]` line, as a sender's line is written, and keeps it in the
-   kernel's slot, which every `logd.query` holder can read. A record is acknowledged on the
+   thread of its own waits on a notification the kernel signals and retains each record as the
+   kernel's `[kernel]` line in the kernel's slot, which the sinks write as any line and every
+   `logd.query` holder can read. A record is acknowledged on the
    reader's next read once its line is written or its sink stalled, so a record a failure report
    flushes is one no sink took.
 
@@ -165,17 +167,18 @@ direct console paths remain as fallbacks for the life of the system.
      write cap via `devmgr_labels::QUERY_DEVICE` sent on its framebuffer class SEND, under a
      `WATCH_CLASS` watch handled as the serial driver's, and mirrors
      every log line it writes to serial onto the framebuffer too, so the
-     steady-state userspace log stream reaches the screen as well as the
-     UART. The mirror is a sink of its own, with its own queue and writer, so a framebuffer driver
-     that is stopped or dead holds neither the serial output nor the log stream beyond
-     `SINK_STALL_MS`. The framebuffer driver, when present, is spawned from the root filesystem
-     in devmgr's drivers-directory pass, which svcmgr posts with `SET_DRIVERS_DIR` before it
-     launches logd, and a `QUERY_DEVICE` of logd's that would find no driver waits for that pass;
-     logd's emit path never calls devmgr and, while no framebuffer driver is resolved (headless
-     boot), writes the mirror nowhere: its sink queues lines up to its queue and counts the rest
-     for the driver resolved next, so serial stays the authoritative channel. The driver clears the
-     screen when it starts (`FramebufferWriter::new`), so the kernel's console stays on it until
-     then.
+     steady-state userspace log stream reaches the screen as well as the UART. The mirror is a sink
+     of its own, with its own cursor into the journal and its own writer, and it never holds a
+     sender, so a framebuffer driver that is stopped or dead holds neither the serial output nor the
+     log stream; what the journal drops before the mirror reaches it is counted in a notice line.
+     The framebuffer driver, when present, is spawned from the root filesystem in devmgr's
+     drivers-directory pass, which svcmgr posts with `SET_DRIVERS_DIR` before it launches logd, and
+     a `QUERY_DEVICE` of logd's that would find no driver waits for that pass; logd's emit path
+     never calls devmgr and, while no framebuffer driver is resolved (headless boot), writes the
+     mirror nowhere: a driver resolved later starts at the newest `SKIP_BACKLOG` (64) lines and
+     counts the ones before them as dropped, so serial stays the authoritative channel. The driver
+     clears the screen when it starts (`FramebufferWriter::new`), so the kernel's console stays on
+     it until then.
    - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
      framebuffer write cap via `QUERY_DEVICE` on its framebuffer class SEND, again on the class
      watch when devmgr restarts the driver, and renders the

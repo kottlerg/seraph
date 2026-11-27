@@ -8,8 +8,8 @@
 //!
 //! svctest is the probe. Between its `log-flood begin` and `log-flood end`
 //! lines it makes [`PROBE_CALLS`] raw `STREAM_BYTES` calls, one every
-//! [`PROBE_GAP`], with no flood, and as many again while two child processes
-//! flood logd:
+//! [`QUIET_GAP`], with no flood, and as many again, one every [`FLOODED_GAP`],
+//! while two child processes flood logd:
 //!
 //! - a flooder, whose [`FLOOD_THREADS`] threads, more than logd's four
 //!   receive workers (`RECV_WORKERS`), log through `seraph::log!` as fast as
@@ -62,17 +62,27 @@ const TAG: &str = "log-flood";
 /// The probe's calls with no flood, and again under it.
 const PROBE_CALLS: usize = 200;
 
-/// The probe's pause between calls: long enough that the probe's own lines
-/// stay within its hold window while the flooders' lines are written ahead
-/// of them.
-const PROBE_GAP: Duration = Duration::from_millis(10);
+/// The probe's pause between its calls with no flood: longer than the serial
+/// sink takes to write a line, so the probe's own lines stay within its hold
+/// window.
+const QUIET_GAP: Duration = Duration::from_millis(10);
+
+/// The probe's pause between its flooded calls. The serial sink writes in
+/// `seq` order, so each probe line waits behind the flooders' two full
+/// windows, `2 * HOLD_WINDOW` lines: with the sink taking `w` a line, the
+/// probe holds `2 * HOLD_WINDOW * w / (gap - w)` lines unwritten, within its
+/// window while the gap is at least `3 * w`. 30 ms keeps the probe a sender
+/// within its share of the sink up to 10 ms a line, past what a loaded host's
+/// x86_64 boot takes (about 8 ms; 3 ms unloaded).
+const FLOODED_GAP: Duration = Duration::from_millis(30);
 
 /// The flooder's threads: logd's four receive workers (`RECV_WORKERS`) and
 /// two more.
 const FLOOD_THREADS: u64 = 4 + 2;
 
-/// How long each child floods: past the probe's flooded calls.
-const FLOOD_FOR: Duration = Duration::from_secs(5);
+/// How long each child floods: past the probe's flooded calls, which take
+/// [`PROBE_CALLS`] times [`FLOODED_GAP`], 6 s, and their own time.
+const FLOOD_FOR: Duration = Duration::from_secs(9);
 
 /// How long the phase lets the children start flooding before the probe's
 /// flooded calls.
@@ -110,7 +120,7 @@ struct Probe
 fn logd_flood_phase(caps: &Caps)
 {
     std::os::seraph::log!("{TAG} begin");
-    let quiet = probe(0).unwrap_or_else(|e| panic!("{e}"));
+    let quiet = probe(0, QUIET_GAP).unwrap_or_else(|e| panic!("{e}"));
 
     let mut flood_child = Command::new("/tests/svctest")
         .arg(FLOODER_ROLE)
@@ -124,7 +134,7 @@ fn logd_flood_phase(caps: &Caps)
     let before = super::logd_sinks::newest_seq(caps.logd_query);
     let fb = stop_framebuffer(caps.debug_authority);
     let fb_stopped = fb.is_some();
-    let flooded = probe(PROBE_CALLS);
+    let flooded = probe(PROBE_CALLS, FLOODED_GAP);
     let flooding =
         matches!(flood_child.try_wait(), Ok(None)) && matches!(resend_child.try_wait(), Ok(None));
     if let Some((process, threads)) = fb
@@ -210,12 +220,12 @@ fn stop_framebuffer(authority: u64) -> Option<(u64, Vec<u64>)>
     Some((fb, threads))
 }
 
-/// Make [`PROBE_CALLS`] numbered calls from `first`, one every
-/// [`PROBE_GAP`]: what the probe saw, or the first failure. A refused line
+/// Make [`PROBE_CALLS`] numbered calls from `first`, one every `gap`:
+/// what the probe saw, or the first failure. A refused line
 /// is sent again after its hint, so that the console check finds it, and
 /// counted. No assertion panics here, since the framebuffer driver may be
 /// stopped.
-fn probe(first: usize) -> Result<Probe, String>
+fn probe(first: usize, gap: Duration) -> Result<Probe, String>
 {
     let cap = std::os::seraph::log::acquire();
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -251,7 +261,7 @@ fn probe(first: usize) -> Result<Probe, String>
                 other => return Err(format!("logd_flood: probe call {n} refused ({other:#x})")),
             }
         }
-        std::thread::sleep(PROBE_GAP);
+        std::thread::sleep(gap);
     }
     Ok(seen)
 }

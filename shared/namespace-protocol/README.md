@@ -4,6 +4,18 @@ Wire-format specification, name validation, rights composition, and
 per-request dispatch (`dispatch_request`) that every Seraph namespace
 server calls from its own receive loop.
 
+The request and reply decoders read hostile input, so they carry the parser rule's property and
+its three drivers ([docs/testing.md](../../docs/testing.md#fuzzing) § Fuzzing, § Bounded
+verification). The property, `property::namespace_protocol_holds`, holds each decoder to its
+documented contract on any input: a server's rights gate (`gate`, `gate_open`), its rights
+composition of a forwarded lookup (`compose_forward_lookup_rights`), its decode of an
+`NS_LOOKUP` path (`validate_name` on each component), and a client's decode of a lookup reply
+(`PathWalk::advance`). Its drivers are the fuzz target `namespace-protocol`
+(`xtask/fuzz/targets`), which starts from the seeds under `fuzz/namespace-protocol/seeds/`; the
+replay of those seeds and any `fuzz/namespace-protocol/regressions/` in the crate's tests; and the
+Kani proofs in `badge.rs`, `gate.rs`, `name.rs`, `lib.rs` and `client.rs`, whose module
+comments state their bounds and how the name and path checks compose from proven steps.
+
 ---
 
 ## Authority
@@ -409,15 +421,21 @@ describes vfsd's synthetic-root composition in detail.
 namespace-protocol/
 ├── Cargo.toml
 ├── README.md
+├── fuzz/
+│   └── namespace-protocol/
+│       └── seeds/     # Checked-in inputs of the `namespace-protocol` fuzz target
 └── src/
-    ├── lib.rs      # NodeKind, NodeStat, EntryName, EntryTarget, EntryView, MemoryReply,
-    │               #   NamespaceBackend, dispatch_request, the NS_LOOKUP walk, MAX_LOOKUP_PATH_LEN
-    ├── badge.rs    # NodeId and badge packing (pack)
-    ├── client.rs   # PathWalk: the client's NS_LOOKUP requests and continuation
-    ├── gate.rs     # gate, GateError, compose_forward_lookup_rights, the per-label table
-    ├── name.rs     # validate_name, MAX_NAME_LEN
-    ├── rights.rs   # NamespaceRights and the bit constants
-    └── wire.rs     # NsError wire codes
+    ├── lib.rs         # NodeKind, NodeStat, EntryName, EntryTarget, EntryView, MemoryReply,
+    │                  #   NamespaceBackend, dispatch_request, the NS_LOOKUP walk and its path
+    │                  #   scan, MAX_LOOKUP_PATH_LEN; the proofs of the path decode
+    ├── badge.rs       # NodeId and badge packing (pack)
+    ├── client.rs      # PathWalk: the client's NS_LOOKUP requests and continuation
+    ├── gate.rs        # gate, GateError, compose_forward_lookup_rights, the per-label table
+    ├── name.rs        # validate_name and its character scan, MAX_NAME_LEN
+    ├── property.rs    # The decoders' contract as one property (host tests, proofs and
+    │                  #   fuzzing only)
+    ├── rights.rs      # NamespaceRights and the bit constants
+    └── wire.rs        # NsError wire codes
 ```
 
 ---

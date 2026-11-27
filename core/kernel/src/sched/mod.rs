@@ -365,8 +365,8 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 // core/kernel/docs/scheduling-internals.md § Softlockup Watchdog.
 
 /// All-idle softlockup threshold: the detector fires when, for this long, no
-/// CPU has dispatched a non-idle thread and no BSP tick has seen the system
-/// idle ([`all_idle_tick`]). Converted to BSP ticks at `ticks_per_second()`
+/// CPU has dispatched a non-idle thread and no sweep of the CPUs has seen the
+/// system idle ([`all_idle_tick`]). Converted to BSP ticks at `ticks_per_second()`
 /// ([`ticks_for_ms`]), so it holds at any tick rate. A tuning threshold; it
 /// bounds no capacity.
 #[cfg(not(test))]
@@ -402,14 +402,32 @@ fn last_non_idle_tick(cpu: usize) -> Option<&'static core::sync::atomic::AtomicU
 
 static WATCHDOG_TICK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// BSP tick (of [`WATCHDOG_TICK_COUNTER`]) at which the all-idle detector's
-/// per-tick sample last found the system idle ([`system_has_no_work`]); 0
-/// before the first such sample. Written only by the BSP's
+/// BSP tick (of [`WATCHDOG_TICK_COUNTER`]) at which the all-idle detector
+/// last ended a sweep that found every CPU idle ([`all_idle_tick`]); 0
+/// before the first such sweep. Written only by the BSP's
 /// `watchdog_tick_and_check`, and read there and by the dump: Relaxed, since
 /// one CPU writes it and the dump's read is diagnostic.
 #[cfg(not(test))]
 static WATCHDOG_LAST_IDLE_TICK: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// The all-idle detector's sweep between BSP ticks ([`AllIdleSweep`]): its
+/// cursor and its two answers so far. Written and read only by the BSP's
+/// `watchdog_tick_and_check`: Relaxed.
+#[cfg(not(test))]
+static WATCHDOG_SWEEP_CURSOR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(AllIdleSweep::START.cursor);
+#[cfg(not(test))]
+static WATCHDOG_SWEEP_IDLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(AllIdleSweep::START.idle);
+#[cfg(not(test))]
+static WATCHDOG_SWEEP_STALE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(AllIdleSweep::START.stale);
+
+/// The first AP of the next window of [`ap_silence_check`]'s sweep
+/// ([`sweep_window`] over the APs). Written and read only by the BSP: Relaxed.
+#[cfg(not(test))]
+static AP_SILENCE_CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
 
 static WATCHDOG_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -1068,73 +1086,141 @@ pub fn watchdog_mark_non_idle(cpu: usize)
     }
 }
 
-/// One BSP tick of the all-idle softlockup detector, at tick `now`: when this
-/// tick's sample found the system idle (`idle_now`: every CPU on its idle
-/// thread with no other thread queued), record `now` in `last_idle`; then
-/// report a stall when the system has not been seen idle for `threshold`
-/// ticks and every CPU's last non-idle dispatch (`last_dispatch`, one entry
-/// per CPU, `None` for a CPU whose stamp slot does not exist yet) is at least
-/// `threshold` ticks old.
+/// One window of a watchdog sweep over the CPUs `first..cpu_count`, and the
+/// cursor of the next: the CPUs from `cursor` (`first` when `cursor` lies
+/// outside the range), at most [`CPU_SCAN_WINDOW`] of them, in index order.
+/// The window that reaches `cpu_count` ends a sweep, and its next cursor is
+/// `first`, so a sweep reads every CPU of the range once, in
+/// `ceil((cpu_count - first) / CPU_SCAN_WINDOW)` windows, one per call; a
+/// range of up to [`CPU_SCAN_WINDOW`] CPUs is read whole at every call
+/// (core/kernel/docs/scheduling-internals.md § Softlockup Watchdog).
+fn sweep_window(cursor: usize, first: usize, cpu_count: usize) -> (core::ops::Range<usize>, usize)
+{
+    let start = if first <= cursor && cursor < cpu_count
+    {
+        cursor
+    }
+    else
+    {
+        first
+    };
+    let end = cpu_count.min(start.saturating_add(CPU_SCAN_WINDOW));
+    let next = if end >= cpu_count { first } else { end };
+    (start..end, next)
+}
+
+/// The all-idle detector's state across the ticks of one sweep of the CPUs
+/// ([`sweep_window`]), kept by the BSP between its ticks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AllIdleSweep
+{
+    /// The first CPU of the next tick's window.
+    cursor: usize,
+    /// Whether every CPU the sweep has read so far had no work.
+    idle: bool,
+    /// Whether every CPU the sweep has read so far had its last non-idle
+    /// dispatch at least the threshold old, each read while the system had
+    /// not been seen idle for the threshold.
+    stale: bool,
+}
+
+impl AllIdleSweep
+{
+    /// The state before the first tick: a sweep that starts at CPU 0.
+    const START: Self = Self {
+        cursor: 0,
+        idle: true,
+        stale: true,
+    };
+}
+
+/// One BSP tick of the all-idle softlockup detector, at tick `now`: read the
+/// window of `sweep` ([`sweep_window`] over the `cpu_count` CPUs), whether
+/// each CPU has no work (`has_no_work`: it runs its idle thread with no other
+/// thread queued) and, while the system has not been seen idle for
+/// `threshold` ticks, each CPU's last non-idle dispatch (`last_dispatch`,
+/// `None` for a CPU whose stamp slot does not exist yet). At the tick that
+/// ends a sweep, record `now` in `last_idle` when every CPU the sweep read
+/// had no work; then report a stall when the system has not been seen idle
+/// for `threshold` ticks and every CPU's last dispatch, as the sweep read it,
+/// was at least `threshold` ticks old. A window's reads of either kind stop
+/// at the first CPU that settles the sweep's answer, and a later window of the
+/// sweep skips them.
 ///
 /// An idle system waits for a deadline, a device interrupt or a message, and is
 /// not a stall however long it waits. The sample is recorded before the
-/// decision on every tick, so the stall clock restarts at the last idle tick:
-/// work that becomes ready after a long idle span (a sleeper the same BSP tick
-/// woke, before this check) is a stall only once it has waited `threshold`
-/// undispatched. The remaining windows are stated in
-/// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog.
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "`idle_now` is data: this tick's idle sample, on which the function records `now` \
-              in `last_idle`"
-)]
-fn all_idle_tick<I>(
+/// decision, so the stall clock restarts at the last idle sweep: work that
+/// becomes ready after a long idle span (a sleeper the same BSP tick woke,
+/// before this check) is a stall only once it has waited `threshold`
+/// undispatched. With up to [`CPU_SCAN_WINDOW`] CPUs every tick is a whole
+/// sweep. The remaining windows, and the latency a sweep of several ticks
+/// adds, are stated in core/kernel/docs/scheduling-internals.md § Softlockup
+/// Watchdog.
+fn all_idle_tick(
     now: u64,
     threshold: u64,
-    idle_now: bool,
+    sweep: &mut AllIdleSweep,
     last_idle: &mut u64,
-    last_dispatch: I,
+    cpu_count: usize,
+    has_no_work: impl Fn(usize) -> bool,
+    last_dispatch: impl Fn(usize) -> Option<u64>,
 ) -> bool
-where
-    I: IntoIterator<Item = Option<u64>>,
 {
-    if idle_now
+    let (window, next) = sweep_window(sweep.cursor, 0, cpu_count);
+    sweep.cursor = next;
+    if window.start == 0
     {
-        *last_idle = now;
+        *sweep = AllIdleSweep {
+            cursor: next,
+            ..AllIdleSweep::START
+        };
     }
-    if now.saturating_sub(*last_idle) < threshold
+    let ends = window.end >= cpu_count;
+    if sweep.idle
+    {
+        sweep.idle = window.clone().all(&has_no_work);
+    }
+    if sweep.stale
+    {
+        sweep.stale = now.saturating_sub(*last_idle) >= threshold
+            && window.into_iter().all(|cpu| {
+                last_dispatch(cpu).is_some_and(|last| now.saturating_sub(last) >= threshold)
+            });
+    }
+    if !ends
     {
         return false;
     }
-    last_dispatch
-        .into_iter()
-        .all(|last| last.is_some_and(|last| now.saturating_sub(last) >= threshold))
+    if sweep.idle
+    {
+        *last_idle = now;
+    }
+    sweep.stale && now.saturating_sub(*last_idle) >= threshold
 }
 
-/// Whether the system has no work: every CPU runs its idle thread and queues no
-/// other thread ([`run_queue::PerCpuScheduler::has_no_work`]). Lock-free: it
-/// reads each scheduler's atomics with no lock and dereferences no TCB, so a
-/// wedged lock holder cannot stall the BSP tick. Not one snapshot across the
-/// CPUs: a thread moving between CPUs during the walk can be missed, which
-/// the next tick's sample re-decides. Stops at the first CPU with work.
+/// Whether CPU `cpu` has no work: it runs its idle thread and queues no other
+/// thread ([`run_queue::PerCpuScheduler::has_no_work`]). Lock-free: it reads
+/// the scheduler's atomics with no lock and dereferences no TCB, so a wedged
+/// lock holder cannot stall the BSP tick.
+///
+/// # Safety
+/// `cpu` is below `CPU_COUNT`.
 #[cfg(not(test))]
-fn system_has_no_work(cpu_count: usize) -> bool
+unsafe fn cpu_has_no_work(cpu: usize) -> bool
 {
-    (0..cpu_count).all(|cpu| {
-        // SAFETY: cpu < cpu_count, which is CPU_COUNT; the scheduler slab
-        // exists, since the BSP's `timer_tick`, the only caller's caller, has
-        // already reached its own scheduler through `PerCpuData::scheduler`. The
-        // scheduler is reached through a shared reference, as every CPU
-        // reaches it, and only its atomics are read.
-        let sched_ptr = unsafe { scheduler_ptr(cpu) };
-        // SAFETY: as above.
-        unsafe { (*sched_ptr).has_no_work() }
-    })
+    // SAFETY: cpu < CPU_COUNT (the caller's contract); the scheduler slab
+    // exists, since the BSP's `timer_tick`, the only caller's caller, has
+    // already reached its own scheduler through `PerCpuData::scheduler`. The
+    // scheduler is reached through a shared reference, as every CPU reaches
+    // it, and only its atomics are read.
+    let sched_ptr = unsafe { scheduler_ptr(cpu) };
+    // SAFETY: as above.
+    unsafe { (*sched_ptr).has_no_work() }
 }
 
 /// BSP-only: tick the global counter and run the wedge detectors — the
 /// owed-wake registry scan and AP-heartbeat silence check on a coarse
-/// cadence, and the all-idle softlockup check every tick. The first
+/// cadence, and one window of the all-idle softlockup check every tick. The first
 /// detector to trip claims the global dump latch (`watchdog_claim_dump`).
 #[cfg(not(test))]
 fn watchdog_tick_and_check()
@@ -1162,20 +1248,30 @@ fn watchdog_tick_and_check()
         }
     }
 
-    // The all-idle detector: its idle sample runs on every tick, before the
-    // decision (see `all_idle_tick`).
+    // The all-idle detector: each tick reads one window of its sweep, and the
+    // idle sample is recorded before the decision (see `all_idle_tick`).
     let threshold = ticks_for_ms(WATCHDOG_THRESHOLD_SECONDS.saturating_mul(1000));
     let mut last_idle = WATCHDOG_LAST_IDLE_TICK.load(core::sync::atomic::Ordering::Relaxed);
+    let mut sweep = AllIdleSweep {
+        cursor: WATCHDOG_SWEEP_CURSOR.load(core::sync::atomic::Ordering::Relaxed),
+        idle: WATCHDOG_SWEEP_IDLE.load(core::sync::atomic::Ordering::Relaxed),
+        stale: WATCHDOG_SWEEP_STALE.load(core::sync::atomic::Ordering::Relaxed),
+    };
     let stalled = all_idle_tick(
         now,
         threshold,
-        system_has_no_work(cpu_count),
+        &mut sweep,
         &mut last_idle,
-        (0..cpu_count).map(|cpu| {
-            last_non_idle_tick(cpu).map(|slot| slot.load(core::sync::atomic::Ordering::Relaxed))
-        }),
+        cpu_count,
+        // SAFETY: the window holds only CPUs below cpu_count, which is
+        // CPU_COUNT.
+        |cpu| unsafe { cpu_has_no_work(cpu) },
+        |cpu| last_non_idle_tick(cpu).map(|slot| slot.load(core::sync::atomic::Ordering::Relaxed)),
     );
     WATCHDOG_LAST_IDLE_TICK.store(last_idle, core::sync::atomic::Ordering::Relaxed);
+    WATCHDOG_SWEEP_CURSOR.store(sweep.cursor, core::sync::atomic::Ordering::Relaxed);
+    WATCHDOG_SWEEP_IDLE.store(sweep.idle, core::sync::atomic::Ordering::Relaxed);
+    WATCHDOG_SWEEP_STALE.store(sweep.stale, core::sync::atomic::Ordering::Relaxed);
     if !stalled
     {
         return;
@@ -1342,7 +1438,8 @@ fn owed_wake_scan()
 }
 
 /// BSP side of the heartbeat cross-check: report an AP whose `timer_tick`
-/// heartbeat has gone silent past the grace window. An AP wedged with
+/// heartbeat has gone silent past the grace window, reading one window of the
+/// APs per scan ([`sweep_window`] from [`AP_SILENCE_CURSOR`]). An AP wedged with
 /// interrupts off cannot run its own detectors; this names it from the BSP,
 /// after having it print its own frame where the architecture can
 /// (`arch::current::interrupts::dump_remote_frame`).
@@ -1363,7 +1460,13 @@ fn ap_silence_check(cpu_count: usize)
         return;
     }
     let stall = heartbeat_stall_ticks(tps);
-    for cpu in 1..cpu_count
+    let (window, next) = sweep_window(
+        AP_SILENCE_CURSOR.load(core::sync::atomic::Ordering::Relaxed),
+        1,
+        cpu_count,
+    );
+    AP_SILENCE_CURSOR.store(next, core::sync::atomic::Ordering::Relaxed);
+    for cpu in window
     {
         let Some(diag) = cpu_diag(cpu)
         else
@@ -5829,7 +5932,8 @@ pub unsafe fn relocate_ready_priority(
 
 /// Most CPUs one scan of the CPUs on a wake or tick path reads: the least-load
 /// and lowest-rank scans of a wake's placement, the busy and idle balance steps'
-/// scans, and the RT push's. A boot of up to `CPU_SCAN_WINDOW` CPUs, or one more
+/// scans, the RT push's, and each window of the BSP watchdog's sweeps
+/// ([`sweep_window`]). A boot of up to `CPU_SCAN_WINDOW` CPUs, or one more
 /// for a scan that leaves its own CPU out, is read whole by every scan; a larger
 /// one is read a window per scan from a cursor of the scanning CPU, so the cost
 /// a scan adds to a wake or a tick does not grow with the CPU count
@@ -10299,58 +10403,140 @@ mod class_tests
 #[cfg(test)]
 mod all_idle_tests
 {
-    use super::all_idle_tick;
+    use super::{AllIdleSweep, CPU_SCAN_WINDOW, all_idle_tick, sweep_window};
 
     const THRESHOLD: u64 = 300;
 
-    /// Run the detector over ticks `from..=to` with every CPU's last non-idle
-    /// dispatch at `stamps`, the system idle at a tick when `idle(tick)`;
-    /// return the first tick that reports a stall.
-    fn first_stall(
-        from: u64,
-        to: u64,
-        stamps: &[u64],
-        last_idle: &mut u64,
-        idle: impl Fn(u64) -> bool,
-    ) -> Option<u64>
+    /// The detector's state across ticks, and the CPU count.
+    struct Detector
     {
-        (from..=to).find(|&now| {
+        cpus: usize,
+        sweep: AllIdleSweep,
+        last_idle: u64,
+    }
+
+    impl Detector
+    {
+        fn new(cpus: usize) -> Self
+        {
+            Self {
+                cpus,
+                sweep: AllIdleSweep::START,
+                last_idle: 0,
+            }
+        }
+
+        /// One tick at `now`, CPU `cpu` having work when `work(now, cpu)`
+        /// and its last non-idle dispatch at `stamp(now, cpu)`.
+        fn tick(
+            &mut self,
+            now: u64,
+            work: impl Fn(u64, usize) -> bool,
+            stamp: impl Fn(u64, usize) -> Option<u64>,
+        ) -> bool
+        {
             all_idle_tick(
                 now,
                 THRESHOLD,
-                idle(now),
-                last_idle,
-                stamps.iter().map(|&s| Some(s)),
+                &mut self.sweep,
+                &mut self.last_idle,
+                self.cpus,
+                |cpu| !work(now, cpu),
+                |cpu| stamp(now, cpu),
             )
-        })
+        }
+
+        /// The first tick of `from..=to` that reports a stall.
+        fn first_stall(
+            &mut self,
+            from: u64,
+            to: u64,
+            work: impl Fn(u64, usize) -> bool,
+            stamp: impl Fn(u64, usize) -> Option<u64>,
+        ) -> Option<u64>
+        {
+            (from..=to).find(|&now| self.tick(now, &work, &stamp))
+        }
+    }
+
+    /// Ticks per sweep of `cpus` CPUs.
+    fn sweep_ticks(cpus: usize) -> u64
+    {
+        cpus.div_ceil(CPU_SCAN_WINDOW) as u64
+    }
+
+    /// The detector as one walk of every CPU per tick decides: a stall when
+    /// the system was not seen idle for the threshold and every CPU's last
+    /// dispatch is that old.
+    fn whole_walk(
+        now: u64,
+        last_idle: &mut u64,
+        cpus: usize,
+        work: impl Fn(usize) -> bool,
+        stamp: impl Fn(usize) -> Option<u64>,
+    ) -> bool
+    {
+        if (0..cpus).all(|cpu| !work(cpu))
+        {
+            *last_idle = now;
+        }
+        now.saturating_sub(*last_idle) >= THRESHOLD
+            && (0..cpus)
+                .all(|cpu| stamp(cpu).is_some_and(|last| now.saturating_sub(last) >= THRESHOLD))
     }
 
     // The defect caught (#965): a system with nothing to run, every thread
     // waiting on a device interrupt or a message with no deadline armed, is
-    // reported as a stall once every CPU's last dispatch is a threshold old.
+    // reported as a stall once every CPU's last dispatch is a threshold old,
+    // at any CPU count.
     #[test]
     fn an_idle_system_is_never_a_stall_however_long_it_waits()
     {
-        let mut last_idle = 0;
-        assert_eq!(
-            first_stall(1, 20 * THRESHOLD, &[1, 1, 1, 1], &mut last_idle, |_| true),
-            None
-        );
+        for cpus in [4, CPU_SCAN_WINDOW, CPU_SCAN_WINDOW + 1, 391, 8192]
+        {
+            let mut detector = Detector::new(cpus);
+            let stall = detector.first_stall(1, 20 * THRESHOLD, |_, _| false, |_, _| Some(1));
+            assert_eq!(stall, None, "cpus={cpus}");
+        }
     }
 
     // The defect caught: work left undispatched after its CPUs stopped
     // dispatching (a non-idle `current` wedged in the kernel, or a queued
     // thread no CPU takes) is not reported, or is reported before it has
-    // waited the threshold.
+    // waited the threshold; or, above CPU_SCAN_WINDOW CPUs, a sweep that does
+    // not restart once work is seen, or that reports more than three sweeps
+    // after one walk of every CPU per tick would, wherever the work lies.
     #[test]
     fn work_undispatched_for_the_threshold_after_the_last_idle_tick_is_a_stall()
     {
-        let mut last_idle = 0;
         let busy_from = 2 * THRESHOLD;
-        let stall = first_stall(1, 10 * THRESHOLD, &[1, 1], &mut last_idle, |t| {
-            t < busy_from
-        });
-        assert_eq!(stall, Some(busy_from - 1 + THRESHOLD));
+        for cpus in [2, CPU_SCAN_WINDOW, CPU_SCAN_WINDOW + 1, 200, 391, 8192]
+        {
+            let bound = busy_from - 1 + THRESHOLD;
+            let slack = if cpus <= CPU_SCAN_WINDOW
+            {
+                0
+            }
+            else
+            {
+                3 * sweep_ticks(cpus)
+            };
+            for busy in [0, cpus / 2, cpus - 1]
+            {
+                let mut detector = Detector::new(cpus);
+                let stall = detector.first_stall(
+                    1,
+                    10 * THRESHOLD,
+                    |now, cpu| now >= busy_from && cpu == busy,
+                    |_, _| Some(1),
+                );
+                let at = stall.unwrap_or_else(|| panic!("cpus={cpus} busy={busy}: no stall"));
+                assert!(
+                    bound <= at && at <= bound + slack,
+                    "cpus={cpus} busy={busy}: stall at {at}, bound {bound} + {slack}"
+                );
+            }
+        }
     }
 
     // The defect caught: the idle sample taken only once every dispatch stamp
@@ -10360,40 +10546,154 @@ mod all_idle_tests
     #[test]
     fn work_woken_a_threshold_after_the_last_dispatch_is_not_a_stall_at_once()
     {
-        let mut last_idle = 0;
-        let wake = 1 + THRESHOLD;
-        let stall = first_stall(1, wake + THRESHOLD, &[1, 1], &mut last_idle, |t| t < wake);
-        assert_eq!(stall, Some(wake - 1 + THRESHOLD));
+        for cpus in [2, 391]
+        {
+            let wake = 1 + THRESHOLD;
+            let mut detector = Detector::new(cpus);
+            let stall = detector.first_stall(
+                1,
+                wake + 2 * THRESHOLD,
+                |now, cpu| now >= wake && cpu == 0,
+                |_, _| Some(1),
+            );
+            let at = stall.unwrap_or_else(|| panic!("cpus={cpus}: no stall"));
+            assert!(at >= wake - 1 + THRESHOLD, "cpus={cpus}: stall at {at}");
+        }
     }
 
     // The defect caught: a CPU that still dispatches, or one whose stamp slot
-    // does not exist yet, read as stalled while the system has work.
+    // does not exist yet, read as stalled while the system has work, at any
+    // CPU count and wherever the CPU lies in the sweep.
     #[test]
     fn a_recent_dispatch_or_a_missing_stamp_on_any_cpu_is_not_a_stall()
     {
-        let now = 10 * THRESHOLD;
-        let mut last_idle = 0;
-        assert!(!all_idle_tick(
-            now,
-            THRESHOLD,
-            false,
-            &mut last_idle,
-            [Some(1), Some(now - THRESHOLD + 1)]
-        ));
-        assert!(!all_idle_tick(
-            now,
-            THRESHOLD,
-            false,
-            &mut last_idle,
-            [Some(1), None]
-        ));
-        assert!(all_idle_tick(
-            now,
-            THRESHOLD,
-            false,
-            &mut last_idle,
-            [Some(1), Some(now - THRESHOLD)]
-        ));
+        for cpus in [2, CPU_SCAN_WINDOW, 200, 391]
+        {
+            for live in [0, CPU_SCAN_WINDOW - 1, CPU_SCAN_WINDOW, cpus - 1]
+            {
+                let live = live.min(cpus - 1);
+                let mut detector = Detector::new(cpus);
+                let dispatching = detector.first_stall(
+                    1,
+                    10 * THRESHOLD,
+                    |_, _| true,
+                    |now, cpu| Some(if cpu == live { now } else { 1 }),
+                );
+                assert_eq!(dispatching, None, "cpus={cpus} live={live}");
+                let mut detector = Detector::new(cpus);
+                let missing = detector.first_stall(
+                    1,
+                    10 * THRESHOLD,
+                    |_, _| true,
+                    |_, cpu| if cpu == live { None } else { Some(1) },
+                );
+                assert_eq!(missing, None, "cpus={cpus} missing={live}");
+            }
+        }
+    }
+
+    // The defect caught: a sweep whose answers are not reset when it starts
+    // again, so work seen once keeps the system from ever reading idle, and a
+    // system that goes idle after work, every dispatch stamp then stale, is
+    // reported as a stall.
+    #[test]
+    fn a_system_idle_again_after_work_is_not_a_stall()
+    {
+        for cpus in [4, 200, 391]
+        {
+            let idle_from = 2 * THRESHOLD;
+            let mut detector = Detector::new(cpus);
+            let stall = detector.first_stall(
+                1,
+                20 * THRESHOLD,
+                |now, cpu| now < idle_from && cpu == cpus - 1,
+                |now, _| Some(now.min(idle_from)),
+            );
+            assert_eq!(stall, None, "cpus={cpus}");
+        }
+    }
+
+    // The defect caught: at up to CPU_SCAN_WINDOW CPUs, a tick whose verdict or
+    // recorded idle tick differs from one walk of every CPU, the detector's
+    // behaviour before the sweep.
+    #[test]
+    fn up_to_a_window_of_cpus_every_tick_decides_as_one_walk_of_every_cpu()
+    {
+        for cpus in [1, 4, CPU_SCAN_WINDOW]
+        {
+            let mut detector = Detector::new(cpus);
+            let mut last_idle = 0;
+            // Work on CPU (now / 7) % cpus over spans of 4 * THRESHOLD ticks
+            // in every eighth, dispatched until 3 * THRESHOLD ticks into its
+            // span.
+            let work = |now: u64, cpu: usize| {
+                now % (8 * THRESHOLD) < 4 * THRESHOLD && cpu == (now / 7) as usize % cpus
+            };
+            let stamp =
+                |now: u64, _cpu: usize| Some(now.min(now - now % (8 * THRESHOLD) + 3 * THRESHOLD));
+            for now in 1..=32 * THRESHOLD
+            {
+                let swept = detector.tick(now, work, stamp);
+                let walked = whole_walk(
+                    now,
+                    &mut last_idle,
+                    cpus,
+                    |cpu| work(now, cpu),
+                    |cpu| stamp(now, cpu),
+                );
+                assert_eq!(swept, walked, "cpus={cpus} now={now}");
+                assert_eq!(detector.last_idle, last_idle, "cpus={cpus} now={now}");
+            }
+        }
+    }
+
+    // The defect caught: a sweep that skips a CPU or reads one twice, so a
+    // CPU's work or stamp goes unread, or that never ends; or a range of up to
+    // CPU_SCAN_WINDOW CPUs not read whole at every call.
+    #[test]
+    fn a_sweep_reads_every_cpu_of_its_range_once()
+    {
+        for (first, cpus) in [
+            (0, 1),
+            (0, CPU_SCAN_WINDOW),
+            (1, CPU_SCAN_WINDOW + 1),
+            (0, 200),
+            (1, 391),
+            (0, 8192),
+        ]
+        {
+            let windows = (cpus - first).div_ceil(CPU_SCAN_WINDOW);
+            let mut cursor = first;
+            for lap in 0..2
+            {
+                let mut read = vec![0u32; cpus];
+                for index in 0..windows
+                {
+                    let (window, next) = sweep_window(cursor, first, cpus);
+                    assert!(window.len() <= CPU_SCAN_WINDOW);
+                    assert_eq!(
+                        next == first,
+                        index + 1 == windows,
+                        "first={first} cpus={cpus}"
+                    );
+                    for cpu in window
+                    {
+                        read[cpu] += 1;
+                    }
+                    cursor = next;
+                }
+                for (cpu, &count) in read.iter().enumerate()
+                {
+                    let expected = u32::from(cpu >= first);
+                    assert_eq!(
+                        count, expected,
+                        "first={first} cpus={cpus} lap={lap} cpu={cpu}"
+                    );
+                }
+            }
+            // A cursor outside the range starts the sweep again.
+            assert_eq!(sweep_window(cpus, first, cpus).0.start, first);
+        }
     }
 }
 

@@ -346,6 +346,11 @@ fn remote_wakes(thread: u64) -> Option<u64>
 /// One Memory cap of `pages` contiguous pages from memmgr
 /// (`REQUEST_MEMORY_CAPS` with `REQUIRE_CONTIGUOUS`). `None` when the
 /// request fails or the reply is not one cap of `pages` pages.
+#[expect(
+    clippy::inline_always,
+    reason = "both grant rows time the request inside their windows, so a call around it would be measured with it"
+)]
+#[inline(always)]
 fn request_contiguous(memmgr_ep: u64, pages: u64) -> Option<u64>
 {
     let flags = u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32;

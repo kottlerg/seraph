@@ -20,7 +20,8 @@ use crate::context::Profile;
 use crate::disk::BlockSize;
 use crate::esp::Knob;
 use crate::qemu::{
-    DiskLine, Execution, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
+    DiskLine, Execution, IdleWait, Iommu, QemuDisplay, RiscvMmu, RiscvZkr, X86Paging,
+    X86ShadowStack,
 };
 use crate::svctest_stage::SvctestSet;
 
@@ -605,6 +606,14 @@ args! {
         /// and the pool seeds from the firmware boot seed and jitter.
         #[arg(long, default_value = "on")]
         pub riscv_zkr: RiscvZkr,
+
+        /// Whether the guest CPU offers the monitored wait the kernel's idle
+        /// loop waits in (`MONITOR`/`MWAIT` on `x86_64`, Zawrs on riscv64).
+        /// `on` boots the polling idle and the IPI-free wake of an idle CPU
+        /// (core/kernel/docs/scheduler.md "Idle Thread"); under TCG an idle
+        /// vCPU then spins on its host thread. `off` boots the halting idle.
+        #[arg(long, default_value = "off")]
+        pub idle_wait: IdleWait,
 
         /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins
         /// the QEMU CPU's `la57` property; the bootloader enables 5-level paging

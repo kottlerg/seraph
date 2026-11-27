@@ -2271,8 +2271,8 @@ pub enum SystemInfoType
     /// Number of times the idle thread of the CPU the call runs on has halted
     /// that CPU since the calling thread's previous `IdleHalts` call, when
     /// that call ran on the same CPU: one per stretch in which the CPU found
-    /// no thread to run, and one more for each interrupt that ends a halt and
-    /// leaves it with none. Each call marks its CPU and that CPU's count in
+    /// no thread to run, and one more for each interrupt or wake that ends a
+    /// halt, or monitored wait, and leaves it with none. Each call marks its CPU and that CPU's count in
     /// the calling thread, so a thread reads only the halts between two of
     /// its own calls on one CPU, never a count since boot. `InvalidState`
     /// when the thread has made no call, or made its previous one on another

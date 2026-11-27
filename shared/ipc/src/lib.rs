@@ -676,6 +676,64 @@ impl IpcMessage
             cap_slots,
         }
     }
+
+    /// Read a delivered message into this one, in place: what
+    /// [`Self::from_delivery`] returns, written over `self` with no copy of
+    /// the whole message, for a loop that receives into one buffer. The data
+    /// words and cap handles past the delivery's counts are zeroed, as in a
+    /// fresh message, so [`Self::word`] past the count reads `0`.
+    ///
+    /// # Safety
+    /// As [`Self::from_delivery`].
+    pub unsafe fn read_delivery(&mut self, ipc_buf: *const u64, delivery: &syscall::IpcDelivery)
+    {
+        let word_count = delivery.data_count.min(MSG_DATA_WORDS_MAX);
+        let (words, rest) = self.data.split_at_mut(word_count);
+        if word_count <= MSG_REGS_DATA_MAX
+        {
+            for (slot, &reg) in words.iter_mut().zip(delivery.regs.iter())
+            {
+                *slot = reg;
+            }
+        }
+        else
+        {
+            for (i, slot) in words.iter_mut().enumerate()
+            {
+                // SAFETY: `i < word_count <= MSG_DATA_WORDS_MAX`, so the
+                // offset stays inside the 4 KiB buffer the caller's contract
+                // names.
+                let word = unsafe { ipc_buf.add(i) };
+                // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+                // page-aligned IPC buffer, and `word` lies inside it.
+                // Volatile because the kernel writes the page.
+                *slot = unsafe { core::ptr::read_volatile(word) };
+            }
+        }
+        rest.fill(0);
+        let cap_count = delivery.cap_count.min(MSG_CAP_SLOTS_MAX);
+        let (caps, rest) = self.cap_slots.split_at_mut(cap_count);
+        // Delivered cap handles at word[MSG_CAP_HANDLES_WORD ..], read only
+        // when the count is non-zero, as in from_delivery.
+        // SAFETY: `syscall_abi` asserts that the cap block, which starts at
+        // word `MSG_CAP_HANDLES_WORD`, ends inside the 4 KiB buffer.
+        let cap_block = unsafe { ipc_buf.add(MSG_CAP_HANDLES_WORD) };
+        for (i, slot) in caps.iter_mut().enumerate()
+        {
+            // SAFETY: `i < cap_count <= MSG_CAP_SLOTS_MAX`, the cap block's
+            // length, so the offset stays inside the block.
+            let word = unsafe { cap_block.add(i) };
+            // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+            // page-aligned IPC buffer, and `word` lies inside it.
+            *slot = unsafe { core::ptr::read_volatile(word) };
+        }
+        rest.fill(0);
+        self.label = delivery.label;
+        self.badge = delivery.badge;
+        // Both counts are clamped above to bounds far below `u8::MAX`.
+        self.data_len = u8::try_from(word_count).unwrap_or(u8::MAX);
+        self.cap_count = u8::try_from(cap_count).unwrap_or(u8::MAX);
+    }
 }
 
 /// Up to eight bytes of `chunk`, zero-padded to the eight bytes of one data
@@ -1369,6 +1427,58 @@ mod tests
             without.caps().is_empty(),
             "a stale block is not this delivery's"
         );
+    }
+
+    // The defects caught: an in-place read that differs from a fresh one, or
+    // that keeps the words or cap handles of the message it overwrites past
+    // the new counts.
+    #[test]
+    fn a_delivery_read_in_place_matches_a_fresh_read()
+    {
+        let mut page = FakePage([SENTINEL; 512]);
+        for (i, word) in page.0.iter_mut().take(MSG_DATA_WORDS_MAX).enumerate()
+        {
+            *word = 0x200 + i as u64;
+        }
+        if let Some(block) = page.0.get_mut(MSG_DATA_WORDS_MAX..MSG_CAP_HANDLES_WORD + 3)
+        {
+            block.copy_from_slice(&[3, 0xA1, 0xA2, 0xA3]);
+        }
+        let buf = core::ptr::addr_of!(page.0).cast::<u64>();
+        let regs: MsgRegs = core::array::from_fn(|i| 0x300 + i as u64);
+        let delivery = |data_count, cap_count| syscall::IpcDelivery {
+            label: 9,
+            badge: 3,
+            data_count,
+            cap_count,
+            regs,
+        };
+        // A message that held the longest delivery, then each shorter one.
+        // SAFETY: `buf` is a 4 KiB-aligned page no Rust reference covers
+        // during the call.
+        let mut msg = unsafe { IpcMessage::from_delivery(buf, &delivery(MSG_DATA_WORDS_MAX, 3)) };
+        for (words, caps) in [
+            (MSG_DATA_WORDS_MAX, 3),
+            (MSG_REGS_DATA_MAX + 1, 2),
+            (MSG_REGS_DATA_MAX, 1),
+            (0, 0),
+        ]
+        {
+            // SAFETY: as for the call above.
+            let fresh = unsafe { IpcMessage::from_delivery(buf, &delivery(words, caps)) };
+            // SAFETY: as for the call above.
+            unsafe { msg.read_delivery(buf, &delivery(words, caps)) };
+            assert_eq!(
+                (msg.label, msg.badge, msg.words(), msg.caps()),
+                (fresh.label, fresh.badge, fresh.words(), fresh.caps()),
+                "{words} words, {caps} caps"
+            );
+            assert!(
+                (words..MSG_DATA_WORDS_MAX).all(|i| msg.word(i) == 0),
+                "{words}: no word of the earlier message past the count"
+            );
+            assert_eq!(msg.cap_slots, fresh.cap_slots, "{caps}: no stale handle");
+        }
     }
 
     // The defect caught: a call that ends before its caller's deadline (a

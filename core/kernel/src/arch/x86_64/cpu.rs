@@ -850,6 +850,93 @@ pub fn halt_until_interrupt()
     }
 }
 
+/// Whether every CPU idles in `MWAIT` on its idle wake word
+/// ([`init_idle_wait`]). Written once by the BSP before any AP starts, so a
+/// Relaxed load on any CPU reads the boot's value: the AP startup handshake
+/// orders the store before the AP's first instruction.
+static IDLE_WAIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Choose the idle wait: `MONITOR`/`MWAIT` where CPUID.01H:ECX.MONITOR
+/// (bit 3) reports it, else `HLT` ([`halt_until_interrupt`]). Returns the
+/// name of the wait chosen. The C1 hint `wait_on_word` passes needs no
+/// leaf-5 extension, and the parts whose monitor Linux treats as broken
+/// (Apollo Lake, Xeon 7400) lack the x86-64-v3 baseline `verify_baseline`
+/// requires. Called once, on the BSP, before any AP starts
+/// (core/kernel/docs/scheduler.md § Idle Thread).
+pub fn init_idle_wait() -> &'static str
+{
+    /// CPUID.01H:ECX bit 3: `MONITOR`/`MWAIT`.
+    const ECX_MONITOR: u32 = 1 << 3;
+
+    let monitor = cpuid(1).2 & ECX_MONITOR != 0;
+    IDLE_WAIT.store(monitor, core::sync::atomic::Ordering::Relaxed);
+    if monitor { "mwait" } else { "hlt" }
+}
+
+/// Whether the idle loop waits on its idle wake word ([`wait_on_word`]); set
+/// by [`init_idle_wait`].
+#[must_use]
+pub fn idle_wait_available() -> bool
+{
+    IDLE_WAIT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Arm `MONITOR` on `word`, and unless `word` no longer holds `polling`,
+/// atomically enable interrupts and `MWAIT` in C1 (hint 0, the state `HLT`
+/// enters) until a store to the word's line or an interrupt.
+///
+/// Precondition: interrupts are **disabled** (IF=0) on entry.
+/// Postcondition: interrupts are **enabled** (IF=1) on return; any interrupt
+/// pending at the wait has been recognised, as for [`halt_until_interrupt`].
+///
+/// The re-read follows the arm, so a store between the caller's last check and
+/// the arm is seen by the re-read, and one after the arm ends the wait. `STI`
+/// delays interrupt recognition until after the next instruction (Intel SDM
+/// Vol. 2B, STI), so `sti; mwait` is atomic as `sti; hlt` is. `MWAIT` may
+/// return for other reasons; the caller loops. Runs `VERW` first where the
+/// transient-execution selection asks for it, as `halt_until_interrupt` does.
+///
+/// # Safety
+/// Ring 0, with interrupts disabled (the precondition); `word` is live
+/// kernel memory, and [`idle_wait_available`] holds.
+pub unsafe fn wait_on_word(word: &core::sync::atomic::AtomicU32, polling: u32)
+{
+    #[cfg(not(test))]
+    super::mitigation::verw_before_idle();
+    // SAFETY: ring 0 with MONITOR present (caller contract); `word` is mapped
+    // kernel memory, so the monitored linear address cannot fault. ECX and EDX
+    // are zero: no extensions, no hints. `nomem` is omitted so the re-read below
+    // stays after the arm.
+    unsafe {
+        core::arch::asm!(
+            "monitor",
+            in("rax") word.as_ptr(),
+            in("ecx") 0u32,
+            in("edx") 0u32,
+            options(nostack, preserves_flags),
+        );
+    }
+    if word.load(core::sync::atomic::Ordering::Relaxed) & polling == 0
+    {
+        // SAFETY: the precondition's IF=0 is lifted here, ending the masked
+        // region with no wait, as the postcondition states.
+        unsafe { super::interrupts::enable() };
+        return;
+    }
+    // SAFETY: ring 0 with MWAIT present (caller contract) and IF=0 on entry;
+    // `sti; mwait` is atomic per the STI shadow, and EAX 0 / ECX 0 ask for C1
+    // with no extensions.
+    unsafe {
+        core::arch::asm!(
+            "sti",
+            "mwait",
+            in("eax") 0u32,
+            in("ecx") 0u32,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 // ── Per-CPU GS-base ───────────────────────────────────────────────────────────
 
 /// MSR address for `IA32_GS_BASE` — the canonical GS segment base.

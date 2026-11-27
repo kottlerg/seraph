@@ -19,6 +19,7 @@
 pub mod deadline_heap;
 pub mod fpu_switch;
 pub mod hold;
+pub mod idle_wake;
 pub mod registry_list;
 pub mod run_limit;
 pub mod run_queue;
@@ -188,6 +189,39 @@ unsafe fn scheduler_ptr(cpu: usize) -> *mut PerCpuScheduler
     );
     // SAFETY: cpu < cpu_count by caller contract; allocation covers cpu_count slots.
     unsafe { base.add(cpu) }
+}
+
+/// Base pointer for the `[IdleWake; cpu_count]` array of idle wake words,
+/// allocated in [`init_per_cpu_storage`]: slot `cpu` is the word CPU `cpu`'s
+/// idle thread waits on with the monitored wait
+/// (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants). A slab
+/// of its own, one cache line per CPU, keeps each word alone in its line and
+/// leaves `PerCpuScheduler`'s size, the stride of every `scheduler_for`, as it
+/// is.
+#[cfg(not(test))]
+static IDLE_WAKES_PTR: core::sync::atomic::AtomicPtr<idle_wake::IdleWake> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Return CPU `cpu`'s idle wake word.
+///
+/// # Safety
+/// As [`scheduler_ptr`]: `cpu < CPU_COUNT`, and [`init_per_cpu_storage`] has
+/// run.
+#[cfg(not(test))]
+#[inline]
+unsafe fn idle_wake_for(cpu: usize) -> &'static idle_wake::IdleWake
+{
+    let base = IDLE_WAKES_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(
+        !base.is_null(),
+        "idle_wake_for: IDLE_WAKES_PTR not initialised"
+    );
+    // SAFETY: cpu < cpu_count by caller contract; the slab covers cpu_count
+    // words.
+    let slot = unsafe { base.add(cpu) };
+    // SAFETY: init_per_cpu_storage initialised every word before publishing
+    // the slab, which is never freed.
+    unsafe { &*slot }
 }
 
 /// Return the idle-TCB slot pointer for `cpu`.
@@ -536,8 +570,9 @@ pub(crate) struct CpuDiag
     syscall_nr: core::sync::atomic::AtomicU64,
     /// The times this CPU's idle thread has halted it since boot, one per
     /// halt of the idle loop ([`note_idle_halt`]): one per stretch in which
-    /// the CPU found no thread to run, and one more for each interrupt that
-    /// ends a halt and leaves it with none. Written by the idle thread only,
+    /// the CPU found no thread to run, and one more for each interrupt or
+    /// wake that ends a halt, or monitored wait, and leaves it with none.
+    /// Written by the idle thread only,
     /// a Relaxed load and store; read by a syscall on this CPU only
     /// (`SYS_SYSTEM_INFO`'s `IdleHalts`, [`idle_halts_since_mark`]), never by
     /// another CPU, and never reported whole: a caller learns only its
@@ -2789,14 +2824,33 @@ fn idle_thread_entry(_cpu_id: u64) -> !
                 crate::arch::current::cpu::disable_interrupts();
             }
 
-            // Step 2: check the run queues. Idle state is not published; a
-            // producer links its thread before it sends the wake IPI, which it
-            // always sends rather than consulting a per-CPU idle mask.
+            // With the monitored wait, set the idle wake flag before the
+            // check: a waker from here on clears it with the store that ends
+            // the wait below, or that the wait's re-check sees, and sends no
+            // IPI; a waker before here found it clear and sent the IPI, which
+            // the masking holds pending until the wait.
             // See core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants.
+            // SAFETY: current_cpu() is this CPU's index, below CPU_COUNT, and
+            // the idle thread runs only after init_per_cpu_storage.
+            let wake = unsafe { idle_wake_for(crate::arch::current::cpu::current_cpu() as usize) };
+            let monitored = crate::arch::current::cpu::idle_wait_available();
+            if monitored
+            {
+                wake.begin_poll();
+            }
+
+            // Step 2: check the run queues. A producer links its thread before
+            // it clears the flag or sends the wake IPI.
             let has_work = idle_sched.has_runnable();
 
             if has_work
             {
+                // Clear the flag before anything else runs, so a waker from
+                // here on sends the IPI a running thread's preemption needs.
+                if monitored
+                {
+                    wake.end_poll();
+                }
                 // SAFETY: paired with the `disable_interrupts` above.
                 unsafe {
                     crate::arch::current::interrupts::enable();
@@ -2810,13 +2864,26 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             }
 
             // Step 3: no work → halt. Atomic on both arches: x86
-            // `sti;hlt`, RISC-V `wfi; csrsi sstatus, SIE`.
+            // `sti;hlt` or `sti;mwait`, RISC-V `wfi` or `wrs.nto`, then
+            // `csrsi sstatus, SIE`.
             // Returns with interrupts enabled; any pending wake interrupt
             // has been recognised. The halt is counted before it is
             // taken: the interrupt that ends it can switch straight to the
             // thread it woke, which must then read the halt in the count.
             note_idle_halt();
-            halt_until_interrupt();
+            if monitored
+            {
+                // SAFETY: interrupts are masked (step 1), the wait's
+                // precondition; the word is this CPU's own, live for the boot.
+                unsafe {
+                    crate::arch::current::cpu::wait_on_word(wake.word(), idle_wake::POLLING);
+                }
+                wake.end_poll();
+            }
+            else
+            {
+                halt_until_interrupt();
+            }
         }
 
         // Test mode: no real halt; the primitive is a host-side no-op.
@@ -3075,6 +3142,14 @@ const _: () = assert!(
     "LAST_NON_IDLE_TICK slab overflows"
 );
 
+/// The idle-wake slab: one [`idle_wake::IdleWake`] word, in its own cache line,
+/// per CPU.
+const IDLE_WAKES_SLAB: PerCpuSlab = PerCpuSlab::of::<idle_wake::IdleWake>("IDLE_WAKES");
+const _: () = assert!(
+    IDLE_WAKES_SLAB.sized_at_every_width(),
+    "IDLE_WAKES slab overflows"
+);
+
 /// The diagnostic-record slab: one [`CpuDiag`] per CPU.
 const CPU_DIAG_SLAB: PerCpuSlab = PerCpuSlab::of::<CpuDiag>("CPU_DIAG");
 const _: () = assert!(
@@ -3212,6 +3287,18 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     let tick_ptr =
         alloc_per_cpu_slab::<core::sync::atomic::AtomicU64>(LAST_NON_IDLE_TICK_SLAB, n, allocator);
     LAST_NON_IDLE_TICK_PTR.store(tick_ptr, core::sync::atomic::Ordering::Release);
+
+    // Per-CPU idle wake words, every flag clear.
+    let wake_ptr = alloc_per_cpu_slab::<idle_wake::IdleWake>(IDLE_WAKES_SLAB, n, allocator);
+    for cpu in 0..n
+    {
+        // SAFETY: the slab covers n words; cpu < n.
+        let slot = unsafe { wake_ptr.add(cpu) };
+        // SAFETY: slot is an aligned slot of the fresh slab, which nothing
+        // else reaches before IDLE_WAKES_PTR is published below.
+        unsafe { core::ptr::write(slot, idle_wake::IdleWake::new()) };
+    }
+    IDLE_WAKES_PTR.store(wake_ptr, core::sync::atomic::Ordering::Release);
 
     // Per-CPU diagnostic records. Zero is every field's idle value, the
     // idle-halt count's included, except the last-syscall stamp, whose "none
@@ -3428,7 +3515,7 @@ pub unsafe fn init(_cpu_count: u32) -> u32
 ///
 /// Called from `kernel_entry_ap` after per-CPU hardware initialisation is
 /// complete. The AP has an empty run queue at this point; it idles until
-/// `enqueue_and_wake` places work on this CPU and sends a wakeup IPI.
+/// `enqueue_and_wake` places work on this CPU and wakes it (`wake_idle_cpu`).
 ///
 /// This function never returns.
 ///
@@ -5351,9 +5438,12 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
     Some(core::ptr::null_mut())
 }
 
-/// Send a wakeup IPI to `target_cpu` without enqueueing anything.
+/// Wake `target_cpu` (`wake_idle_cpu`) without enqueueing anything: the
+/// wakeup IPI, or, for a CPU waiting idle on its monitored wake word, the
+/// clear of its idle wake flag, which ends the wait with no trap. A CPU
+/// running a thread has its flag clear, so it always takes the IPI's trap.
 ///
-/// Used wherever a path needs a remote CPU to take a trap: the
+/// Used wherever a path needs a remote CPU running a thread to take a trap: the
 /// `sys_thread_stop` and `sys_thread_start` drains and the object-teardown
 /// stop (`stop_threads_bound_to`) on a CPU running a target they marked
 /// `Stopped` or `Exited`, and `sys_thread_set_affinity` on a CPU running a
@@ -5363,8 +5453,8 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// the target's preemption by an outranking thread at a return to user mode)
 /// or the target's own park or yield, where the requeue denylist drops a
 /// `Stopped` or `Exited` target and the affinity check relocates a moved one.
-/// The callers' drains wait for that; the prod itself only exits a `hlt` on an
-/// idle CPU. `sys_thread_set_affinity` also uses it as the wake-protocol prod
+/// The callers' drains wait for that; the prod itself only ends the halt or
+/// wait of an idle CPU. `sys_thread_set_affinity` also uses it as the wake-protocol prod
 /// of the destination CPU after `migrate_ready_thread` moved a `Ready` thread
 /// there (the move linked the thread on that CPU's run queue; the prod wakes it
 /// from idle to dispatch the thread), and `sys_thread_set_priority` as the
@@ -6677,9 +6767,10 @@ fn rt_push_target(
 /// [`rt_push_target`] from the other CPUs' ranks, read lock-free from this
 /// CPU's `rt_push_cursor`, which a miss moves past the CPUs it read, and
 /// moves the thread through [`pull_unpinned_ready`] under
-/// [`PullRule::Waiting`], which decides again under both locks and sends the
-/// wake IPI that preempts at the target (core/kernel/docs/scheduler.md § Load
-/// Balancing, "RT push").
+/// [`PullRule::Waiting`], which decides again under both locks and wakes the
+/// target: the wake IPI that preempts at a target running a thread, or the
+/// clear of an idle target's idle wake flag (core/kernel/docs/scheduler.md
+/// § Load Balancing, "RT push").
 ///
 /// # Safety
 /// Called from `this_cpu`'s `timer_tick` with no scheduler lock held;
@@ -6991,8 +7082,8 @@ unsafe fn count_wake_placement(
     }
     thread::PlacementCounts::count(&counts.remote_wakes);
     // A snapshot under the target's run-queue lock, held: the target runs its
-    // idle thread, and so halts or is about to, until the wake IPI that
-    // `enqueue_and_wake` sends after the unlock.
+    // idle thread, and so halts or waits or is about to, until the wake that
+    // `enqueue_and_wake` makes after the unlock.
     if core::ptr::eq(target.current(), target.idle())
     {
         thread::PlacementCounts::count(&counts.idle_wakes);
@@ -7821,10 +7912,12 @@ pub unsafe fn select_target_cpu(_tcb: *mut ThreadControlBlock, _hint: WakeHint) 
     0
 }
 
-/// Send a wakeup IPI to `target_cpu`. Always sent (except for self) per
-/// the wake-protocol invariant in core/kernel/docs/scheduling-internals.md
-/// § Wake Protocol Invariants — predicating on a per-CPU "is idle" hint
-/// is a missed-wakeup race against the target's halt boundary.
+/// Wake `target_cpu` after a link on its run queues: clear its idle wake flag
+/// when it waits on the word with the monitored wait, whose store ends the
+/// wait, and otherwise send it the wakeup IPI (except for self), per
+/// core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants. The
+/// IPI is skipped only when this call's read-modify-write cleared a set flag;
+/// a plain read of the flag would race the target's re-check.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`).
@@ -7840,6 +7933,17 @@ unsafe fn wake_idle_cpu(target_cpu: usize)
     if target_cpu == current
     {
         return;
+    }
+
+    if crate::arch::current::cpu::idle_wait_available()
+    {
+        // SAFETY: target_cpu is a valid online CPU index (caller contract), so
+        // its idle wake word is initialised.
+        let target = unsafe { idle_wake_for(target_cpu) };
+        if target.wake()
+        {
+            return;
+        }
     }
 
     // SAFETY: target_cpu is valid; apic_id_for returns the APIC/hart ID.
@@ -8116,6 +8220,18 @@ pub unsafe fn schedule(requeue: Requeue)
     // reference: other CPUs reach this scheduler concurrently, and the run
     // queues are touched only through its lock-held `unsafe` methods.
     let sched = unsafe { crate::percpu::current_scheduler() };
+    // The idle wake flag is set only inside the idle loop's wait, which no
+    // switch interrupts: the idle thread clears it before it calls schedule(),
+    // and an interrupt taken in kernel mode never switches (the timer tick
+    // returns before its switch for the idle thread's zero slice, and the
+    // return work runs only on a return to user mode). A flag left set here
+    // would let wakers skip the IPI a running thread's preemption needs.
+    debug_assert!(
+        // SAFETY: cpu < CPU_COUNT, asserted above; schedule() runs after
+        // init_per_cpu_storage.
+        !unsafe { idle_wake_for(cpu) }.polling(),
+        "schedule: cpu {cpu} entered with its idle wake flag set"
+    );
 
     // The scheduler lock is taken with lock_raw/unlock_raw below, paired before
     // function return (or before the context switch that may change the stack).

@@ -3887,9 +3887,9 @@ pub enum SystemInfoType
     /// Number of times the idle thread of the CPU the call runs on has halted
     /// that CPU since the calling thread's previous IdleHalts call, when that
     /// call ran on the same CPU: one per stretch in which the CPU found no
-    /// thread to run, and one more for each interrupt that ends a halt and
-    /// leaves it with none. Counted before the halt, so a thread the ending
-    /// interrupt wakes reads it. Each call marks its CPU and that CPU's count
+    /// thread to run, and one more for each interrupt or wake that ends a halt,
+    /// or monitored wait, and leaves it with none. Counted before the halt, so
+    /// a thread whose wake ends it reads it. Each call marks its CPU and that CPU's count
     /// in the calling thread's TCB, which a thread's creation leaves unmarked,
     /// so a thread reads only the halts between two of its own calls on one
     /// CPU, never a count since boot. InvalidState when the thread has made no
@@ -4303,7 +4303,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `KLOG_READ_MAX` | 16384 | Most bytes one `SYS_KERNEL_LOG_READ` writes |
 | `KLOG_STALL_MS` | 1000 | Milliseconds an attached kernel log reader may leave a record unread, measured from its append or from the reader's last read of a new record when that came later, before the kernel writes its lines directly |
 | `PMU_CONFIGURE_MAX` | 8 | Most events one `SYS_PMU_CONFIGURE` takes |
-| `BOOT_PROTOCOL_VERSION` | 24 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 25 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
 [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs) crates, which are the

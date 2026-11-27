@@ -82,6 +82,77 @@ impl RiscvMmu
 }
 
 crate::argparse::value_enum! {
+    /// Whether the guest CPU offers the monitored wait the kernel's idle loop
+    /// waits in where every CPU has it (core/kernel/docs/scheduler.md § Idle
+    /// Thread): `MONITOR`/`MWAIT` on `x86_64`, Zawrs `WRS.NTO` on riscv64.
+    ///
+    /// Off by default: under TCG, `MWAIT` with more than one vCPU and `WRS.NTO`
+    /// return at once, so an idle vCPU offered them spins on its host thread
+    /// instead of sleeping; default KVM leaves `MONITOR` out. Explicit both
+    /// ways, against QEMU default drift.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum IdleWait
+    {
+        /// Leave the wait out (`monitor=off`, `zawrs=off`) — the default. The
+        /// kernel idles in `HLT` or `WFI` and wakes an idle CPU with an IPI.
+        Off,
+        /// Offer the wait: `zawrs=on` on riscv64, `monitor=on` on `x86_64`
+        /// TCG, and on `x86_64` KVM `-overcommit cpu-pm=on`, under which KVM
+        /// runs the guest's `MWAIT` without an exit and QEMU reports
+        /// `MONITOR` to the guest, where the host's KVM can disable `MWAIT`
+        /// exits.
+        On,
+    }
+}
+
+impl IdleWait
+{
+    /// `-cpu` property suffix that pins the riscv64 guest's Zawrs.
+    fn riscv_cpu_prop(self) -> &'static str
+    {
+        match self
+        {
+            Self::Off => ",zawrs=off",
+            Self::On => ",zawrs=on",
+        }
+    }
+
+    /// The `x86_64` launch arguments of the wait on `accel`: the `-cpu`
+    /// property suffix, and the arguments that precede `-cpu`.
+    ///
+    /// # Errors
+    /// Fails for [`IdleWait::On`] on KVM when the host CPU reports no
+    /// `MONITOR`, where KVM cannot let the guest's `MWAIT` run and QEMU
+    /// leaves `MONITOR` out of the guest's CPUID, so the boot would idle in
+    /// `HLT` while the run asks for the wait; and on HVF, WHPX and NVMM, where
+    /// the wait is untested.
+    fn x86_args(
+        self,
+        accel: Accel,
+        host: X86Host,
+    ) -> Result<(&'static str, &'static [&'static str])>
+    {
+        match (self, accel)
+        {
+            (Self::Off, _) => Ok((",monitor=off", &[])),
+            (Self::On, Accel::Tcg) => Ok((",monitor=on", &[])),
+            (Self::On, Accel::Kvm) if host.cpu_has_monitor =>
+            {
+                Ok(("", &["-overcommit", "cpu-pm=on"]))
+            }
+            (Self::On, Accel::Kvm) => bail!(
+                "--idle-wait on under KVM: the host CPU reports no MONITOR, so KVM cannot \
+                 let the guest's MWAIT run (SERAPH_ACCEL=tcg offers it under TCG)"
+            ),
+            (Self::On, Accel::Hvf | Accel::Whpx | Accel::Nvmm) =>
+            {
+                bail!("--idle-wait on is offered under KVM and TCG only, not {accel:?}")
+            }
+        }
+    }
+}
+
+crate::argparse::value_enum! {
     /// Whether the guest RISC-V CPU implements the `Zkr` entropy source.
     ///
     /// With it, the firmware grants S-mode the `seed` CSR and the kernel's
@@ -224,6 +295,9 @@ struct X86Host
     /// Whether the QEMU launched knows the `cet-ss` CPU property
     /// ([`qemu_knows_cet_ss`]).
     qemu_has_cet_ss: bool,
+    /// Whether the host CPU reports `MONITOR`/`MWAIT`
+    /// ([`host_cpu_has_monitor`]).
+    cpu_has_monitor: bool,
 }
 
 impl X86Host
@@ -234,6 +308,7 @@ impl X86Host
         Self {
             cpu_has_la57: host_cpu_has_la57(),
             qemu_has_cet_ss: qemu_knows_cet_ss(),
+            cpu_has_monitor: host_cpu_has_monitor(),
         }
     }
 }
@@ -938,6 +1013,8 @@ pub struct QemuLaunchSpec<'a>
     /// Whether the guest CPU implements `Zkr`; riscv64 only, ignored on
     /// `x86_64`.
     pub riscv_zkr: RiscvZkr,
+    /// Whether the guest CPU offers the idle loop's monitored wait.
+    pub idle_wait: IdleWait,
     /// Guest paging depth; `x86_64` only, ignored on riscv64.
     pub x86_paging: X86Paging,
     /// Whether the guest CPU offers CET shadow stacks; `x86_64` only, ignored
@@ -1337,6 +1414,21 @@ fn host_cpu_has_la57() -> bool
     false
 }
 
+/// Whether the host CPU reports `MONITOR`/`MWAIT` (`CPUID.01H:ECX[3]`),
+/// which KVM needs before it lets a guest's `MWAIT` run without an exit.
+#[cfg(target_arch = "x86_64")]
+fn host_cpu_has_monitor() -> bool
+{
+    std::arch::x86_64::__cpuid_count(1, 0).ecx & (1 << 3) != 0
+}
+
+/// A host that is not `x86_64` runs an `x86_64` guest under TCG only.
+#[cfg(not(target_arch = "x86_64"))]
+fn host_cpu_has_monitor() -> bool
+{
+    false
+}
+
 /// Refuse a 5-level request a native accelerator cannot honour.
 ///
 /// A native accelerator passes the host CPU's paging features through, and
@@ -1384,12 +1476,15 @@ fn extend_x86(
 {
     check_x86_paging(spec.x86_paging, accel, host.cpu_has_la57)?;
     // The `-cpu` properties every accelerator's model takes: the paging
-    // depth and the shadow-stack feature, each pinned to the run's request.
+    // depth, the shadow-stack feature and the idle wait, each pinned to the
+    // run's request.
+    let (idle_wait_prop, idle_wait_args) = spec.idle_wait.x86_args(accel, host)?;
     let props = format!(
-        "{}{}",
+        "{idle_wait_prop}{}{}",
         spec.x86_paging.cpu_la57_prop(),
         spec.x86_shadow_stack.cpu_cet_ss_prop(host)?
     );
+    args.extend(idle_wait_args.iter().map(|&a| a.into()));
     let irqchip = X86Irqchip::of(spec.iommu, spec.interrupt_remapping, accel);
     args.extend(["-machine".into(), irqchip.machine().into()]);
     if spec.smm
@@ -1529,14 +1624,18 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec, execution: Execut
     // (core/kernel/docs/perfmon.md); without it no programmable counter counts
     // an event, and the kernel reports no counters.
     //
+    // The `zawrs` property (`IdleWait::riscv_cpu_prop`, off by default) gives
+    // the hart Zawrs, whose `WRS.NTO` the kernel's idle loop waits in.
+    //
     // The trailing satp-mode properties (`RiscvMmu::cpu_satp_props`) pin the
     // paging-mode ceiling the guest advertises via DTB `mmu-type`.
     args.extend([
         "-cpu".into(),
         format!(
             "rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,\
-             ssaia=on,smaia=on,smstateen=on,svadu=off,svade=on,sscofpmf=on{}{}",
+             ssaia=on,smaia=on,smstateen=on,svadu=off,svade=on,sscofpmf=on{}{}{}",
             spec.riscv_zkr.cpu_zkr_prop(),
+            spec.idle_wait.riscv_cpu_prop(),
             spec.riscv_mmu.cpu_satp_props()
         ),
     ]);
@@ -1950,6 +2049,7 @@ mod tests
             incoming: None,
             riscv_mmu: RiscvMmu::Sv48,
             riscv_zkr: RiscvZkr::On,
+            idle_wait: IdleWait::Off,
             x86_paging: X86Paging::Four,
             x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
@@ -2005,6 +2105,77 @@ mod tests
         let cpu = cpu_arg(&argv);
         assert!(cpu.contains(",zkr=off"));
         assert!(!cpu.contains(",zkr=on"));
+    }
+
+    #[test]
+    fn argv_reflects_idle_wait_on_riscv64()
+    {
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        assert!(cpu_arg(&argv).contains(",zawrs=off"));
+
+        let mut spec = riscv_spec(1, 512);
+        spec.idle_wait = IdleWait::On;
+        let argv = build_qemu_argv(&spec).unwrap();
+        let cpu = cpu_arg(&argv);
+        assert!(cpu.contains(",zawrs=on"));
+        assert!(!cpu.contains(",zawrs=off"));
+    }
+
+    // The defects caught: a default launch whose guest is offered a wait
+    // that TCG turns into a spin, and a request for the wait that boots a
+    // guest without it (KVM on a host with no MONITOR, where QEMU drops it
+    // silently) instead of refusing with the reason.
+    #[test]
+    fn argv_reflects_idle_wait_on_x86_64()
+    {
+        let all = [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm, Accel::Tcg];
+        for accel in all
+        {
+            let mut argv = Vec::new();
+            extend_x86(
+                &mut argv,
+                &x86_spec(X86Paging::Four),
+                accel,
+                Execution::Standard,
+                HOST,
+            )
+            .unwrap();
+            assert!(cpu_arg(&argv).contains(",monitor=off"), "{accel:?}");
+            assert!(!argv.iter().any(|a| a == "-overcommit"), "{accel:?}");
+        }
+
+        let mut spec = x86_spec(X86Paging::Four);
+        spec.idle_wait = IdleWait::On;
+        let mut argv = Vec::new();
+        extend_x86(&mut argv, &spec, Accel::Tcg, Execution::Standard, HOST).unwrap();
+        assert!(cpu_arg(&argv).contains(",monitor=on"));
+
+        let monitor_host = X86Host {
+            cpu_has_monitor: true,
+            ..HOST
+        };
+        let mut argv = Vec::new();
+        extend_x86(
+            &mut argv,
+            &spec,
+            Accel::Kvm,
+            Execution::Standard,
+            monitor_host,
+        )
+        .unwrap();
+        let at = argv.iter().position(|a| a == "-overcommit").unwrap();
+        assert_eq!(argv[at + 1], "cpu-pm=on");
+        assert!(!cpu_arg(&argv).contains("monitor="));
+
+        for accel in [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm]
+        {
+            let err =
+                extend_x86(&mut Vec::new(), &spec, accel, Execution::Standard, HOST).unwrap_err();
+            assert!(
+                err.to_string().contains("--idle-wait on"),
+                "{accel:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2128,6 +2299,7 @@ mod tests
             incoming: Some("exec:cat state.bin"),
             riscv_mmu: RiscvMmu::Sv48,
             riscv_zkr: RiscvZkr::On,
+            idle_wait: IdleWait::Off,
             x86_paging: X86Paging::Four,
             x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
@@ -2146,6 +2318,7 @@ mod tests
     const HOST: X86Host = X86Host {
         cpu_has_la57: true,
         qemu_has_cet_ss: true,
+        cpu_has_monitor: false,
     };
 
     fn x86_spec(x86_paging: X86Paging) -> QemuLaunchSpec<'static>
@@ -2168,6 +2341,7 @@ mod tests
             incoming: None,
             riscv_mmu: RiscvMmu::Sv48,
             riscv_zkr: RiscvZkr::On,
+            idle_wait: IdleWait::Off,
             x86_paging,
             x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,

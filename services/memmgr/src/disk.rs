@@ -32,8 +32,8 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::{MAP_READ, PAGE_SIZE};
 
 use crate::{
-    FaultDecline, MemLedger, coalesce, ensure_slots, evict, ledger_mut, map_self, map_self_with,
-    reply_label, return_taken, select, self_aspace,
+    Answer, FaultDecline, MemLedger, coalesce, ensure_slots, evict, ledger_mut, map_self,
+    map_self_with, return_taken, select, self_aspace,
 };
 
 /// The window where memmgr maps a buffer of the swap service's for one
@@ -149,16 +149,22 @@ pub(crate) fn init()
 
 /// Hand a swap label's request to its handler, with the caps its contract
 /// keeps (`crate::dispatch`).
-pub(crate) fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, service_ep: u64)
+pub(crate) fn route(
+    opcode: u64,
+    req: &IpcMessage,
+    kept: &[u64],
+    answer: &mut Answer,
+    service_ep: u64,
+)
 {
     match opcode
     {
-        memmgr_labels::SWAP_REGISTER => handle_register(req, kept, ipc_buf, service_ep),
-        memmgr_labels::SWAP_TAKE => handle_take(kept, ipc_buf),
-        memmgr_labels::SWAP_DONE => handle_done(req, ipc_buf),
-        memmgr_labels::SWAP_RESTORE => handle_restore(req, kept, ipc_buf),
-        memmgr_labels::SWAP_WANTED => handle_wanted(ipc_buf),
-        _ => reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT),
+        memmgr_labels::SWAP_REGISTER => handle_register(req, kept, answer, service_ep),
+        memmgr_labels::SWAP_TAKE => handle_take(kept, answer),
+        memmgr_labels::SWAP_DONE => handle_done(req, answer),
+        memmgr_labels::SWAP_RESTORE => handle_restore(req, kept, answer),
+        memmgr_labels::SWAP_WANTED => handle_wanted(answer),
+        _ => answer.set_status(memmgr_errors::INVALID_ARGUMENT),
     }
 }
 
@@ -248,7 +254,7 @@ pub(crate) fn reply_fault(
     l: &MemLedger,
     path: FaultPath,
     disk: Option<NodeIdx>,
-    ipc_buf: *mut u64,
+    answer: &mut Answer,
 ) -> bool
 {
     match path
@@ -258,26 +264,25 @@ pub(crate) fn reply_fault(
             let Some(n) = disk.and_then(|s| l.disk_node(s))
             else
             {
-                crate::decline_fault(ipc_buf, FaultDecline::OnDiskChunk, DETAIL_UNREGISTERED);
+                crate::decline_fault(answer, FaultDecline::OnDiskChunk, DETAIL_UNREGISTERED);
                 return true;
             };
             let reply = IpcMessage::builder(syscall_abi::FAULT_REPLY_REDIRECT)
                 .word(0, disk::slot_word(n.slot, n.len, n.nonce))
                 .cap(state().endpoint)
                 .build();
-            // SAFETY: ipc_buf is the registered IPC buffer page. The kernel
-            // resolves the cap without moving it, so memmgr keeps it.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            // The kernel resolves the cap without moving it, so memmgr keeps it.
+            answer.set(reply);
             true
         }
         FaultPath::DeclineUnregistered =>
         {
-            crate::decline_fault(ipc_buf, FaultDecline::OnDiskChunk, DETAIL_UNREGISTERED);
+            crate::decline_fault(answer, FaultDecline::OnDiskChunk, DETAIL_UNREGISTERED);
             true
         }
         FaultPath::DeclineLost =>
         {
-            crate::decline_fault(ipc_buf, FaultDecline::OnDiskChunk, DETAIL_LOST);
+            crate::decline_fault(answer, FaultDecline::OnDiskChunk, DETAIL_LOST);
             true
         }
         FaultPath::Back | FaultPath::Remap | FaultPath::RestoreFromStore => false,
@@ -286,14 +291,9 @@ pub(crate) fn reply_fault(
 
 /// Reply `label` with the words `words` and the cap `cap` moved back to the
 /// caller; a reply that cannot reach it deletes the cap.
-fn reply_with_cap(ipc_buf: *mut u64, label: u64, words: &[u64], cap: u64)
+fn reply_with_cap(answer: &mut Answer, label: u64, words: &[u64], cap: u64)
 {
-    let reply = IpcMessage::builder(label).words(0, words).cap(cap).build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-    {
-        let _ = syscall::cap_delete(cap);
-    }
+    answer.set_or_delete_caps(IpcMessage::builder(label).words(0, words).cap(cap).build());
 }
 
 /// Whether `cap` is an Endpoint cap.
@@ -332,12 +332,12 @@ fn unmap_window(pages: u64)
 /// every write in flight ([`free_pool::Ledger::end_writes`]): a new swap
 /// service knows nothing of its predecessor's. The reply's `data[0]` is the
 /// slots memmgr uses, the count clamped to [`MAX_SLOTS`].
-fn handle_register(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep: u64)
+fn handle_register(req: &IpcMessage, caps: &[u64], answer: &mut Answer, service_ep: u64)
 {
     let Some(&cap) = caps.first()
     else
     {
-        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        answer.set_status(memmgr_errors::INVALID_ARGUMENT);
         return;
     };
     let want = caps.get(1).copied().unwrap_or(0);
@@ -357,7 +357,7 @@ fn handle_register(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep
         {
             let _ = syscall::cap_delete(want);
         }
-        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        answer.set_status(memmgr_errors::INVALID_ARGUMENT);
         return;
     }
     let s = state();
@@ -382,8 +382,7 @@ fn handle_register(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, total)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    answer.set(reply);
 }
 
 /// Give the slot map the page its next slot needs, from the pool: mapped at
@@ -441,17 +440,17 @@ fn grow_slots(l: &mut MemLedger) -> bool
 /// Its time in memmgr's loop is bounded: a walk of at most [`TAKE_STEPS`]
 /// steps, one copy of the stream or the pages (at most a chunk's bytes), one
 /// seal of it, and one copy of the sealed bytes out.
-fn handle_take(caps: &[u64], ipc_buf: *mut u64)
+fn handle_take(caps: &[u64], answer: &mut Answer)
 {
     let Some(&cap) = caps.first()
     else
     {
-        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        answer.set_status(memmgr_errors::INVALID_ARGUMENT);
         return;
     };
     let l = ledger_mut();
     let (label, words) = take(l, cap);
-    reply_with_cap(ipc_buf, label, &words, cap);
+    reply_with_cap(answer, label, &words, cap);
 }
 
 /// [`handle_take`]'s work: its reply label and words.
@@ -565,7 +564,7 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
 /// raw, again on them ([`free_pool::Ledger::abandon_write`]); a write a restore or a
 /// teardown cancelled meanwhile frees its slot either way. Reply: `SUCCESS`,
 /// or `INVALID_ARGUMENT` for a slot that holds no write in flight.
-fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
+fn handle_done(req: &IpcMessage, answer: &mut Answer)
 {
     let l = ledger_mut();
     let done = u32::try_from(req.word(0)).is_ok_and(|slot| {
@@ -582,8 +581,7 @@ fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
     {
         coalesce(l);
     }
-    reply_label(
-        ipc_buf,
+    answer.set_status(
         if done
         {
             memmgr_errors::SUCCESS
@@ -599,7 +597,7 @@ fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
 /// slot words `MAKE_RESIDENT` posted for the swap service, oldest first, and
 /// empty the list. The words name uses of slots that may have ended since: a
 /// `SWAP_RESTORE` of one replies `RESTORE_STALE` then, and changes nothing.
-fn handle_wanted(ipc_buf: *mut u64)
+fn handle_wanted(answer: &mut Answer)
 {
     let mut words = [0u64; WANT_WORDS];
     let n = state().wants.take(&mut words);
@@ -608,8 +606,7 @@ fn handle_wanted(ipc_buf: *mut u64)
         .word(0, u64::try_from(n).unwrap_or(0))
         .words(1, taken)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    answer.set(reply);
 }
 
 /// `SWAP_RESTORE` (services/memmgr/docs/ipc-interface.md § Label 25):
@@ -635,17 +632,17 @@ fn handle_wanted(ipc_buf: *mut u64)
 /// the chunk staying on disk. Reply: `SUCCESS`; `RESTORE_DECLINED`;
 /// `RESTORE_STALE`; or `INVALID_ARGUMENT` for a missing or small cap, or
 /// one memmgr cannot map.
-fn handle_restore(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64)
+fn handle_restore(req: &IpcMessage, caps: &[u64], answer: &mut Answer)
 {
     let Some(&cap) = caps.first()
     else
     {
-        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        answer.set_status(memmgr_errors::INVALID_ARGUMENT);
         return;
     };
     let l = ledger_mut();
     let (label, word) = restore(l, req.word(0), cap);
-    reply_with_cap(ipc_buf, label, &[word], cap);
+    reply_with_cap(answer, label, &[word], cap);
 }
 
 /// [`handle_restore`]'s work: its reply label and word.

@@ -367,6 +367,7 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     null::bench_null_syscall(ctx, &mut h);
     ipc::bench_ipc_round_trip(ctx, &mut h);
     notification::bench_notification_roundtrip(ctx, &mut h);
+    notification::bench_notification_cross_cpu(ctx, &mut h);
     cap::bench_cap_create_delete(ctx, &mut h);
     cap::bench_cap_info_lookup(ctx, &mut h);
     mm::bench_mem_map_unmap(ctx, &mut h);

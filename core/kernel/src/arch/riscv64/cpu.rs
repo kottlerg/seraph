@@ -50,6 +50,76 @@ pub fn halt_until_interrupt()
     }
 }
 
+/// Whether every hart idles in `WRS.NTO` on its idle wake word
+/// ([`init_idle_wait`]). Written once by the boot hart before any other hart
+/// starts, so a Relaxed load on any hart reads the boot's value: the hart start
+/// orders the store before the hart's first instruction.
+static IDLE_WAIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Choose the idle wait: Zawrs `WRS.NTO` where the bootloader confirmed Zawrs
+/// on every enabled hart (`boot_protocol::HART_CAP_ZAWRS`), else `WFI`
+/// ([`halt_until_interrupt`]). Returns the name of the wait chosen. Called
+/// once, on the boot hart, after `platform::capture_kernel_mmio()` and before
+/// any other hart starts (core/kernel/docs/scheduler.md § Idle Thread).
+#[cfg(not(test))]
+pub fn init_idle_wait() -> &'static str
+{
+    let zawrs = crate::platform::kernel_mmio().hart_caps & boot_protocol::HART_CAP_ZAWRS != 0;
+    IDLE_WAIT.store(zawrs, core::sync::atomic::Ordering::Relaxed);
+    if zawrs { "wrs.nto" } else { "wfi" }
+}
+
+/// Whether the idle loop waits on its idle wake word ([`wait_on_word`]); set
+/// by [`init_idle_wait`].
+#[must_use]
+pub fn idle_wait_available() -> bool
+{
+    IDLE_WAIT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Register a reservation on `word` (`lr.w`), and unless `word` no longer
+/// holds `polling`, stall in `WRS.NTO` until a store invalidates the
+/// reservation or a locally enabled interrupt is pending, then set
+/// `sstatus.SIE`.
+///
+/// Precondition: `sstatus.SIE = 0` on entry.
+/// Postcondition: `sstatus.SIE = 1` on return; any interrupt pending at the
+/// wait traps as SIE is set, as for [`halt_until_interrupt`].
+///
+/// The `lr.w` is both the re-read and the arm, so a store before it is read by
+/// it and one after it invalidates the reservation and ends the stall. Zawrs
+/// stalls only while no locally enabled interrupt is pending "regardless of
+/// the global interrupt enable", and resumes by the rules of `WFI`, so with
+/// `SIE = 0` a pending interrupt ends the stall and traps at the `csrsi`.
+/// `WRS.NTO` may return for other reasons; the caller loops. Encoded as a
+/// word (`0x00d00073`) because the kernel target's assembler lacks Zawrs.
+///
+/// # Safety
+/// S-mode with `sstatus.SIE = 0` (the precondition) and `mstatus.TW = 0`
+/// (the firmware's, as `WFI` needs); `word` is live kernel memory, and
+/// [`idle_wait_available`] holds.
+pub unsafe fn wait_on_word(word: &core::sync::atomic::AtomicU32, polling: u32)
+{
+    // SAFETY: `word` is mapped, aligned kernel memory (caller contract), so
+    // `lr.w` cannot fault; `WRS.NTO` is implemented (caller contract) and
+    // returns to the next instruction; the `csrsi` sets SIE=1, the
+    // postcondition. Not `nomem`: the reservation reads memory.
+    unsafe {
+        core::arch::asm!(
+            "lr.w {v}, ({p})",
+            "and {v}, {v}, {m}",
+            "beqz {v}, 1f",
+            ".4byte 0x00d00073",
+            "1:",
+            "csrsi sstatus, 0x2",
+            p = in(reg) word.as_ptr(),
+            m = in(reg) polling,
+            v = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
 // ── Stack and memory sampling ─────────────────────────────────────────────────
 
 /// Store `value` to each of the `words` 8-byte words from `p` up, eight

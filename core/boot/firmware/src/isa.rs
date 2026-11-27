@@ -9,16 +9,18 @@
 
 use boot_protocol::{
     HART_CAP_SSAIA, HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT, HART_CAP_SVPBMT,
+    HART_CAP_ZAWRS,
 };
 
 /// ISA-extension names the hart-capability readers recognize, with the
 /// `HART_CAP_*` bit each confirms.
-pub const HART_CAP_NAMES: [(&[u8], u64); 5] = [
+pub const HART_CAP_NAMES: [(&[u8], u64); 6] = [
     (b"sstc", HART_CAP_SSTC),
     (b"svpbmt", HART_CAP_SVPBMT),
     (b"svinval", HART_CAP_SVINVAL),
     (b"svnapot", HART_CAP_SVNAPOT),
     (b"ssaia", HART_CAP_SSAIA),
+    (b"zawrs", HART_CAP_ZAWRS),
 ];
 
 /// Whether a RISC-V ISA string (`"rv64imafdc_zicsr_..._sstc_..."`, its bytes up

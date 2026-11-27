@@ -2895,7 +2895,9 @@ shares (in `target/xtask/host/` outside a git checkout):
   alone. With `--wait-host` a refused command waits for the grant to end; without it, it fails at
   once naming the holder. The lock holds only what the host admits: cargo's compile of xtask
   itself, which any `cargo xtask` command runs first when the checkout's build of xtask is not
-  current (its sources changed, or a worktree that has not built it yet), comes before any
+  current (a file it is built from changed: `xtask/`, a crate `xtask/Cargo.toml` depends on,
+  the root `Cargo.toml` or `Cargo.lock`, `.cargo/` or the toolchain; or a worktree that has not
+  built it yet), comes before any
   admission, and an xtask built from a branch without the timing grant neither registers its
   builds nor refuses them.
 

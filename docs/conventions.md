@@ -745,7 +745,11 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    manual dispatch of `fuzz.yml` on `master` while the commit to be
    tagged is its head (`gh workflow run fuzz.yml --ref master`), at the
    default time per target, whose run's head commit is that commit and
-   whose conclusion is `success`. A run at an earlier `master` commit that
+   whose conclusion is `success`. Both hot-path accounts are regenerated
+   at the same commit, every configuration of each
+   ([core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md#regenerating-it)
+   § Regenerating It), and land through one Markdown-only PR, whose merge
+   is then the commit to be tagged. A run at an earlier `master` commit that
    contains the bump stands for the commit to be tagged when the change between the two is
    documentation or comments only, as [testing.md](testing.md#coverage-tiers)
    § Coverage tiers defines it.

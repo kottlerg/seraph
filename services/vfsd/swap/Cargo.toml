@@ -9,8 +9,7 @@ publish.workspace = true
 
 [dependencies]
 gpt = { path = "../gpt", package = "vfsd-gpt" }
-# The IPC error codes that tell a block driver's death apart (`RegionsEnd::of`).
-syscall-abi = { path = "../../../abi/syscall" }
+grant = { path = "../grant", package = "vfsd-grant" }
 
 [lints]
 workspace = true

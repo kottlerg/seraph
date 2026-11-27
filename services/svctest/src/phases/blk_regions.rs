@@ -29,11 +29,14 @@
 //!   list;
 //! - a transfer on a region whose registered Memory cap its client revoked is
 //!   refused `OUT_OF_BOUNDS` and ends the region;
-//! - `BLK_END_REGIONS` on the partition cap after a revoke of a derivation
-//!   of it ends every region registered through the derivation, a
+//! - `BLK_RETIRE_PARTITION` on the partition cap after a revoke of a
+//!   derivation of it ends every region registered through the derivation, a
 //!   registration a thread sends in a loop on the derivation while the revoke
-//!   and the end run included; the partition then registers a region again,
-//!   and `BLK_END_REGIONS` on a region cap is refused `OUT_OF_BOUNDS`.
+//!   and the retire run included; every later request on the retired cap is
+//!   refused `OUT_OF_BOUNDS`, a registration, a geometry request and a second
+//!   retire among them, also once the range is registered again as a new
+//!   grant, which registers a region; a retire on a region cap is refused
+//!   `OUT_OF_BOUNDS`, and the phase retires the new grant at its end.
 
 use std::os::seraph::{current_ipc_buf, startup_info};
 use std::sync::Arc;
@@ -136,6 +139,15 @@ fn geometry(cap: u64, what: &str) -> (u64, u64)
         "blk_regions: {what}: BLK_GET_GEOMETRY status"
     );
     (reply.word(0), reply.word(1))
+}
+
+/// The reply label of `BLK_GET_GEOMETRY` on `cap`.
+fn geometry_label(cap: u64) -> u64
+{
+    let msg = IpcMessage::builder(blk_labels::BLK_GET_GEOMETRY)
+        .word(0, version())
+        .build();
+    call(cap, &msg, "BLK_GET_GEOMETRY").label
 }
 
 /// Whether `cap` names no capability in svctest's `CSpace`.
@@ -384,9 +396,8 @@ fn blk_regions_phase(caps: &Caps)
 
     dead_childs_region(partition);
     revoked_memory(partition);
-    end_after_revoke(partition);
+    retire_after_revoke(disk, partition);
 
-    let _ = syscall::cap_delete(partition);
     let _ = syscall::cap_delete(disk);
     std::os::seraph::log!("blk_regions phase passed ({block}-byte blocks)");
 }
@@ -706,15 +717,19 @@ fn revoked_memory(partition: u64)
     region.release("region of a revoked cap");
 }
 
-/// `BLK_END_REGIONS` on `partition` after a revoke of the derivation of it
-/// a holder registered through, as vfsd sends it: a region the holder
-/// registered, and every region a thread registered on the derivation in a
-/// loop that runs until the revoke cuts it off, are ended, their caps
-/// revoked. The thread races the revoke, so a registration of it may be
-/// queued on the driver's endpoint when the revoke runs; the driver serves
-/// that ahead of the end, which ends it too. Then the partition registers a
-/// region again, and the end on a region cap is refused.
-fn end_after_revoke(partition: u64)
+/// `BLK_RETIRE_PARTITION` on `partition` after a revoke of the derivation
+/// of it a holder registered through, as vfsd cuts a grant off
+/// (services/drivers/virtio/blk/README.md § Grants and regions): a region the
+/// holder registered, and every region a thread registered on the derivation
+/// in a loop that runs until the revoke or the retire cuts it off, are ended,
+/// their caps revoked. The thread races the revoke, so a registration of it
+/// may reach the driver after the retire; the driver refuses it by its
+/// retired badge. After the retire every request on `partition` is refused
+/// `OUT_OF_BOUNDS`, a second retire included; `partition` is deleted. The
+/// scratch range registered again on `disk` is a new grant, which registers
+/// a region while the retired cap still reaches nothing, refuses a retire on
+/// a region cap, and is retired and deleted in turn.
+fn retire_after_revoke(disk: u64, partition: u64)
 {
     let holder = syscall::cap_derive(partition, syscall::RIGHTS_EP_SEND_GRANT)
         .expect("blk_regions: holder's partition cap");
@@ -741,40 +756,65 @@ fn end_after_revoke(partition: u64)
     }
     syscall::cap_revoke_all(partition)
         .unwrap_or_else(|e| panic!("blk_regions: revoking the holder's cap failed ({e})"));
-    end_regions(partition, blk_errors::SUCCESS, "the end after the revoke");
+    retire(
+        partition,
+        blk_errors::SUCCESS,
+        "the retire after the revoke",
+    );
     let registrations = racer.join().expect("blk_regions: racer thread panicked");
     assert!(
         gone(first.cap) && gone(first.liveness),
-        "blk_regions: the holder's region outlived the end after the revoke"
+        "blk_regions: the holder's region outlived the retire"
     );
     first.release("holder's region");
     for registered in registrations
     {
         assert!(
             gone(registered.cap) && gone(registered.liveness),
-            "blk_regions: a region the racer registered outlived the end after the revoke"
+            "blk_regions: a region the racer registered outlived the retire"
         );
         super::memmgr::release_grant(registered.grant, registered.grant_id);
     }
 
-    let again = Region::register(
-        partition,
-        blk_labels::REGION_DEVICE_READS_WRITES,
-        "region after the end",
-    )
-    .unwrap_or_else(|label| panic!("blk_regions: a region after the end refused ({label:#x})"));
-    end_regions(
-        again.cap,
-        blk_errors::OUT_OF_BOUNDS,
-        "the end on a region cap",
+    assert_eq!(
+        Region::register(
+            partition,
+            blk_labels::REGION_DEVICE_READS_WRITES,
+            "region on the retired partition",
+        )
+        .err(),
+        Some(blk_errors::OUT_OF_BOUNDS),
+        "blk_regions: a registration on the retired partition"
     );
-    again.unregister("region after the end");
+    retire(partition, blk_errors::OUT_OF_BOUNDS, "a second retire");
+
+    let (again, _, _) = scratch_partition(disk);
+    assert_eq!(
+        geometry_label(partition),
+        blk_errors::OUT_OF_BOUNDS,
+        "blk_regions: the retired partition's geometry after the range's new grant"
+    );
+    let _ = syscall::cap_delete(partition);
+    let region = Region::register(
+        again,
+        blk_labels::REGION_DEVICE_READS_WRITES,
+        "region on the new grant",
+    )
+    .unwrap_or_else(|label| panic!("blk_regions: a region on the new grant refused ({label:#x})"));
+    retire(
+        region.cap,
+        blk_errors::OUT_OF_BOUNDS,
+        "a retire on a region cap",
+    );
+    region.unregister("region on the new grant");
+    retire(again, blk_errors::SUCCESS, "the retire of the new grant");
+    let _ = syscall::cap_delete(again);
 }
 
-/// `BLK_END_REGIONS` on `cap`, whose reply label must be `want`.
-fn end_regions(cap: u64, want: u64, what: &str)
+/// `BLK_RETIRE_PARTITION` on `cap`, whose reply label must be `want`.
+fn retire(cap: u64, want: u64, what: &str)
 {
-    let msg = IpcMessage::builder(blk_labels::BLK_END_REGIONS)
+    let msg = IpcMessage::builder(blk_labels::BLK_RETIRE_PARTITION)
         .word(0, version())
         .build();
     assert_eq!(call(cap, &msg, what).label, want, "blk_regions: {what}");
@@ -791,7 +831,8 @@ struct Registered
 }
 
 /// Register one-page regions on `holder` in a loop, counting each in
-/// `made`, until a call on `holder` fails, the revoke having taken it.
+/// `made`, until a call on `holder` fails, the revoke having taken it, or
+/// is refused `OUT_OF_BOUNDS`, the retire having reached the driver first.
 /// At most two of its regions stay registered: past that it unregisters
 /// the oldest, so the partition's bound is never reached. Returns every
 /// region it registered.
@@ -813,6 +854,9 @@ fn register_until_cut_off(holder: u64, made: &AtomicUsize) -> Vec<Registered>
             .build();
         // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
         let reply = unsafe { ipc::ipc_call(holder, &msg, ipc_buf) };
+        // A call the revoke cut off fails; one that reached the driver after
+        // the retire is refused by the retired badge, and its Memory cap is
+        // deleted with the refusal.
         let Ok(reply) = reply
         else
         {
@@ -820,6 +864,11 @@ fn register_until_cut_off(holder: u64, made: &AtomicUsize) -> Vec<Registered>
             super::memmgr::release_grant(grant, grant_id);
             return all;
         };
+        if reply.label == blk_errors::OUT_OF_BOUNDS && reply.caps().is_empty()
+        {
+            super::memmgr::release_grant(grant, grant_id);
+            return all;
+        }
         let &[cap, liveness] = reply.caps()
         else
         {

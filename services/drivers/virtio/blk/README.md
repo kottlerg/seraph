@@ -80,6 +80,44 @@ the driver's own sweeper thread (§ DMA Discipline).
 
 ---
 
+## Grants and regions
+
+A partition badge is one grant of a range, and the driver keeps the grants
+and the regions registered through them in one model, `virtio_blk::Grants`,
+which its host tests drive:
+
+- A partition badge is **registered** from the `REGISTER_PARTITION` that
+  mints it until the `BLK_RETIRE_PARTITION` sent on it, then **retired**.
+  Each registration mints a fresh badge from a counter that only grows, a
+  range already registered included, so a retired badge is never minted
+  again on this endpoint. A new driver serves a new endpoint, which no cap
+  of the old one reaches.
+- A region belongs to the one badge it was registered through, a partition
+  badge or a whole-disk badge, and cannot outlive a partition badge: the
+  retire unregisters every region of the badge, as `BLK_UNREGISTER_REGION`
+  does, before its reply.
+- No request carrying a retired badge is served, whenever its sender sent
+  it: a registration, a transfer or a geometry request on the badge is
+  answered `OUT_OF_BOUNDS`, and so is a region transfer on a region of the
+  badge, which the retire has ended. A call is bound to the endpoint when its
+  sender resolves the cap, so a request sent before a revoke of the sender's
+  cap can reach the driver after it; the retire refuses it by its badge, not
+  by when it arrives.
+
+Whoever holds a partition cap the driver minted, and grants derivations of
+it, cuts a holder off with three steps in this order: revoke the
+derivations (`cap_revoke_all`), retire the badge (`BLK_RETIRE_PARTITION` on
+the kept cap), delete the kept cap. To grant the range again it registers
+the range again and derives from the new cap. After the retire the cut-off
+holder reaches nothing through the badge, and the next holder's badge is
+another, so nothing the cut-off holder sent reaches the next grant. vfsd is
+that granter
+([namespace-composition.md](../../../vfsd/docs/namespace-composition.md#revocation)
+§ Revocation). The whole-disk badge is not retired: devmgr mints and revokes
+it, and no granter grants it again.
+
+---
+
 ## Messages
 
 All operations use `SYS_IPC_CALL` (synchronous call/reply). Labels are
@@ -90,10 +128,10 @@ defined in `shared/ipc::blk_labels`; error codes in `shared/ipc::blk_errors`.
 Register a partition LBA range and receive a partition-badged `SEND_GRANT`
 cap scoped to it. Callable only with a `MOUNT_AUTHORITY`-badged cap (the
 whole-disk cap); callers whose badge lacks it receive `REGISTER_REJECTED`.
-The badge identifies the range: registering a range already registered
-returns a cap carrying that range's badge, so a remount reuses its entry, and
-the driver's table holds one entry per distinct range. The table grows with
-those ranges and has no fixed size.
+Each registration is a new grant under a fresh badge, a range already
+registered included, until `BLK_RETIRE_PARTITION` retires it (§ Grants and
+regions). The driver's table holds one entry per live grant, grows with them,
+and has no fixed size.
 
 **Request:**
 
@@ -222,8 +260,8 @@ is fixed for the device's life.
 Register a staging buffer. Sent on a partition or whole-disk cap. The driver
 checks the Memory cap, maps it for the device once with the access the
 request names (`DMA_MAP`), and keeps it, and the mapping, until the region is
-unregistered: by `BLK_UNREGISTER_REGION`, by `BLK_END_REGIONS` on the
-registering badge, by the end of the client's lease (the last copy of the
+unregistered: by `BLK_UNREGISTER_REGION`, by `BLK_RETIRE_PARTITION` on the
+partition badge it was registered through, by the end of the client's lease (the last copy of the
 liveness cap outside the driver is gone, its process having died or deleted
 it), by the next transfer after the client revoked the Memory cap it
 registered, or by devmgr's withdrawal of the driver. The
@@ -252,7 +290,7 @@ so the client copies data out once before it parses or checks it.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 3 | `OUT_OF_BOUNDS` | The badge is neither a whole-disk badge nor a registered partition's |
+| 3 | `OUT_OF_BOUNDS` | The badge is neither a whole-disk badge nor a registered partition's (a retired partition's is not) |
 | 5 | `INVALID_MEMORY_CAP` | The cap is absent, not a Memory cap, empty, or missing the rights the access needs; or `data[1]` names no access |
 | 6 | `LABEL_VERSION_MISMATCH` | `data[0]` is not the driver's `BLK_LABELS_VERSION` |
 | 7 | `DEVICE_FAULT` | The driver has failed stop after a lost request, or devmgr refused the mapping for a reason other than its bounds |
@@ -306,38 +344,34 @@ region cap and of the liveness cap. Served after the driver has failed stop
 too. Reply: label 0 (success), `OUT_OF_BOUNDS` (3) for a cap naming no live
 region (a second unregistration included), or `LABEL_VERSION_MISMATCH` (6).
 
-### Label 10: `BLK_END_REGIONS`
+### Label 10: `BLK_RETIRE_PARTITION`
 
-End every region registered through the badge of the partition or
-whole-disk cap the request is sent on, `data[0]` the caller's
-`BLK_LABELS_VERSION`. The driver unregisters each as `BLK_UNREGISTER_REGION`
-does, all before the reply, so once the reply arrives the device reaches no
-frame of them and no copy of their region or liveness caps is left. Served
-after the driver has failed stop too. Reply: label 0 (success), whether or
-not the badge held a region; `OUT_OF_BOUNDS` (3) on a region cap or an
-unbadged cap; or `LABEL_VERSION_MISMATCH` (6).
+Retire the partition badge of the cap the request is sent on, `data[0]` the
+caller's `BLK_LABELS_VERSION` (§ Grants and regions). The driver removes the
+badge, so it serves no later request carrying it, and unregisters every
+region registered through it as `BLK_UNREGISTER_REGION` does, all before the
+reply: once the reply arrives the device reaches no frame of them and no copy
+of their region or liveness caps is left. Served after the driver has failed
+stop too. Reply: label 0 (success), whether or not the badge held a region;
+`OUT_OF_BOUNDS` (3) on any other badge, a retired partition badge (a second
+retire included), a whole-disk, region or unbadged cap; or
+`LABEL_VERSION_MISMATCH` (6).
 
 A region outlives the partition cap it was registered on: its region cap is
-minted from this endpoint, so a revoke of the partition cap does not reach
-it. Whoever grants derivations of a partition or whole-disk cap and revokes
-them therefore MUST send `BLK_END_REGIONS` on the cap it kept after each
-revoke, before it deletes that cap or grants a new derivation; vfsd does so
-at each revoke
-([namespace-composition.md](../../../vfsd/docs/namespace-composition.md#revocation)
-§ Revocation). The order makes the end complete: after the revoke the cut-off
-holder can send no registration, and one it sent before the revoke is ahead
-of the end on this endpoint's queue, which the driver serves in order, so the
-end unregisters it too. A driver that died between the revoke and the end
-took its regions with it: devmgr withdraws a dead driver and revokes its
-service endpoint, from which every region cap derives
+minted from this endpoint, so a revoke of the partition cap does not reach it.
+A granter that revokes a derivation of a partition cap therefore MUST retire
+the badge before it deletes its kept cap or grants the range again, and grants
+it again only through a new registration (§ Grants and regions). A driver that
+died before the retire took its grants and regions with it: devmgr withdraws a
+dead driver and revokes its service endpoint, from which every partition and
+region cap derives
 ([docs/device-management.md](../../../../docs/device-management.md#dma-safe-teardown)
 § DMA-Safe Teardown), so the granter's call failing for the driver's death
-leaves no region; any other failure leaves the cut-off
-holder's regions reachable through their region caps until it unregisters
-them or its process ends, and the granter then grants the partition to no
-new holder. Any holder of a badge can end that badge's regions: on a
-partition, the one holder the granter allows at a time; on the whole-disk
-badge, the `MOUNT_AUTHORITY` holders.
+leaves nothing to retire. Any other failure leaves the badge registered and the
+cut-off holder's regions reachable through their region caps until it
+unregisters them or its process ends, and the granter then grants the range to
+no new holder. Any holder of a partition cap can retire its badge: the one
+holder the granter allows at a time, who ends its own grant.
 
 ### Internal label: `SWEEP`
 
@@ -404,9 +438,11 @@ memmgr's pool through the driver's Memory cap and devmgr's
 ([memory-pool.md](../../../memmgr/docs/memory-pool.md) § Reclamation), unless
 the client revokes the cap it registered, which takes both copies with it:
 before each region transfer the driver checks that its kept cap still
-answers `cap_info`, and unregisters a region whose cap does not, so the
-frames of a revoked region reach the device during at most the one request
-in flight, the window the per-transfer path has
+answers `cap_info`, and unregisters a region whose cap does not, before it
+programs the device, so the device is never programmed at such frames. The
+check does not unmap them sooner: from the client's release of the frames
+until the region's next transfer or its unregistration, they stay mapped for
+the device while held by no reference, and memmgr may hand them out
 ([docs/device-management.md](../../../../docs/device-management.md#dma-safe-teardown)
 § DMA-Safe Teardown).
 Unregistration relies on the depth of 1 below: no request on the region is

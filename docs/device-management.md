@@ -214,15 +214,18 @@ A driver programs its device only with the device address of a DMA mapping of th
   gone) has it delete the capability, the transfer being over. A registered region's frame stays
   mapped, and the driver keeps its capability, until the region is unregistered: by its client;
   by the driver once the client holds no liveness capability for it, its process gone; by the
-  holder of the partition the client registered it on, after revoking the client's partition
-  capability
-  ([virtio-blk README](../services/drivers/virtio/blk/README.md#label-10-blk_end_regions)
-  § Label 10: `BLK_END_REGIONS`); or by the driver at the next transfer after the client revoked
+  retire of the partition grant the client registered it through, which the grant's holder
+  sends after revoking the client's partition capability
+  ([virtio-blk README](../services/drivers/virtio/blk/README.md#grants-and-regions)
+  § Grants and regions); or by the driver at the next transfer after the client revoked
   the capability it registered, which takes the driver's and devmgr's copies with it, since
-  both derive from the client's. Until that transfer, the frames of a region so revoked, like
-  those of a transfer in flight whose lent capability is revoked, are held by no copy devmgr
-  keeps; the region check bounds that window to one request, and devmgr holding the frames of
-  a standing mapping by a reference no lender can revoke is the remaining step.
+  both derive from the client's. From that revoke and the client's release of the frames until
+  the region's next transfer or its unregistration, the frames stay mapped for the device and
+  are held by no reference, so memmgr may hand them out; the region check keeps the driver
+  from programming the device at them, and does not unmap them sooner. The frames of a transfer
+  in flight whose lent capability is revoked are held by no copy devmgr keeps for that one
+  request. devmgr holding the frames of a standing mapping by a reference no lender can revoke
+  is the remaining step.
 - **When the driver is gone.** A driver that dies mid-transfer, or exits after an unacknowledged
   reset, leaves the mapping standing, and its own capability goes with its `CSpace`. When devmgr
   withdraws the device it deletes its mapping capabilities only once the IOMMU blocks the device,

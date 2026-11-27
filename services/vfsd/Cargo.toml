@@ -17,6 +17,8 @@ boot-protocol = { path = "../../abi/boot-protocol" }
 # Package is `vfsd-gpt`, which names whose parser it is; the `gpt` dependency
 # key keeps the in-crate path short.
 gpt = { path = "gpt", package = "vfsd-gpt" }
+# Pure host-tested cut-off of a partition grant (revoke, retire, delete).
+grant = { path = "grant", package = "vfsd-grant" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
 # The walk to the storage statement.

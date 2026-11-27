@@ -14,8 +14,9 @@ pub const DEVICE_STATUS_IOERR: u64 = 1;
 /// support the request type.
 pub const DEVICE_STATUS_UNSUPP: u64 = 2;
 /// Read LBA is outside the bounds registered for the caller's badge, or
-/// the badge names no registered range or no live region (a region ends at
-/// its unregistration, at `BLK_END_REGIONS`, at its client's lease end, and
+/// the badge names no registered range (never minted, or retired by
+/// `BLK_RETIRE_PARTITION`) or no live region (a region ends at its
+/// unregistration, at its partition's retire, at its client's lease end, and
 /// when its client revoked the Memory cap it registered).
 pub const OUT_OF_BOUNDS: u64 = 3;
 /// Partition registration rejected (no authority or bad args).

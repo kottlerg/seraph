@@ -326,8 +326,9 @@ elements:
   mapped for the device, and transfer through the region cap it gets back
   (`BLK_READ_REGION`, `BLK_WRITE_REGION`) with no cap on each request,
   until the region is unregistered (`BLK_UNREGISTER_REGION`, the end of
-  the holder's lease, or `BLK_END_REGIONS`, which whoever revokes a
-  partition cap sends on the cap it kept).
+  the holder's lease, or `BLK_RETIRE_PARTITION`, which whoever revokes a
+  partition cap sends on the cap it kept, ending that grant of the
+  partition for good).
 
 Authoritative wire shapes for `REGISTER_PARTITION`,
 `BLK_READ_INTO_MEMORY`, `BLK_WRITE_FROM_MEMORY`, `BLK_GET_GEOMETRY`, and

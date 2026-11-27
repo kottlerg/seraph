@@ -9,7 +9,8 @@
 //! and the IPC loop. This library holds the pure decisions those paths
 //! make on client- and device-supplied values: the device geometry the
 //! driver serves in logical blocks, the transfer length a client's block
-//! count asks for, the partition table that scopes a partition badge, and
+//! count asks for, the grants ([`Grants`]): the partition badges the driver
+//! minted and the regions registered through them, and
 //! the reply label a request's outcome maps to. Each is a wire-contract
 //! decision (`shared/ipc::blk_labels`, `shared/ipc::blk_errors`), so they
 //! live where a host test can pin them. It also holds the registered regions
@@ -131,22 +132,21 @@ pub struct PartitionBound
     pub length_lba: u64,
 }
 
-/// The partition ranges registered on the driver, keyed by partition badge.
+/// The partition grants registered on the driver, keyed by partition badge.
 ///
-/// A registration of a range already in the table returns that range's
-/// badge: the badge is the range's identity, and a cap carrying it grants
-/// exactly that range, so a remount of a partition reuses its entry. The
-/// table therefore holds one entry per distinct range a `MOUNT_AUTHORITY`
-/// holder registered, not one per registration. It grows on the heap with
-/// the distinct ranges; nothing in it is fixed-size.
+/// Each registration is one grant and takes a fresh badge, one no earlier
+/// registration had, whether or not its range is already registered; a
+/// retire ([`Grants::retire`]) removes the entry, and its badge
+/// names nothing from then on. The table holds one entry per live grant. It
+/// grows on the heap with them; nothing in it is fixed-size.
 #[derive(Default)]
 pub struct PartitionTable
 {
     entries: Vec<PartitionBound>,
-    /// Next fresh partition badge. Badges stay in the low 62 bits, so they
-    /// are bit-disjoint from `blk_labels::MOUNT_AUTHORITY` and from
-    /// [`REGION_BADGE`] by construction; reaching bit 62 takes 2^62 distinct
-    /// ranges.
+    /// Next fresh partition badge. It only grows, so no badge is minted
+    /// twice. Badges stay in the low 62 bits, so they are bit-disjoint from
+    /// `blk_labels::MOUNT_AUTHORITY` and from [`REGION_BADGE`] by
+    /// construction; reaching bit 62 takes 2^62 registrations.
     next_badge: u64,
 }
 
@@ -161,8 +161,8 @@ impl PartitionTable
         }
     }
 
-    /// The bound registered for `badge`, if any. Badge 0 (unbadged) never
-    /// names one.
+    /// The bound registered for `badge`, if any: `None` for a badge never
+    /// minted or retired. Badge 0 (unbadged) never names one.
     #[must_use]
     pub fn lookup(&self, badge: u64) -> Option<PartitionBound>
     {
@@ -173,8 +173,8 @@ impl PartitionTable
         self.entries.iter().copied().find(|b| b.badge == badge)
     }
 
-    /// Register the range `[base_lba, base_lba + length_lba)` and return its
-    /// badge, reusing the badge of an identical range already registered.
+    /// Register the range `[base_lba, base_lba + length_lba)` as a new grant
+    /// and return its fresh badge.
     ///
     /// Returns `None` for an empty range, when the fresh-badge counter has
     /// reached [`REGION_BADGE`], or when the heap cannot grow the table. The
@@ -184,13 +184,6 @@ impl PartitionTable
         if length_lba == 0
         {
             return None;
-        }
-        if let Some(b) = self
-            .entries
-            .iter()
-            .find(|b| b.base_lba == base_lba && b.length_lba == length_lba)
-        {
-            return Some(b.badge);
         }
         let badge = self.next_badge;
         if badge >= REGION_BADGE
@@ -206,6 +199,14 @@ impl PartitionTable
             length_lba,
         });
         Some(badge)
+    }
+
+    /// Remove the grant `badge` names; `false` when it names none.
+    fn remove(&mut self, badge: u64) -> bool
+    {
+        let before = self.entries.len();
+        self.entries.retain(|b| b.badge != badge || badge == 0);
+        self.entries.len() != before
     }
 }
 
@@ -509,12 +510,7 @@ impl<K> RegionTable<K>
     #[must_use]
     pub fn admit(&self, partition: u64) -> Option<RegionId>
     {
-        let held = self
-            .slots
-            .iter()
-            .filter(|s| matches!(&s.state, SlotState::Live { region, .. } if region.partition == partition))
-            .count();
-        if held >= MAX_REGIONS_PER_PARTITION
+        if self.live_of(partition) >= MAX_REGIONS_PER_PARTITION
         {
             return None;
         }
@@ -585,7 +581,7 @@ impl<K> RegionTable<K>
     /// Unregister one live region registered for `partition`, as
     /// [`RegionTable::remove`] does: its slot retires until its
     /// sole-reference post. Returns the region and what was kept with it, or
-    /// `None` once `partition` holds no live region; `BLK_END_REGIONS`
+    /// `None` once `partition` holds no live region; [`Grants::retire`]
     /// calls it until `None`.
     pub fn remove_one_of(&mut self, partition: u64) -> Option<(Region, K)>
     {
@@ -598,6 +594,16 @@ impl<K> RegionTable<K>
             // Found Live just above, with `&mut` held throughout.
             SlotState::Free | SlotState::Retiring => None,
         }
+    }
+
+    /// Live regions registered for `partition`.
+    #[must_use]
+    pub fn live_of(&self, partition: u64) -> usize
+    {
+        self.slots
+            .iter()
+            .filter(|s| matches!(&s.state, SlotState::Live { region, .. } if region.partition == partition))
+            .count()
     }
 
     /// Unregister the live region `id` names, returning it and what was kept
@@ -642,6 +648,166 @@ impl<K> RegionTable<K>
             SlotState::Live { region, kept } => Post::Ended(region, kept),
             SlotState::Retiring | SlotState::Free => Post::Retired,
         }
+    }
+}
+
+// ── Grants: partition badges and their regions ─────────────────────────────
+
+/// What a request's badge reaches, as [`Grants::scope`] resolves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope
+{
+    /// A whole-disk cap: the whole device.
+    WholeDisk,
+    /// A registered partition grant: its range.
+    Partition(PartitionBound),
+}
+
+/// Why [`Grants::admit_region`] refused a registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionRefusal
+{
+    /// The badge reaches nothing: unbadged, a region's or the sweeper's, or
+    /// a partition badge never minted or retired (`blk_errors::OUT_OF_BOUNDS`).
+    NoScope,
+    /// The badge's regions or the driver's slots are at their bound
+    /// (`blk_errors::REGION_LIMIT`).
+    Limit,
+}
+
+/// The driver's grants: the partition badges it minted
+/// ([`PartitionTable`]) and the regions registered through them and through
+/// whole-disk badges ([`RegionTable`]), with the decisions the service loop
+/// makes on them (README § Grants and regions).
+///
+/// A partition badge is registered or retired, and a retired badge never
+/// returns: [`Grants::register_partition`] mints a fresh one for every
+/// grant. A region belongs to the one badge it was registered through and
+/// cannot outlive it. The invariants, which the host tests drive in every
+/// order of a retire against requests sent before it:
+///
+/// - no request carrying a retired badge is served, whenever it was sent:
+///   [`Grants::scope`] and [`Grants::admit_region`] refuse it, and a
+///   region transfer is served only while its region is live and its badge
+///   still scopes ([`Grants::region`]);
+/// - a retire leaves no live region of the badge: each is handed to the
+///   caller to unmap and release, and its slot retires until the
+///   sole-reference post its release owes, naming no badge meanwhile;
+/// - no badge is minted twice: a retired badge never names a grant again,
+///   and a range registered again takes a new badge.
+pub struct Grants<K>
+{
+    partitions: PartitionTable,
+    regions: RegionTable<K>,
+}
+
+impl<K> Default for Grants<K>
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
+impl<K> Grants<K>
+{
+    /// No grant and no region.
+    #[must_use]
+    pub fn new() -> Self
+    {
+        Self {
+            partitions: PartitionTable::new(),
+            regions: RegionTable::new(),
+        }
+    }
+
+    /// `REGISTER_PARTITION`: grant `[base_lba, base_lba + length_lba)` under
+    /// a fresh badge ([`PartitionTable::register`]).
+    pub fn register_partition(&mut self, base_lba: u64, length_lba: u64) -> Option<u64>
+    {
+        self.partitions.register(base_lba, length_lba)
+    }
+
+    /// What a request carrying `badge` reaches; `None` for every badge
+    /// that reaches nothing, a retired partition badge among them.
+    #[must_use]
+    pub fn scope(&self, badge: u64) -> Option<Scope>
+    {
+        match Caller::of(badge)
+        {
+            Caller::WholeDisk(_) => Some(Scope::WholeDisk),
+            Caller::Partition(badge) => self.partitions.lookup(badge).map(Scope::Partition),
+            Caller::Unbadged | Caller::Region(_) | Caller::Sweeper | Caller::Unknown => None,
+        }
+    }
+
+    /// Retire the partition grant `badge` names: remove the badge, so no
+    /// later request carrying it is served, and end every live region
+    /// registered through it, each handed to `release` to unmap and to
+    /// release its capabilities. `false`, changing nothing, when `badge`
+    /// is no live partition badge (a whole-disk badge, a retired one).
+    pub fn retire(&mut self, badge: u64, mut release: impl FnMut(Region, K)) -> bool
+    {
+        if !matches!(Caller::of(badge), Caller::Partition(_)) || !self.partitions.remove(badge)
+        {
+            return false;
+        }
+        while let Some((region, kept)) = self.regions.remove_one_of(badge)
+        {
+            release(region, kept);
+        }
+        true
+    }
+
+    /// The identifier a region registered through `badge` would take, and
+    /// the badge it counts against.
+    ///
+    /// # Errors
+    /// [`RegionRefusal`]: the badge reaches nothing, or its bound or the
+    /// driver's is reached.
+    pub fn admit_region(&self, badge: u64) -> Result<RegionId, RegionRefusal>
+    {
+        self.scope(badge).ok_or(RegionRefusal::NoScope)?;
+        self.regions.admit(badge).ok_or(RegionRefusal::Limit)
+    }
+
+    /// Make `region` live under `id` ([`RegionTable::insert`]), `id` one
+    /// [`Grants::admit_region`] returned with no change since.
+    ///
+    /// # Errors
+    /// `kept`, when the slot is not free.
+    pub fn insert_region(&mut self, id: RegionId, region: Region, kept: K) -> Result<(), K>
+    {
+        self.regions.insert(id, region, kept)
+    }
+
+    /// The live region `id` names and what was kept with it, while the badge
+    /// it was registered through still scopes; `None` otherwise.
+    #[must_use]
+    pub fn region(&self, id: RegionId) -> Option<(&Region, &K)>
+    {
+        let region = self.regions.get(id)?;
+        self.scope(region.partition)?;
+        Some((region, self.regions.kept(id)?))
+    }
+
+    /// Unregister the live region `id` names ([`RegionTable::remove`]).
+    pub fn remove_region(&mut self, id: RegionId) -> Option<(Region, K)>
+    {
+        self.regions.remove(id)
+    }
+
+    /// Apply a sole-reference post ([`RegionTable::post`]).
+    pub fn post(&mut self, correlator: u64) -> Post<K>
+    {
+        self.regions.post(correlator)
+    }
+
+    /// Live regions registered through `badge`.
+    #[must_use]
+    pub fn regions_of(&self, badge: u64) -> usize
+    {
+        self.regions.live_of(badge)
     }
 }
 
@@ -962,16 +1128,16 @@ mod tests
         }
     }
 
+    // Defect caught: a second grant of a range sharing the first's badge, so
+    // retiring one grant would cut off the other, or a retired badge minted
+    // again for a later grant, reaching its holder's late requests.
     #[test]
-    fn registering_a_range_twice_reuses_its_badge_and_entry()
+    fn every_registration_is_a_fresh_badge_and_a_removed_one_names_nothing()
     {
         let mut t = PartitionTable::new();
         let a = t.register(2048, 100).expect("fresh range");
-        let b = t.register(4096, 100).expect("fresh range");
+        let b = t.register(2048, 100).expect("the same range again");
         assert_ne!(a, b);
-        // A remount of the first range: same badge, no new entry, so the
-        // table does not grow with registrations.
-        assert_eq!(t.register(2048, 100), Some(a));
         assert_eq!(t.entries.len(), 2);
         assert_eq!(
             t.lookup(a),
@@ -981,8 +1147,13 @@ mod tests
                 length_lba: 100
             })
         );
-        // Overlapping but distinct ranges are distinct entries.
-        assert_ne!(t.register(2048, 99), Some(a));
+        assert!(t.remove(a));
+        assert!(!t.remove(a));
+        assert_eq!(t.lookup(a), None);
+        assert!(t.lookup(b).is_some());
+        let c = t.register(2048, 100).expect("the range after its retire");
+        assert!(c != a && c != b);
+        assert_eq!(t.entries.len(), 2);
     }
 
     #[test]
@@ -1005,8 +1176,8 @@ mod tests
         assert_eq!(last & (ipc::blk_labels::MOUNT_AUTHORITY | REGION_BADGE), 0);
         assert_eq!(Caller::of(last), Caller::Partition(last));
         assert_eq!(t.register(1, 1), None);
-        // An already-registered range still resolves.
-        assert_eq!(t.register(0, 1), Some(last));
+        assert_eq!(t.register(0, 1), None);
+        assert!(t.lookup(last).is_some());
     }
 
     #[test]
@@ -1292,41 +1463,191 @@ mod tests
         assert_eq!(t.kept(id), None);
     }
 
-    // Defect caught: a partition cap revoked by its granter leaving the
-    // revoked holder's regions live (BLK_END_REGIONS ending too few, or
-    // another partition's).
-    #[test]
-    fn ending_a_partitions_regions_takes_each_of_its_own_and_retires_their_slots()
+    /// Register a region through `badge` in `g`, keeping `kept` with it.
+    fn grant_region(g: &mut Grants<u8>, badge: u64, kept: u8) -> RegionId
     {
-        let mut t: RegionTable<u8> = RegionTable::new();
-        let mut ids = Vec::new();
-        for (kept, partition) in [(1, 5), (2, 6), (3, 5), (4, 5)]
-        {
-            let id = t.admit(partition).unwrap();
-            t.insert(id, region(partition), kept).unwrap();
-            ids.push(id);
-        }
+        let id = g.admit_region(badge).expect("region admitted");
+        g.insert_region(id, region(badge), kept)
+            .expect("admitted slot free");
+        id
+    }
+
+    /// Retire `badge` in `g`, returning what was kept with each region it
+    /// ended, sorted, or `None` when the retire was refused.
+    fn retire(g: &mut Grants<u8>, badge: u64) -> Option<Vec<u8>>
+    {
         let mut ended = Vec::new();
-        while let Some((r, kept)) = t.remove_one_of(5)
-        {
-            assert_eq!(r.partition, 5);
+        let done = g.retire(badge, |r, kept| {
+            assert_eq!(r.partition, badge, "a retire ended another badge's region");
             ended.push(kept);
-        }
+        });
         ended.sort_unstable();
-        assert_eq!(ended, [1, 3, 4]);
-        assert_eq!(t.get(ids[1]), Some(&region(6)));
-        for &i in &[ids[0], ids[2], ids[3]]
+        done.then_some(ended)
+    }
+
+    // Defect caught: a partition grant revoked by its granter leaving the
+    // revoked holder's regions live, or ending another grant's.
+    #[test]
+    fn a_retire_ends_every_region_of_its_badge_and_no_other()
+    {
+        let mut g: Grants<u8> = Grants::new();
+        let a = g.register_partition(0, 64).unwrap();
+        let b = g.register_partition(64, 64).unwrap();
+        let disk = ipc::blk_labels::MOUNT_AUTHORITY | 1;
+        let ids: Vec<RegionId> = [(1, a), (2, b), (3, a), (4, disk), (5, a)]
+            .into_iter()
+            .map(|(kept, badge)| grant_region(&mut g, badge, kept))
+            .collect();
+        assert_eq!(retire(&mut g, a), Some(vec![1, 3, 5]));
+        assert_eq!(g.regions_of(a), 0);
+        assert_eq!(g.region(ids[1]).map(|(_, k)| *k), Some(2));
+        assert_eq!(g.region(ids[3]).map(|(_, k)| *k), Some(4));
+        for &i in &[ids[0], ids[2], ids[4]]
         {
-            assert_eq!(t.get(i), None);
-            // Retiring until the binding's post, which then frees the slot.
-            assert_eq!(t.post(i.correlator()), Post::Retired);
+            assert!(g.region(i).is_none());
+            // Retiring until the post its release owes, which frees the slot.
+            assert_eq!(g.post(i.correlator()), Post::Retired);
+            assert_eq!(g.post(i.correlator()), Post::Stale);
         }
-        // The partition registers again up to its bound.
-        for _ in 0..MAX_REGIONS_PER_PARTITION
+        // A whole-disk badge, a retired one, and a region's are not retired.
+        assert_eq!(retire(&mut g, disk), None);
+        assert_eq!(retire(&mut g, a), None);
+        assert_eq!(retire(&mut g, ids[1].badge()), None);
+        assert_eq!(g.regions_of(disk), 1);
+    }
+
+    /// One request of a cut-off holder of a partition grant, sent before
+    /// the granter's retire and served at any point around it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Late
+    {
+        /// `BLK_REGISTER_REGION` on the partition cap.
+        Register,
+        /// `BLK_READ_INTO_MEMORY` or another request scoped by the badge.
+        Transfer,
+        /// `BLK_READ_REGION` on a region registered before any of these.
+        RegionTransfer,
+        /// A second `BLK_RETIRE_PARTITION` on the badge.
+        Retire,
+    }
+
+    /// Every ordering of `items`.
+    fn orderings<T: Copy>(items: &[T]) -> Vec<Vec<T>>
+    {
+        if items.len() <= 1
         {
-            let id = t.admit(5).unwrap();
-            t.insert(id, region(5), 0).unwrap();
+            return vec![items.to_vec()];
         }
-        assert_eq!(t.admit(5), None);
+        let mut out = Vec::new();
+        for i in 0..items.len()
+        {
+            let mut rest = items.to_vec();
+            let first = rest.remove(i);
+            for mut tail in orderings(&rest)
+            {
+                tail.insert(0, first);
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    // Defect caught: a request the cut-off holder sent before the retire and
+    // the driver served after it (a registration that resolved its cap
+    // before the revoke and queued after the retire), leaving the holder a
+    // region, a transfer, or an effect on the next grant of the range.
+    #[test]
+    fn no_request_carrying_a_retired_badge_is_served_in_any_order()
+    {
+        // `None` marks the granter's retire; the rest are the holder's.
+        let mut events: Vec<Option<Late>> = vec![None];
+        events.extend(
+            [
+                Late::Register,
+                Late::Transfer,
+                Late::RegionTransfer,
+                Late::Retire,
+            ]
+            .map(Some),
+        );
+        for order in orderings(&events)
+        {
+            let mut g: Grants<u8> = Grants::new();
+            let other = g.register_partition(0, 64).unwrap();
+            let kept_other = grant_region(&mut g, other, 9);
+            let badge = g.register_partition(0, 64).unwrap();
+            let early = grant_region(&mut g, badge, 1);
+            let mut retired = false;
+            for event in &order
+            {
+                match event
+                {
+                    None =>
+                    {
+                        let ended = retire(&mut g, badge);
+                        // A late retire that came first took the regions.
+                        assert_eq!(ended.is_some(), !retired, "{order:?}");
+                        retired = true;
+                    }
+                    Some(Late::Register) =>
+                    {
+                        let admitted = g.admit_region(badge);
+                        assert_eq!(admitted.is_ok(), !retired, "{order:?}");
+                        if let Ok(id) = admitted
+                        {
+                            g.insert_region(id, region(badge), 2).unwrap();
+                        }
+                    }
+                    Some(Late::Transfer) =>
+                    {
+                        assert_eq!(g.scope(badge).is_some(), !retired, "{order:?}");
+                    }
+                    Some(Late::RegionTransfer) =>
+                    {
+                        assert_eq!(g.region(early).is_some(), !retired, "{order:?}");
+                    }
+                    Some(Late::Retire) =>
+                    {
+                        let ended = retire(&mut g, badge);
+                        assert_eq!(ended.is_some(), !retired, "{order:?}");
+                        retired = true;
+                    }
+                }
+            }
+            assert!(retired);
+            assert_eq!(g.regions_of(badge), 0, "{order:?}");
+            assert_eq!(g.scope(badge), None, "{order:?}");
+            assert_eq!(
+                g.admit_region(badge),
+                Err(RegionRefusal::NoScope),
+                "{order:?}"
+            );
+            // The other grant of the same range is untouched.
+            assert_eq!(g.region(kept_other).map(|(_, k)| *k), Some(9));
+            // The granter grants the range again under a new badge.
+            let again = g.register_partition(0, 64).unwrap();
+            assert!(again != badge && again != other, "{order:?}");
+            grant_region(&mut g, again, 3);
+            assert_eq!(g.scope(badge), None, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn a_retired_badge_never_scopes_even_one_minted_past_it()
+    {
+        let mut g: Grants<u8> = Grants::new();
+        let a = g.register_partition(0, 8).unwrap();
+        assert!(retire(&mut g, a).is_some());
+        for _ in 0..16
+        {
+            let b = g.register_partition(0, 8).unwrap();
+            assert_ne!(b, a);
+            assert_eq!(g.scope(a), None);
+        }
+        assert_eq!(g.scope(0), None);
+        assert_eq!(
+            g.scope(ipc::blk_labels::MOUNT_AUTHORITY | 7),
+            Some(Scope::WholeDisk)
+        );
     }
 }

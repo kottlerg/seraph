@@ -15,7 +15,7 @@
 //! partition registration (`REGISTER_PARTITION`), the device geometry
 //! (`BLK_GET_GEOMETRY`), and registered regions (`BLK_REGISTER_REGION`,
 //! `BLK_READ_REGION`, `BLK_WRITE_REGION`, `BLK_UNREGISTER_REGION`,
-//! `BLK_END_REGIONS`) over IPC.
+//! `BLK_RETIRE_PARTITION`) over IPC.
 //! A sweeper thread unregisters the region of a client that holds no
 //! liveness cap any more ([`start_sweeper`]).
 
@@ -27,8 +27,8 @@ use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
 use virtio_blk::{
-    Caller, Geometry, IoOutcome, PartitionTable, Post, Region, RegionAccess, RegionId, RegionTable,
-    RequestTiming,
+    Caller, Geometry, Grants, IoOutcome, Post, Region, RegionAccess, RegionId, RegionRefusal,
+    RequestTiming, Scope,
 };
 use virtio_core::bootstrap::{DeliveredDevice, DeviceInterrupt};
 use virtio_core::pci::{ConfigError, PciTransport};
@@ -602,11 +602,11 @@ pub struct BlkRuntime<'a>
     /// segment is mapped for the device for the request's duration, and each
     /// registered region for its registration.
     dma_ep: u64,
-    partitions: PartitionTable,
-    /// The registered regions, with the capabilities the driver keeps for
-    /// each. Only this thread touches it: the sweeper thread hands it each
-    /// post as a request ([`start_sweeper`]).
-    regions: RegionTable<RegionCaps>,
+    /// The partition grants and the registered regions, with the
+    /// capabilities the driver keeps for each region. Only this thread
+    /// touches it: the sweeper thread hands it each post as a request
+    /// ([`start_sweeper`]).
+    grants: Grants<RegionCaps>,
     /// The event queue every region's liveness binding posts to, which the
     /// sweeper thread waits on.
     sweep_queue: u64,
@@ -733,9 +733,9 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
             {
                 handle_unregister_region(&msg, ipc_buf, rt, &mut reply);
             }
-            blk_labels::BLK_END_REGIONS =>
+            blk_labels::BLK_RETIRE_PARTITION =>
             {
-                handle_end_regions(&msg, ipc_buf, rt, &mut reply);
+                handle_retire_partition(&msg, ipc_buf, rt, &mut reply);
             }
             virtio_blk::SWEEP if Caller::of(msg.badge) == Caller::Sweeper =>
             {
@@ -1051,31 +1051,18 @@ fn quiesce_device(rt: &mut BlkRuntime)
 ///   need to walk the partition table before partitioning is complete.
 /// * Badge with [`MOUNT_AUTHORITY`] clear and non-zero low bits →
 ///   partition-identity badge issued by [`handle_register_partition`];
-///   bounded by the registered partition.
+///   bounded by the registered partition, and refused once retired.
 /// * `badge == 0` → un-badged caller; rejected. Every consumer of
 ///   this endpoint holds a badged cap.
 fn resolve_lba(badge: u64, lba: u64, rt: &BlkRuntime) -> Result<u64, u64>
 {
-    if badge == 0
-    {
-        return Err(ipc::blk_errors::OUT_OF_BOUNDS);
-    }
-
-    if badge & ipc::blk_labels::MOUNT_AUTHORITY != 0
+    let bound = match rt.grants.scope(badge)
     {
         // MOUNT_AUTHORITY holders read the whole disk directly,
         // bounded only by device capacity.
-        if lba >= rt.geometry.capacity
-        {
-            return Err(ipc::blk_errors::OUT_OF_BOUNDS);
-        }
-        return Ok(lba);
-    }
-
-    let Some(bound) = rt.partitions.lookup(badge)
-    else
-    {
-        return Err(ipc::blk_errors::OUT_OF_BOUNDS);
+        Some(Scope::WholeDisk) if lba < rt.geometry.capacity => return Ok(lba),
+        Some(Scope::Partition(bound)) => bound,
+        Some(Scope::WholeDisk) | None => return Err(ipc::blk_errors::OUT_OF_BOUNDS),
     };
     if lba >= bound.length_lba
     {
@@ -1097,10 +1084,10 @@ fn resolve_lba(badge: u64, lba: u64, rt: &BlkRuntime) -> Result<u64, u64>
 /// additional scopes.
 ///
 /// Data words: `[BLK_LABELS_VERSION, base_lba, length_lba]`, in logical
-/// blocks. The driver registers the range in its [`PartitionTable`], which
-/// returns the badge of an identical range already registered or a fresh
-/// one, derives a badged `SEND_GRANT` cap on its own service endpoint
-/// scoped to that badge, and returns the cap in `caps[0]` of the reply.
+/// blocks. The driver registers the range as a new grant under a fresh badge
+/// ([`Grants::register_partition`]), derives a badged `SEND_GRANT` cap on
+/// its own service endpoint scoped to that badge, and returns the cap in
+/// `caps[0]` of the reply.
 /// Server-side derivation is required because
 /// [`MOUNT_AUTHORITY`] caps are badged and the kernel rejects
 /// re-badging of a badged source — the caller cannot mint partition
@@ -1140,20 +1127,20 @@ fn handle_register_partition(msg: &IpcMessage, rt: &mut BlkRuntime, out: &mut Re
         return;
     }
 
-    let Some(badge) = rt.partitions.register(base_lba, length_lba)
+    let Some(badge) = rt.grants.register_partition(base_lba, length_lba)
     else
     {
         reject(out);
         return;
     };
 
-    // A failed derivation leaves the range registered: the entry may be one
-    // an earlier registration's cap still uses, and a fresh one is reused by
-    // the caller's retry, so the table still holds one entry per range.
+    // A failed derivation retires the grant, which no cap carries, so the
+    // table holds only grants some cap was minted for.
     let Ok(partition_cap) =
         syscall::cap_derive_badge(rt.service_ep, syscall::RIGHTS_EP_SEND_GRANT, badge)
     else
     {
+        rt.grants.retire(badge, |_, _| {});
         reject(out);
         return;
     };
@@ -1180,13 +1167,11 @@ fn handle_get_geometry(msg: &IpcMessage, rt: &BlkRuntime, out: &mut Reply)
     drop_caps(msg.caps());
     let reply = if msg.word(0) == u64::from(ipc::BLK_LABELS_VERSION)
     {
-        let length = if msg.badge & ipc::blk_labels::MOUNT_AUTHORITY != 0
+        let length = match rt.grants.scope(msg.badge)
         {
-            Some(rt.geometry.capacity)
-        }
-        else
-        {
-            rt.partitions.lookup(msg.badge).map(|b| b.length_lba)
+            Some(Scope::WholeDisk) => Some(rt.geometry.capacity),
+            Some(Scope::Partition(bound)) => Some(bound.length_lba),
+            None => None,
         };
         match length
         {
@@ -1268,16 +1253,12 @@ fn register_region(
     {
         return Err(ipc::blk_errors::LABEL_VERSION_MISMATCH);
     }
-    let partition = match Caller::of(msg.badge)
+    // A whole-disk or registered partition badge, a retired one refused.
+    let partition = msg.badge;
+    if rt.grants.scope(partition).is_none()
     {
-        Caller::WholeDisk(badge) => badge,
-        Caller::Partition(badge) if rt.partitions.lookup(badge).is_some() => badge,
-        Caller::Partition(_)
-        | Caller::Unbadged
-        | Caller::Region(_)
-        | Caller::Sweeper
-        | Caller::Unknown => return Err(ipc::blk_errors::OUT_OF_BOUNDS),
-    };
+        return Err(ipc::blk_errors::OUT_OF_BOUNDS);
+    }
     if rt.device_faulted
     {
         return Err(ipc::blk_errors::DEVICE_FAULT);
@@ -1297,9 +1278,13 @@ fn register_region(
         return Err(ipc::blk_errors::INVALID_MEMORY_CAP);
     }
     let id = rt
-        .regions
-        .admit(partition)
-        .ok_or(ipc::blk_errors::REGION_LIMIT)?;
+        .grants
+        .admit_region(partition)
+        .map_err(|refusal| match refusal
+        {
+            RegionRefusal::NoScope => ipc::blk_errors::OUT_OF_BOUNDS,
+            RegionRefusal::Limit => ipc::blk_errors::REGION_LIMIT,
+        })?;
     let dma_access = if access.device_writes()
     {
         virtio_core::dma::DEVICE_READS_WRITES
@@ -1338,7 +1323,7 @@ fn register_region(
         unmap_region(rt.dma_ep, &region, ipc_buf);
         return Err(ipc::blk_errors::REGION_LIMIT);
     };
-    if let Err(kept) = rt.regions.insert(id, region, kept)
+    if let Err(kept) = rt.grants.insert_region(id, region, kept)
     {
         // `admit` found the slot free and nothing has changed the table
         // since; refused all the same, the binding's post finds the slot at
@@ -1465,10 +1450,12 @@ fn handle_region_transfer(
 /// unregistered ([`release_region`]) and the request answered
 /// `OUT_OF_BOUNDS`, before the device is programmed: its client revoked the
 /// cap it registered, devmgr's copy with it, and memmgr may pool the frames
-/// once the client releases them. The window left is the one request in
-/// flight, as on the per-transfer path; the check goes once devmgr holds a
-/// mapped frame against its lender's revoke
-/// (docs/device-management.md § DMA-Safe Teardown).
+/// once the client releases them. The check keeps the device from being
+/// programmed at such frames; it does not unmap them before this transfer
+/// comes, so from the client's release until then they stay mapped for the
+/// device, held by no reference. The check goes once devmgr holds a mapped
+/// frame against its lender's revoke (docs/device-management.md § DMA-Safe
+/// Teardown).
 fn region_transfer(
     msg: &IpcMessage,
     ipc_buf: *mut u64,
@@ -1485,17 +1472,17 @@ fn region_transfer(
     {
         return ipc::blk_errors::OUT_OF_BOUNDS;
     };
-    let (Some(region), Some(memory)) = (
-        rt.regions.get(id).copied(),
-        rt.regions.kept(id).map(|kept| kept.memory),
-    )
+    let Some((region, memory)) = rt
+        .grants
+        .region(id)
+        .map(|(region, kept)| (*region, kept.memory))
     else
     {
         return ipc::blk_errors::OUT_OF_BOUNDS;
     };
     if syscall::cap_info(memory, syscall::CAP_INFO_MEMORY_SIZE).is_err()
     {
-        if let Some((region, kept)) = rt.regions.remove(id)
+        if let Some((region, kept)) = rt.grants.remove_region(id)
         {
             std::os::seraph::log!(warn: "region ended: registered Memory cap revoked");
             release_region(rt.dma_ep, &region, &kept, ipc_buf);
@@ -1579,7 +1566,7 @@ fn handle_unregister_region(
     {
         let removed = match Caller::of(msg.badge)
         {
-            Caller::Region(id) => rt.regions.remove(id),
+            Caller::Region(id) => rt.grants.remove_region(id),
             Caller::Unbadged
             | Caller::WholeDisk(_)
             | Caller::Partition(_)
@@ -1603,32 +1590,33 @@ fn handle_unregister_region(
     out.set_status(code);
 }
 
-/// Handle a `BLK_END_REGIONS` request on a partition or whole-disk cap
-/// (README § Label 10: `BLK_END_REGIONS`): unregister every live region
-/// registered through the caller's badge ([`RegionTable::remove_one_of`]),
-/// each as `BLK_UNREGISTER_REGION` would ([`release_region`]), before the
-/// reply. A partition cap's granter sends it after revoking the caps derived
-/// from its own, so no holder it cut off keeps a region. Served after a lost
+/// Handle a `BLK_RETIRE_PARTITION` request on a partition cap (README
+/// § Label 10: `BLK_RETIRE_PARTITION`): retire the caller's partition badge
+/// ([`Grants::retire`]), so no later request carrying it is served, and
+/// release every region registered through it as `BLK_UNREGISTER_REGION`
+/// would ([`release_region`]), before the reply. Any other badge, a
+/// retired one among them, is answered `OUT_OF_BOUNDS`. Served after a lost
 /// request too, since the reset device reaches nothing.
-fn handle_end_regions(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, out: &mut Reply)
+fn handle_retire_partition(
+    msg: &IpcMessage,
+    ipc_buf: *mut u64,
+    rt: &mut BlkRuntime,
+    out: &mut Reply,
+)
 {
     drop_caps(msg.caps());
     let code = if msg.word(0) == u64::from(ipc::BLK_LABELS_VERSION)
     {
-        match Caller::of(msg.badge)
+        let dma_ep = rt.dma_ep;
+        if rt.grants.retire(msg.badge, |region, kept| {
+            release_region(dma_ep, &region, &kept, ipc_buf);
+        })
         {
-            Caller::WholeDisk(badge) | Caller::Partition(badge) =>
-            {
-                while let Some((region, kept)) = rt.regions.remove_one_of(badge)
-                {
-                    release_region(rt.dma_ep, &region, &kept, ipc_buf);
-                }
-                ipc::blk_errors::SUCCESS
-            }
-            Caller::Unbadged | Caller::Region(_) | Caller::Sweeper | Caller::Unknown =>
-            {
-                ipc::blk_errors::OUT_OF_BOUNDS
-            }
+            ipc::blk_errors::SUCCESS
+        }
+        else
+        {
+            ipc::blk_errors::OUT_OF_BOUNDS
         }
     }
     else
@@ -1640,14 +1628,14 @@ fn handle_end_regions(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, 
 
 /// Handle the sweeper's [`virtio_blk::SWEEP`] request: apply the
 /// sole-reference post whose correlator `data[0]` carries
-/// ([`RegionTable::post`]). A live region's post means its client holds no
+/// ([`Grants::post`]). A live region's post means its client holds no
 /// liveness cap any more, its process gone or its cap deleted, so the region
 /// is released ([`release_region`]); a retiring slot is freed; a stale post
 /// is dropped.
 fn handle_sweep(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, out: &mut Reply)
 {
     drop_caps(msg.caps());
-    if let Post::Ended(region, kept) = rt.regions.post(msg.word(0))
+    if let Post::Ended(region, kept) = rt.grants.post(msg.word(0))
     {
         release_region(rt.dma_ep, &region, &kept, ipc_buf);
     }
@@ -1661,7 +1649,7 @@ fn handle_sweep(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, out: &
 /// on the service loop's thread and no lock is held across a device wait or a
 /// call to devmgr. The queue holds [`virtio_blk::MAX_REGIONS`] entries and
 /// observer nodes: each slot has at most one binding awaiting its post
-/// ([`RegionTable`]), so neither runs out. Returns the queue; exits when the
+/// ([`virtio_blk::RegionTable`]), so neither runs out. Returns the queue; exits when the
 /// queue, the SEND or the thread cannot be made, since a region would then
 /// outlive its client.
 fn start_sweeper(service_ep: u64) -> u64
@@ -1916,8 +1904,7 @@ fn main() -> !
         completion,
         service_ep: caps.service_ep,
         dma_ep: caps.dma_ep,
-        partitions: PartitionTable::new(),
-        regions: RegionTable::new(),
+        grants: Grants::new(),
         sweep_queue,
         geometry,
         device_faulted: false,

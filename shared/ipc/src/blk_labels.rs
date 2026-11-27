@@ -19,7 +19,8 @@
 pub const MOUNT_AUTHORITY: u64 = 1u64 << 63;
 
 /// Register a partition range, receiving back a badged SEND cap
-/// scoped to that partition.
+/// scoped to that partition. Each registration is a new grant under a
+/// badge no earlier registration had, until [`BLK_RETIRE_PARTITION`].
 ///
 /// Caller's badge must have [`MOUNT_AUTHORITY`] set. The driver derives
 /// the partition cap itself because [`MOUNT_AUTHORITY`] caps are
@@ -69,8 +70,9 @@ pub const BLK_WRITE_FROM_MEMORY: u64 = 4;
 pub const BLK_GET_GEOMETRY: u64 = 5;
 /// Register a staging buffer with the driver, which maps it for the device
 /// once and keeps the mapping until [`BLK_UNREGISTER_REGION`], the end of
-/// the client's lease, or devmgr's withdrawal of the driver. Sent on a
-/// partition or whole-disk cap.
+/// the client's lease, the retire of the partition it was registered
+/// through ([`BLK_RETIRE_PARTITION`]), or devmgr's withdrawal of the
+/// driver. Sent on a partition or whole-disk cap.
 ///
 /// Request: `data[0]` = caller's `BLK_LABELS_VERSION`, `data[1]` = the
 /// device's access, [`REGION_DEVICE_READS`] or
@@ -99,14 +101,15 @@ pub const BLK_WRITE_REGION: u64 = 8;
 /// revoked. Specified in `services/drivers/virtio/blk/README.md` § Label 9:
 /// `BLK_UNREGISTER_REGION`.
 pub const BLK_UNREGISTER_REGION: u64 = 9;
-/// End every region registered through the badge of the partition or
-/// whole-disk cap it is sent on: `data[0]` = caller's `BLK_LABELS_VERSION`.
-/// Each region is unregistered as [`BLK_UNREGISTER_REGION`] would, before
-/// the reply. Whoever grants derivations of a partition cap and revokes them
-/// sends it on its own kept cap after the revoke, so a holder it cut off
-/// keeps no region. Specified in `services/drivers/virtio/blk/README.md`
-/// § Label 10: `BLK_END_REGIONS`.
-pub const BLK_END_REGIONS: u64 = 10;
+/// Retire the partition grant whose cap it is sent on: `data[0]` = caller's
+/// `BLK_LABELS_VERSION`. The driver refuses every later request carrying
+/// the grant's badge, whenever it was sent, and unregisters every region
+/// registered through it as [`BLK_UNREGISTER_REGION`] would, before the
+/// reply. Whoever revokes a derivation of a partition cap it kept sends it
+/// on that cap next, then deletes the cap; to grant the range again it
+/// registers it again. Specified in `services/drivers/virtio/blk/README.md`
+/// § Label 10: `BLK_RETIRE_PARTITION`.
+pub const BLK_RETIRE_PARTITION: u64 = 10;
 /// [`BLK_REGISTER_REGION`] access: the device only reads the region, so
 /// the region serves [`BLK_WRITE_REGION`] alone.
 pub const REGION_DEVICE_READS: u64 = 1;

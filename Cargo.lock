@@ -1035,6 +1035,7 @@ dependencies = [
  "syscall",
  "syscall-abi",
  "vfsd-gpt",
+ "vfsd-grant",
  "vfsd-root-backend",
  "vfsd-swap",
 ]
@@ -1042,6 +1043,13 @@ dependencies = [
 [[package]]
 name = "vfsd-gpt"
 version = "0.1.5"
+
+[[package]]
+name = "vfsd-grant"
+version = "0.1.5"
+dependencies = [
+ "syscall-abi",
+]
 
 [[package]]
 name = "vfsd-root-backend"
@@ -1055,8 +1063,8 @@ dependencies = [
 name = "vfsd-swap"
 version = "0.1.5"
 dependencies = [
- "syscall-abi",
  "vfsd-gpt",
+ "vfsd-grant",
 ]
 
 [[package]]

@@ -22,6 +22,7 @@ vfsd/
 │                            # src/lib.rs, docs/testing.md § Bounded verification) and fuzz
 │                            # inputs (fuzz/gpt/), the fuzz target `gpt` (docs/testing.md
 │                            # § Fuzzing)
+├── grant/                   # `vfsd-grant` crate: pure host-tested cut-off of a partition grant
 ├── root-backend/            # `vfsd-root-backend` crate: VfsdRootBackend (NamespaceBackend impl)
 ├── swap/                    # `vfsd-swap` crate: pure host-tested swap-partition hand-out
 ├── src/
@@ -82,9 +83,10 @@ vfsd/
   `SWAP_AUTHORITY` badge bit, hands the swap service a raw partition cap
   on the `SERAPH_SWAP` partition, which vfsd never mounts. The first
   request looks the partition up and registers it, so vfsd's startup does
-  not depend on one; each later request revokes the cap handed out before,
-  so one holder at a time reaches the partition. The hand-out's decisions
-  are the host-tested `vfsd-swap` crate. See
+  not depend on one; each later request cuts off the grant handed out
+  before (revoke, retire, delete) and registers the partition again, so one
+  holder at a time reaches the partition. The hand-out's decisions are the
+  host-tested `vfsd-swap` crate, the cut-off the `vfsd-grant` crate. See
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md) and
   [`docs/storage.md`](../../docs/storage.md).
 - **System-root cap delivery** — vfsd does not push a system-root

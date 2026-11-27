@@ -8,7 +8,7 @@
 //! served over the `BLK_GET_GEOMETRY`, `BLK_READ_INTO_MEMORY`, and
 //! `BLK_WRITE_FROM_MEMORY` requests fatfs issues, and over the registered-region
 //! labels (`BLK_REGISTER_REGION`, `BLK_READ_REGION`, `BLK_WRITE_REGION`,
-//! `BLK_UNREGISTER_REGION`, `BLK_END_REGIONS`; [`Regions`]), with block faults
+//! `BLK_UNREGISTER_REGION`; [`Regions`]), with block faults
 //! armed by sector and attempt, or every request failed at once ([`RamDisk::fail_all`]).
 //! The device keeps a log of the reads and of the writes it served
 //! ([`RamDisk::take_reads`], [`RamDisk::take_writes`]).
@@ -300,13 +300,11 @@ impl RamDisk
     }
 }
 
-/// A region the device holds: the badge it was registered through, the
-/// Memory cap it was registered with, its length, whether the device may
-/// write it, the root of its region caps and the parent of its liveness
-/// Notification.
+/// A region the device holds: the Memory cap it was registered with, its
+/// length, whether the device may write it, the root of its region caps and
+/// the parent of its liveness Notification.
 struct Region
 {
-    owner: u64,
     memory: u64,
     len: u64,
     writable: bool,
@@ -336,17 +334,10 @@ impl Regions
         self.slots.get(slot)?.as_ref()
     }
 
-    /// `BLK_REGISTER_REGION` through `owner`'s badge with `memory` and the
-    /// access word `access`: the reply label and, on success, the region cap
-    /// and the liveness cap. The device keeps `memory` on success; the caller
-    /// deletes it otherwise.
-    fn register(
-        &mut self,
-        ep: u64,
-        owner: u64,
-        memory: u64,
-        access: u64,
-    ) -> (u64, Option<(u64, u64)>)
+    /// `BLK_REGISTER_REGION` with `memory` and the access word `access`: the
+    /// reply label and, on success, the region cap and the liveness cap. The
+    /// device keeps `memory` on success; the caller deletes it otherwise.
+    fn register(&mut self, ep: u64, memory: u64, access: u64) -> (u64, Option<(u64, u64)>)
     {
         let writable = match access
         {
@@ -379,7 +370,6 @@ impl Regions
         if let Some(free) = self.slots.get_mut(slot)
         {
             *free = Some(Region {
-                owner,
                 memory,
                 len,
                 writable,
@@ -402,25 +392,6 @@ impl Regions
         if let Some(region) = self.slots.get_mut(slot).and_then(Option::take)
         {
             Self::release(&region);
-        }
-        blk_errors::SUCCESS
-    }
-
-    /// `BLK_END_REGIONS` on `badge`: unregister every region registered
-    /// through it. The reply label.
-    fn end(&mut self, badge: u64) -> u64
-    {
-        if badge & REGION_BADGE != 0
-        {
-            return blk_errors::OUT_OF_BOUNDS;
-        }
-        for slot in &mut self.slots
-        {
-            if slot.as_ref().is_some_and(|region| region.owner == badge)
-                && let Some(region) = slot.take()
-            {
-                Self::release(&region);
-            }
         }
         blk_errors::SUCCESS
     }
@@ -547,8 +518,7 @@ pub fn serve(ep: u64, disk: &SharedDisk)
 }
 
 /// Serve a registered-region request `msg` (`BLK_REGISTER_REGION`,
-/// `BLK_READ_REGION`, `BLK_WRITE_REGION`, `BLK_UNREGISTER_REGION`,
-/// `BLK_END_REGIONS`), which
+/// `BLK_READ_REGION`, `BLK_WRITE_REGION`, `BLK_UNREGISTER_REGION`), which
 /// carried `cap` in `caps[0]` (`0` for none), and reply to it: the device
 /// keeps a registered region's Memory cap and deletes every other. Returns
 /// `false` for any other label, `cap` then left to the caller.
@@ -571,7 +541,7 @@ fn region_request(
     {
         let (status, caps) = if current
         {
-            regions.register(ep, msg.badge, cap, msg.word(1))
+            regions.register(ep, cap, msg.word(1))
         }
         else
         {
@@ -601,11 +571,7 @@ fn region_request(
             region_transfer(disk, aspace, va, regions, msg, Direction::Write)
         }
         blk_labels::BLK_UNREGISTER_REGION if current => regions.unregister(msg.badge),
-        blk_labels::BLK_END_REGIONS if current => regions.end(msg.badge),
-        blk_labels::BLK_UNREGISTER_REGION | blk_labels::BLK_END_REGIONS =>
-        {
-            blk_errors::LABEL_VERSION_MISMATCH
-        }
+        blk_labels::BLK_UNREGISTER_REGION => blk_errors::LABEL_VERSION_MISMATCH,
         _ => return false,
     };
     if cap != 0

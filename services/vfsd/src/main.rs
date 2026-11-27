@@ -1159,6 +1159,24 @@ struct SwapIo<'a>
     ipc_buf: *mut u64,
 }
 
+impl grant::GrantOps for SwapIo<'_>
+{
+    fn revoke_descendants(&mut self, cap: u64) -> grant::Step
+    {
+        PartitionIo(self.ipc_buf).revoke_descendants(cap)
+    }
+
+    fn retire(&mut self, cap: u64) -> grant::Step
+    {
+        PartitionIo(self.ipc_buf).retire(cap)
+    }
+
+    fn delete(&mut self, cap: u64)
+    {
+        PartitionIo(self.ipc_buf).delete(cap);
+    }
+}
+
 impl swap::SwapOps for SwapIo<'_>
 {
     fn lookup(&mut self) -> Result<gpt::PartitionLocation, gpt::GptLookupError>
@@ -1184,26 +1202,6 @@ impl swap::SwapOps for SwapIo<'_>
         )
     }
 
-    fn revoke_descendants(&mut self, cap: u64) -> bool
-    {
-        match syscall::cap_revoke_all(cap)
-        {
-            Ok(()) => true,
-            Err(code) =>
-            {
-                std::os::seraph::log!(
-                    warn: "GET_SWAP_PARTITION: cap_revoke_all failed: code={code}"
-                );
-                false
-            }
-        }
-    }
-
-    fn end_regions(&mut self, cap: u64) -> swap::RegionsEnd
-    {
-        end_partition_regions(cap, self.ipc_buf)
-    }
-
     fn derive(&mut self, cap: u64) -> Option<u64>
     {
         syscall::cap_derive(cap, syscall::RIGHTS_EP_SEND_GRANT).ok()
@@ -1220,8 +1218,8 @@ impl swap::SwapOps for SwapIo<'_>
 /// statement names, else the boot disk's by type and priority. With none,
 /// the request replies [`vfsd_errors::NO_MOUNT`]; so does a tie, and a
 /// named partition that is no swap partition.
-/// A failed registration, revoke, end of the previous holder's block
-/// regions or derivation replies [`vfsd_errors::IO_ERROR`].
+/// A failed cut-off of the previous grant, registration or derivation
+/// replies [`vfsd_errors::IO_ERROR`].
 fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime, reply: &mut Reply)
 {
     let handed = rt
@@ -1243,9 +1241,8 @@ fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime, reply: &mut Re
                 {
                     ipc::vfsd_errors::NO_MOUNT
                 }
-                swap::HandOutError::Register
-                | swap::HandOutError::Revoke
-                | swap::HandOutError::EndRegions
+                swap::HandOutError::CutOff
+                | swap::HandOutError::Register
                 | swap::HandOutError::Derive => ipc::vfsd_errors::IO_ERROR,
             };
             IpcMessage::new(label)
@@ -2024,15 +2021,16 @@ fn driver_unmount(endpoint: u64, force: Force, ipc_buf: *mut u64) -> DriverUnmou
     }
 }
 
-/// Tear down the driver of a mount whose unmount began: revoke its
-/// partition cap, so it reaches the disk no more; revoke its service
+/// Tear down the driver of a mount whose unmount began: cut off its
+/// partition grant ([`release_partition`]), so it reaches the disk no more,
+/// its block regions included; revoke its service
 /// endpoint ([`driver::teardown_driver`]), which invalidates every cap a
 /// client holds on the mount; wait, bounded, for its death to post; then
 /// destroy its process ([`destroy_driver`]), which a driver that did not
 /// exit needs and one that did takes as a no-op.
 fn teardown_mount(mount: &Mount, ipc_buf: *mut u64)
 {
-    revoke_partition(mount.partition, ipc_buf);
+    release_partition(mount.partition, ipc_buf);
     driver::teardown_driver(mount.endpoint);
     match syscall::event_recv_timeout(mount.death_queue, DRIVER_DEATH_TIMEOUT_MS)
     {
@@ -2046,12 +2044,12 @@ fn teardown_mount(mount: &Mount, ipc_buf: *mut u64)
 }
 
 /// Tear down the driver of a mount whose removal began after its death:
-/// revoke its partition cap and its service endpoint, as
+/// cut off its partition grant and revoke its service endpoint, as
 /// [`teardown_mount`] does, and destroy what is left of its process; its
 /// death has posted, so nothing is waited for.
 fn teardown_dead_mount(mount: &Mount, ipc_buf: *mut u64)
 {
-    revoke_partition(mount.partition, ipc_buf);
+    release_partition(mount.partition, ipc_buf);
     driver::teardown_driver(mount.endpoint);
     destroy_driver(mount, ipc_buf);
 }
@@ -2185,7 +2183,7 @@ fn find_partition(
 
 /// The whole-disk cap of the held disk at `disk`; `None` once it is
 /// removed.
-fn held_disk_cap(rt: &VfsdRuntime, disk: usize) -> Option<u64>
+pub(crate) fn held_disk_cap(rt: &VfsdRuntime, disk: usize) -> Option<u64>
 {
     rt.disks
         .lock()
@@ -2320,7 +2318,7 @@ fn do_mount_internal(
     else
     {
         std::os::seraph::log!(warn: "MOUNT: partition cap derive failed");
-        revoke_partition(partition, ipc_buf);
+        release_partition(partition, ipc_buf);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
 
@@ -2354,7 +2352,7 @@ fn do_mount_internal(
     {
         std::os::seraph::log!(warn: "MOUNT: failed to spawn fatfs");
         log_cap_delete("module_cap (spawn-fail)", module_cap_for_spawn);
-        revoke_partition(partition, ipc_buf);
+        release_partition(partition, ipc_buf);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
     let driver_ep = fatfs.send;
@@ -2431,6 +2429,7 @@ fn do_mount_internal(
             partition,
             disk: location.disk,
             first_lba: partition_lba,
+            length_lba: partition_len,
         };
         // A concurrent MOUNT of the partition may have installed since the
         // check before the spawn: one driver serves a partition.
@@ -2497,71 +2496,83 @@ fn do_mount_internal(
 }
 
 /// Release what a mount transaction holds once it fails after its driver
-/// started: the partition cap is revoked, cutting the driver off its
-/// partition; the driver's service endpoint is revoked
+/// started: the partition grant is cut off ([`release_partition`]),
+/// cutting the driver off its partition; the driver's service endpoint is revoked
 /// ([`driver::teardown_driver`]), invalidating every cap minted from it
 /// and stopping the driver; and the process handle and death queue are
 /// deleted.
 fn release_failed_mount(fatfs: &driver::FatfsDriver, partition: u64, ipc_buf: *mut u64)
 {
-    revoke_partition(partition, ipc_buf);
+    release_partition(partition, ipc_buf);
     driver::teardown_driver(fatfs.endpoint);
     log_cap_delete("driver process handle", fatfs.process);
     log_cap_delete("driver death queue", fatfs.death_queue);
 }
 
-/// Revoke and delete a partition cap vfsd registered: the driver's
-/// derivation of it stops reaching the block driver. Between the two, the
-/// block regions registered through the partition's badge are ended
-/// ([`end_partition_regions`]), so the cut-off holder keeps none. A null
-/// `ipc_buf` skips the end: only a restart's thread with no IPC buffer
-/// passes one, whose holder died before the restart began and took its
-/// regions with it, and which granted no new holder.
-pub(crate) fn revoke_partition(partition: u64, ipc_buf: *mut u64)
+/// End a partition grant vfsd made and nothing grants again from
+/// ([`grant::release`]): revoke the caps derived from `partition`, retire
+/// its badge with the block driver, delete it, the cap deleted whatever the
+/// outcome. A retire that failed for a reason other than the driver's death
+/// is logged: the cut-off holder may keep a block region of the badge.
+pub(crate) fn release_partition(partition: u64, ipc_buf: *mut u64)
 {
-    if let Err(code) = syscall::cap_revoke_all(partition)
+    if grant::release(&mut PartitionIo(ipc_buf), partition).is_err()
     {
-        std::os::seraph::log!(warn: "partition revoke: cap_revoke_all failed: code={code}");
+        std::os::seraph::log!(warn: "partition grant not retired; a block region may outlive it");
     }
-    if !ipc_buf.is_null()
-    {
-        end_partition_regions(partition, ipc_buf);
-    }
-    log_cap_delete("partition cap", partition);
 }
 
-/// End every block region registered through `partition`'s badge
-/// (`blk_labels::BLK_END_REGIONS` on `partition`), after a revoke of the
-/// caps derived from it: a region cap is minted from the block driver's
-/// endpoint, so the revoke does not reach it
-/// (`services/drivers/virtio/blk/README.md` § Label 10: `BLK_END_REGIONS`).
-/// The revoke comes first, so the cut-off holder registers nothing after the
-/// end, and a registration it queued before the revoke is served before the
-/// end. Anything but [`swap::RegionsEnd::Ended`] is logged.
-pub(crate) fn end_partition_regions(partition: u64, ipc_buf: *mut u64) -> swap::RegionsEnd
+/// The operations of a partition cut-off ([`grant::GrantOps`]) on this
+/// thread's IPC buffer, the registered IPC buffer page.
+pub(crate) struct PartitionIo(pub(crate) *mut u64);
+
+impl grant::GrantOps for PartitionIo
 {
-    let msg = IpcMessage::builder(blk_labels::BLK_END_REGIONS)
-        .word(0, u64::from(ipc::BLK_LABELS_VERSION))
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(partition, &msg, ipc_buf) };
-    let end = swap::RegionsEnd::of(
-        reply
-            .as_ref()
-            .map(|r| r.label == ipc::blk_errors::SUCCESS)
-            .map_err(|&code| code),
-    );
-    match (end, &reply)
+    fn revoke_descendants(&mut self, cap: u64) -> grant::Step
     {
-        (swap::RegionsEnd::Ended, _) =>
-        {}
-        (_, Err(code)) =>
+        let revoked = syscall::cap_revoke_all(cap);
+        if let Err(code) = revoked
         {
-            std::os::seraph::log!(warn: "BLK_END_REGIONS call failed: code={code:#x}");
+            std::os::seraph::log!(warn: "partition cap_revoke_all failed: code={code:#x}");
         }
-        (_, Ok(r)) => std::os::seraph::log!(warn: "BLK_END_REGIONS refused: code={:#x}", r.label),
+        grant::Step::of(revoked.map(|()| true))
     }
-    end
+
+    /// `BLK_RETIRE_PARTITION` on `cap`
+    /// (`services/drivers/virtio/blk/README.md` § Label 10:
+    /// `BLK_RETIRE_PARTITION`). Anything but its success is logged.
+    fn retire(&mut self, cap: u64) -> grant::Step
+    {
+        let msg = IpcMessage::builder(blk_labels::BLK_RETIRE_PARTITION)
+            .word(0, u64::from(ipc::BLK_LABELS_VERSION))
+            .build();
+        // SAFETY: self.0 is the registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(cap, &msg, self.0) };
+        match &reply
+        {
+            Ok(r) if r.label == ipc::blk_errors::SUCCESS =>
+            {}
+            Ok(r) =>
+            {
+                std::os::seraph::log!(warn: "BLK_RETIRE_PARTITION refused: code={:#x}", r.label);
+            }
+            Err(code) =>
+            {
+                std::os::seraph::log!(warn: "BLK_RETIRE_PARTITION call failed: code={code:#x}");
+            }
+        }
+        grant::Step::of(
+            reply
+                .as_ref()
+                .map(|r| r.label == ipc::blk_errors::SUCCESS)
+                .map_err(|&code| code),
+        )
+    }
+
+    fn delete(&mut self, cap: u64)
+    {
+        log_cap_delete("partition cap", cap);
+    }
 }
 
 /// For each synthetic intermediate the install made visible, walk the
@@ -2718,8 +2729,9 @@ fn idle_loop() -> !
 /// minted by devmgr), so vfsd cannot mint partition caps locally — the
 /// kernel rejects re-badging of a badged source. Partition cap
 /// derivation lives server-side in virtio-blk; this call just sends the
-/// bounds and consumes the cap from the reply.
-fn derive_and_register_partition(
+/// bounds and consumes the cap from the reply. Each call is a new grant,
+/// under a badge no earlier one had.
+pub(crate) fn derive_and_register_partition(
     blk_ep: u64,
     base_lba: u64,
     length_lba: u64,

@@ -276,18 +276,19 @@ so a disk with no swap partition is a supported configuration: vfsd boots and mo
 otherwise, and each request then replies `NO_MOUNT`. A lookup or registration that fails keeps
 nothing, and the next request tries again.
 
-Every request derives the caller's cap from the kept one. One holder at a time reaches the
-partition: a request after the first revokes every cap derived from the kept one, and so the
-previous holder's, then ends the block regions registered through the partition
-(`BLK_END_REGIONS`,
-[virtio-blk README](../../drivers/virtio/blk/README.md#label-10-blk_end_regions) § Label 10),
-so the previous holder keeps none, before it derives the new one. One lock covers the whole
-hand-out, so the first request's registration and a later request's revoke never interleave, and
-two concurrent requests leave exactly one live cap. A revoke that fails derives nothing, leaving
-the previous holder the only one; an end that fails other than for the block driver's death
-derives nothing, leaving no holder; a derivation that fails after the revoke leaves no holder,
-never a stale one, until a later request succeeds. The pure decisions are
-[`vfsd-swap`](../swap/src/lib.rs), host-tested.
+Every request derives the caller's cap from a grant of its own. One holder at a time reaches the
+partition: a request after the first cuts off the grant the previous one made (revoke the caps
+derived from the kept cap, the previous holder's among them; retire the grant, which ends the
+block regions registered through it and refuses every later request carrying its badge; delete
+the kept cap;
+[virtio-blk README](../../drivers/virtio/blk/README.md#grants-and-regions) § Grants and regions),
+then registers the partition again, a new grant it keeps, and derives the new holder's cap from
+it. One lock covers the whole hand-out, so two concurrent requests leave exactly one live cap. A
+retire that fails other than for the block driver's death derives nothing, leaving the previous
+holder the only one, and the next request tries the cut-off again; a registration or a derivation
+that fails leaves no holder, never a stale one, until a later request succeeds. The pure
+decisions are [`vfsd-swap`](../swap/src/lib.rs) and [`vfsd-grant`](../grant/src/lib.rs),
+host-tested.
 
 **Request**
 

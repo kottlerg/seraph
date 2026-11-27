@@ -184,7 +184,7 @@ is not taken.
 | 5 | #1542: monomorphise the page-table leaf walker's visitor (taken: PR #1657) | local | 1585 / 1314 per harvest of 32 pages, measured; 4334 to 1239 cycles on x86_64 under KVM |
 | 6 | #1550: serve small kernel entropy draws from one squeezed block (taken: PR #1656) | design | 25618 / 25185 per thread lifecycle, measured; 17479 to 14321 cycles on x86_64 under KVM |
 | 7 | #1543: scan kernel stacks a line at a time, and paint them with wider stores (taken: PR #1660) | local | 4632 / 11391 per thread lifecycle, measured; 14284 to 13498 cycles on x86_64 under KVM |
-| 8 | #1695: find a parked receiver's slot through a per-CPU hint in the endpoint, with no scan (taken: PR #1709) | design | 13 / 13 per IPC round trip, measured (`ubench.ipc_rt` 13 / 13 to 16) |
+| 8 | #1695: find a parked receiver's slot through a per-CPU hint in the endpoint, with no scan (taken: PR #1709) | design | 13 / 13 per IPC round trip, measured (`ubench.ipc_rt` 13 / 13 to 16); no change resolved on x86_64 under KVM, a median p50 of 3063 cycles before and after |
 
 Not taken:
 

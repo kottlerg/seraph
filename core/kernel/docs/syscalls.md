@@ -4177,13 +4177,16 @@ Describe the calling CPU's performance counters.
 
 **Return:** `rax`/`a0`: the description on success, packed at the `PMU_INFO_*` shifts: the user
 counters a configuration may take (bits 0-7), their width in bits (bits 8-15), and the events the
-CPU counts, bit `i` for event id `i` (bits 16-31); negative `SyscallError` on failure. CPUs of a
-hybrid part can answer differently.
+CPU counts, bit `i` for event id `i` (bits 16-31); negative `SyscallError` on failure. Each CPU
+describes its own counters, so CPUs of a hybrid part, and riscv64 harts that differ in Sscofpmf
+or its delegation, can answer differently.
 
 **Errors**, checked in this order: `InvalidCapability` (the handle names no `PmuControl` cap);
 `InsufficientRights` (it lacks `Configure`); `NotSupported` (the CPU has no counters the kernel
 drives: x86-64 other than Intel architectural performance monitoring or AMD family 17h and later,
-QEMU's TCG among them; riscv64 without the SBI PMU extension or a programmable counter).
+QEMU's TCG among them; riscv64 without the SBI PMU extension or a programmable counter, or on a
+hart whose `sie.LCOFIE` probe shows no Sscofpmf with its overflow interrupt delegated to S-mode;
+[perfmon.md](perfmon.md)).
 
 ---
 

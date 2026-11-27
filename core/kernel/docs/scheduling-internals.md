@@ -1232,6 +1232,12 @@ The return points and the bits they handle:
 - The return from an exception taken in user mode (`sched::exception_return_work`): `PREEMPT`
   (`AT_EXCEPTION`), and the interrupt return's work after a reschedule.
 
+One syscall reads the word before its return: `SYS_MEMORY_ZERO`, whose length the caller chooses,
+makes the one-load test between two of its batches, after an interrupt window, and ends the call
+when `PREEMPT`, `STOPPED`, `UPCALL_SYSCALL`, `UPCALL_ANY` or `RUN_LIMIT` is set
+(`syscall::mem::sys_memory_zero`; [syscalls.md](syscalls.md) § `SYS_MEMORY_ZERO` (79)). It
+clears nothing, so the syscall's return that follows takes the bits and runs their checks.
+
 Rules:
 
 1. A producer makes its work visible, then sets the bit with a Release `fetch_or`

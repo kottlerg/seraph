@@ -164,7 +164,10 @@ capability would read the dead object's state
 ([cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state in donated memory).
 The clear runs before the free takes the object's locks, in batches of 16 pages with the interrupts
 pending on the CPU taken between batches, so the clear masks interrupts for one batch at a time
-whatever the free's size. The only kernel-written bytes left in free space are the allocator's own
+whatever the free's size. `SYS_MEMORY_ZERO`, which zeroes a holder's pages above the cursor through
+the direct map, uses the same batch (`cap::retype::CLEAR_BATCH_PAGES`;
+[syscalls.md](syscalls.md) § `SYS_MEMORY_ZERO` (79)). The only kernel-written bytes left in free
+space are the allocator's own
 free-list words, written after the clear: a free sub-page slot's first 8 bytes (the next slot's
 offset) and the 16-byte header (page count and next run's offset) at the start of every free block
 on the page list, each list ending at an all-ones sentinel. A freed block that joins the free run
@@ -220,7 +223,9 @@ fails the retype with `OutOfMemory` before the ledger, free lists, or region byt
 `SYS_MEM_MAP` pins its range first (raises each frame's count), issues a `SeqCst` fence, then
 reads the cursor and refuses a range below it; the pins drop when the call returns, after each
 installed leaf has raised its own count. With the fences on both sides, of a racing retype and map
-at least one observes the other, so a page is never both carved and mapped. Retypes served from a
+at least one observes the other, so a page is never both carved and mapped. `SYS_MEMORY_ZERO` makes
+the same pin, fence and cursor read for each 16-page batch before it stores, so a page is never
+both carved and zeroed. Retypes served from a
 free list need no check: their bytes lie below the cursor, which no mapping can reach once the
 cursor has passed them, and the cursor passed them only after the check.
 
@@ -232,7 +237,11 @@ Memory handle a second time, and it refuses the map with `InvalidCapability` if 
 longer names the same object. A revoke clears the slot under its CSpace's lock before the
 issuer's later `CAP_INFO_MEMORY_MAPPINGS`, which fences before it reads the counts. Either the
 second lookup sees the cleared slot, or the issuer's count sees the pins and then every leaf
-the map installs. The query reads one count per page of the window it names, at most 512 pages
+the map installs. `SYS_MEMORY_ZERO` resolves its handle again for each batch, after its pins and
+fence, and stores only when the slot still names the same object with Map and Write: either the
+revoke stops the next batch, or the issuer's count sees the pins of the batch in flight, which drop
+only after its stores, so a server that waits for a zero count sees no later write to the pages.
+The query reads one count per page of the window it names, at most 512 pages
 of the region; a larger region is read window by window.
 
 **Text-write check.** `SYS_THREAD_WRITE_MEM` with `THREAD_MEM_TEXT` writes a page the thread's

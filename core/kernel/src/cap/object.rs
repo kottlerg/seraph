@@ -740,7 +740,8 @@ impl MemoryObject
 
 /// RAII guard releasing a read lock on a [`MemoryObject`] when dropped.
 ///
-/// Used by `sys_mem_map` and `cap::retype::retype_allocate` to ensure the
+/// Used by `sys_mem_map`, each batch of `sys_memory_zero` and
+/// `cap::retype::retype_allocate` to ensure the
 /// read lock is released on every return path, including `?` short-circuits.
 pub struct MemoryReadGuard<'a>
 {

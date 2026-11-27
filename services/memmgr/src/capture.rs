@@ -38,7 +38,7 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::{MSG_CAP_SLOTS_MAX, PAGE_SIZE};
 
 use crate::{
-    MemLedger, SCRUB_VA, cap_badge, delete_caps, disk, evict, ledger_mut, map_self, reply_label,
+    Answer, MemLedger, SCRUB_VA, cap_badge, delete_caps, disk, evict, ledger_mut, map_self,
     self_aspace,
 };
 
@@ -61,7 +61,7 @@ const PAGE_BYTES: usize = PAGE_SIZE as usize;
 pub(crate) fn handle_capture_chunks(
     req: &IpcMessage,
     caps: &[u64],
-    ipc_buf: *mut u64,
+    answer: &mut Answer,
     procmgr_badge: u64,
     service_ep: u64,
 )
@@ -89,10 +89,9 @@ pub(crate) fn handle_capture_chunks(
     {
         Ok(reply) =>
         {
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            answer.set(reply);
         }
-        Err(label) => reply_label(ipc_buf, label),
+        Err(label) => answer.set_status(label),
     }
 }
 

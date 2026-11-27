@@ -23,9 +23,11 @@
 //! augments it, and each successful derive consumes one slot — the loop ends
 //! at pool exhaustion (`OutOfMemory`) with the reserve still free.
 //!
-//! With the reserve spent, the fixture also validates memmgr's failed-grant
-//! rollback: a `REQUEST_MEMORY_CAPS` whose cap-bearing reply cannot land in
-//! this `CSpace` must leave memmgr's pool `free_bytes` unchanged.
+//! With the reserve spent, the fixture also validates memmgr's undo of a
+//! request whose cap-bearing reply cannot land in this `CSpace`: a
+//! `REQUEST_MEMORY_CAPS` and a `CREATE_SUB_NODE` that fail so must leave this
+//! process's charge, memmgr's pool `free_bytes` and the used slots of
+//! memmgr's own `CSpace` unchanged.
 //!
 //! Driven by `services/svctest`'s `recv_wedge` phase, which spawns this
 //! mode, waits for exit, and asserts the exit code.
@@ -57,6 +59,68 @@ const ROLLBACK_WINDOW_TRIES: u32 = 8;
 /// least one, so a grant still landing past this bound means general
 /// allocations were not stopped at the reserve.
 const RESERVE_GRANTS_MAX: u64 = syscall_abi::CSPACE_IPC_RECV_RESERVE;
+
+/// This process's own charge in pages (`QUERY_MEMORY_USAGE` `data[0]`).
+/// Exits the process when the query fails.
+fn own_pages(memmgr: u64, ipc_buf: *mut u64) -> u64
+{
+    let msg = ipc::IpcMessage::new(ipc::memmgr_labels::QUERY_MEMORY_USAGE);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    match unsafe { ipc::ipc_call(memmgr, &msg, ipc_buf) }
+    {
+        Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS => reply.word(0),
+        _ =>
+        {
+            std::os::seraph::log!("QUERY_MEMORY_USAGE failed");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// memmgr's pool `free_bytes` and the used slots of its own `CSpace`
+/// (`QUERY_POOL_STATUS` `data[3]` and `data[19]`). Exits the process when
+/// the query fails.
+fn pool_state(memmgr: u64, ipc_buf: *mut u64) -> (u64, u64)
+{
+    let msg = ipc::IpcMessage::new(ipc::memmgr_labels::QUERY_POOL_STATUS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    match unsafe { ipc::ipc_call(memmgr, &msg, ipc_buf) }
+    {
+        Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS => (reply.word(3), reply.word(19)),
+        _ =>
+        {
+            std::os::seraph::log!("QUERY_POOL_STATUS failed");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// One `CREATE_SUB_NODE` call with no max, into this `CSpace` with its
+/// reserve spent: its reply carries the new node's handle, so it must fail
+/// with `IPC_REPLY_TRANSFER_FAILED`. Exits the process on any other outcome.
+fn sub_node_fails(memmgr: u64, ipc_buf: *mut u64)
+{
+    let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::CREATE_SUB_NODE)
+        .word(0, u64::MAX)
+        .word(1, 0)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    match unsafe { ipc::ipc_call(memmgr, &msg, ipc_buf) }
+    {
+        Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED =>
+        {}
+        Ok(reply) =>
+        {
+            std::os::seraph::log!("CREATE_SUB_NODE unexpected reply label {}", reply.label);
+            std::process::exit(1);
+        }
+        Err(e) =>
+        {
+            std::os::seraph::log!("CREATE_SUB_NODE call failed (err={e})");
+            std::process::exit(1);
+        }
+    }
+}
 
 /// One one-page `REQUEST_MEMORY_CAPS` call: `Some(caps carried)` for a landed
 /// grant, `None` for a reply whose cap transfer failed. Exits the process on
@@ -139,58 +203,56 @@ pub fn main() -> !
     assert!(landed > 0, "no grant landed in the IPC receive reserve");
     std::os::seraph::log!("{landed} grants landed in the IPC receive reserve; reserve spent");
 
-    // A cap-bearing grant into the spent CSpace fails at the kernel's
-    // reply-side pre-allocate: memmgr's ipc_reply errors and the caller is
-    // woken with a synthetic IPC_REPLY_TRANSFER_FAILED reply. memmgr must
-    // roll the grant back — pool free_bytes is identical before and after,
-    // or the frames stay accounted to this process and the derived caps
-    // stranded in memmgr.
+    // A cap-bearing reply into the spent CSpace fails at the kernel's
+    // reply-side pre-allocate, and the caller is woken with a synthetic
+    // IPC_REPLY_TRANSFER_FAILED reply. memmgr must undo each such request: a
+    // grant's frames go back to the pool, uncharged from this process, and
+    // its derived caps are deleted; a sub-node's handle state is dropped and
+    // its handle cap deleted. Otherwise this process's charge, the pool's
+    // free_bytes or memmgr's used CSpace slots stay moved.
     //
-    // free_bytes is a system-global figure, so an unrelated process
-    // allocating or dying inside the sample window (crasher shares this
-    // boot) moves it without any rollback defect. The window is retried on
-    // inequality: transient churn is bounded and a quiet window follows,
-    // while a genuine rollback leak shifts every window and keeps failing.
+    // free_bytes and memmgr's used slots are system-global, so an unrelated
+    // process allocating or dying inside the sample window (crasher shares
+    // this boot) moves them without any undo defect, and a first touch of a
+    // stack page moves the charge. The window is retried while any of them
+    // moves: transient churn is bounded and a quiet window follows, while a
+    // missing undo moves them in every window and keeps failing.
+    let memmgr = info.memmgr_endpoint;
     let mut verified = false;
     for attempt in 0..ROLLBACK_WINDOW_TRIES
     {
-        let Some(free_before) = std::os::seraph::memmgr_pool_free_bytes()
-        else
-        {
-            std::os::seraph::log!("QUERY_POOL_STATUS failed before grant attempts");
-            std::process::exit(1);
-        };
+        let own_before = own_pages(memmgr, ipc_buf);
+        let pool_before = pool_state(memmgr, ipc_buf);
         for _ in 0..8
         {
             assert!(
-                request_one_page(info.memmgr_endpoint, ipc_buf).is_none(),
+                request_one_page(memmgr, ipc_buf).is_none(),
                 "cap-bearing grant into a CSpace with its reserve spent must fail"
             );
+            sub_node_fails(memmgr, ipc_buf);
         }
-        let Some(free_after) = std::os::seraph::memmgr_pool_free_bytes()
-        else
-        {
-            std::os::seraph::log!("QUERY_POOL_STATUS failed after grant attempts");
-            std::process::exit(1);
-        };
-        if free_before == free_after
+        let pool_after = pool_state(memmgr, ipc_buf);
+        let own_after = own_pages(memmgr, ipc_buf);
+        if (own_before, pool_before) == (own_after, pool_after)
         {
             verified = true;
             break;
         }
         std::os::seraph::log!(
-            "pool churned during rollback window (attempt {attempt}: \
-             {free_before} -> {free_after}); retrying"
+            "undo window moved, retrying: attempt={attempt} \
+             charge={own_before}->{own_after} free_bytes={}->{} memmgr_slots={}->{}",
+            pool_before.0,
+            pool_after.0,
+            pool_before.1,
+            pool_after.1
         );
     }
     assert!(
         verified,
-        "memmgr must roll back grants whose reply failed \
-         (free_bytes never stabilised across {ROLLBACK_WINDOW_TRIES} windows)"
+        "memmgr must undo requests whose reply failed (the charge, free_bytes \
+         and its used slots never stabilised across {ROLLBACK_WINDOW_TRIES} windows)"
     );
-    std::os::seraph::log!(
-        "failed-grant rollback verified (free_bytes unchanged); entering recv loop"
-    );
+    std::os::seraph::log!("failed-reply undo verified");
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop

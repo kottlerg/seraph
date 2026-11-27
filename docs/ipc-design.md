@@ -63,7 +63,9 @@ runs on (it took a queued call)
 them through `ipc::serve` ([shared/ipc/README.md](../shared/ipc/README.md) § Serving): a handler
 whose turn ends with its reply leaves the reply for the loop's next receive to send this way, and a
 handler with work after its reply, or a loop with work before its next receive, sends the reply
-alone first, so no reply waits behind work.
+first, so no reply waits behind work: alone, or, from a server that outranks its caller and last
+received through `SYS_IPC_REPLY_RECV`, with a receive that does not wait, since a plain reply from
+it leaves the caller's wake queued on its CPU until it parks.
 
 A server that needs to delegate work may make a downstream call before replying: the pending reply
 stays bound to the receiving thread until that thread replies, and the downstream call does not

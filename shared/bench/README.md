@@ -16,6 +16,7 @@ bench/
     ├── lib.rs              # Crate root and re-exports
     ├── counters.rs         # Counters, Reading
     ├── stats.rs            # Samples, Summary, summarize
+    ├── rate.rs             # CycleRate: the window rate check
     ├── line.rs             # Report, Unit, Value, parse_line, Parsed, LineError, ParseError
     ├── window.rs           # WindowShape, WindowEnd, WindowTally
     └── arch/
@@ -126,10 +127,14 @@ count and benchmark, as for any row
 ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)).
 
 A difference of two reads on one CPU measures the window, wherever the measured threads ran in
-between, only when both reads ran on that CPU and the CPU did not halt between them
+between, only when both reads ran on that CPU and the CPU's counter ran throughout: the CPU did not
+halt between them, or its counter runs through a halt
 ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)). A row whose reads are
 taken by a thread pinned to the measuring CPU, which does not itself run the measured path, meets
-the first condition by its pin. A row whose reads are taken by the measured thread, with no affinity
+the first condition by its pin. When that thread blocks while the measured threads run, its CPU
+may halt in the window, so such a row (`ubench.pipeline`) checks each window against a clock that
+runs through a halt (§ Window rate check) and counts the windows it leaves out in
+`clock_stopped=`. A row whose reads are taken by the measured thread, with no affinity
 between them, cannot, and meets it as fsbench's rows do: pinned to the measuring CPU, the thread
 opens its idle-halt span (§ Idle halts) and takes the opening read, then clears its affinity, which
 moves nothing, so the window holds that syscall too; after the window's operations it takes the
@@ -180,13 +185,48 @@ carries no count.
 
 ---
 
+## Window rate check
+
+A window whose reading thread blocks while other threads do its work elsewhere
+(`ubench.pipeline`) leaves the reading CPU with nothing to run, and the CPU halts in it. The
+window then counts its elapsed time only if the counter runs through a halt:
+
+| Counter | Through a halt |
+|---|---|
+| x86-64 `rdtsc`, a CPU with an invariant TSC | Runs at its constant rate in every C-state |
+| x86-64 `rdtsc` under KVM | The host's TSC: runs |
+| riscv64 `cycle` on hardware | Left to the implementation: a hart may stop it while it waits in `wfi` |
+| riscv64 `cycle` under QEMU's TCG | Runs: the host's tick counter (from QEMU's source) |
+| Either under icount | Runs: the shared icount clock, which follows the host's time while every vCPU idles ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)) |
+
+riscv64's `time` runs through a halt, but U-mode does not read it: the kernel grants `cycle`
+alone, as
+[core/kernel/docs/cross-boundary-disclosure.md](../../core/kernel/docs/cross-boundary-disclosure.md)
+records.
+Such a benchmark therefore reads, around each window, a clock that runs through a halt, the
+kernel's elapsed microseconds (`SYS_SYSTEM_INFO(ElapsedUs)`, from `rdtsc` on x86-64 and `time`
+on riscv64), and measures the counter's rate against it over a span in which its CPU is kept
+busy. `CycleRate::counted` takes a window whose cycles reach its elapsed microseconds at that
+rate, less `RATE_SLACK_MICROS` (3) for the clock's truncation to whole microseconds and its
+reads, within `RATE_TOLERANCE_PERCENT` (5); a window that falls short is left out of the samples,
+so a counter that stops in a halt shows as windows left out, never as a sample short of its time.
+The clock's reads bracket the counter's, so a window also falls short when its thread is delayed
+between a clock read and the counter read beside it by more than the slack: under QEMU without
+icount, where the host may stall a vCPU at any instruction, a short window is left out now and
+then with its counter running (`ubench.pipeline` at `work=0` on riscv64). A left-out window
+therefore says that its sample could not be shown whole, not that the counter stopped; a window
+that counted its time is never left out. On x86-64 the elapsed clock is the TSC itself, so only
+such a delay leaves a window out, and the check rests on the invariant TSC § Counters requires.
+
+---
+
 ## Consumers
 
 | Consumer | Suite | What it reports |
 |---|---|---|
 | [`core/ktest`](../../core/ktest/README.md) | `ktest` | Tier 3, one line per kernel benchmark (§ Tier 3) |
 | [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3`; at more than one CPU, the window rows `fsbench.read size=16 path=inline affinity=any` and `fsbench.open depth=3 affinity=any` |
-| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.console_write`, per variant, and `ubench.empty_window` |
+| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.pipeline`, `ubench.console_write`, per variant, and `ubench.empty_window` |
 
 ---
 

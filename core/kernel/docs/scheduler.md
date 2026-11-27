@@ -915,7 +915,9 @@ Each thread carries six counters of how its wakes and the load balancer placed i
 ([syscalls.md](syscalls.md#sys_cap_info-36) § `SYS_CAP_INFO` (36)). They are diagnostics: no
 kernel path reads them to decide. ktest's round-trip benchmarks report them for the two threads of
 each round trip, so a result line names whether the round trips stayed on one CPU or paid a wake
-of another ([core/ktest/README.md](../../ktest/README.md)).
+of another ([core/ktest/README.md](../../ktest/README.md)). ubench's `pipeline` reports them for
+a producer and a consumer thread, neither pinned
+([services/ubench/README.md](../../../services/ubench/README.md)).
 
 | Counter | Counts |
 |---|---|

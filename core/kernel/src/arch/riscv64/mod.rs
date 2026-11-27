@@ -21,6 +21,7 @@ pub mod idt;
 pub mod interrupts;
 pub mod paging;
 pub mod platform;
+pub mod pmu;
 pub mod sbi;
 pub mod shadow_stack;
 pub mod speculation;

@@ -421,7 +421,8 @@ const CR4_UINTR: u64 = 1 << 25;
 /// The CR4 controls ring 3 reaches that the kernel does not grant, cleared on
 /// every CPU by [`enable_smep_smap`]. `FSGSBASE`, `TSD` and `PCE` are
 /// documented there; `PKS` is the supervisor half of `PKE` and is cleared
-/// with it.
+/// with it. `PCE` is the one the kernel grants afterwards: `perfmon` sets it
+/// per thread.
 const CR4_USER_CONTROLS_DENIED: u64 =
     CR4_VME | CR4_PVI | CR4_TSD | CR4_PCE | CR4_FSGSBASE | CR4_KL | CR4_PKE | CR4_PKS | CR4_UINTR;
 
@@ -437,8 +438,10 @@ const CR4_USER_CONTROLS_DENIED: u64 =
 /// counter (`RDTSC`, `RDTSCP`) and no performance counter (`RDPMC` raises
 /// `#GP`), the counter set
 /// [capability-model.md](../../../../../docs/capability-model.md)
-/// § Microarchitectural Isolation states. With PVI, KL, PKE and UINTR clear, a
-/// ring-3 `CLI` or `STI` raises `#GP`, and the Key Locker, protection-key and
+/// § Microarchitectural Isolation states. The clear PCE is each CPU's starting
+/// grant: `perfmon` sets it while a thread bound with `SYS_PMU_BIND` runs and
+/// clears it again for any other (core/kernel/docs/perfmon.md). With PVI, KL,
+/// PKE and UINTR clear, a ring-3 `CLI` or `STI` raises `#GP`, and the Key Locker, protection-key and
 /// user-interrupt instructions raise `#UD`: each reaches per-CPU state the
 /// kernel does not switch between threads.
 ///

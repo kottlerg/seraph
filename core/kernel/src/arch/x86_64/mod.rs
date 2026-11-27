@@ -20,6 +20,7 @@ pub mod mitigation;
 pub mod msi;
 pub mod paging;
 pub mod platform;
+pub mod pmu;
 pub mod remap;
 pub mod shadow_stack;
 pub mod speculation;

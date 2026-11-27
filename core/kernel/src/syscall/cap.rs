@@ -1357,6 +1357,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 run_limit: core::sync::atomic::AtomicU32::new(0),
                 run_count: core::sync::atomic::AtomicU32::new(0),
                 run_limit_pending: core::sync::atomic::AtomicBool::new(false),
+                pmu_reader: core::sync::atomic::AtomicBool::new(false),
                 is_user: true,
                 saved_state: saved,
                 kernel_stack_top: kstack_top,

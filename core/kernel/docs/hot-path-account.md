@@ -143,7 +143,7 @@ words, the one whose payload passes the register words, copies it in 180.
 The benchmark cell gates the release profile (opt-level 2, LTO, one codegen
 unit), for its ktest rows, ubench and fsbench alike, so one rule states what the cell measures:
 the build that runs on hardware. Dev (opt-level 2 with debug assertions and overflow checks,
-without LTO) adds 5 % to 67 % to a path on x86_64 (the counter reads alone, `ktest.empty_window`,
+without LTO) adds 5 % to 69 % to a path on x86_64 (the counter reads alone, `ktest.empty_window`,
 are 13 against 6), unevenly, so a dev count does not predict
 the release count and a cut ranked on dev is mis-ranked:
 

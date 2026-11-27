@@ -227,7 +227,7 @@ A driver programs its device only with the device address of a DMA mapping of th
   from programming the device at them, and does not unmap them sooner. The frames of a transfer
   in flight whose lent capability is revoked are held by no copy devmgr keeps for that one
   request. devmgr holding the frames of a standing mapping by a reference no lender can revoke
-  is the remaining step.
+  is the remaining step ([#1731](https://github.com/kottlerg/seraph/issues/1731)).
 - **When the driver is gone.** A driver that dies mid-transfer, or exits after an unacknowledged
   reset, leaves the mapping standing, and its own capability goes with its `CSpace`. When devmgr
   withdraws the device it deletes its mapping capabilities only once the IOMMU blocks the device,

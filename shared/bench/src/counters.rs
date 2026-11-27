@@ -12,6 +12,11 @@
 //! another thread. A [`Reading`] holds every column the result line can come
 //! to report; the cycle counter is the only one read, and the others read
 //! `None`.
+//!
+//! The kernel's `sched-stages` feature calls [`Counters::open`] and
+//! [`Counters::read`] from `schedule()`, in kernel mode with interrupts
+//! disabled, so neither may make a syscall, allocate, or have any other side
+//! effect (shared/bench/README.md § Counters).
 
 use core::marker::PhantomData;
 

@@ -226,7 +226,10 @@ impl Recorder
     }
 
     /// The `SystemInfoType::SchedStages` word `word` other than the arm: a
-    /// stage's sum, or a count. `None` for an unknown word.
+    /// stage's sum, or a count. `None` for an unknown word. The word is a
+    /// user value, so the stage index is also bounded as data, through
+    /// `nospec::mask_index` (core/kernel/docs/capability-internals.md
+    /// § Speculative-Execution Hardening).
     pub fn read(&self, word: u64) -> Option<u64>
     {
         match word
@@ -235,7 +238,8 @@ impl Recorder
             syscall::SCHED_STAGES_RESUMES => Some(self.resumes.load(Ordering::Relaxed)),
             _ =>
             {
-                let stage = usize::try_from(word).ok()?;
+                let stage = usize::try_from(word).ok().filter(|&stage| stage < STAGES)?;
+                let stage = crate::arch::nospec::mask_index(stage, STAGES);
                 self.sums.get(stage).map(|sum| sum.load(Ordering::Relaxed))
             }
         }

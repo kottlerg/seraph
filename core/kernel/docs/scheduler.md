@@ -482,9 +482,9 @@ A kernel built with its `sched-stages` Cargo feature (`cargo xtask build --sched
 the stages of `schedule()` on one CPU, for a benchmark pinned to that CPU to read
 (`core/kernel/src/sched/stages.rs`). `schedule()` reads the cycle counter at its entry and at the
 end of each stage: `rdtsc` on x86-64 and the `cycle` CSR on riscv64, the counter the benchmarks
-read through `shared/bench`. When the switch commits to another thread, each stage's cycles are
-added to that stage's sum, which `SYS_SYSTEM_INFO(SchedStages)` returns by its word
-([syscalls.md](syscalls.md#sys_system_info-43) § `SYS_SYSTEM_INFO` (43)):
+read through [shared/bench](../../../shared/bench/README.md#counters). When the switch commits to
+another thread, each stage's cycles are added to that stage's sum, which
+`SYS_SYSTEM_INFO(SchedStages)` returns by its word ([syscalls.md](syscalls.md#sys_system_info-43) § `SYS_SYSTEM_INFO` (43)):
 
 | Stage | Word | From the previous stamp until |
 |---|---|---|

@@ -8,20 +8,19 @@
 //! `riscv,isa` property.
 
 use boot_protocol::{
-    HART_CAP_SSAIA, HART_CAP_SSCOFPMF, HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT,
-    HART_CAP_SVPBMT, HART_CAP_ZAWRS,
+    HART_CAP_SSAIA, HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT, HART_CAP_SVPBMT,
+    HART_CAP_ZAWRS,
 };
 
 /// ISA-extension names the hart-capability readers recognize, with the
 /// `HART_CAP_*` bit each confirms.
-pub const HART_CAP_NAMES: [(&[u8], u64); 7] = [
+pub const HART_CAP_NAMES: [(&[u8], u64); 6] = [
     (b"sstc", HART_CAP_SSTC),
     (b"svpbmt", HART_CAP_SVPBMT),
     (b"svinval", HART_CAP_SVINVAL),
     (b"svnapot", HART_CAP_SVNAPOT),
     (b"ssaia", HART_CAP_SSAIA),
     (b"zawrs", HART_CAP_ZAWRS),
-    (b"sscofpmf", HART_CAP_SSCOFPMF),
 ];
 
 /// Whether a RISC-V ISA string (`"rv64imafdc_zicsr_..._sstc_..."`, its bytes up
@@ -94,7 +93,6 @@ mod tests
             hart_caps(|e| e == b"sstc" || e == b"ssaia"),
             HART_CAP_SSTC | HART_CAP_SSAIA
         );
-        assert_eq!(hart_caps(|e| e == b"sscofpmf"), HART_CAP_SSCOFPMF);
         assert_eq!(hart_caps(|_| false), 0);
     }
 }
@@ -104,16 +102,16 @@ mod proofs
 {
     use crate::property::acpi as property;
 
-    /// Every ISA string of at most 10 bytes names an extension exactly when
-    /// one of its underscore-separated segments before its first NUL is it: 10
-    /// bytes hold the longest name, `sscofpmf`, between two separators, and
+    /// Every ISA string of at most 9 bytes names an extension exactly when
+    /// one of its underscore-separated segments before its first NUL is it: 9
+    /// bytes hold the longest name, `svinval`, between two separators, and
     /// every shorter segment, cut or joined. The loops are the string's
     /// bytes, once per name.
     #[kani::proof]
-    #[kani::unwind(12)]
+    #[kani::unwind(11)]
     fn every_isa_string_names_its_whole_segments()
     {
-        let bytes: [u8; 10] = kani::any();
+        let bytes: [u8; 9] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= bytes.len());
         property::isa_holds(&bytes[..len]);

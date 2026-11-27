@@ -314,14 +314,15 @@ Each feature is classified per architecture as one of:
   CSR (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 - **SBI PMU extension and Sscofpmf** — the user performance counters of a
   `PmuControl` holder ([core/kernel/docs/perfmon.md](../core/kernel/docs/perfmon.md)): the SBI PMU
-  extension with at least one programmable hardware counter, and Sscofpmf on every hart
-  (`HART_CAP_SSCOFPMF`). Without Sscofpmf the SBI PMU extension cannot filter a counter by
-  privilege mode, so a user reader's counts would include the kernel's execution; the platform
-  then has no user counters. Without either, `SYS_PMU_INFO` answers `NotSupported` and the kernel
-  logs `pmu: no counters`; nothing else depends on it. Under
-  emulation the CPU model must enable Sscofpmf (`sscofpmf=on`,
-  [build-system.md](build-system.md) § QEMU and Firmware), with which QEMU describes the events
-  of its programmable counters.
+  extension with at least one programmable hardware counter, and Sscofpmf with its overflow
+  interrupt (`LCOFI`) delegated to S-mode, which each hart probes for itself by writing
+  `sie.LCOFIE` and reading it back. Without Sscofpmf the SBI PMU extension cannot filter a
+  counter by privilege mode, so a user reader's counts would include the kernel's execution. A
+  hart that lacks the extension, Sscofpmf or the delegation has no user counters: `SYS_PMU_INFO`
+  answers `NotSupported` on that CPU (each CPU reports its own description), and where it is
+  the boot CPU the kernel logs `pmu: no counters`; nothing else depends on it. Under emulation
+  the CPU model must enable Sscofpmf (`sscofpmf=on`, [build-system.md](build-system.md) § QEMU
+  and Firmware), with which QEMU describes the events of its programmable counters.
 - **Goldfish RTC** — the wall clock: when the platform describes one, the `goldfish-rtc` driver
   answers `timed`'s wall-time reads ([services/drivers/README.md](../services/drivers/README.md)
   § Existing Drivers). It is not a boot dependency: without one, wall-time reads fail and the

@@ -52,7 +52,7 @@ most one wrap.
 |---|---|---|---|
 | `intel` | CPUID 0AH (version, general-purpose and fixed counters, width, the unavailable-event vector), 1AH (hybrid core type), the family and model | Fixed counter 1, else the highest general-purpose counter (`Layout::of`) | Architectural encodings gated on the unavailable-event vector; the TLB events from a model table (Skylake, Ice Lake and Tiger Lake, Golden Cove and Gracemont by core type) |
 | `amd` | CPUID 80000001H `ECX[23]` (core counter extension) and 80000022H (PerfMonV2), family 17h and later | The highest core counter | Every event but the last-level cache ones, which the core counters do not count |
-| `riscv` | `sbi_pmu_counter_get_info` results | The programmable counter of the highest CSR (`Layout::of`) | The SBI hardware and cache event indices; which a hart counts is probed at bring-up; offered only where every hart has Sscofpmf |
+| `riscv` | `sbi_pmu_counter_get_info` results | The programmable counter of the highest CSR (`Layout::of`) | The SBI hardware and cache event indices; which a hart counts is probed at bring-up; offered only on a hart whose `sie` read back shows Sscofpmf (`has_sscofpmf`) |
 
 Each module also encodes an event select (x86-64: event, unit mask, `USR`, `OS`, `EN`) or the SBI
 configuration flags (riscv64: the mode's inhibit bits alone, since the firmware may apply them to

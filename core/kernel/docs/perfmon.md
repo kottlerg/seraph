@@ -23,8 +23,8 @@ in `SYS_PMU_CONFIGURE`. No lock guards it.
 The description is taken on each CPU, by that CPU, at its bring-up (`perfmon::init_this_cpu`:
 the boot CPU in Phase 5, each AP in its entry; [initialization.md](initialization.md)), because a
 hybrid part's core types differ in what they count. Bring-up leaves every user counter stopped
-at zero and no grant in effect. A riscv64 hart whose `hart_caps` lacks `HART_CAP_SSCOFPMF`
-describes no counters. The boot CPU logs the description,
+at zero and no grant in effect. A riscv64 hart on which `sie.LCOFIE` reads back zero describes
+no counters (below). The boot CPU logs the description,
 `pmu: counters=<n> width=<bits> events=<mask>`, or `pmu: no counters`.
 
 ---
@@ -51,11 +51,16 @@ PerfMonV2) are set at bring-up and left set. On riscv64 the firmware owns the se
 (`mhpmevent`): a counter is claimed with `sbi_pmu_counter_config_matching`, over the free user
 counters with the mode's inhibit flags alone, started at zero with `sbi_pmu_counter_start`, and
 released with `sbi_pmu_counter_stop` and its reset flag. The events a hart counts are probed once at
-bring-up, by claiming and releasing a counter for each. Counters are offered only when every hart
-has Sscofpmf: without it the SBI PMU extension cannot filter a counter by privilege mode (OpenSBI
+bring-up, by claiming and releasing a counter for each. A hart offers counters only when it has
+Sscofpmf: without it the SBI PMU extension cannot filter a counter by privilege mode (OpenSBI
 accepts and ignores the inhibit flags), so a user reader's counts would include the kernel's
-execution, a disclosure channel, and the kernel reports no counters. Sscofpmf also gives the
-overflow interrupt the kernel's reserved counter needs. On a hart with Smcntrpmf, OpenSBI answers
+execution, a disclosure channel. Each hart probes this itself first
+(`arch::riscv64::pmu::probe_sscofpmf`): it sets `sie.LCOFIE`, the overflow interrupt's enable,
+reads `sie` back and clears the bit. The bit holds only on a hart with Sscofpmf whose firmware
+delegates that interrupt to S-mode; a hart where it reads back zero, including one whose firmware
+has Sscofpmf but keeps the interrupt, reports no counters. Harts that differ report different
+descriptions, each its own through `SYS_PMU_INFO` on that CPU. The delegated overflow interrupt
+is also what the kernel's reserved counter needs. On a hart with Smcntrpmf, OpenSBI answers
 `Cycles` or `Instructions` with the fixed `cycle` or `instret` counter when no offered counter
 counts it, after writing the request's inhibit flags into that counter's `mcyclecfg` or
 `minstretcfg`. Such an answer is no claim (`pmu::riscv::claimed_index`): the claim flags never clear

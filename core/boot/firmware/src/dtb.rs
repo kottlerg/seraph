@@ -2138,9 +2138,8 @@ mod proofs
     /// `every_isa_string_names_its_whole_segments`'s, so these two harnesses
     /// check that the step records the reading in the open node. The
     /// loops are the values' entries, the extension names and the states'
-    /// compare, so each unwinds two past its value's bytes, and the two ISA
-    /// harnesses one past the seven extension names, which is more; a name's
-    /// compare is with a constant and needs no unwinding.
+    /// compare, so each unwinds two past its value's bytes; the names are
+    /// constants, whose compares need no unwinding.
     macro_rules! cpu_property_proofs {
         ($($proof:ident: $name:literal, $len:literal, $unwind:literal;)*) => {$(
             #[doc = concat!("Every step of the CPU walk takes a `", $name,
@@ -2164,8 +2163,8 @@ mod proofs
         every_cpu_walk_step_records_its_compatible: "compatible", 8, 10;
         every_cpu_walk_step_records_its_reg: "reg", 5, 7;
         every_cpu_walk_step_records_its_status: "status", 9, 11;
-        every_cpu_walk_step_records_its_isa_extensions: "riscv,isa-extensions", 5, 8;
-        every_cpu_walk_step_records_its_isa: "riscv,isa", 5, 8;
+        every_cpu_walk_step_records_its_isa_extensions: "riscv,isa-extensions", 5, 7;
+        every_cpu_walk_step_records_its_isa: "riscv,isa", 5, 7;
         every_cpu_walk_step_records_its_mmu_type: "mmu-type", 12, 14;
     }
 

@@ -29,7 +29,7 @@ use crate::bprintln;
 ///   ([`Tree::aia`]) → `aplic`, `imsic`.
 /// - `/cpus` nodes ([`Tree::hart_caps`]) → `timebase_freq` and the
 ///   `HART_CAP_*` bits every enabled hart advertises (Sstc, Svpbmt, Svinval,
-///   Svnapot, Ssaia, Zawrs, Sscofpmf).
+///   Svnapot, Ssaia, Zawrs).
 ///
 /// A field already populated by a prior pass is left untouched; the caller
 /// runs higher-authority sources (ACPI) first when both are available.

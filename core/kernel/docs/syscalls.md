@@ -4371,7 +4371,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `KLOG_READ_MAX` | 16384 | Most bytes one `SYS_KERNEL_LOG_READ` writes |
 | `KLOG_STALL_MS` | 1000 | Milliseconds an attached kernel log reader may leave a record unread, measured from its append or from the reader's last read of a new record when that came later, before the kernel writes its lines directly |
 | `PMU_CONFIGURE_MAX` | 8 | Most events one `SYS_PMU_CONFIGURE` takes |
-| `BOOT_PROTOCOL_VERSION` | 26 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 25 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
 [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs) crates, which are the

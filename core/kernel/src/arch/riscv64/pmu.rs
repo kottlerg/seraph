@@ -16,8 +16,9 @@
 #[cfg(not(test))]
 use pmu::riscv::{
     Counter, CounterInfo, EXT_PMU, FID_COUNTER_CONFIG_MATCHING, FID_COUNTER_GET_INFO,
-    FID_COUNTER_START, FID_COUNTER_STOP, FID_NUM_COUNTERS, Layout, START_SET_INIT_VALUE,
-    STOP_RESET, claimed_index, config_flags, event_index, fixed_counter,
+    FID_COUNTER_START, FID_COUNTER_STOP, FID_NUM_COUNTERS, Layout, SIE_LCOFIE,
+    START_SET_INIT_VALUE, STOP_RESET, claimed_index, config_flags, event_index, fixed_counter,
+    has_sscofpmf,
 };
 #[cfg(not(test))]
 use pmu::{EventList, Info, PmuEvent, PmuMode};
@@ -125,6 +126,33 @@ fn reset_fixed(event: PmuEvent)
     }
 }
 
+/// Whether this hart has Sscofpmf with its overflow interrupt delegated to
+/// S-mode: set `sie.LCOFIE`, read `sie` back (`pmu::riscv::has_sscofpmf`),
+/// and clear the bit again, which nothing else sets.
+///
+/// # Safety
+/// S-mode on this hart with interrupts disabled, so the enable admits no
+/// interrupt while it is set.
+#[cfg(not(test))]
+unsafe fn probe_sscofpmf() -> bool
+{
+    let sie: u64;
+    // SAFETY: csrs, csrr and csrc of sie are S-mode accesses to this hart's
+    // interrupt enables; with sstatus.SIE clear (contract) the enable admits
+    // no interrupt, and the bit is cleared before the sequence ends.
+    unsafe {
+        core::arch::asm!(
+            "csrs sie, {bit}",
+            "csrr {sie}, sie",
+            "csrc sie, {bit}",
+            bit = in(reg) SIE_LCOFIE,
+            sie = out(reg) sie,
+            options(nostack, nomem),
+        );
+    }
+    has_sscofpmf(sie)
+}
+
 /// Start the claimed counter `index` at zero; whether the firmware did.
 #[cfg(not(test))]
 fn start(index: u64) -> bool
@@ -153,20 +181,23 @@ fn release(mask: u64)
 }
 
 /// Describe this hart's counters into `state`: the user counters, their
-/// width and the events they count, probed one by one. `Info::NONE` where a
-/// hart lacks Sscofpmf (`boot_protocol::HART_CAP_SSCOFPMF`), without which
-/// the firmware cannot filter a counter by privilege mode and a user reader's
-/// counts would include the kernel's execution, or where the firmware has no
-/// PMU extension or leaves no user counter. On a hart with Smcntrpmf it sets
-/// the filter of `cycle` and `instret` first (`reset_fixed`), the one a
-/// refused claim's write is undone to.
+/// width and the events they count, probed one by one. `Info::NONE` where the
+/// hart lacks Sscofpmf with its overflow interrupt delegated to S-mode
+/// (`probe_sscofpmf`), without which the firmware cannot filter a counter by
+/// privilege mode and a user reader's counts would include the kernel's
+/// execution, or where the firmware has no PMU extension or leaves no user
+/// counter. Each hart probes itself, so harts that differ describe
+/// different counters, as `SYS_PMU_INFO` reports them per CPU. On a hart
+/// with Smcntrpmf it sets the filter of `cycle` and `instret` first
+/// (`reset_fixed`), the one a refused claim's write is undone to.
 ///
 /// # Safety
 /// S-mode on the hart being initialised, with interrupts disabled.
 #[cfg(not(test))]
 pub unsafe fn init(state: &mut ArchPmu) -> Info
 {
-    if crate::platform::kernel_mmio().hart_caps & boot_protocol::HART_CAP_SSCOFPMF == 0
+    // SAFETY: S-mode with interrupts disabled (contract).
+    if !unsafe { probe_sscofpmf() }
     {
         return Info::NONE;
     }

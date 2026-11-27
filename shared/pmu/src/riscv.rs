@@ -242,6 +242,22 @@ pub const fn claimed_index(mask: u64, index: u64) -> Option<u64>
     }
 }
 
+/// `sie`'s local counter-overflow interrupt enable (`LCOFIE`, bit 13), which
+/// Sscofpmf adds.
+pub const SIE_LCOFIE: u64 = 1 << 13;
+
+/// Whether a hart offers counters, from `sie` read back after
+/// [`SIE_LCOFIE`] was written: the bit holds only on a hart that has Sscofpmf
+/// and whose firmware delegates the overflow interrupt to S-mode, and reads
+/// back zero otherwise. Without Sscofpmf the SBI PMU extension cannot filter
+/// a counter by privilege mode, so a user reader's counts would include the
+/// kernel's execution.
+#[must_use]
+pub const fn has_sscofpmf(sie_readback: u64) -> bool
+{
+    sie_readback & SIE_LCOFIE != 0
+}
+
 /// The SBI index of the fixed counter `OpenSBI` answers `event` with when no
 /// offered counter counts it: `cycle` (0) for `Cycles`, `instret` (2) for
 /// `Instructions`, none for any other event.
@@ -281,6 +297,18 @@ mod tests
         assert_eq!(claimed_index(u64::MAX, 63), Some(63));
         assert_eq!(claimed_index(u64::MAX, 64), None);
         assert_eq!(claimed_index(u64::MAX, u64::MAX), None);
+    }
+
+    // Defect guarded: counters offered on a hart whose `sie.LCOFIE` reads back
+    // zero (no Sscofpmf, or its overflow interrupt not delegated), where the
+    // mode filter does not hold, or refused on one where it holds.
+    #[test]
+    fn has_sscofpmf_reads_lcofie_alone()
+    {
+        assert!(!has_sscofpmf(0));
+        assert!(!has_sscofpmf(!SIE_LCOFIE));
+        assert!(has_sscofpmf(SIE_LCOFIE));
+        assert!(has_sscofpmf(SIE_LCOFIE | (1 << 1) | (1 << 5) | (1 << 9)));
     }
 
     // Defect guarded: a fixed-counter answer left with the filter a refused

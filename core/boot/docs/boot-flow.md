@@ -355,7 +355,7 @@ Pointer and resource-address fields hold physical addresses; `init_image` carrie
 unbiased link virtual addresses, and the only kernel virtual addresses are the
 KASLR-biased `kernel_virtual_base` and `direct_map_base`, which the kernel scrubs from
 this donated page after consuming them. The `version` field is set to
-`BOOT_PROTOCOL_VERSION` (currently `26`). Fields are populated as follows:
+`BOOT_PROTOCOL_VERSION` (currently `25`). Fields are populated as follows:
 
 | Field | Source |
 |---|---|

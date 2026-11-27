@@ -11,7 +11,7 @@
 //! Everything but [`client`] is pure logic, shared by the kernel and its
 //! callers and host-tested. The access model is docs/capability-model.md
 //! § `PmuControl`; the syscalls are core/kernel/docs/syscalls.md
-//! § `SYS_PMU_INFO` (79) onwards.
+//! § `SYS_PMU_INFO` (80) onwards.
 
 #![no_std]
 

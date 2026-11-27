@@ -25,7 +25,8 @@
 //! The cases are `unit::retype`'s page-pool and placement cases,
 //! `unit::cap_batches`'s derivation-lock cases, `unit::teardown_windows`'s
 //! teardown cases and `unit::locked_windows`'s cases of the registry walks and
-//! wake-all drains that hold a lock for one batch at a time. They run one at a time: the rig's words and the worker's
+//! wake-all drains that hold a lock for one batch at a time, and `unit::memory_zero`'s zero of a
+//! large piece. They run one at a time: the rig's words and the worker's
 //! stack are this module's own.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -139,6 +140,14 @@ pub enum Call
     },
     /// `SYS_ASPACE_HOLD` of the address-space cap.
     Hold(u64),
+    /// `SYS_MEMORY_ZERO` of `pages` pages of `memory` from page `offset`, a
+    /// piece mapped nowhere in ktest.
+    Zero
+    {
+        memory: u64,
+        offset: u64,
+        pages: u64,
+    },
     /// `SYS_THREAD_EXIT` of the worker itself, which never returns: made by
     /// [`measure_exit`] alone, which ends the probes once its bracket's stretch
     /// has ended and takes that time for the call's end.
@@ -173,6 +182,11 @@ impl Call
             Call::SchedSplit { cap, at } => (7, [cap, u64::from(at), 0]),
             Call::Exit => (8, [0; 3]),
             Call::Hold(cap) => (9, [cap, 0, 0]),
+            Call::Zero {
+                memory,
+                offset,
+                pages,
+            } => (10, [memory, offset, pages]),
         }
     }
 }
@@ -196,6 +210,9 @@ fn make_call(op: u64, args: [u64; 3]) -> Result<(u64, u64), i64>
             .and_then(|at| sched_split(a0, at)),
         8 => syscall::thread_exit(),
         9 => aspace_hold(a0).map(|()| (0, 0)),
+        // SAFETY: a `Call::Zero` names a piece mapped nowhere in ktest, so the
+        // zero changes no memory ktest's program uses.
+        10 => unsafe { syscall::memory_zero(a0, a1, a2) }.map(|pages| (pages, 0)),
         _ => Err(0),
     }
 }

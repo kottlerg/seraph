@@ -179,7 +179,8 @@ to a capability are type-specific.
 
 A capability to one or more contiguous physical frames. Rights:
 - **Map** — may map these frames into an address space
-- **Write** — authority to create writable mappings
+- **Write** — authority to create writable mappings, and, with Map, to have the
+  kernel zero the region's pages through its direct map (`SYS_MEMORY_ZERO`)
 - **Execute** — authority to create executable mappings
 - **Retype** — authority to consume bytes of this Memory's region as the
   backing storage for a newly created kernel object (see
@@ -626,7 +627,7 @@ A binding is the thread's, not the capability's: it ends by `SYS_PMU_BIND` off o
 exit, and revoking the `PmuControl` capability that made it does not end it. A bind or unbind of
 a thread running on another CPU holds from that thread's first return to user mode after the
 kernel's interrupt reaches the CPU ([core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md)
-§ `SYS_PMU_BIND` (81)).
+§ `SYS_PMU_BIND` (82)).
 
 `PmuControlObject` carries no fields, and its init descriptor has `aux0 = aux1 = 0`; there is no
 split or merge. The kernel mints the one root cap at boot into init's CSpace, carrying

@@ -62,17 +62,17 @@ use syscall_abi::{
     SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV,
     SYS_IPC_REPLY, SYS_IPC_REPLY_RECV, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER,
     SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_KERNEL_LOG_BIND, SYS_KERNEL_LOG_READ,
-    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
-    SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PMU_BIND,
-    SYS_PMU_CONFIGURE, SYS_PMU_INFO, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO,
-    SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES,
-    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS,
-    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
-    SYS_THREAD_SET_RUN_LIMIT, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
-    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
-    ipc_delivered_cap_count, ipc_delivered_data_count,
+    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT,
+    SYS_MEMORY_ZERO, SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND,
+    SYS_NOTIFICATION_WAIT, SYS_PMU_BIND, SYS_PMU_CONFIGURE, SYS_PMU_INFO, SYS_SBI_CALL,
+    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
+    SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER,
+    SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM,
+    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_RUN_LIMIT, SYS_THREAD_SET_UPCALL_MASK,
+    SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT, SyscallError, ipc_delivered_cap_count, ipc_delivered_data_count,
 };
 
 pub use syscall_abi::{
@@ -1121,6 +1121,89 @@ pub fn memory_merge(parent_cap: u64, tail_cap: u64) -> Result<(), i64>
     // kernel validates contiguity, rights, and derivation invariants.
     let ret = unsafe { syscall3(SYS_MEMORY_MERGE, parent_cap, tail_cap, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Zero `page_count` pages of `memory_cap` from page `offset_pages`,
+/// through the kernel's direct map, in one call: no mapping of the pages is
+/// needed. The cap needs Map and Write, and the range lies at or above the
+/// page-rounded retype cursor (`core/kernel/docs/syscalls.md`
+/// § `SYS_MEMORY_ZERO` (79)).
+///
+/// Returns the pages zeroed, from `offset_pages` on: `page_count`, or fewer
+/// when the kernel stopped between two 16-page batches so the caller could be
+/// preempted, stopped or given an upcall. A short count is part of the
+/// contract, not an error: a caller that ignores it leaves pages unzeroed and
+/// has a bug. [`memory_zero_all`] calls again until the range is zeroed and
+/// is the wrapper to use.
+///
+/// # Safety
+/// When a page of the range is mapped in the calling program's own address
+/// space, at any address, the call changes the program's memory under
+/// whatever the page holds:
+/// - the range holds no Rust object a store of zero bytes would make
+///   invalid, and no reference to it is live;
+/// - the range holds no code the program may execute;
+/// - no other access to the range runs concurrently with the call, except a
+///   volatile read, which may see any byte of a word before or after its
+///   zero.
+///
+/// # Errors
+/// Returns a negative `i64` error code, only when no page was zeroed:
+/// `InvalidArgument` (`page_count` zero, the range past the cap's end or
+/// overflowing, or below the retype cursor), `InvalidCapability` (also the
+/// handle deleted or revoked before the first batch), `InsufficientRights`
+/// (the cap lacks Map or Write), or `OutOfMemory` (a frame's mapping count
+/// is saturated). A batch after the first that fails its checks ends the call
+/// with the count so far; the next call, from there, returns the error.
+#[inline]
+pub unsafe fn memory_zero(memory_cap: u64, offset_pages: u64, page_count: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall3 issues the raw syscall instruction; the kernel writes
+    // only the cap's frames, which the caller's contract covers.
+    let ret = unsafe { syscall3(SYS_MEMORY_ZERO, memory_cap, offset_pages, page_count) };
+    if ret < 0
+    {
+        Err(ret)
+    }
+    else
+    {
+        Ok(ret.cast_unsigned())
+    }
+}
+
+/// Zero `page_count` pages of `memory_cap` from page `offset_pages`, calling
+/// [`memory_zero`] again from where each call stopped until every page is
+/// zeroed. A `page_count` of zero zeroes nothing and succeeds.
+///
+/// # Safety
+/// As [`memory_zero`].
+///
+/// # Errors
+/// As [`memory_zero`]. An error from a call after the first leaves the pages
+/// before the failing batch zeroed and the rest as they were.
+#[inline]
+pub unsafe fn memory_zero_all(
+    memory_cap: u64,
+    offset_pages: u64,
+    page_count: u64,
+) -> Result<(), i64>
+{
+    let mut done = 0;
+    while done < page_count
+    {
+        // SAFETY: the caller's contract, over a part of its range.
+        let zeroed = unsafe {
+            memory_zero(
+                memory_cap,
+                offset_pages.saturating_add(done),
+                page_count.saturating_sub(done),
+            )
+        }?;
+        // A call that succeeds zeroes at least one page and at most the
+        // pages asked for, so the loop advances and ends at `page_count`.
+        done = done.saturating_add(zeroed);
+    }
+    Ok(())
 }
 
 /// Split `mmio_cap` into two non-overlapping child `Mmio` caps.

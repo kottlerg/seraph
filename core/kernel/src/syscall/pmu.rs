@@ -5,12 +5,12 @@
 
 //! Performance counter syscall handlers.
 //!
-//! `SYS_PMU_INFO` (79) describes the calling CPU's counters,
-//! `SYS_PMU_CONFIGURE` (80) programs them, and `SYS_PMU_BIND` (81) grants or
+//! `SYS_PMU_INFO` (80) describes the calling CPU's counters,
+//! `SYS_PMU_CONFIGURE` (81) programs them, and `SYS_PMU_BIND` (82) grants or
 //! revokes a thread's direct user-mode reads. Each takes a `PmuControl`
 //! capability carrying `Configure`. The call contracts are in
-//! `core/kernel/docs/syscalls.md` § `SYS_PMU_INFO` (79),
-//! § `SYS_PMU_CONFIGURE` (80) and § `SYS_PMU_BIND` (81); the mechanism is in
+//! `core/kernel/docs/syscalls.md` § `SYS_PMU_INFO` (80),
+//! § `SYS_PMU_CONFIGURE` (81) and § `SYS_PMU_BIND` (82); the mechanism is in
 //! `core/kernel/docs/perfmon.md`.
 
 #[cfg(not(test))]
@@ -45,7 +45,7 @@ fn authority(handle: u64) -> Result<(PinnedCap, *mut crate::cap::cspace::CSpace)
     Ok((pin, cspace))
 }
 
-/// `SYS_PMU_INFO` (79): describe the calling CPU's performance counters.
+/// `SYS_PMU_INFO` (80): describe the calling CPU's performance counters.
 ///
 /// arg0 = `PmuControl` capability handle (requires `Configure`).
 ///
@@ -70,7 +70,7 @@ pub fn sys_pmu_info(tf: UserFrame) -> Result<u64, SyscallError>
     Ok(info.pack())
 }
 
-/// `SYS_PMU_CONFIGURE` (80): program the calling CPU's user counters, or
+/// `SYS_PMU_CONFIGURE` (81): program the calling CPU's user counters, or
 /// release them.
 ///
 /// arg0 = `PmuControl` capability handle (requires `Configure`), arg1 = the
@@ -142,7 +142,7 @@ pub fn sys_pmu_configure(tf: UserFrame) -> Result<u64, SyscallError>
     result
 }
 
-/// `SYS_PMU_BIND` (81): grant or revoke a thread's direct user-mode reads of
+/// `SYS_PMU_BIND` (82): grant or revoke a thread's direct user-mode reads of
 /// the counters of the CPU it runs on.
 ///
 /// arg0 = `PmuControl` capability handle (requires `Configure`), arg1 =

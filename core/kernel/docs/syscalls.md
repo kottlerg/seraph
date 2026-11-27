@@ -245,13 +245,14 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  76  SYS_KERNEL_LOG_BIND
                                  77  SYS_IPC_REPLY_RECV
                                  78  SYS_THREAD_SET_RUN_LIMIT
-                                 79  SYS_PMU_INFO
-                                 80  SYS_PMU_CONFIGURE
-                                 81  SYS_PMU_BIND
+                                 79  SYS_MEMORY_ZERO
+                                 80  SYS_PMU_INFO
+                                 81  SYS_PMU_CONFIGURE
+                                 82  SYS_PMU_BIND
 ```
 
-**Implementation status.** Every number 0–81 has a handler; every number at or past
-`SYSCALL_NR_BOUND` (82) returns `UnknownSyscall`. The kernel refuses a number at or past the
+**Implementation status.** Every number 0–82 has a handler; every number at or past
+`SYSCALL_NR_BOUND` (83) returns `UnknownSyscall`. The kernel refuses a number at or past the
 bound, then selects the handler with one `match` on the number, clamped as data
 ([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and calls
 it directly. The `match` and a build-time check of its numbers come from one list
@@ -1815,6 +1816,67 @@ object),
 
 ---
 
+### `SYS_MEMORY_ZERO` (79)
+
+Zero pages of a Memory capability through the kernel's direct map, with no mapping of them. A
+pager zeroes the frames it hands out this way, with no window of its own address space to map
+them at and unmap them from.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `memory_cap` | Memory capability (Map and Write rights) |
+| 1 | `offset_pages` | First page to zero, in pages from the start of the region |
+| 2 | `page_count` | Pages to zero; nonzero |
+
+**Return:** `rax`/`a0`: the pages zeroed, from `offset_pages` on, on success; `SyscallError`
+on failure. The count is `page_count`, or fewer when the call stopped early (below). A short
+count is part of every caller's contract, not an error: the caller calls again from
+`offset_pages` plus the count for the rest, and a caller that ignores it leaves pages unzeroed.
+`shared/syscall`'s `memory_zero_all` makes those calls.
+
+**Capability requirements:** `memory_cap` (Map and Write). Zeroing is what a writable mapping
+and stores through it could do, so the call asks for the rights `SYS_MEM_MAP` asks of a writable
+mapping.
+
+The whole range `[offset_pages, offset_pages + page_count)` must lie inside the region's current
+size, checked before any page is zeroed. The call then zeroes it in batches of 16 pages, the
+kernel's clear batch ([memory-internals.md](memory-internals.md) § Kernel Object Memory). Each
+batch is checked and committed under `SYS_MEM_MAP`'s protocol for its range: under the Memory
+object's read lock the batch is bounded by the current size, its frames are pinned in the frame
+map, it must lie at or above the page-rounded retype cursor (so no kernel object is ever zeroed),
+and the handle must still name the same object with Map and Write; only then are its pages zeroed
+([memory-internals.md](memory-internals.md) § Frame Map Table). No lock and no pin is held from
+one batch to the next.
+
+Between two batches the call takes the interrupts pending on its CPU and then, when that CPU's
+return work holds a stop, an upcall, or a run-limit fault, or a preemption with a thread queued on
+the CPU that outranks the caller ([scheduling-internals.md](scheduling-internals.md) § Return Work),
+returns the pages zeroed so far; the return to user mode that follows switches, stops or delivers.
+The return work is read only between batches, so every call zeroes at least one batch, and a caller
+that is always outranked still advances. A slice expiry does not end the call: a tick that lands in
+a window between batches refills the slice without rescheduling, as in every preemption-disabled
+window (§ `SYS_THREAD_STOP`, Latency contract). The return switches only to a thread that outranks
+the caller, so a thread at the caller's own level runs at the caller's first slice expiry with
+preemption enabled after that refill, a full slice later at the least, not when the call returns. A
+batch after the first whose checks fail (a split shrank the region, a retype reached the range, the
+handle was revoked or deleted) also ends the call with the count so far, and the next call, starting
+at that batch, returns the error.
+
+The call issues no instruction-fetch synchronisation. A page it zeroes that a mapping shows
+executable holds code written through a writable alias, which the holder synchronises with
+`SYS_MEM_PROTECT` to executable ([memory-internals.md](memory-internals.md)
+§ Instruction-Fetch Synchronisation).
+
+**Errors:** returned only when no page was zeroed. `InvalidArgument` (`page_count` zero, the
+range overflows or lies past the region's end, or its first batch lies below the retype
+cursor), `InvalidCapability` (also a handle deleted or revoked before the first batch),
+`InsufficientRights` (the cap lacks Map or Write), `OutOfMemory` (a frame's mapping count is
+saturated).
+
+---
+
 ### `SYS_MMIO_MERGE` (70)
 
 Merge two MMIO region capabilities over adjacent ranges into one capability over the joined
@@ -2008,7 +2070,8 @@ target's remaining time slice (at most the longest slice, 20 timer ticks, that o
 [scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)), except when the
 slice expires while the target runs a preemption-disabled kernel section with interrupts enabled (a
 TLB-shootdown or drain spin, or a page-pool seeding, teardown, explicit-placement pre-grow,
-registry-walk, waiter-drain, or derivation-lock window between batches, `interrupt_window`):
+registry-walk, waiter-drain, memory-zero, or derivation-lock window between batches,
+`interrupt_window`):
 `timer_tick` then refills the slice without rescheduling, and `preempt_enable` does not reschedule,
 so the stop completes at the first later slice-expiry tick with preemption enabled, a further slice
 later at the least, or at the target's next return to user mode when a thread queued on its CPU
@@ -4102,7 +4165,7 @@ The events are portable ids (`PMU_EVENT_*`): `Cycles` (0), `Instructions` (1),
 `DtlbMisses` (6) and `ItlbMisses` (7). Which of them a CPU counts is its own; `SYS_PMU_INFO`
 reports it.
 
-### `SYS_PMU_INFO` (79)
+### `SYS_PMU_INFO` (80)
 
 Describe the calling CPU's performance counters.
 
@@ -4124,7 +4187,7 @@ QEMU's TCG among them; riscv64 without the SBI PMU extension or a programmable c
 
 ---
 
-### `SYS_PMU_CONFIGURE` (80)
+### `SYS_PMU_CONFIGURE` (81)
 
 Program the calling CPU's user counters, or release them.
 
@@ -4160,7 +4223,7 @@ no counter for an event the CPU reports, which leaves the CPU with none ([perfmo
 
 ---
 
-### `SYS_PMU_BIND` (81)
+### `SYS_PMU_BIND` (82)
 
 Grant or revoke a thread's direct user-mode reads of the counters of the CPU it runs on. On
 x86-64 the grant is `CR4.PCE`, all-or-nothing: a bound thread can `RDPMC` every counter `RDPMC`
@@ -4254,7 +4317,9 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   Long-running operations (revocation traversal, SMP TLB shootdown waits) proceed in
   bounded batches or in preempt-disabled, interrupt-enabled windows, and re-check
   state between batches (see [scheduling-internals.md](scheduling-internals.md)
-  § Lock Hierarchy).
+  § Lock Hierarchy). `SYS_MEMORY_ZERO`, whose length the caller chooses, also returns between
+  two of its batches when a thread may outrank its caller, with the pages zeroed so far
+  (§ `SYS_MEMORY_ZERO`).
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
   `SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`,

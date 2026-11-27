@@ -55,6 +55,7 @@ pub mod irq_preserves_user_regs;
 pub mod irq_shared_line;
 pub mod mem_map_retyped_refused;
 pub mod memory_lifecycle;
+pub mod memory_zero_preempt;
 pub mod mmio_revoke_unmaps;
 pub mod mmio_spill_withdrawn;
 pub mod multi_caller_ipc_fifo;
@@ -216,6 +217,10 @@ pub fn run_all(ctx: &TestContext)
         priority_preemption::run(ctx)
     );
     run_integration_test!("integration::rt_wake_preempt", rt_wake_preempt::run(ctx));
+    run_integration_test!(
+        "integration::memory_zero_preempt",
+        memory_zero_preempt::run(ctx)
+    );
     run_integration_test!(
         "integration::rt_wake_placement",
         rt_wake_placement::run(ctx)

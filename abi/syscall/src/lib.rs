@@ -787,21 +787,26 @@ pub const SYS_IPC_REPLY_RECV: u64 = 77;
 /// reset points before the kernel raises [`FAULT_EXC_RUN_LIMIT`] on it. See
 /// `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_RUN_LIMIT` (78).
 pub const SYS_THREAD_SET_RUN_LIMIT: u64 = 78;
+/// Memory: zero pages of a Memory capability through the kernel's direct map,
+/// returning the number zeroed, which is fewer than asked when the call stops
+/// early to let the caller be preempted. See `core/kernel/docs/syscalls.md`
+/// § `SYS_MEMORY_ZERO` (79).
+pub const SYS_MEMORY_ZERO: u64 = 79;
 /// `PmuControl`: describe the calling CPU's performance counters (the user
 /// counter count, their width and the events they count), through a
 /// `PmuControl` capability carrying [`RIGHTS_PMU_CONFIGURE`]. See
-/// `core/kernel/docs/syscalls.md` § `SYS_PMU_INFO` (79).
-pub const SYS_PMU_INFO: u64 = 79;
+/// `core/kernel/docs/syscalls.md` § `SYS_PMU_INFO` (80).
+pub const SYS_PMU_INFO: u64 = 80;
 /// `PmuControl`: program the calling CPU's user counters with up to
 /// [`PMU_CONFIGURE_MAX`] events, or release them, through a `PmuControl`
 /// capability carrying [`RIGHTS_PMU_CONFIGURE`]. See
-/// `core/kernel/docs/syscalls.md` § `SYS_PMU_CONFIGURE` (80).
-pub const SYS_PMU_CONFIGURE: u64 = 80;
+/// `core/kernel/docs/syscalls.md` § `SYS_PMU_CONFIGURE` (81).
+pub const SYS_PMU_CONFIGURE: u64 = 81;
 /// `PmuControl`: grant or revoke a thread's direct user-mode counter reads,
 /// through a `PmuControl` capability carrying [`RIGHTS_PMU_CONFIGURE`] and a
 /// Thread capability carrying [`RIGHTS_THREAD_CONTROL`]. See
-/// `core/kernel/docs/syscalls.md` § `SYS_PMU_BIND` (81).
-pub const SYS_PMU_BIND: u64 = 81;
+/// `core/kernel/docs/syscalls.md` § `SYS_PMU_BIND` (82).
+pub const SYS_PMU_BIND: u64 = 82;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
@@ -812,7 +817,7 @@ pub const SYSCALL_NR_BOUND: u64 = SYS_PMU_BIND + 1;
 //
 // The portable events, the mode filter and the register packing of
 // `SYS_PMU_INFO`, `SYS_PMU_CONFIGURE` and `SYS_PMU_BIND`
-// (`core/kernel/docs/syscalls.md` § `SYS_PMU_CONFIGURE` (80)). An event id is
+// (`core/kernel/docs/syscalls.md` § `SYS_PMU_CONFIGURE` (81)). An event id is
 // also its bit in the supported-event mask `SYS_PMU_INFO` returns.
 
 /// Event id: core clock cycles, at the rate the core runs.
@@ -1438,7 +1443,8 @@ pub const RIGHTS_ALL: u64 = !0u64;
 /// Memory: may map this memory into an address space.
 pub const RIGHTS_MEM_MAP: u64 = 1 << 0;
 
-/// Memory: authority to create writable mappings from this memory.
+/// Memory: authority to create writable mappings from this memory, and, with
+/// [`RIGHTS_MEM_MAP`], to have the kernel zero its pages ([`SYS_MEMORY_ZERO`]).
 pub const RIGHTS_MEM_WRITE: u64 = 1 << 1;
 
 /// Memory: authority to create executable mappings from this memory.

@@ -797,12 +797,16 @@ of its own to a thread's lifecycle:
    dispatch on the target raises its level unseen by the push's scan when the scan's lock-free
    `ranks` read falls between its dequeue, under the target's lock, and its `mark_dispatched`,
    which records the level after the lock release. A link on the target after the scan raises its
-   queued rank the same way. When the link, or the dispatch's record of its level, comes before
-   the push's re-check, the re-check reads it under the target's lock and refuses
-   (`RuleFailed`), which costs a tick. A dispatch that records its level after the re-check is
-   one the re-check cannot see: the thread then waits on the target, whose ticks' waiting test
-   finds it and whose pushes move it on from the target's own cursor, within the push's bound
-   again (one tick up to 129 CPUs, ceil((n - 1) / 128) ticks above;
+   queued rank the same way. A priority change that raises the level of the target's running
+   thread does too: `sys_thread_set_priority` only marks the recorded level stale
+   (`mark_level_stale`), so the scan reads the old level until the target's next return to user
+   mode records it again (`preempt_if_outranked`). When the link, or the record of the level by a
+   dispatch or after a priority change, comes before the push's re-check, the re-check reads it
+   under the target's lock and refuses (`RuleFailed`), which costs a tick. A record of the level
+   after the re-check, by a dispatch or after a priority change, is one the re-check cannot see:
+   the thread then waits on the target, whose ticks' waiting test finds it and whose pushes move
+   it on from the target's own cursor, within the push's bound again (one tick up to 129 CPUs,
+   ceil((n - 1) / 128) ticks above;
    [scheduler.md § Load Balancing](scheduler.md#load-balancing), "RT push"). The pull's wake IPI
    to the target (always sent, § Wake Protocol Invariants) makes the target's next return to user
    mode decide the preemption under its lock.

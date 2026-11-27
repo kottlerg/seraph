@@ -801,12 +801,15 @@ The bound for a movable waiting thread is one tick of the CPU it waits on in a b
 CPUs above that it is ceil((n - 1) / 128) ticks: successive misses read successive windows, so a CPU
 whose level is below the thread's at all of those ticks is read by one of them; that is 64 ticks at
 8192 CPUs. Each push that a contended try-lock defers (`PullOutcome::Deferred`), or that the
-re-check under the locks refuses (`PullOutcome::RuleFailed`) because a thread was linked on the
-target since the scan read its ranks or a dispatch there recorded a higher level between the scan
-and the re-check, adds a tick, since a push that found a target leaves the cursor
-where it was. One that a dispatch on the target overtakes adds the bound again, now on the target:
-a dispatch records its level after it releases its run-queue lock (`mark_dispatched`), so a push
-can read a level the target is leaving, move the thread there, and find it waiting again, where
+re-check under the locks refuses (`PullOutcome::RuleFailed`) because, between the scan's read of
+the target's ranks and the re-check, a thread was linked on the target, a dispatch there recorded a
+higher level, or the target recorded again the level of its running thread that a priority change
+raised (`preempt_if_outranked`), adds a tick, since a push that found a target leaves the cursor
+where it was. One that such a dispatch or record on the target overtakes adds the bound again, now
+on the target: a dispatch records its level after it releases its run-queue lock
+(`mark_dispatched`), and a priority change of the running thread leaves its old level recorded
+until the target's next return to user mode records it again, so a push can read a level the
+target is leaving, move the thread there, and find it waiting again, where
 that CPU's pushes move it on from its own cursor, within one tick up to 129 CPUs and
 ceil((n - 1) / 128) ticks above. A tick pushes one thread, so each movable waiting thread that the
 pushes take first adds a tick too, and so does a priority change of the running thread, whose stale
@@ -1169,9 +1172,10 @@ Balancing, "RT push") to a CPU whose running and queued threads it outranks, whe
 preempts as above: within one tick of the CPU it waits on in a boot of up to 129 CPUs, and within
 ceil((n - 1) / 128) such ticks in a boot of n CPUs above that (64 at the 8192 of `MAX_CPUS`). Each
 push that a contended try-lock defers, or that the re-check under the locks refuses (a thread linked
-on the target, or a higher level a dispatch there recorded, since the push read its ranks), adds
-one tick; each push that a dispatch on the target
-overtakes adds that bound again, on the target; each movable waiting thread that the CPU's pushes
+on the target, a higher level a dispatch there recorded, or a level that a priority change of its
+running thread raised and the target recorded again, since the push read its ranks), adds one tick;
+each push that such a dispatch or record on the target overtakes adds that bound again, on the
+target; each movable waiting thread that the CPU's pushes
 take ahead of it adds one tick, since a tick pushes one thread; and a priority change of the thread
 it waits behind adds one. A thread waits for the higher one to block, yield or expire only while no
 CPU it may run on runs and queues only lower levels: when every such CPU runs or queues its level or

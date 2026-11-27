@@ -53,11 +53,13 @@
 //! - **Framebuffer restarted.** devmgr restarts the killed driver
 //!   (services/devmgr/docs/responsibilities.md § Driver Restart): the phase
 //!   requires the class's next ordinal to answer with the new instance, and
-//!   logd's framebuffer writer to take it up. On a new driver a `skip` sink's
-//!   cursor starts at most its backlog (the framebuffer's `backlog` setting,
-//!   64 by default) behind the newest entry, so the writer counts the lines it
-//!   shows that were sent while no driver ran as dropped, in a notice logd
-//!   retains after the last of them.
+//!   logd's framebuffer writer to take it up. devmgr can restart the driver
+//!   within milliseconds, before the lines sent after the kill, so the
+//!   writer may have dropped none of those. The phase therefore stops the new
+//!   instance and sends as many lines again, so the history drops svctest's
+//!   oldest before the sink writes them, and starts it: logd must retain its
+//!   notice of the framebuffer's drops after the last line, which only a
+//!   writer serving the new instance retains.
 //!
 //! The serial driver is only stopped, since a kill would end the console the
 //! boot is judged on.
@@ -223,13 +225,26 @@ pub fn logd_sinks_phase(caps: &Caps)
     await_withdrawn(caps.framebuffer_deny_class);
     let lines = send_lines("framebuffer killed", FLOOD_LINES, LEVEL_CRITICAL)
         .unwrap_or_else(|e| panic!("{e}"));
-    let last = retained_seq(caps.logd_query, &lines, "framebuffer killed");
+    retained_seq(caps.logd_query, &lines, "framebuffer killed");
     std::os::seraph::log!(
         "logd_sinks: {FLOOD_LINES} lines taken after the framebuffer driver died"
     );
 
     await_restarted(caps.framebuffer_deny_class);
-    let dropped = await_fb_notice(caps.logd_query, last, "the driver's restart");
+    // devmgr can restart the driver before the lines above are sent, so
+    // whether the sink dropped any of them depends on that race. Stopping the
+    // new instance while lines are sent makes the drops, and the notice that
+    // only a writer serving a driver retains, certain.
+    let restarted = super::crash::badge_named(authority, FRAMEBUFFER_NAME)
+        .unwrap_or_else(|| panic!("logd_sinks: procmgr lists no restarted framebuffer driver"));
+    let threads = attach(authority, restarted, "restarted framebuffer");
+    stop(&threads, "restarted framebuffer");
+    let sent = send_lines("restarted framebuffer stopped", FLOOD_LINES, LEVEL_CRITICAL);
+    start(&threads, "restarted framebuffer");
+    detach(authority, restarted, threads, "restarted framebuffer");
+    let lines = sent.unwrap_or_else(|e| panic!("{e}"));
+    let last = retained_seq(caps.logd_query, &lines, "restarted framebuffer stopped");
+    let dropped = await_fb_notice(caps.logd_query, last, "the restarted driver's start");
     std::os::seraph::log!(
         "logd_sinks: logd's framebuffer writer took up the restarted driver, {dropped} lines \
          counted dropped"

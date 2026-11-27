@@ -7,8 +7,8 @@
 //!
 //! RISC-V only. The kernel forwards an SBI call only for the sanctioned
 //! extensions listed in [`sbi_required_right`], each gated by its `SbiControl`
-//! right; every other extension ID, including the kernel-managed
-//! TIME/IPI/RFENCE/HSM, is rejected with `InvalidArgument` regardless of cap.
+//! right; every other extension ID, including the kernel-reserved
+//! TIME/IPI/RFENCE/HSM/PMU, is rejected with `InvalidArgument` regardless of cap.
 //! See docs/capability-model.md § `SbiControl` (RISC-V only), Kernel floor.
 //!
 //! On x86-64, this syscall returns `SyscallError::NotSupported`.
@@ -55,14 +55,10 @@ const SBI_EXT_BASE: u64 = 0x10;
 #[cfg(not(test))]
 const SBI_EXT_DBCN: u64 = 0x4442_434E;
 
-/// SBI Performance Monitoring Unit (PMU) extension ID — ASCII "PMU".
-#[cfg(not(test))]
-const SBI_EXT_PMU: u64 = 0x0050_4D55;
-
 /// Map an SBI extension ID to the `SbiControl` right required to forward it.
 ///
 /// `None` means the extension is unsanctioned: every EID outside this table,
-/// including the kernel-managed TIME/IPI/RFENCE/HSM, is rejected by the caller
+/// including the kernel-reserved TIME/IPI/RFENCE/HSM/PMU, is rejected by the caller
 /// with `InvalidArgument` regardless of cap. Adding a sanctioned extension is
 /// one entry here, one `RIGHTS_SBI_*` constant in `abi/syscall`, and one
 /// `SbiRights` bit in `cap::slot`.
@@ -77,7 +73,6 @@ fn sbi_required_right(extension: u64) -> Option<crate::cap::slot::SbiRights>
         SBI_EXT_CPPC => Some(SbiRights::CPPC),
         SBI_EXT_BASE => Some(SbiRights::BASE),
         SBI_EXT_DBCN => Some(SbiRights::DBCN),
-        SBI_EXT_PMU => Some(SbiRights::PMU),
         _ => None,
     }
 }

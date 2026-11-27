@@ -2471,8 +2471,7 @@ fn populate_cspace(
                 | SbiRights::SUSPEND
                 | SbiRights::CPPC
                 | SbiRights::BASE
-                | SbiRights::DBCN
-                | SbiRights::PMU,
+                | SbiRights::DBCN,
             ptr,
             "Phase 7: cannot allocate SbiControl capability",
         );

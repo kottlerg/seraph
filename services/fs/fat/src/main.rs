@@ -587,7 +587,7 @@ fn service_loop(
             // earlier flush bound is answered as a failed block access
             // (`Reply::send_last`).
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            unsafe { reply.send_last(ipc::fs_errors::IO_ERROR, ipc_buf) };
+            unsafe { reply.send_last(device_gone_refusal, ipc_buf) };
             std::process::exit(fs_labels::EXIT_DEVICE_GONE.cast_signed());
         }
         // The last request may have met a full cache on a path that does
@@ -2078,7 +2078,7 @@ fn reply_now(msg: IpcMessage, reply: &mut Reply, service: u64, ipc_buf: *mut u64
     if cache::device_gone()
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        unsafe { reply.send_last(ipc::fs_errors::IO_ERROR, ipc_buf) };
+        unsafe { reply.send_last(device_gone_refusal, ipc_buf) };
     }
     else
     {
@@ -2086,6 +2086,25 @@ fn reply_now(msg: IpcMessage, reply: &mut Reply, service: u64, ipc_buf: *mut u64
         unsafe { reply.flush(service, ipc_buf) };
     }
     !reply.undelivered()
+}
+
+/// The status a request the driver took up but will not serve, since the
+/// block device is gone, is answered with: a failed block access's, in the
+/// wire codes of the request's protocol (fs-driver-protocol.md § Loss of the
+/// block device).
+fn device_gone_refusal(call: &IpcMessage) -> u64
+{
+    if matches!(
+        call.label & 0xFFFF,
+        ns_labels::NS_LOOKUP | ns_labels::NS_STAT | ns_labels::NS_READDIR
+    )
+    {
+        namespace_protocol::NsError::IoError.as_label()
+    }
+    else
+    {
+        ipc::fs_errors::IO_ERROR
+    }
 }
 
 /// Send the refusal `code` now, through the slot: for the handlers whose dispatch turn does more

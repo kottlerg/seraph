@@ -250,14 +250,14 @@ impl Reply
     /// [`Self::undelivered`]'s; the caps of an undelivered reply set with
     /// [`Self::set_or_delete_caps`] are deleted. A call an earlier
     /// [`Self::flush`] bound, which the slot holds and the thread will not
-    /// serve, is answered `refusal` alone, as its caller would be told of a
-    /// failure to serve it, and the caps it carried into this thread's
-    /// `CSpace` are deleted.
+    /// serve, is answered alone with the status `refusal` picks for it, the
+    /// one its protocol gives for a failure to serve it, and the caps it
+    /// carried into this thread's `CSpace` are deleted.
     ///
     /// # Safety
     /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer
     /// page as registered via `syscall::ipc_buffer_set`.
-    pub unsafe fn send_last(&mut self, refusal: u64, ipc_buf: *mut u64)
+    pub unsafe fn send_last(&mut self, refusal: impl FnOnce(&IpcMessage) -> u64, ipc_buf: *mut u64)
     {
         self.send_last_with(
             &mut Kernel {
@@ -268,10 +268,15 @@ impl Reply
         );
     }
 
-    fn send_last_with<T: Transport>(&mut self, kernel: &mut T, refusal: u64)
+    fn send_last_with<T: Transport>(
+        &mut self,
+        kernel: &mut T,
+        refusal: impl FnOnce(&IpcMessage) -> u64,
+    )
     {
         if let Some(after) = self.state.unheld()
         {
+            let code = refusal(&self.msg);
             for &cap in self.msg.caps()
             {
                 kernel.delete_cap(cap);
@@ -279,7 +284,7 @@ impl Reply
             self.state = after;
             // The caller is gone or will be answered by no one else: either
             // way nothing is left to undo.
-            let _ = kernel.reply(&IpcMessage::new(refusal));
+            let _ = kernel.reply(&IpcMessage::new(code));
             return;
         }
         if self.state != Slot::Pending
@@ -840,16 +845,16 @@ mod tests
     {
         let mut kernel = Script::new();
         let mut reply = with_reply();
-        reply.send_last_with(&mut kernel, REFUSAL);
-        reply.send_last_with(&mut kernel, REFUSAL);
-        Reply::new().send_last_with(&mut kernel, REFUSAL);
+        reply.send_last_with(&mut kernel, |_| REFUSAL);
+        reply.send_last_with(&mut kernel, |_| REFUSAL);
+        Reply::new().send_last_with(&mut kernel, |_| REFUSAL);
         assert_eq!(kernel.calls(), &[Some(Call::Reply(REPLY))]);
         assert!(!reply.undelivered());
 
         let mut kernel = Script::new();
         kernel.reply = Err(err(SyscallError::InvalidCapability));
         let mut reply = with_owned_reply();
-        reply.send_last_with(&mut kernel, REFUSAL);
+        reply.send_last_with(&mut kernel, |_| REFUSAL);
         assert_eq!(
             kernel.calls(),
             &[Some(Call::Reply(REPLY)), Some(Call::Delete(CAP))]
@@ -867,7 +872,10 @@ mod tests
         let mut reply = with_reply();
         reply.flush_with(&mut kernel, EP);
         assert!(reply.holds_call());
-        reply.send_last_with(&mut kernel, REFUSAL);
+        reply.send_last_with(&mut kernel, |held| {
+            assert_eq!(held.label, NEXT);
+            REFUSAL
+        });
         assert!(!reply.holds_call());
         assert!(!reply.undelivered());
         let calls = kernel.calls();

@@ -70,18 +70,18 @@ without a bound and returns the request. A handler with work after its reply (an
 syscall), and a loop with work before its next receive, set the reply and send it first with
 `Reply::flush(ep, ipc_buf)`, so no reply waits behind work; a thread about to exit sends its last
 reply alone with `Reply::send_last`, so that no receive binds a call the exit would fail, and
-answers a call an earlier `flush` bound with the refusal it is given, deleting that call's caps.
-`flush` sends it with a receive that does not wait (`SYS_IPC_REPLY_RECV` at `WAIT_TRY_ONCE`), not
-alone: a server that outranks its caller and last received through `SYS_IPC_REPLY_RECV` may run on
-the caller's CPU, where a plain reply leaves the caller's wake queued behind it until it parks,
-while the wake of a reply whose receive does not park goes to another CPU
-([scheduler.md](../../core/kernel/docs/scheduler.md) § Thread Assignment). A call that receive binds
-is held in the `Reply`, and the next `next_request` or `next_request_timeout` returns it with no
-syscall, so it is served once the loop's work is done, as it would have been from the endpoint's
-queue. A loop that uses the reply's outcome reads `Reply::undelivered` after the send that carried
-it, `flush` or the next receive: it is true when the reply did not reach its caller (the caller is
-gone, or its `CSpace` could not take the reply's caps), until the next send, so the loop can undo
-what the reply reported.
+answers a call an earlier `flush` bound with the refusal its argument picks for that call, deleting
+that call's caps. `flush` sends it with a receive that does not wait (`SYS_IPC_REPLY_RECV` at
+`WAIT_TRY_ONCE`), not alone: a server that outranks its caller and last received through
+`SYS_IPC_REPLY_RECV` may run on the caller's CPU, where a plain reply leaves the caller's wake
+queued behind it until it parks, while the wake of a reply whose receive does not park goes to
+another CPU ([scheduler.md](../../core/kernel/docs/scheduler.md) § Thread Assignment). A call that
+receive binds is held in the `Reply`, and the next `next_request` or `next_request_timeout` returns
+it with no syscall, so it is served once the loop's work is done, as it would have been from the
+endpoint's queue. A loop that uses the reply's outcome reads `Reply::undelivered` after the send
+that carried it, `flush` or the next receive: it is true when the reply did not reach its caller
+(the caller is gone, or its `CSpace` could not take the reply's caps), until the next send, so the
+loop can undo what the reply reported.
 
 `next_request` returns the receive's errors, those of `ipc_recv`, for the loop's `RecvGuard`
 ([IPC Design](../../docs/ipc-design.md) § Receive-Failure Policy). The kernel reports the receive's

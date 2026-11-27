@@ -50,9 +50,10 @@ pub const NUM_PRIORITY_LEVELS: usize = 32;
 /// Priority assigned to idle threads.
 pub const IDLE_PRIORITY: u8 = 0;
 
-/// Time-slice length of a strict-priority (RT) thread, in preemption-timer ticks. Decremented by
-/// `timer_tick` on every tick; a thread is preempted when its counter reaches zero. A fair thread's
-/// slice is its level instead ([`quantum_ticks`]). A tuning value; it bounds no capacity.
+/// Time-slice length of a strict-priority (RT) thread, in preemption-timer
+/// ticks. Decremented by `timer_tick` on every tick; a thread is preempted when
+/// its counter reaches zero. A fair thread's slice is its level instead
+/// ([`quantum_ticks`]). A tuning value; it bounds no capacity.
 pub const TIME_SLICE_TICKS: u32 = 10;
 
 /// Lowest level of the strict-priority (RT) class. Levels from it to
@@ -8234,15 +8235,17 @@ pub unsafe fn schedule(requeue: Requeue)
     );
     stages::start(cpu);
 
-    // The scheduler lock is taken with lock_raw/unlock_raw below, paired before function return (or
-    // before the context switch that may change the stack). Read `current` before any lock: it is
-    // written only by this CPU's own dispatch, so a lock-free read here is sound.
+    // The scheduler lock is taken with lock_raw/unlock_raw below, paired before
+    // function return (or before the context switch that may change the stack).
+    // Read `current` before any lock: it is written only by this CPU's own
+    // dispatch, so a lock-free read here is sound.
     let current = sched.current();
 
-    // Lock order: `current.sched_lock` (outer) → per-CPU run-queue lock (inner). The outgoing
-    // requeue writes `current.state` (Running→Ready), which `enqueue_and_wake` / `set_state` read
-    // under `sched_lock`; holding current's `sched_lock` across the requeue serialises those writes
-    // with those readers (no data race). The returned flags carry the caller's true interrupt state
+    // Lock order: `current.sched_lock` (outer) → per-CPU run-queue lock (inner).
+    // The outgoing requeue writes `current.state` (Running→Ready), which
+    // `enqueue_and_wake` / `set_state` read under `sched_lock`; holding current's
+    // `sched_lock` across the requeue serialises those writes with those readers
+    // (no data race). The returned flags carry the caller's true interrupt state
     // and govern the final `restore_interrupts_from`.
     let cur_sched_saved: Option<u64> = if current.is_null()
     {
@@ -8520,8 +8523,9 @@ pub unsafe fn schedule(requeue: Requeue)
     // If the scheduler selected the same thread, nothing to do.
     if next == current
     {
-        // Same thread re-selected (no switch). Re-mark Running under `current.sched_lock` (held);
-        // `context_saved` is untouched because no register save happens.
+        // Same thread re-selected (no switch). Re-mark Running under
+        // `current.sched_lock` (held); `context_saved` is untouched because no
+        // register save happens.
         if !current.is_null()
         {
             // Still running on THIS CPU: keep preferred_cpu authoritative
@@ -8627,12 +8631,13 @@ pub unsafe fn schedule(requeue: Requeue)
     }
     stages::lap(cpu, stages::Stage::Release);
 
-    // Incoming dispatch flip — THE exclusivity point. Mark `next` Running under its `sched_lock` so
-    // a concurrent enqueue_and_wake(next) serialises here and coalesces (it cannot link a thread
-    // the dispatcher is committing to run). If `next` was set_state'd Stopped/Exited between
-    // dequeue and here (reachable: dealloc marks Exited under all-CPU locks before its not-current
-    // spin blocks), it is now off-queue and drained — fall back to idle this cycle (the next tick
-    // re-schedules).
+    // Incoming dispatch flip — THE exclusivity point. Mark `next` Running under
+    // its `sched_lock` so a concurrent enqueue_and_wake(next) serialises here and
+    // coalesces (it cannot link a thread the dispatcher is committing to run). If
+    // `next` was set_state'd Stopped/Exited between dequeue and here (reachable:
+    // dealloc marks Exited under all-CPU locks before its not-current spin
+    // blocks), it is now off-queue and drained — fall back to idle this cycle
+    // (the next tick re-schedules).
     //
     // A dispatched `next`'s IOPB is loaded into this CPU's TSS inside the same
     // critical section (its own bitmap, copied only when the TSS does not hold
@@ -8778,8 +8783,9 @@ pub unsafe fn schedule(requeue: Requeue)
         watchdog_mark_non_idle(cpu);
     }
 
-    // Update the kernel trap stack pointer so the next ring-3 → ring-0 transition (interrupt,
-    // exception, or syscall) lands on the correct kernel stack for the incoming thread.
+    // Update the kernel trap stack pointer so the next ring-3 → ring-0
+    // transition (interrupt, exception, or syscall) lands on the correct
+    // kernel stack for the incoming thread.
     //
     // On x86-64: writes TSS RSP0 + PerCpuData::kernel_rsp.
     // On RISC-V: writes PerCpuData::kernel_rsp (offset 8 from tp); sscratch
@@ -8849,10 +8855,13 @@ pub unsafe fn schedule(requeue: Requeue)
         unsafe { (*cur_as).mark_inactive_on_cpu(cpu) };
     }
 
-    // Case (b): user AS → kernel/idle thread. Load the kernel root page table so satp/CR3 never
-    // points to a potentially-freeable user page table root. sfence.vma is deliberately omitted:
-    // kernel-mapped translations are identical across every address space (global mappings), and
-    // the next case-(a) activate flushes stale user entries before user code runs again.
+    // Case (b): user AS → kernel/idle thread.
+    // Load the kernel root page table so satp/CR3 never points to a
+    // potentially-freeable user page table root. sfence.vma is
+    // deliberately omitted: kernel-mapped translations are identical
+    // across every address space (global mappings), and the next
+    // case-(a) activate flushes stale user entries before user code
+    // runs again.
     if nxt_as.is_null() && !cur_as.is_null()
     {
         // SAFETY: the kernel root table is a valid root with the kernel
@@ -8887,10 +8896,11 @@ pub unsafe fn schedule(requeue: Requeue)
     }
     stages::lap(cpu, stages::Stage::Aspace);
 
-    // Extended-state (FPU, SIMD, vector) switch-out (`sched::fpu_switch`): save the outgoing user
-    // thread's live registers into its area (x86-64 XSAVE when this CPU's `fpu_owner` names it;
-    // RISC-V the F/D and V files that are Dirty). `fpu_owner` keeps naming it. A kernel thread or
-    // idle (null area) saves nothing. The matching load is `switch_in_restore` below, after the
+    // Extended-state (FPU, SIMD, vector) switch-out (`sched::fpu_switch`): save
+    // the outgoing user thread's live registers into its area (x86-64 XSAVE when
+    // this CPU's `fpu_owner` names it; RISC-V the F/D and V files that are
+    // Dirty). `fpu_owner` keeps naming it. A kernel thread or idle (null area)
+    // saves nothing. The matching load is `switch_in_restore` below, after the
     // `context_saved` Acquire.
     if !current.is_null()
     {
@@ -8904,11 +8914,12 @@ pub unsafe fn schedule(requeue: Requeue)
         }
     }
 
-    // `next` may have been redirected to idle by the dispatch-flip fallback above, so capture its
-    // saved-state pointer here (post-flip). `current_state` / `save_flag` were captured and the CPU
-    // + current.sched_lock released earlier — the cross-CPU `context_saved` spin and `switch()`
-    // below run lockless (the synchroniser is `context_saved` Acquire/Release, not the lock;
-    // holding it across the spin would re-introduce issue #144's deadlock).
+    // `next` may have been redirected to idle by the dispatch-flip fallback
+    // above, so capture its saved-state pointer here (post-flip). `current_state`
+    // / `save_flag` were captured and the CPU + current.sched_lock released
+    // earlier — the cross-CPU `context_saved` spin and `switch()` below run
+    // lockless (the synchroniser is `context_saved` Acquire/Release, not the
+    // lock; holding it across the spin would re-introduce issue #144's deadlock).
     // SAFETY: next is a valid TCB; saved_state field is always valid.
     let next_state = unsafe { core::ptr::addr_of!((*next).saved_state) };
 

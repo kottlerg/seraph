@@ -177,10 +177,15 @@ kernel's elapsed microseconds (`SYS_SYSTEM_INFO(ElapsedUs)`, from `rdtsc` on x86
 on riscv64), and measures the counter's rate against it over a span in which its CPU is kept
 busy. `CycleRate::counted` takes a window whose cycles reach its elapsed microseconds at that
 rate, less `RATE_SLACK_MICROS` (3) for the clock's truncation to whole microseconds and its
-reads, within `RATE_TOLERANCE_PERCENT` (5); a window that falls short did not count all of its
-elapsed time and is left out of the samples, so a counter that stops in a halt shows as windows
-left out, never as a sample short of its time. On x86-64 the elapsed clock is the TSC itself, so
-the check holds by construction and rests on the invariant TSC § Counters requires.
+reads, within `RATE_TOLERANCE_PERCENT` (5); a window that falls short is left out of the samples,
+so a counter that stops in a halt shows as windows left out, never as a sample short of its time.
+The clock's reads bracket the counter's, so a window also falls short when its thread is delayed
+between a clock read and the counter read beside it by more than the slack: under QEMU without
+icount, where the host may stall a vCPU at any instruction, a short window is left out now and
+then with its counter running (`ubench.pipeline` at `work=0` on riscv64). A left-out window
+therefore says that its sample could not be shown whole, not that the counter stopped; a window
+that counted its time is never left out. On x86-64 the elapsed clock is the TSC itself, so only
+such a delay leaves a window out, and the check rests on the invariant TSC § Counters requires.
 
 ---
 

@@ -81,30 +81,31 @@ fault already backed adds to neither, so a fault that backs more than its own ch
 `faults=` below `n=`.
 
 `pipeline` measures where the kernel runs two threads that hand work to each other, as
-[core/kernel/docs/scheduler.md § Thread Assignment](../../core/kernel/docs/scheduler.md#thread-assignment)
-places them, so neither is pinned, and neither can read a counter that times a window: either
-may move between two reads. ubench's thread, pinned to CPU 0, is the pipeline's head and tail
-instead. Per window it reads its counter, wakes the producer through a notification, waits on another for the
-consumer's word that the window's 64 items have passed, and reads again, so a sample is the
-window's elapsed cycles on CPU 0 wherever the pair ran; throughput is `window_ops=` over the
-sample. The window holds what the observer costs it: the producer's wake from CPU 0 at its start,
-which is the first placement each window asks of the kernel, and the observer's own wake at its end,
-once per 64 items. The observer is blocked for the rest of the window and takes no CPU time from the
-pair. At one CPU the three threads share the CPU and the window never idles; at more, CPU 0 halts
-when nothing else runs there, and a window counts that time only if the counter runs through a
-halt. Every window is therefore checked against the kernel's elapsed microseconds
-([shared/bench/README.md § Window rate check](../../shared/bench/README.md#window-rate-check)): one
-whose cycles fall short of its elapsed time is left out of the samples and counted in
-`clock_stopped=`, and a line all of whose windows were left out is the benchmark's FAIL line,
-which names `window_us=`. Each line's extras, after its summary: `window_ops=`, the items a
-sample holds; `remote_wakes=`, `idle_wakes=`, `wake_moves=` and `pulls=`, how much the two
-threads' placement counters grew over the timed windows, summed, as ktest's round-trip lines
-report them, from the counters
-[core/kernel/docs/scheduler.md § Placement Counters](../../core/kernel/docs/scheduler.md#placement-counters)
-names; `apart=`, the timed windows at whose end the two threads
-were last on different CPUs; `clock_stopped=`; and `window_us=`, the mean elapsed microseconds of
-a timed window, over every one, which gives the throughput even where every window was left
-out. The line at one CPU gates like every other; the lines at more report.
+[core/kernel/docs/scheduler.md § Thread
+Assignment](../../core/kernel/docs/scheduler.md#thread-assignment) places them, so neither is
+pinned, and neither can read a counter that times a window: either may move between two reads.
+ubench's thread, pinned to CPU 0, is the pipeline's head and tail instead. Per window it reads its
+counter, wakes the producer through a notification, waits on another for the consumer's word that
+the window's 64 items have passed, and reads again, so a sample is the window's elapsed cycles on
+CPU 0 wherever the pair ran; throughput is `window_ops=` over the sample. The window holds what the
+observer costs it: the producer's wake from CPU 0 at its start, which is the first placement each
+window asks of the kernel, and the observer's own wake at its end, once per 64 items. The observer
+is blocked for the rest of the window and takes no CPU time from the pair. At one CPU the three
+threads share the CPU and the window never idles; at more, CPU 0 halts when nothing else runs
+there, and a window counts that time only if the counter runs through a halt. Every window is
+therefore checked against the kernel's elapsed microseconds ([shared/bench/README.md § Window rate
+check](../../shared/bench/README.md#window-rate-check)): one whose cycles fall short of its elapsed
+time, because the counter stopped or the thread was delayed between a clock read and a counter
+read, is left out of the samples and counted in `clock_stopped=`, and a line all of whose windows
+were left out is the benchmark's FAIL line, which names `window_us=`. Each line's extras, after its
+summary: `window_ops=`, the items a sample holds; `remote_wakes=`, `idle_wakes=`, `wake_moves=` and
+`pulls=`, how much the two threads' placement counters grew over the timed windows, summed, as
+ktest's round-trip lines report them, from the counters [core/kernel/docs/scheduler.md § Placement
+Counters](../../core/kernel/docs/scheduler.md#placement-counters) names; `apart=`, the timed
+windows at whose end the two threads were last on different CPUs; `clock_stopped=`; and
+`window_us=`, the mean elapsed microseconds of a timed window, over every one, which gives the
+throughput even where every window was left out. The line at one CPU gates like every other; the
+lines at more report.
 
 ---
 

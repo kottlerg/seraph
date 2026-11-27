@@ -145,9 +145,9 @@ logs one of:
   windows that counted, and its other extras are those of § Benchmarks; a failed placement read
   leaves `remote_wakes=` out;
 - for a window row whose reads the measured thread takes and whose counted windows fall below half
-  its windows, no result line but a WARN line, `<name> <variant>: counted windows below the
-  floor`, with the counts (`pipeline` has no floor: it reports the windows that counted, however
-  few, and fails when none did, § Benchmarks);
+  its windows, no result line but a WARN line, `fault_fill path=grant affinity=any: counted windows
+  below the floor`, with the counts (`pipeline` has no floor: it reports the windows that counted,
+  however few, and fails when none did, § Benchmarks);
 - `bench <name> SKIP (<why>)` for a case the boot cannot run (a thread count above the CPUs
   online, or no framebuffer), beside the lines of the cases it ran;
 - `bench <name> FAIL (<why>)` when the benchmark failed: a failed call, a reply of the wrong

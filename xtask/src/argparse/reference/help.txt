@@ -96,7 +96,8 @@ Options:
       --ktest-bench-only               Build ktest with its `bench-only` feature: the benchmark tier alone, each benchmark at its full iteration count, for a run whose result lines are compared (core/ktest/README.md "Tier 3"). Needs a build that includes ktest (`--component all` or `ktest`)
       --ktest-only <PREFIXES>          Build ktest focused on the tests whose names start with one of these comma-separated prefixes (`stress::stop_`, `cap::,ipc::`): it runs only those, and no benchmark, ends a passing run with `[ktest] SELECTED TESTS PASSED` in place of the full run's marker, and fails a run whose selection matches no test (core/ktest/README.md "Test selection"). The build records the selection in the sysroot, and `run --runs` refuses an image of it without `--ktest-only-ok`. Needs a build that includes ktest (`--component all` or `ktest`); refused with `--ktest-bench-only`
       --wait-host <SECS>               When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override                  Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override                  Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>                 Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
   -h, --help                           Print help (see more with '--help')
 === xtask build --help
 Build Seraph components and populate the sysroot
@@ -140,7 +141,10 @@ Options:
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
 
       --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+
+      --grant <HOLDER>
+          Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
 
   -h, --help
           Print help (see a summary with '-h')
@@ -221,13 +225,13 @@ Options:
       --wait-host <SECS>
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>
+          Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
       --alone
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
       --timing
           A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help
           Print help (see more with '--help')
 === xtask run --help
@@ -410,16 +414,16 @@ Options:
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
 
       --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+
+      --grant <HOLDER>
+          Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
 
       --alone
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
           A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
 
   -h, --help
           Print help (see a summary with '-h')
@@ -431,7 +435,8 @@ Usage: xtask clean [OPTIONS]
 Options:
       --all               Also remove the cargo target/ directory (full clean)
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>    Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
   -h, --help              Print help
 === xtask clean --help
 Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
@@ -441,7 +446,8 @@ Usage: xtask clean [OPTIONS]
 Options:
       --all               Also remove the cargo target/ directory (full clean)
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>    Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
   -h, --help              Print help
 === xtask test -h
 Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
@@ -465,10 +471,10 @@ Options:
       --riscv-mmu <RISCV_MMU>    The `kaslr` case's riscv64 paging-mode ceiling (default: sv48; ignored on `x86_64`) [possible values: sv39, sv48, sv57]
       --x86-paging <X86_PAGING>  The `kaslr` case's guest x86-64 paging depth (default: 4; ignored on riscv64) [possible values: 4, 5]
       --wait-host <SECS>         When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override            Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override            Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>           Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
       --alone                    Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
       --timing                   A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help                     Print help (see more with '--help')
 === xtask test --help
 Run Seraph's tests: without a case, check formatting and lint the test code (and over the whole workspace the host crates, as `build` does), then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
@@ -569,16 +575,16 @@ Options:
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
 
       --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+
+      --grant <HOLDER>
+          Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
 
       --alone
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
           A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
 
   -h, --help
           Print help (see a summary with '-h')
@@ -590,7 +596,8 @@ Usage: xtask crypto-vectors [OPTIONS]
 Options:
       --check             Regenerate in memory and fail unless the checked-in files are byte-identical, writing nothing
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>    Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
   -h, --help              Print help
 === xtask crypto-vectors --help
 Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
@@ -600,7 +607,8 @@ Usage: xtask crypto-vectors [OPTIONS]
 Options:
       --check             Regenerate in memory and fail unless the checked-in files are byte-identical, writing nothing
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>    Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
   -h, --help              Print help
 === xtask fuzz -h
 Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
@@ -621,7 +629,8 @@ Options:
       --replay <FILE>     Run the property once on FILE and exit non-zero when it fails: the command a crash report prints
       --minimize          Reduce the target's working corpus to a subset of its inputs with the same coverage, the shorter inputs kept first
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>    Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
   -h, --help              Print help
 === xtask fuzz --help
 Build the fuzz targets with coverage instrumentation and run one, or with `--all` each, under the in-tree engine for an execution budget or a time; replay one input, minimize a corpus, list the targets, or with `--self-test` check that the engine finds its planted defects reproducibly. Exits non-zero when an input fails, with its report under target/xtask/fuzz/<target>/crashes/ (see xtask/README.md)
@@ -642,7 +651,8 @@ Options:
       --replay <FILE>     Run the property once on FILE and exit non-zero when it fails: the command a crash report prints
       --minimize          Reduce the target's working corpus to a subset of its inputs with the same coverage, the shorter inputs kept first
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>    Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
   -h, --help              Print help
 === xtask kani -h
 Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, or with `--since` of each crate a change can affect, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--shard`, one part of a crate's harnesses; with `--plan`, print the jobs CI's matrix runs; with `--pin`, print the pinned release (see xtask/README.md)
@@ -661,7 +671,8 @@ Options:
       --github-output <FILE>  With --plan, append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): the matrix and whether it holds a job
       --pin                   Print the pinned Kani release and exit, verifying nothing
       --wait-host <SECS>      When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override         Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override         Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>        Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
   -h, --help                  Print help
 === xtask kani --help
 Run the Kani proof harnesses (`#[cfg(kani)] mod proofs`) of every crate that holds one, or with `--since` of each crate a change can affect, with the pinned Kani release, and fail on any failed, undetermined or unwinding-incomplete check, on a Kani release other than the pinned one, and on a harness that lies in no package; with `--shard`, one part of a crate's harnesses; with `--plan`, print the jobs CI's matrix runs; with `--pin`, print the pinned release (see xtask/README.md)
@@ -680,7 +691,8 @@ Options:
       --github-output <FILE>  With --plan, append the workflow's outputs to FILE (`$GITHUB_OUTPUT`): the matrix and whether it holds a job
       --pin                   Print the pinned Kani release and exit, verifying nothing
       --wait-host <SECS>      When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override         Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override         Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>        Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
   -h, --help                  Print help
 === xtask cells -h
 Print the CI cells a change owes: each file the change from a base commit touches, the class the layer record places it in and why, and the validate cells and bench boots of its most demanding file; every cell without a base. Fails on a file no row places. With `--github-output`, append the matrices build-test.yml runs (see xtask/README.md)
@@ -846,10 +858,10 @@ Options:
       --timeout <TIMEOUT>  Seconds the whole boot may take [default: 3600]
       --reuse              Account the boot log and record the configuration's last trace left under target/xtask/path-account/, without booting
       --wait-host <SECS>   When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>     Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
       --alone              Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
       --timing             A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>     Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help               Print help (see more with '--help')
 === xtask path-account trace --help
 Boot the sysroot's benchmark image, built with `--limited-debug all` (ktest's bench-only image, `mkdisk --harness ktest`; or the init image with ubench staged), at one CPU under icount with the path-account plugin counting every instruction, check each gated measurement's windows against their samples and the counts, and write the configuration's result under target/xtask/path-account/
@@ -884,16 +896,16 @@ Options:
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
 
       --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+
+      --grant <HOLDER>
+          Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
 
       --alone
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
           A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1073,10 +1085,10 @@ Options:
       --out <DIR>          The directory the tables are written to (default: `shared/aml/fixtures/<config>`). Its `.aml` files are replaced
       --timeout <TIMEOUT>  Seconds to wait for the firmware to reach its boot options [default: 600]
       --wait-host <SECS>   When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>     Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
       --alone              Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
       --timing             A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>     Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help               Print help (see more with '--help')
 === xtask capture-acpi --help
 Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
@@ -1105,16 +1117,16 @@ Options:
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
 
       --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+
+      --grant <HOLDER>
+          Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
 
       --alone
           Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
 
       --timing
           A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1187,7 +1199,8 @@ Options:
       --arch <ARCH>        The architectures to build (default: both). Repeatable, or comma-separated [possible values: x86_64, riscv64]
       --profile <PROFILE>  The profiles to build (default: both). Repeatable, or comma-separated [possible values: debug, release]
       --wait-host <SECS>   When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+      --grant <HOLDER>     Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
   -h, --help               Print help (see more with '--help')
 === xtask compare-images --help
 Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
@@ -1221,7 +1234,10 @@ Options:
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
 
       --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. The command still registers, so other commands see it
+
+      --grant <HOLDER>
+          Run under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused, and while a timing grant is, a build too
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1552,25 +1568,29 @@ Options:
 === xtask orch grant set -h
 Give the exclusive grant. Refuses while one is outstanding
 
-Usage: xtask orch grant set <HOLDER> <COMMANDS>...
+Usage: xtask orch grant set [OPTIONS] <HOLDER> <COMMANDS>...
 
 Arguments:
   <HOLDER>       The worker that holds the grant
   <COMMANDS>...  The commands the grant covers, flags included
 
 Options:
-  -h, --help  Print help
+      --timing       A timing grant: hold every build not under it as well as every boot, and return once the host is quiet (no command not under the grant holds it), or fail at the bound naming what still holds it, the grant left set
+      --wait <SECS>  How long a timing grant waits for the host to be quiet [default: 1800]
+  -h, --help         Print help
 === xtask orch grant set --help
 Give the exclusive grant. Refuses while one is outstanding
 
-Usage: xtask orch grant set <HOLDER> <COMMANDS>...
+Usage: xtask orch grant set [OPTIONS] <HOLDER> <COMMANDS>...
 
 Arguments:
   <HOLDER>       The worker that holds the grant
   <COMMANDS>...  The commands the grant covers, flags included
 
 Options:
-  -h, --help  Print help
+      --timing       A timing grant: hold every build not under it as well as every boot, and return once the host is quiet (no command not under the grant holds it), or fail at the bound naming what still holds it, the grant left set
+      --wait <SECS>  How long a timing grant waits for the host to be quiet [default: 1800]
+  -h, --help         Print help
 === xtask orch grant clear -h
 End the outstanding grant
 

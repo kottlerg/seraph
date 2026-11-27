@@ -62,8 +62,9 @@ use syscall_abi::{
     SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV,
     SYS_IPC_REPLY, SYS_IPC_REPLY_RECV, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER,
     SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_KERNEL_LOG_BIND, SYS_KERNEL_LOG_READ,
-    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
-    SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL,
+    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT,
+    SYS_MEMORY_ZERO, SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND,
+    SYS_NOTIFICATION_WAIT, SYS_PMU_BIND, SYS_PMU_CONFIGURE, SYS_PMU_INFO, SYS_SBI_CALL,
     SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
     SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER,
     SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM,
@@ -91,10 +92,10 @@ pub use syscall_abi::{
     RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE,
     RIGHTS_IRQ_MINT, RIGHTS_IRQ_NOTIFY, RIGHTS_KLOG_READ, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP,
     RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_PHYS, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE,
-    RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE,
-    RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_THREAD,
-    RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL, RIGHTS_WS_MODIFY,
-    RIGHTS_WS_WAIT, WAIT_TRY_ONCE,
+    RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_PMU_CONFIGURE,
+    RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND,
+    RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL,
+    RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT, WAIT_TRY_ONCE,
 };
 pub use syscall_abi::{
     EXT_REGS_RISCV64_F0_OFFSET, EXT_REGS_RISCV64_FCSR_OFFSET, EXT_REGS_RISCV64_V0_OFFSET,
@@ -1120,6 +1121,89 @@ pub fn memory_merge(parent_cap: u64, tail_cap: u64) -> Result<(), i64>
     // kernel validates contiguity, rights, and derivation invariants.
     let ret = unsafe { syscall3(SYS_MEMORY_MERGE, parent_cap, tail_cap, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Zero `page_count` pages of `memory_cap` from page `offset_pages`,
+/// through the kernel's direct map, in one call: no mapping of the pages is
+/// needed. The cap needs Map and Write, and the range lies at or above the
+/// page-rounded retype cursor (`core/kernel/docs/syscalls.md`
+/// § `SYS_MEMORY_ZERO` (79)).
+///
+/// Returns the pages zeroed, from `offset_pages` on: `page_count`, or fewer
+/// when the kernel stopped between two 16-page batches so the caller could be
+/// preempted, stopped or given an upcall. A short count is part of the
+/// contract, not an error: a caller that ignores it leaves pages unzeroed and
+/// has a bug. [`memory_zero_all`] calls again until the range is zeroed and
+/// is the wrapper to use.
+///
+/// # Safety
+/// When a page of the range is mapped in the calling program's own address
+/// space, at any address, the call changes the program's memory under
+/// whatever the page holds:
+/// - the range holds no Rust object a store of zero bytes would make
+///   invalid, and no reference to it is live;
+/// - the range holds no code the program may execute;
+/// - no other access to the range runs concurrently with the call, except a
+///   volatile read, which may see any byte of a word before or after its
+///   zero.
+///
+/// # Errors
+/// Returns a negative `i64` error code, only when no page was zeroed:
+/// `InvalidArgument` (`page_count` zero, the range past the cap's end or
+/// overflowing, or below the retype cursor), `InvalidCapability` (also the
+/// handle deleted or revoked before the first batch), `InsufficientRights`
+/// (the cap lacks Map or Write), or `OutOfMemory` (a frame's mapping count
+/// is saturated). A batch after the first that fails its checks ends the call
+/// with the count so far; the next call, from there, returns the error.
+#[inline]
+pub unsafe fn memory_zero(memory_cap: u64, offset_pages: u64, page_count: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall3 issues the raw syscall instruction; the kernel writes
+    // only the cap's frames, which the caller's contract covers.
+    let ret = unsafe { syscall3(SYS_MEMORY_ZERO, memory_cap, offset_pages, page_count) };
+    if ret < 0
+    {
+        Err(ret)
+    }
+    else
+    {
+        Ok(ret.cast_unsigned())
+    }
+}
+
+/// Zero `page_count` pages of `memory_cap` from page `offset_pages`, calling
+/// [`memory_zero`] again from where each call stopped until every page is
+/// zeroed. A `page_count` of zero zeroes nothing and succeeds.
+///
+/// # Safety
+/// As [`memory_zero`].
+///
+/// # Errors
+/// As [`memory_zero`]. An error from a call after the first leaves the pages
+/// before the failing batch zeroed and the rest as they were.
+#[inline]
+pub unsafe fn memory_zero_all(
+    memory_cap: u64,
+    offset_pages: u64,
+    page_count: u64,
+) -> Result<(), i64>
+{
+    let mut done = 0;
+    while done < page_count
+    {
+        // SAFETY: the caller's contract, over a part of its range.
+        let zeroed = unsafe {
+            memory_zero(
+                memory_cap,
+                offset_pages.saturating_add(done),
+                page_count.saturating_sub(done),
+            )
+        }?;
+        // A call that succeeds zeroes at least one page and at most the
+        // pages asked for, so the loop advances and ends at `page_count`.
+        done = done.saturating_add(zeroed);
+    }
+    Ok(())
 }
 
 /// Split `mmio_cap` into two non-overlapping child `Mmio` caps.
@@ -3779,6 +3863,91 @@ pub fn kernel_log_bind(klog_cap: u64, ntf_cap: u64, bits: u64) -> Result<(), i64
     // handles and a bit mask, and changes no mapping, IPC page, or thread
     // entry state.
     let ret = unsafe { syscall3(SYS_KERNEL_LOG_BIND, klog_cap, ntf_cap, bits) };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+// ── Performance counters ─────────────────────────────────────────────────────
+
+/// Describe the calling CPU's performance counters (`SYS_PMU_INFO`), through
+/// `pmu_cap`, a `PmuControl` capability carrying `RIGHTS_PMU_CONFIGURE`.
+///
+/// Returns the packed description: the user counter count, their width and
+/// the supported-event mask, at the `PMU_INFO_*` shifts. `shared/pmu`'s
+/// `Info::unpack` reads it.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` if `pmu_cap`
+/// names no `PmuControl` capability, `InsufficientRights` if it lacks
+/// `RIGHTS_PMU_CONFIGURE`, or `NotSupported` if the calling CPU has no PMU.
+#[inline]
+pub fn pmu_info(pmu_cap: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall2 issues the raw syscall; it passes only a capability
+    // handle, and changes no mapping, IPC page, or thread entry state.
+    let ret = unsafe { syscall2(SYS_PMU_INFO, pmu_cap, 0) };
+    u64::try_from(ret).map_err(|_| ret)
+}
+
+/// Program the calling CPU's user counters with the `n` events of `events`,
+/// one id per byte from the low byte up, counting in `mode` (`PMU_MODE_*`
+/// bits), or release them with `n == 0` (`SYS_PMU_CONFIGURE`), through
+/// `pmu_cap`, a `PmuControl` capability carrying `RIGHTS_PMU_CONFIGURE`.
+/// The caller's affinity must name the CPU it runs on.
+///
+/// Returns the read handles, one per byte in the order of the events (0 for
+/// a release). `shared/pmu`'s `Pmu::configure` packs the events and reads
+/// the handles.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` or
+/// `InsufficientRights` for `pmu_cap`, `InvalidArgument` for more than
+/// `PMU_CONFIGURE_MAX` events, an unknown or repeated id, or a mode word
+/// that names no mode, `InvalidState` if the caller's affinity does not name
+/// the CPU it runs on, or `NotSupported` if the CPU has no PMU, does not
+/// count an event, or has too few counters for the events.
+#[inline]
+pub fn pmu_configure(pmu_cap: u64, events: u64, n: u64, mode: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall4 issues the raw syscall; it passes only a capability
+    // handle and scalars, and changes no mapping, IPC page, or thread entry
+    // state.
+    let ret = unsafe { syscall4(SYS_PMU_CONFIGURE, pmu_cap, events, n, mode) };
+    u64::try_from(ret).map_err(|_| ret)
+}
+
+/// Grant the thread `thread_cap` names direct user-mode reads of its CPU's
+/// performance counters (`SYS_PMU_BIND` with `on` = 1), through `pmu_cap`,
+/// a `PmuControl` capability carrying `RIGHTS_PMU_CONFIGURE`.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` if `pmu_cap`
+/// names no `PmuControl` capability or `thread_cap` no Thread,
+/// `InsufficientRights` if either lacks its right (`RIGHTS_PMU_CONFIGURE`,
+/// `RIGHTS_THREAD_CONTROL`), or `NotSupported` if the calling CPU has no
+/// PMU.
+#[inline]
+pub fn pmu_bind(pmu_cap: u64, thread_cap: u64) -> Result<(), i64>
+{
+    pmu_bind_raw(pmu_cap, thread_cap, 1)
+}
+
+/// Revoke the direct counter reads of the thread `thread_cap` names
+/// (`SYS_PMU_BIND` with `on` = 0); the errors are [`pmu_bind`]'s.
+///
+/// # Errors
+/// As [`pmu_bind`].
+#[inline]
+pub fn pmu_unbind(pmu_cap: u64, thread_cap: u64) -> Result<(), i64>
+{
+    pmu_bind_raw(pmu_cap, thread_cap, 0)
+}
+
+fn pmu_bind_raw(pmu_cap: u64, thread_cap: u64, on: u64) -> Result<(), i64>
+{
+    // SAFETY: syscall3 issues the raw syscall; it passes only capability
+    // handles and a flag, and changes no mapping, IPC page, or thread entry
+    // state.
+    let ret = unsafe { syscall3(SYS_PMU_BIND, pmu_cap, thread_cap, on) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 

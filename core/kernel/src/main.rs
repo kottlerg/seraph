@@ -117,6 +117,7 @@ pub mod irq;
 mod klog;
 mod mm;
 mod percpu;
+mod perfmon;
 mod platform;
 mod sched;
 mod stack_depth;
@@ -703,6 +704,17 @@ unsafe fn kernel_entry_post_rebase(
     // pointer, above.
     unsafe {
         arch::current::cpu::disable_unswitched_user_state();
+    }
+    // Describe the BSP's performance counters, leave its user counters
+    // stopped, and log the description (`perfmon`). After
+    // `percpu::init_bsp`, whose entry holds the state, and after
+    // `cpu::enable_smep_smap` (x86-64) and `interrupts::init` (riscv64) wrote
+    // the grant this starts from.
+    #[cfg(not(test))]
+    // SAFETY: BSP in ring 0 / S-mode with interrupts disabled, once, its
+    // per-CPU pointer installed, before any thread enters user mode.
+    unsafe {
+        perfmon::init_this_cpu(true);
     }
     // Initialise the BSP's own interrupt-controller state that needs its
     // per-CPU pointer (riscv64: its IMSIC file, whose first AIA CSR access
@@ -1736,6 +1748,7 @@ unsafe fn kernel_entry_post_rebase(
                         run_limit: core::sync::atomic::AtomicU32::new(0),
                         run_count: core::sync::atomic::AtomicU32::new(0),
                         run_limit_pending: core::sync::atomic::AtomicBool::new(false),
+                        pmu_reader: core::sync::atomic::AtomicBool::new(false),
                         is_user: true,
                         saved_state: init_saved,
                         kernel_stack_top: kstack_top,
@@ -2051,6 +2064,15 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     // pointer, above.
     unsafe {
         arch::current::cpu::disable_unswitched_user_state();
+    }
+
+    // Describe this AP's performance counters and leave its user counters
+    // stopped, as the BSP did in Phase 5.
+    // SAFETY: ring 0 / S-mode on this AP with interrupts disabled, once,
+    // `percpu::init_ap` installed its per-CPU pointer and `interrupts::init_ap`
+    // (riscv64) wrote its `scounteren`, above; it has not entered user mode.
+    unsafe {
+        perfmon::init_this_cpu(false);
     }
 
     // Set this AP's per-CPU transient-execution controls of the selection the

@@ -27,6 +27,7 @@ core/kernel/
 │   ├── framebuffer.rs          # Framebuffer text renderer
 │   ├── irq.rs                  # IRQ routing: wired-line table (sized at boot), delivery gates
 │   ├── percpu.rs               # Per-CPU private state
+│   ├── perfmon.rs              # User performance counters: per-CPU description, configure, bind
 │   ├── platform.rs             # kernel_mmio cache (Phase 4), Phase 6 MMIO-aperture validation
 │   ├── stack_depth.rs          # Kernel stack paint and deepest-use report (StackHighWater)
 │   ├── sync.rs                 # Kernel synchronisation primitives
@@ -52,6 +53,7 @@ core/kernel/
 │   │   │   ├── fpu.rs          # Extended-state (x87/SSE/AVX) control
 │   │   │   ├── ap_trampoline.rs # AP SIPI startup trampoline
 │   │   │   ├── platform.rs     # Bootloader-discovered hardware accessors
+│   │   │   ├── pmu.rs          # Intel and AMD performance counters: describe, configure, grant
 │   │   │   ├── console.rs      # Early serial (COM1 16550, I/O-port) output
 │   │   │   ├── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
 │   │   │   ├── speculation.rs  # Bound mask (cmp/sbb), opaque identity, enumeration, controls
@@ -76,6 +78,7 @@ core/kernel/
 │   │       ├── fpu.rs          # Extended-state (F/D/V) control
 │   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)
 │   │       ├── platform.rs     # Bootloader-discovered hardware accessors
+│   │       ├── pmu.rs          # SBI PMU counters: describe, configure, grant
 │   │       ├── console.rs      # Early serial (ns16550 MMIO UART) output
 │   │       ├── entropy.rs      # Zkr seed CSR hardware RNG; cycle counter for jitter
 │   │       ├── shadow_stack.rs # Kernel shadow stacks: off (Zicfiss not yet built)
@@ -145,6 +148,7 @@ core/kernel/
 │       ├── ipc.rs              # IPC syscall implementations
 │       ├── klog.rs             # SYS_KERNEL_LOG_READ and SYS_KERNEL_LOG_BIND
 │       ├── mem.rs              # Memory syscall implementations
+│       ├── pmu.rs              # SYS_PMU_INFO, SYS_PMU_CONFIGURE, SYS_PMU_BIND
 │       ├── sbi.rs              # SYS_SBI_CALL (riscv64)
 │       ├── sysinfo.rs          # SYS_SYSTEM_INFO
 │       └── thread.rs           # Thread lifecycle and control syscalls
@@ -161,6 +165,7 @@ core/kernel/
     ├── capability-internals.md # Capability subsystem implementation details
     ├── entropy.md              # Entropy subsystem, CSPRNG, health tests, draw API
     ├── kernel-log.md           # Kernel log: ring, print classes, reader protocol, flushes
+    ├── perfmon.md              # Kernel Performance Counters: per-CPU state, counters, the grant
     ├── ipc-internals.md        # IPC subsystem implementation details
     ├── scheduler.md            # Scheduler internals and algorithms
     ├── scheduling-internals.md # SMP locking, wake protocol, IPI taxonomy, BSP boot transient
@@ -248,6 +253,13 @@ See [`docs/ipc-internals.md`](docs/ipc-internals.md).
 The kernel log appends the kernel's address-free lines as records while a userspace reader
 holding a `KernelLog` capability is attached, and writes them directly otherwise. A failure path
 flushes the records no reader has read first. See [`docs/kernel-log.md`](docs/kernel-log.md).
+
+### `perfmon`
+
+The user performance counters a `PmuControl` capability governs: each CPU describes its counters
+at bring-up, `SYS_PMU_CONFIGURE` programs the calling CPU's counters, and `SYS_PMU_BIND` decides
+which threads read them from user mode. The architecture halves are `arch/*/pmu.rs`, the syscalls
+are in `syscall/pmu.rs`. See [`docs/perfmon.md`](docs/perfmon.md), Kernel Performance Counters.
 
 ### `sched/`
 

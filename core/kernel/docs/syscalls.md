@@ -245,10 +245,14 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  76  SYS_KERNEL_LOG_BIND
                                  77  SYS_IPC_REPLY_RECV
                                  78  SYS_THREAD_SET_RUN_LIMIT
+                                 79  SYS_MEMORY_ZERO
+                                 80  SYS_PMU_INFO
+                                 81  SYS_PMU_CONFIGURE
+                                 82  SYS_PMU_BIND
 ```
 
-**Implementation status.** Every number 0–78 has a handler; every number at or past
-`SYSCALL_NR_BOUND` (79) returns `UnknownSyscall`. The kernel refuses a number at or past the
+**Implementation status.** Every number 0–82 has a handler; every number at or past
+`SYSCALL_NR_BOUND` (83) returns `UnknownSyscall`. The kernel refuses a number at or past the
 bound, then selects the handler with one `match` on the number, clamped as data
 ([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and calls
 it directly. The `match` and a build-time check of its numbers come from one list
@@ -1812,6 +1816,67 @@ object),
 
 ---
 
+### `SYS_MEMORY_ZERO` (79)
+
+Zero pages of a Memory capability through the kernel's direct map, with no mapping of them. A
+pager zeroes the frames it hands out this way, with no window of its own address space to map
+them at and unmap them from.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `memory_cap` | Memory capability (Map and Write rights) |
+| 1 | `offset_pages` | First page to zero, in pages from the start of the region |
+| 2 | `page_count` | Pages to zero; nonzero |
+
+**Return:** `rax`/`a0`: the pages zeroed, from `offset_pages` on, on success; `SyscallError`
+on failure. The count is `page_count`, or fewer when the call stopped early (below). A short
+count is part of every caller's contract, not an error: the caller calls again from
+`offset_pages` plus the count for the rest, and a caller that ignores it leaves pages unzeroed.
+`shared/syscall`'s `memory_zero_all` makes those calls.
+
+**Capability requirements:** `memory_cap` (Map and Write). Zeroing is what a writable mapping
+and stores through it could do, so the call asks for the rights `SYS_MEM_MAP` asks of a writable
+mapping.
+
+The whole range `[offset_pages, offset_pages + page_count)` must lie inside the region's current
+size, checked before any page is zeroed. The call then zeroes it in batches of 16 pages, the
+kernel's clear batch ([memory-internals.md](memory-internals.md) § Kernel Object Memory). Each
+batch is checked and committed under `SYS_MEM_MAP`'s protocol for its range: under the Memory
+object's read lock the batch is bounded by the current size, its frames are pinned in the frame
+map, it must lie at or above the page-rounded retype cursor (so no kernel object is ever zeroed),
+and the handle must still name the same object with Map and Write; only then are its pages zeroed
+([memory-internals.md](memory-internals.md) § Frame Map Table). No lock and no pin is held from
+one batch to the next.
+
+Between two batches the call takes the interrupts pending on its CPU and then, when that CPU's
+return work holds a stop, an upcall, or a run-limit fault, or a preemption with a thread queued on
+the CPU that outranks the caller ([scheduling-internals.md](scheduling-internals.md) § Return Work),
+returns the pages zeroed so far; the return to user mode that follows switches, stops or delivers.
+The return work is read only between batches, so every call zeroes at least one batch, and a caller
+that is always outranked still advances. A slice expiry does not end the call: a tick that lands in
+a window between batches refills the slice without rescheduling, as in every preemption-disabled
+window (§ `SYS_THREAD_STOP`, Latency contract). The return switches only to a thread that outranks
+the caller, so a thread at the caller's own level runs at the caller's first slice expiry with
+preemption enabled after that refill, a full slice later at the least, not when the call returns. A
+batch after the first whose checks fail (a split shrank the region, a retype reached the range, the
+handle was revoked or deleted) also ends the call with the count so far, and the next call, starting
+at that batch, returns the error.
+
+The call issues no instruction-fetch synchronisation. A page it zeroes that a mapping shows
+executable holds code written through a writable alias, which the holder synchronises with
+`SYS_MEM_PROTECT` to executable ([memory-internals.md](memory-internals.md)
+§ Instruction-Fetch Synchronisation).
+
+**Errors:** returned only when no page was zeroed. `InvalidArgument` (`page_count` zero, the
+range overflows or lies past the region's end, or its first batch lies below the retype
+cursor), `InvalidCapability` (also a handle deleted or revoked before the first batch),
+`InsufficientRights` (the cap lacks Map or Write), `OutOfMemory` (a frame's mapping count is
+saturated).
+
+---
+
 ### `SYS_MMIO_MERGE` (70)
 
 Merge two MMIO region capabilities over adjacent ranges into one capability over the joined
@@ -2005,7 +2070,8 @@ target's remaining time slice (at most the longest slice, 20 timer ticks, that o
 [scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)), except when the
 slice expires while the target runs a preemption-disabled kernel section with interrupts enabled (a
 TLB-shootdown or drain spin, or a page-pool seeding, teardown, explicit-placement pre-grow,
-registry-walk, waiter-drain, or derivation-lock window between batches, `interrupt_window`):
+registry-walk, waiter-drain, memory-zero, or derivation-lock window between batches,
+`interrupt_window`):
 `timer_tick` then refills the slice without rescheduling, and `preempt_enable` does not reschedule,
 so the stop completes at the first later slice-expiry tick with preemption enabled, a further slice
 later at the least, or at the target's next return to user mode when a thread queued on its CPU
@@ -4084,6 +4150,113 @@ cap); `InsufficientRights` (it lacks `Read`); `InvalidCapability` (a non-zero `n
 no Notification); `InsufficientRights` (the Notification cap lacks `Notify`);
 `InvalidArgument` (a Notification with `bits == 0`).
 
+## Performance Counter Syscalls
+
+The counters, the grant and the per-CPU state behind these calls are specified in
+[perfmon.md](perfmon.md). Each call takes a `PmuControl` capability carrying `Configure`
+([capability-model.md](../../../docs/capability-model.md) § `PmuControl`) and acts on the calling
+CPU's counters. The register packing is stated once in `abi/syscall` (the `PMU_*` constants) and
+read and written by [shared/pmu](../../../shared/pmu/README.md). A configuration takes at most
+`PMU_CONFIGURE_MAX` (8) events and returns 8-bit read handles: both are limits of this version of
+the calls, whose event and handle words carry one byte per entry.
+
+The events are portable ids (`PMU_EVENT_*`): `Cycles` (0), `Instructions` (1),
+`LlcReferences` (2), `LlcMisses` (3), `BranchInstructions` (4), `BranchMisses` (5),
+`DtlbMisses` (6) and `ItlbMisses` (7). Which of them a CPU counts is its own; `SYS_PMU_INFO`
+reports it.
+
+### `SYS_PMU_INFO` (80)
+
+Describe the calling CPU's performance counters.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `pmu_cap` | `PmuControl` capability carrying `Configure` |
+
+**Return:** `rax`/`a0`: the description on success, packed at the `PMU_INFO_*` shifts: the user
+counters a configuration may take (bits 0-7), their width in bits (bits 8-15), and the events the
+CPU counts, bit `i` for event id `i` (bits 16-31); negative `SyscallError` on failure. Each CPU
+describes its own counters, so CPUs of a hybrid part, and riscv64 harts that differ in Sscofpmf
+or its delegation, can answer differently.
+
+**Errors**, checked in this order: `InvalidCapability` (the handle names no `PmuControl` cap);
+`InsufficientRights` (it lacks `Configure`); `NotSupported` (the CPU has no counters the kernel
+drives: x86-64 other than Intel architectural performance monitoring or AMD family 17h and later,
+QEMU's TCG among them; riscv64 without the SBI PMU extension or a programmable counter, or on a
+hart whose `sie.LCOFIE` probe shows no Sscofpmf with its overflow interrupt delegated to S-mode;
+[perfmon.md](perfmon.md)).
+
+---
+
+### `SYS_PMU_CONFIGURE` (81)
+
+Program the calling CPU's user counters, or release them.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `pmu_cap` | `PmuControl` capability carrying `Configure` |
+| 1 | `events` | Event ids, one per byte from the low byte up; the bytes past the `n`th are ignored |
+| 2 | `n` | Number of events, `0..=PMU_CONFIGURE_MAX`; `0` releases the counters |
+| 3 | `mode` | `PMU_MODE_USER`, `PMU_MODE_KERNEL`, or both; read only when `n > 0` |
+
+The configuration replaces the CPU's previous one, whoever made it, and its counters start from
+zero. The caller's hard affinity must name the CPU it runs on: a thread that set its affinity
+moves there at its next schedule, so it yields once before configuring. A counter counts all work
+on the CPU in the mode, not the caller's alone ([perfmon.md](perfmon.md) § What a value means). A
+thread's grant is in effect only while the CPU holds a configuration, so a release ends it on the
+CPU and a configuration that holds counters starts it for the bound threads that run there
+([perfmon.md](perfmon.md) § The grant).
+
+**Return:** `rax`/`a0`: the read handles on success, one per byte in the order of the events (the
+`RDPMC` index on x86-64, the counter CSR's offset from `cycle` on riscv64), `0` for a release;
+negative `SyscallError` on failure.
+
+**Errors**, checked in this order: `InvalidCapability`, `InsufficientRights` (as for
+`SYS_PMU_INFO`); `InvalidArgument` (`n` past `PMU_CONFIGURE_MAX`, an id that names no event, an
+event named twice, or, with `n > 0`, a `mode` that is not one of the three); `NotSupported` (the CPU
+has no counters); `InvalidState` (the caller's hard affinity does not name the CPU it runs on);
+`NotSupported` (the CPU has fewer than `n` user counters, or does not count one of the events). A
+refused configuration leaves the previous one in place, except on riscv64 when the firmware claims
+no counter for an event the CPU reports, which leaves the CPU with none ([perfmon.md](perfmon.md)
+§ Counters).
+
+---
+
+### `SYS_PMU_BIND` (82)
+
+Grant or revoke a thread's direct user-mode reads of the counters of the CPU it runs on. On
+x86-64 the grant is `CR4.PCE`, all-or-nothing: a bound thread can `RDPMC` every counter `RDPMC`
+names, the fixed counters, the kernel's reserved counter and, on AMD, the Data Fabric and L3
+counters included, not only the configured ones; riscv64 grants the configured counters'
+`scounteren` bits alone.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `pmu_cap` | `PmuControl` capability carrying `Configure` |
+| 1 | `thread_cap` | Thread capability carrying `Control` |
+| 2 | `on` | `1` to grant, `0` to revoke |
+
+A thread without the grant, or one with it on a CPU that has no user configuration, that reads a
+counter takes the CPU's fault (`#GP(0)` on x86-64, an illegal-instruction exception on riscv64),
+delivered as its own fault. The change holds before the caller's next instruction when the thread is
+the caller; from the thread's first return to user mode after the kernel's interrupt reaches its
+CPU when it runs on another; and from its next dispatch otherwise ([perfmon.md](perfmon.md)
+§ The grant). The grant holds until a bind revokes it or the thread exits: revoking the
+`PmuControl` capability does not end it.
+
+**Return:** `rax`/`a0`: 0 on success; negative `SyscallError` on failure.
+
+**Errors**, checked in this order: `InvalidCapability`, `InsufficientRights` (as for
+`SYS_PMU_INFO`); `InvalidCapability` (`thread_cap` names no Thread); `InsufficientRights` (the
+Thread cap lacks `Control`); `InvalidArgument` (`on` is neither 0 nor 1); `NotSupported` (the
+calling CPU has no counters).
+
 ---
 
 ## Revocation Notes
@@ -4147,7 +4320,9 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   Long-running operations (revocation traversal, SMP TLB shootdown waits) proceed in
   bounded batches or in preempt-disabled, interrupt-enabled windows, and re-check
   state between batches (see [scheduling-internals.md](scheduling-internals.md)
-  § Lock Hierarchy).
+  § Lock Hierarchy). `SYS_MEMORY_ZERO`, whose length the caller chooses, also returns between
+  two of its batches when a thread may outrank its caller, with the pages zeroed so far
+  (§ `SYS_MEMORY_ZERO`).
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
   `SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`,
@@ -4198,6 +4373,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `KLOG_RECORD_MAX` | 536 | Bytes of a kernel log record at its longest: the 24-byte header and `KLOG_LINE_MAX` |
 | `KLOG_READ_MAX` | 16384 | Most bytes one `SYS_KERNEL_LOG_READ` writes |
 | `KLOG_STALL_MS` | 1000 | Milliseconds an attached kernel log reader may leave a record unread, measured from its append or from the reader's last read of a new record when that came later, before the kernel writes its lines directly |
+| `PMU_CONFIGURE_MAX` | 8 | Most events one `SYS_PMU_CONFIGURE` takes |
 | `BOOT_PROTOCOL_VERSION` | 25 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
@@ -4213,7 +4389,8 @@ source of truth.
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
 [Kernel Entropy Subsystem](entropy.md), [IPC Subsystem Internals](ipc-internals.md),
-[Memory Subsystem Internals](memory-internals.md), [Scheduler Internals](scheduler.md),
+[Memory Subsystem Internals](memory-internals.md), [Kernel Performance Counters](perfmon.md),
+[Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),
 [core/ktest/README.md](../../ktest/README.md),

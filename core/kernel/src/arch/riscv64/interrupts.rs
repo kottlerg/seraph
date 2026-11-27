@@ -1316,11 +1316,13 @@ const SCOUNTEREN_CY: u64 = 1 << 0;
 /// userspace cycle measurements read (the counterpart of the timestamp counter
 /// x86-64 grants). `time`, `instret` and every `hpmcounter` stay denied, so
 /// a U-mode read of one raises an illegal-instruction exception, which the
-/// kernel delivers as the thread's fault
+/// kernel delivers as the thread's fault. This is each hart's starting grant:
+/// `perfmon` adds the configured counters' bits while a thread bound with
+/// `SYS_PMU_BIND` runs (core/kernel/docs/perfmon.md)
 /// ([docs/capability-model.md](../../../../../docs/capability-model.md)
 /// § Microarchitectural Isolation).
 #[cfg(not(test))]
-const USER_COUNTERS: u64 = SCOUNTEREN_CY;
+pub(super) const USER_COUNTERS: u64 = SCOUNTEREN_CY;
 
 /// Write this hart's `scounteren` whole with [`USER_COUNTERS`], replacing
 /// every bit the firmware left, so each hart grants U-mode the same counters.

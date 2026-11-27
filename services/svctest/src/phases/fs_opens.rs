@@ -659,12 +659,13 @@ fn sole(cap: u64) -> bool
 /// deleted, its node kept, must end at a scheduled sweep, which svctest brings
 /// on by starting sessions, while an open in svctest's own session still
 /// reads. A `session-undeliverable-child`, whose `CSpace` cannot take the
-/// `FS_SESSION` reply, sees fatfs end the session it started, its page
-/// leaving the child's node. A `read-undeliverable-child`, whose `CSpace`
-/// cannot take an `FS_READ_MEMORY` reply's page, sees fatfs give each such
-/// page back, so more reads than an open may hold pages all fail their
-/// transfer and none is refused. fatfs once kept a dead client's open, and its
-/// release SEND, until the open's node was removed.
+/// `FS_SESSION` reply, sees fatfs end the session it started before it serves
+/// the child's next request, its page leaving the child's node. A
+/// `read-undeliverable-child`, whose `CSpace` cannot take an `FS_READ_MEMORY`
+/// reply's page, sees fatfs give each such page back, so more reads than an
+/// open may hold pages all fail their transfer and none is refused. fatfs once
+/// kept a dead client's open, and its release SEND, until the open's node was
+/// removed.
 pub fn fs_reclaims_dead_opens_phase(_: &Caps)
 {
     let ipc_buf = current_ipc_buf();
@@ -804,7 +805,8 @@ fn dropped_session_swept(node: u64, ipc_buf: *mut u64) -> usize
 /// reserve included, and ask for a session on [`RECLAIM_NAME`]'s node
 /// carrying the handle: moving the handle out frees one slot, so the reply's
 /// session cap and liveness cap cannot both land. Check that the reply
-/// transfer fails and that fatfs then ends the session it started, its page
+/// transfer fails and that fatfs, once it has received another request (an
+/// `NS_STAT` of the child's), has ended the session it started, its page
 /// leaving the sub-node. Allocates nothing on the heap after the exhaustion,
 /// since a heap refill needs a free slot. Exit codes: 0 = the page went, 2 =
 /// the lookup failed, 3 = the sub-node or its handle could not be made, 4 = a
@@ -872,6 +874,10 @@ fn session_undeliverable_child_main() -> !
         Some(_) => std::process::exit(5),
         None => std::process::exit(6),
     }
+    // fatfs undoes a reply that was not delivered once its loop's next
+    // receive returns, before it serves the request that receive brings: a
+    // request of this child's own brings it, whatever else fatfs serves.
+    let _ = ns_stat(node, ipc_buf);
     let start = Instant::now();
     while start.elapsed() < RECLAIM_WAIT
     {

@@ -647,8 +647,9 @@ fn service_loop(
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     let mut session_sweeps = SweepSchedule::new();
     let mut reply = Reply::new();
-    // The page an `FS_READ_MEMORY` reply hands over, until that reply is sent.
-    let mut pending: Option<PendingRelease> = None;
+    // What the loop undoes when the reply a handler left is not delivered,
+    // until that reply is sent.
+    let mut pending: Option<Undo> = None;
     loop
     {
         // The last request found the block device capability revoked and
@@ -734,7 +735,6 @@ fn service_loop(
                 caps.block_dev,
                 ipc_buf,
                 &mut reply,
-                caps.service,
             );
             if unmounted
             {
@@ -885,7 +885,7 @@ fn service_loop(
                 // Takes the opens' lock itself, only around a sweep and the
                 // session's start: its page request, CSpace top-up, and
                 // liveness object's retype call memmgr.
-                handle_session_node_cap(
+                pending = handle_session_node_cap(
                     node_id,
                     &msg,
                     nodes,
@@ -903,7 +903,7 @@ fn service_loop(
                 // Takes the opens' lock itself, only around the records'
                 // update: its CSpace top-up and its session's page request
                 // may call memmgr.
-                handle_open_node_cap(
+                pending = handle_open_node_cap(
                     node_id,
                     parent_rights,
                     &msg,
@@ -948,7 +948,7 @@ fn service_loop(
             {
                 // With CREATE_OPEN, takes the opens' lock itself, as FS_OPEN
                 // does.
-                handle_create_node_cap(
+                pending = handle_create_node_cap(
                     node_id,
                     parent_rights,
                     &msg,
@@ -1065,7 +1065,7 @@ fn service_loop(
                     eviction,
                     &mut reply,
                 )
-                .map(|cookie| PendingRelease { open, cookie });
+                .map(|cookie| Undo::Page { open, cookie });
             }
             (fs_labels::FS_RELEASE_MEMORY, Some(open)) =>
             {
@@ -1502,8 +1502,10 @@ fn relieve_pressure(opens: &mut Opens, cache: &PageCache, eviction: &EvictionSta
 /// with a session cap whose badge names it, carrying `RIGHTS_EP_IDENTIFY`
 /// beside `SEND`, and the session's liveness cap.
 /// The sessions are swept for those whose client is gone when
-/// `session_sweeps` says a sweep is due. A reply the client cannot take moves
-/// no cap, so the session is ended at once.
+/// `session_sweeps` says a sweep is due. The success reply is left in `reply`
+/// to ride the loop's next receive; a reply the client cannot take moves no
+/// cap, the slot deletes both, and the loop ends the session (the returned
+/// [`Undo::Session`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "the request, its node, and the driver state a session touches (node table, opens and \
@@ -1519,7 +1521,7 @@ fn handle_session_node_cap(
     cache: &PageCache,
     ipc_buf: *mut u64,
     reply: &mut Reply,
-)
+) -> Option<Undo>
 {
     let opcode = fs_labels::FS_SESSION;
     // The mount's root cap names `NodeId(0)`, which the node table never
@@ -1527,13 +1529,13 @@ fn handle_session_node_cap(
     if node_id.raw() != 0 && nodes.get(node_id).is_none()
     {
         reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, reply);
-        return;
+        return None;
     }
     let Some((&handle, rest)) = msg.caps().split_first()
     else
     {
         reply_err(ipc::fs_errors::INVALID_ARGUMENT, reply);
-        return;
+        return None;
     };
     drop_caps(rest);
     let mut refuse = |code: u64| {
@@ -1547,7 +1549,7 @@ fn handle_session_node_cap(
     if !cache.fund_run_time_headroom(startup_info().self_cspace)
     {
         refuse(ipc::fs_errors::TOO_MANY_OPEN);
-        return;
+        return None;
     }
     let grant = match session::request_page(handle, ipc_buf)
     {
@@ -1555,7 +1557,7 @@ fn handle_session_node_cap(
         Err(code) =>
         {
             refuse(code);
-            return;
+            return None;
         }
     };
     let Some(liveness) = Liveness::create()
@@ -1563,7 +1565,7 @@ fn handle_session_node_cap(
     {
         session::release_page(grant);
         refuse(ipc::fs_errors::TOO_MANY_OPEN);
-        return;
+        return None;
     };
     let started = opens
         .lock()
@@ -1575,13 +1577,7 @@ fn handle_session_node_cap(
         liveness.discard();
         session::release_page(grant);
         refuse(ipc::fs_errors::TOO_MANY_OPEN);
-        return;
-    };
-    let end = || {
-        opens
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .end_session_by_id(id, cache);
+        return None;
     };
     // A session cap carries no namespace rights: it names the session, and
     // FS_OPEN reads it from the cap the open carries. Its endpoint rights add
@@ -1599,19 +1595,19 @@ fn handle_session_node_cap(
     else
     {
         // Ending the session revokes the liveness child with its parent.
-        end();
+        opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .end_session_by_id(id, cache);
         reply_err(ipc::fs_errors::IO_ERROR, reply);
-        return;
+        return None;
     };
     let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .cap(session_cap)
         .cap(liveness.child)
         .build();
-    if !reply_now(answer, reply, caps.service, ipc_buf)
-    {
-        let _ = syscall::cap_delete(session_cap);
-        end();
-    }
+    reply.set_or_delete_caps(answer);
+    Some(Undo::Session(id))
 }
 
 /// End every session whose client holds no copy of its liveness cap any
@@ -1628,7 +1624,8 @@ fn sweep_sessions(opens: &Mutex<Opens>, session_sweeps: &mut SweepSchedule, cach
 /// `FS_OPEN` against a file node cap (services/fs/docs/fs-driver-protocol.md
 /// § Label 18). The open is made in the session the request's session cap
 /// names ([`request_session`], [`open_in_session`]), with the release SEND
-/// `caps[1]` carries.
+/// `caps[1]` carries. Returns what the loop undoes when the reply is not
+/// delivered.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request, its node and rights, and the driver state an open touches (node table, \
@@ -1644,13 +1641,13 @@ fn handle_open_node_cap(
     cache: &PageCache,
     ipc_buf: *mut u64,
     reply: &mut Reply,
-)
+) -> Option<Undo>
 {
     let opcode = fs_labels::FS_OPEN;
     if nodes.get(node_id).is_none_or(|n| n.kind != NodeKind::File)
     {
         reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, reply);
-        return;
+        return None;
     }
     let (id, release_send) = match request_session(msg, caps.service)
     {
@@ -1658,7 +1655,7 @@ fn handle_open_node_cap(
         Err(code) =>
         {
             reply_dropping_caps(msg, opcode, code, reply);
-            return;
+            return None;
         }
     };
     open_in_session(
@@ -1673,7 +1670,7 @@ fn handle_open_node_cap(
         cache,
         ipc_buf,
         reply,
-    );
+    )
 }
 
 /// The session a request's `caps[0]` names, and the release SEND its
@@ -1746,9 +1743,10 @@ impl OpenRequest
 }
 
 /// An `FS_OPEN` in the session `session` names: record the open
-/// ([`record_open`]) and reply with an open cap whose badge names the open.
-/// A reply the client cannot take moves no cap, so the open is closed at
-/// once.
+/// ([`record_open`]) and leave in `reply` an open cap whose badge names the
+/// open, to ride the loop's next receive. A reply the client cannot take
+/// moves no cap: the slot deletes it, and the loop closes the open (the
+/// returned [`Undo::Open`]).
 fn open_in_session(
     session: u64,
     open: OpenRequest,
@@ -1756,35 +1754,25 @@ fn open_in_session(
     cache: &PageCache,
     ipc_buf: *mut u64,
     reply: &mut Reply,
-)
+) -> Option<Undo>
 {
-    let Some(id) = record_open(session, open, opens, cache, ipc_buf, reply)
-    else
-    {
-        return;
-    };
-    let close = || {
-        opens
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .close(OpenRef(id), cache);
-    };
+    let id = record_open(session, open, opens, cache, ipc_buf, reply)?;
     let Some(open_cap) = open.mint(id)
     else
     {
         // Closing the open deletes its release SEND.
-        close();
+        opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .close(OpenRef(id), cache);
         reply_err(ipc::fs_errors::IO_ERROR, reply);
-        return;
+        return None;
     };
     let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .cap(open_cap)
         .build();
-    if !reply_now(answer, reply, open.service, ipc_buf)
-    {
-        let _ = syscall::cap_delete(open_cap);
-        close();
-    }
+    reply.set_or_delete_caps(answer);
+    Some(Undo::Open(OpenRef(id)))
 }
 
 /// Record an open of `open.node_id` in the session `session` names, with
@@ -1946,14 +1934,11 @@ impl Liveness
 /// session, which revokes the client's liveness and page caps and gives the
 /// session pages back, write the `FSInfo` hints of a mounted
 /// volume, reply, and return `true`, after which the caller ends its turn
-/// and exits the process; a refused unmount returns `false`. The single
+/// and exits the process; a refused unmount leaves its refusal in `reply`,
+/// for the loop's next receive, and returns `false`. The single
 /// dispatch thread runs this between requests, so no request of this driver
 /// is in flight; the eviction worker finds the opens gone when it next takes
 /// their lock.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is state the handler reads or the reply slot it answers through"
-)]
 fn handle_unmount(
     msg: &IpcMessage,
     state: &mut FatState,
@@ -1962,17 +1947,11 @@ fn handle_unmount(
     block_dev: u64,
     ipc_buf: *mut u64,
     reply: &mut Reply,
-    service: u64,
 ) -> bool
 {
     if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
     {
-        let _ = reply_now(
-            IpcMessage::new(ipc::fs_errors::LABEL_VERSION_MISMATCH),
-            reply,
-            service,
-            ipc_buf,
-        );
+        reply_err(ipc::fs_errors::LABEL_VERSION_MISMATCH, reply);
         return false;
     }
     let mut opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1981,10 +1960,11 @@ fn handle_unmount(
     if live != 0 && msg.label & fs_labels::UNMOUNT_FORCE == 0
     {
         drop(opens_g);
-        let busy = IpcMessage::builder(ipc::fs_errors::BUSY)
-            .word(0, live as u64)
-            .build();
-        let _ = reply_now(busy, reply, service, ipc_buf);
+        reply.set(
+            IpcMessage::builder(ipc::fs_errors::BUSY)
+                .word(0, live as u64)
+                .build(),
+        );
         return false;
     }
     opens_g.release_all(cache);
@@ -2151,14 +2131,18 @@ fn reply_err(code: u64, reply: &mut Reply)
 }
 
 /// Send `msg` now, through the loop's slot, for a handler with work after
-/// its reply or a turn the loop's pre-receive work may follow
-/// ([`Reply::flush`]: a caller fatfs outranks waits behind none of it);
-/// whether it reached the caller.
+/// its reply ([`Reply::flush`]: a caller fatfs outranks waits behind none of
+/// it). A handler with no work after its reply but the undo of one not
+/// delivered leaves the reply in the slot instead, and the undo to the loop
+/// ([`Undo`]): the reply then rides the next receive, which parks, so the
+/// caller's wake is placed on fatfs's CPU, where a send whose receive does not
+/// park wakes it on another (core/kernel/docs/scheduler.md § Thread
+/// Assignment).
 #[expect(
     clippy::large_types_passed_by_value,
     reason = "`Reply::set` takes the message by value and stores it in the slot, so the move is the hand-off"
 )]
-fn reply_now(msg: IpcMessage, reply: &mut Reply, service: u64, ipc_buf: *mut u64) -> bool
+fn reply_now(msg: IpcMessage, reply: &mut Reply, service: u64, ipc_buf: *mut u64)
 {
     reply.set(msg);
     // A request that found the device gone ends the driver once it is
@@ -2173,26 +2157,37 @@ fn reply_now(msg: IpcMessage, reply: &mut Reply, service: u64, ipc_buf: *mut u64
         // SAFETY: ipc_buf is the registered IPC buffer page.
         unsafe { reply.flush(service, ipc_buf) };
     }
-    !reply.undelivered()
 }
 
-/// A page an `FS_READ_MEMORY` reply hands the client, held on the open until
-/// the reply is sent: a reply that does not arrive (the client is gone, or its
-/// `CSpace` cannot take the page's cap) leaves the client with no page to
-/// release, so the loop releases it ([`settle_pending`]).
+/// What a success reply left in the loop's slot hands the client, which the
+/// loop undoes when that reply does not arrive (the client is gone, or its
+/// `CSpace` cannot take the reply's caps), since the client then holds no cap
+/// through which to undo it ([`settle_pending`]). The reply is set with
+/// [`Reply::set_or_delete_caps`], so its caps are deleted in the send.
 #[derive(Clone, Copy)]
-struct PendingRelease
+enum Undo
 {
-    open: OpenRef,
-    cookie: u64,
+    /// The page an `FS_READ_MEMORY` reply hands over, held on `open` under
+    /// `cookie`: released as `FS_RELEASE_MEMORY` would.
+    Page
+    {
+        open: OpenRef, cookie: u64
+    },
+    /// The open an `FS_OPEN` or create-open reply names: closed as
+    /// `FS_CLOSE` would.
+    Open(OpenRef),
+    /// The session, by id, an `FS_SESSION` reply names: ended.
+    Session(u64),
 }
 
-/// After a send of the loop's reply: release `pending`'s page when the reply
-/// that handed it over was not delivered, as `FS_RELEASE_MEMORY` would, and
-/// clear it either way. A no-op when no page is pending, or when the reply is
-/// still set (a send that found none to send leaves it).
+/// After a send of the loop's reply: undo `pending` when the reply it
+/// belongs to was not delivered, and clear it either way. A no-op when
+/// nothing is pending, or when the reply is still set (a send that found none
+/// to send leaves it). It runs before the loop's work after the send, so no
+/// request is served, and no sweep or release made, between a reply and its
+/// undo.
 fn settle_pending(
-    pending: &mut Option<PendingRelease>,
+    pending: &mut Option<Undo>,
     reply: &Reply,
     opens: &Mutex<Opens>,
     cache: &PageCache,
@@ -2202,17 +2197,30 @@ fn settle_pending(
     {
         return;
     }
-    let Some(page) = pending.take()
+    let Some(undo) = pending.take()
     else
     {
         return;
     };
-    if reply.undelivered()
+    if !reply.undelivered()
     {
-        opens
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .release_held(page.open, page.cookie, cache);
+        return;
+    }
+    let mut opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
+    match undo
+    {
+        Undo::Page { open, cookie } =>
+        {
+            opens_g.release_held(open, cookie, cache);
+        }
+        Undo::Open(open) =>
+        {
+            opens_g.close(open, cache);
+        }
+        Undo::Session(id) =>
+        {
+            opens_g.end_session_by_id(id, cache);
+        }
     }
 }
 
@@ -2239,7 +2247,7 @@ fn device_gone_refusal(call: &IpcMessage) -> u64
 /// after the reply.
 fn reply_err_now(code: u64, reply: &mut Reply, service: u64, ipc_buf: *mut u64)
 {
-    let _ = reply_now(IpcMessage::new(code), reply, service, ipc_buf);
+    reply_now(IpcMessage::new(code), reply, service, ipc_buf);
 }
 
 /// Resolve a parent-dir `NodeId` to the directory's cluster number.
@@ -2798,7 +2806,8 @@ fn self_aspace_cap() -> Option<u64>
 /// the parent dir; the returned cap is attenuated by it. With
 /// `CREATE_OPEN` the file is opened in the same request
 /// ([`create_and_open`]); `CREATE_OPEN_EXISTING` without it is refused
-/// `INVALID_ARGUMENT`, the caps it carried already deleted.
+/// `INVALID_ARGUMENT`, the caps it carried already deleted. Returns what the
+/// loop undoes when a create-open's reply is not delivered.
 #[expect(
     clippy::too_many_arguments,
     reason = "an entry point that forwards the request and the driver state to \
@@ -2815,7 +2824,7 @@ fn handle_create_node_cap(
     caps: &FatCaps,
     ipc_buf: *mut u64,
     reply: &mut Reply,
-)
+) -> Option<Undo>
 {
     let open = msg.label & fs_labels::CREATE_OPEN != 0;
     let existing = msg.label & fs_labels::CREATE_OPEN_EXISTING != 0;
@@ -2832,11 +2841,12 @@ fn handle_create_node_cap(
             caps,
             ipc_buf,
             reply,
-        );
+        )
     }
     else if existing
     {
         reply_err(ipc::fs_errors::INVALID_ARGUMENT, reply);
+        None
     }
     else
     {
@@ -2852,6 +2862,7 @@ fn handle_create_node_cap(
             ipc_buf,
             reply,
         );
+        None
     }
 }
 
@@ -3087,8 +3098,10 @@ fn create_entry_common(
 /// (the session cap, the name, the session's room and page, the open's
 /// record, the node table's slot, the open cap) is settled before the entry
 /// is written ([`prepare_create_open`]), so a refused open leaves no entry. A
-/// failed write closes the open; a reply the client cannot take closes it
-/// too, and the entry stays, as after a plain `FS_CREATE` whose client died.
+/// failed write closes the open. The success reply rides the loop's next
+/// receive; one the client cannot take has the loop close the open (the
+/// returned [`Undo::Open`]), and the entry stays, as after a plain
+/// `FS_CREATE` whose client died.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request, the parent node and its rights, and the driver state a create and \
@@ -3105,9 +3118,9 @@ fn create_and_open(
     caps: &FatCaps,
     ipc_buf: *mut u64,
     reply: &mut Reply,
-)
+) -> Option<Undo>
 {
-    let Some(prepared) = prepare_create_open(
+    let prepared = prepare_create_open(
         node_id,
         parent_rights,
         msg,
@@ -3118,11 +3131,7 @@ fn create_and_open(
         caps,
         ipc_buf,
         reply,
-    )
-    else
-    {
-        return;
-    };
+    )?;
     // Closing the open deletes its release SEND.
     let mut refuse = |code: u64| {
         let _ = syscall::cap_delete(prepared.open_cap);
@@ -3147,7 +3156,7 @@ fn create_and_open(
         Err(code) =>
         {
             refuse(code);
-            return;
+            return None;
         }
     };
     // The reservation leaves room, so the allocation does not fail.
@@ -3155,7 +3164,7 @@ fn create_and_open(
     else
     {
         refuse(ipc::fs_errors::TOO_MANY_OPEN);
-        return;
+        return None;
     };
     opens
         .lock()
@@ -3169,14 +3178,8 @@ fn create_and_open(
         .word(1, u64::from(size))
         .cap(prepared.open_cap)
         .build();
-    if !reply_now(answer, reply, caps.service, ipc_buf)
-    {
-        let _ = syscall::cap_delete(prepared.open_cap);
-        opens
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .close(OpenRef(prepared.id), cache);
-    }
+    reply.set_or_delete_caps(answer);
+    Some(Undo::Open(OpenRef(prepared.id)))
 }
 
 /// What [`prepare_create_open`] settled before a create that opens its file
@@ -3455,7 +3458,7 @@ fn handle_remove_node_cap(
     nodes.invalidate_for_loc(removed_loc);
 
     let reply_msg = IpcMessage::new(ipc::fs_errors::SUCCESS);
-    let _ = reply_now(reply_msg, reply, service, ipc_buf);
+    reply_now(reply_msg, reply, service, ipc_buf);
 }
 
 /// Where a failed removal of the entry whose 8.3 slot is `sfn_loc` left
@@ -3636,7 +3639,7 @@ fn handle_rename_node_cap(
     nodes.invalidate_for_loc(src_loc);
 
     let reply_msg = IpcMessage::new(ipc::fs_errors::SUCCESS);
-    let _ = reply_now(reply_msg, reply, service, ipc_buf);
+    reply_now(reply_msg, reply, service, ipc_buf);
 }
 
 /// `FS_TRUNCATE`: shrink a file to a new length.

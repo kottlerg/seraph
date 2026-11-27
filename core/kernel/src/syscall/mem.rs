@@ -1345,19 +1345,22 @@ pub fn sys_memory_merge(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 const ZERO_BATCH_PAGES: usize = crate::cap::retype::CLEAR_BATCH_PAGES;
 
 /// The return-work bits on which `SYS_MEMORY_ZERO` stops between two batches
-/// and returns the pages zeroed so far: a thread queued on this CPU may
-/// outrank the caller (`PREEMPT`, posted by a local or a remote link, a stale
-/// level, or the wake IPI), the caller is stopped (`STOPPED`), it has an
-/// upcall to take (`UPCALL_SYSCALL`, `UPCALL_ANY`), or a run-limit fault
-/// (`RUN_LIMIT`). The return to user mode that follows handles each.
-/// `RECLAIM` and `SOLE_REF` are housekeeping that the return makes whenever
-/// the call ends, and do not stop it. A slice expiry posts no bit: a tick that
-/// lands in a window between batches, where preemption is disabled, refills
-/// the slice and does not reschedule (core/kernel/docs/scheduler.md
-/// § Kernel-Mode Preemption Points), so it does not end the call.
+/// whatever else holds, and returns the pages zeroed so far: the caller is
+/// stopped (`STOPPED`), it has an upcall to take (`UPCALL_SYSCALL`,
+/// `UPCALL_ANY`), or a run-limit fault (`RUN_LIMIT`). The return to user mode
+/// that follows handles each. `PREEMPT` (posted by a local or a remote link,
+/// a stale level, or the wake IPI) stops the call only when a thread queued on
+/// this CPU outranks the caller ([`zero_stops`]): on riscv64 every TLB
+/// shootdown IPI posts it too, and a set bit without such a thread would end
+/// the call for a return that switches nothing. `RECLAIM` and `SOLE_REF` are
+/// housekeeping that the return makes whenever the call ends, and do not stop
+/// it. A slice expiry posts no bit: a tick that lands in a window between
+/// batches, where preemption is disabled, refills the slice and does not
+/// reschedule (core/kernel/docs/scheduler.md § Kernel-Mode Preemption Points),
+/// so it does not end the call.
 const ZERO_STOP_WORK: u32 = {
-    use crate::percpu::return_work::{PREEMPT, RUN_LIMIT, STOPPED, UPCALL_ANY, UPCALL_SYSCALL};
-    PREEMPT | STOPPED | UPCALL_SYSCALL | UPCALL_ANY | RUN_LIMIT
+    use crate::percpu::return_work::{RUN_LIMIT, STOPPED, UPCALL_ANY, UPCALL_SYSCALL};
+    STOPPED | UPCALL_SYSCALL | UPCALL_ANY | RUN_LIMIT
 };
 
 /// Pages the next batch of a `SYS_MEMORY_ZERO` zeroes with `remaining` pages
@@ -1368,10 +1371,15 @@ fn zero_batch_pages(remaining: usize) -> usize
 }
 
 /// Whether `SYS_MEMORY_ZERO` stops after a batch, given the return-work bits
-/// `pending` on this CPU (`percpu::return_work_pending`).
-fn zero_stops(pending: u32) -> bool
+/// `pending` on this CPU (`percpu::return_work_pending`): on a bit of
+/// [`ZERO_STOP_WORK`], or on `PREEMPT` when `outranked`, consulted only
+/// then, says a thread queued on this CPU outranks the caller
+/// (`PerCpuScheduler::outranked`, the test the return's preemption decision
+/// makes first, true for any queued thread while the level is stale).
+fn zero_stops(pending: u32, outranked: impl FnOnce() -> bool) -> bool
 {
     pending & ZERO_STOP_WORK != 0
+        || (pending & crate::percpu::return_work::PREEMPT != 0 && outranked())
 }
 
 /// `SYS_MEMORY_ZERO` (79): zero pages of a Memory cap through the kernel's
@@ -1384,8 +1392,8 @@ fn zero_stops(pending: u32) -> bool
 /// ([`zero_batch`]), with no lock and no frame pin held from one batch to the
 /// next. Between two batches the call opens an interrupt window
 /// (`cap::object::interrupt_window`) and then returns the pages zeroed so
-/// far when this CPU's return work holds a bit of [`ZERO_STOP_WORK`]; the
-/// caller calls again for the rest. The bits are read only between batches,
+/// far when [`zero_stops`] says the return work wants it; the caller calls
+/// again for the rest. The bits are read only between batches,
 /// so every call zeroes at least one batch and a caller that is always
 /// outranked still advances. A later batch whose checks fail also ends the
 /// call with the count so far, and the next call, starting at that batch,
@@ -1483,7 +1491,13 @@ pub fn sys_memory_zero(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: syscall context, on a CPU whose per-CPU pointer is
         // installed; preemption is enabled again, but a syscall is not
         // preempted, so the word read is this CPU's.
-        if zero_stops(unsafe { crate::percpu::return_work_pending() })
+        let pending = unsafe { crate::percpu::return_work_pending() };
+        let outranked = || {
+            // SAFETY: as for the word; the window has closed, so interrupts
+            // are masked, as `PerCpuScheduler::outranked` reads them.
+            unsafe { crate::percpu::current_scheduler() }.outranked()
+        };
+        if zero_stops(pending, outranked)
         {
             break;
         }
@@ -1651,32 +1665,65 @@ mod tests
         }
     }
 
-    /// A zero stops between batches for each kind of work that ends a
-    /// syscall to switch, stop or deliver, alone or with others, and for
+    /// The scheduler's test, for a call that must not consult it.
+    fn not_consulted() -> bool
+    {
+        panic!("the outranked test was consulted")
+    }
+
+    /// A zero stops between batches for a stop, an upcall or a run-limit
+    /// fault, alone or with others and whatever the scheduler says, and for
     /// none of the housekeeping kinds.
     #[test]
-    fn zero_stops_for_preemption_stop_upcall_and_run_limit_alone()
+    fn zero_stops_for_a_stop_an_upcall_and_a_run_limit_alone()
     {
         for bit in [
-            return_work::PREEMPT,
             return_work::STOPPED,
             return_work::UPCALL_SYSCALL,
             return_work::UPCALL_ANY,
             return_work::RUN_LIMIT,
         ]
         {
-            assert!(zero_stops(bit), "bit {bit:#x}");
-            assert!(zero_stops(bit | return_work::RECLAIM), "bit {bit:#x}");
+            assert!(zero_stops(bit, not_consulted), "bit {bit:#x}");
+            assert!(
+                zero_stops(bit | return_work::RECLAIM, not_consulted),
+                "bit {bit:#x}"
+            );
+            assert!(
+                zero_stops(bit | return_work::PREEMPT, || false),
+                "bit {bit:#x}"
+            );
         }
-        assert!(!zero_stops(0));
-        assert!(!zero_stops(return_work::RECLAIM));
-        assert!(!zero_stops(return_work::SOLE_REF));
-        assert!(!zero_stops(return_work::RECLAIM | return_work::SOLE_REF));
-        // Every kind a syscall's return handles is either a stop or one of
-        // the two housekeeping kinds.
+        assert!(!zero_stops(0, not_consulted));
+        assert!(!zero_stops(return_work::RECLAIM, not_consulted));
+        assert!(!zero_stops(return_work::SOLE_REF, not_consulted));
+        assert!(!zero_stops(
+            return_work::RECLAIM | return_work::SOLE_REF,
+            not_consulted
+        ));
+        // Every kind a syscall's return handles is a stop, the preemption
+        // the scheduler's test decides, or one of the two housekeeping kinds.
         assert_eq!(
-            ZERO_STOP_WORK | return_work::RECLAIM | return_work::SOLE_REF,
+            ZERO_STOP_WORK | return_work::PREEMPT | return_work::RECLAIM | return_work::SOLE_REF,
             return_work::AT_SYSCALL
         );
+    }
+
+    /// `PREEMPT` stops a zero only when a queued thread outranks the caller:
+    /// a set bit with none (a shootdown IPI on riscv64, a link below the
+    /// caller's level) lets the call go on.
+    #[test]
+    fn zero_stops_on_preempt_only_when_outranked()
+    {
+        assert!(zero_stops(return_work::PREEMPT, || true));
+        assert!(!zero_stops(return_work::PREEMPT, || false));
+        assert!(zero_stops(
+            return_work::PREEMPT | return_work::RECLAIM,
+            || true
+        ));
+        assert!(!zero_stops(
+            return_work::PREEMPT | return_work::SOLE_REF,
+            || false
+        ));
     }
 }

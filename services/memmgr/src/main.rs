@@ -5052,32 +5052,38 @@ impl Undo
 
 /// A turn's answer to the caller of its request: the reply its handler sets,
 /// which the receive loop sends with its next receive (`SYS_IPC_REPLY_RECV`),
-/// or alone before a step of the turn's tail that has work to do
-/// ([`Self::flush`]), and the [`Undo`] of the request's effect, run as soon
-/// as the send reports the reply undelivered
-/// (services/memmgr/docs/memory-pool.md § Receive loop). The receive loop's
-/// alone; a handler sets at most one reply.
+/// or before a step of the turn's tail that has work to do with a receive
+/// that does not wait ([`Self::flush`]), and the [`Undo`] of the request's
+/// effect, run as soon as the send reports the reply undelivered
+/// (services/memmgr/docs/memory-pool.md § Receive loop). Only the receive
+/// loop's thread holds it; a handler sets at most one reply.
 struct Answer
 {
     reply: ipc::serve::Reply,
     undo: Option<Undo>,
+    /// The call a flush's receive bound, the next turn's request.
+    next: Option<IpcMessage>,
+    /// memmgr's service endpoint, on which every receive waits.
+    ep: u64,
     /// memmgr's registered IPC buffer page ([`Self::new`]'s contract).
     ipc_buf: *mut u64,
 }
 
 impl Answer
 {
-    /// An empty answer, sent through `ipc_buf`.
+    /// An empty answer, sent through `ipc_buf` by receives on `ep`.
     ///
     /// # Safety
     /// `ipc_buf` must point to memmgr's 4 KiB-aligned IPC buffer page as
     /// registered via `syscall::ipc_buffer_set`, on the receive loop's thread,
     /// the only one that sends through the answer.
-    const unsafe fn new(ipc_buf: *mut u64) -> Self
+    const unsafe fn new(ep: u64, ipc_buf: *mut u64) -> Self
     {
         Self {
             reply: ipc::serve::Reply::new(),
             undo: None,
+            next: None,
+            ep,
             ipc_buf,
         }
     }
@@ -5121,30 +5127,53 @@ impl Answer
         self.undo = Some(undo);
     }
 
-    /// Send the reply now, alone (`SYS_IPC_REPLY`), when one is set: before a
-    /// step of the turn's tail that has work to do, which no caller's reply
-    /// waits behind. Its undo runs here on `l`, the caller's reference to
-    /// the ledger, when the reply is not delivered.
+    /// Send the reply now, when one is set, before a step of the turn's tail
+    /// that has work to do: with a receive that does not wait
+    /// (`SYS_IPC_REPLY_RECV` at `WAIT_TRY_ONCE`), whose reply wake the kernel
+    /// places off memmgr's CPU, so the caller waits for none of that work
+    /// even when the call placed it there (core/kernel/docs/scheduler.md
+    /// § Thread Assignment). A call that receive binds is the next turn's
+    /// request ([`Self::next_request`]); a receive that finds none, or fails,
+    /// leaves the next turn's receive to report a lasting failure. The undo
+    /// runs here on `l`, the caller's reference to the ledger, when the reply
+    /// is not delivered.
     fn flush(&mut self, l: &mut MemLedger)
     {
+        if !self.reply.is_set()
+        {
+            return;
+        }
         // SAFETY: ipc_buf is memmgr's registered IPC buffer page, and this is
         // the receive loop's thread (Self::new's contract).
-        let _ = unsafe { self.reply.flush(self.ipc_buf) };
+        let got = unsafe {
+            ipc::serve::next_request_timeout(
+                self.ep,
+                &mut self.reply,
+                self.ipc_buf,
+                syscall::WAIT_TRY_ONCE,
+            )
+        };
         self.settle(l);
+        self.next = got.ok();
     }
 
-    /// Receive the next request on `ep`, waiting up to `timeout_ms`
-    /// milliseconds (`0`: without bound), after sending the reply, when one
-    /// is still set, with the receive. Its undo runs on return when the reply
-    /// was not delivered, before memmgr serves anything else.
+    /// The next request: the call a flush bound, or else the next call on
+    /// memmgr's endpoint, waiting up to `timeout_ms` milliseconds (`0`:
+    /// without bound), after sending the reply, when one is still set, with
+    /// the receive. Its undo runs on return when the reply was not delivered,
+    /// before memmgr serves anything else.
     ///
     /// # Errors
     /// [`ipc::serve::next_request_timeout`]'s.
-    fn next_request(&mut self, ep: u64, timeout_ms: u64) -> Result<IpcMessage, i64>
+    fn next_request(&mut self, timeout_ms: u64) -> Result<IpcMessage, i64>
     {
+        if let Some(req) = self.next.take()
+        {
+            return Ok(req);
+        }
         // SAFETY: as in flush.
         let got = unsafe {
-            ipc::serve::next_request_timeout(ep, &mut self.reply, self.ipc_buf, timeout_ms)
+            ipc::serve::next_request_timeout(self.ep, &mut self.reply, self.ipc_buf, timeout_ms)
         };
         // No reference to the ledger is held across the receive.
         self.settle(ledger_mut());
@@ -5646,12 +5675,13 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     // SAFETY: ipc_buf is memmgr's registered IPC buffer page, and this thread
     // is the receive loop, the only one that sends through the answer.
-    let mut answer = unsafe { Answer::new(ipc_buf) };
+    let mut answer = unsafe { Answer::new(boot.service_ep, ipc_buf) };
     // A turn runs from one receive's return to the next receive
     // (services/memmgr/docs/memory-pool.md § Receive loop): the message's
-    // handling, if any, then the tail, whose steps each send the reply alone
-    // first when they have work to do; a reply still set rides the next
-    // receive. The first turn has no receive before it.
+    // handling, if any, then the tail, whose steps each send the reply first,
+    // with a receive that does not wait, when they have work to do; a reply
+    // still set rides the next receive, and a call the earlier send bound is
+    // the next request. The first turn has no receive before it.
     let mut req = None;
     let mut received = false;
     loop
@@ -5683,7 +5713,7 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
         {
             0
         };
-        let got = answer.next_request(boot.service_ep, wait);
+        let got = answer.next_request(wait);
         // A failed receive ends its turn too, so the top-up before the retry
         // can recheck the deferred list: that top-up is what refills a spent
         // receive reserve.

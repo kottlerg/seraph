@@ -427,8 +427,9 @@ fn slice_due() -> Option<u64>
 
 /// One turn's eviction work, after the turn's message, if any: drain the done
 /// jobs, then, while the clock runs and the interval since the last slice has
-/// passed, run a slice of it. A turn with either sends its reply alone first
-/// ([`Answer::flush`]), so no caller waits for this work; it drains only the
+/// passed, run a slice of it. A turn with either sends its reply first, with
+/// a receive that does not wait ([`Answer::flush`]), so no caller waits for
+/// this work; it drains only the
 /// jobs done when it looked, and leaves one done since to the next turn,
 /// which the receive's bounded wait brings (services/memmgr/docs/memory-pool.md
 /// § Receive loop). While memmgr reclaims, the slice finds the cold chunks and

@@ -557,25 +557,33 @@ Thread Assignment). A turn runs from one receive's return to the next receive, i
 6. **Pressure signal.** The level and the draw room are recomputed, and every registrant signalled
    on a change (§ Memory pressure).
 7. **The receive**, which sends the reply still set, waiting a bounded time while the clock runs or
-   a job is in flight (§ Eviction).
+   a job is in flight (§ Eviction); a turn whose earlier send bound a call (below) makes none, and
+   that call is the next turn's request.
 
 A turn that received no message (the bounded wait ended, or the receive failed) runs steps 4 to 7,
 and one whose receive failed skips step 4, so that the top-up before the retry is what refills a
 spent receive reserve (§ Reclamation).
 
 **Work in front of a reply.** Each of steps 2, 4, 5 and 6 first checks whether it has work to do,
-and a step that has sends the reply alone (`SYS_IPC_REPLY`) before doing it, so no caller's reply
-waits for a freed object's teardown, a drain, a clock slice, a donation or a broadcast. The checks
-are: an object queued for retirement; a job slot marked done, or a clock slice due (the clock runs
-and `SWEEP_INTERVAL_US` has passed since the last); the headroom or the growth budget low enough to
-call for a top-up; a change of the level or an opening of the draw room. A reply that rides the
-receive therefore waits behind the request's own handling and, past it, only these checks (an atomic
-load per job slot, a clock read while the clock runs, the three `cap_info` reads of the headroom,
-and the pressure computation) and step 3's sends, one Notification send per node of the charged
-chain that is at its limit or refused the charge, which never block. A job the worker finishes after
-step 4 looked is drained by the next turn: the receive waits a bounded time while a job is in
-flight. A turn that sent its reply alone ends in a plain receive, after which the kernel predicts no
-serving receiver for the next caller; such turns are those that do memmgr's background work.
+and a step that has sends the reply before doing it, with a receive that does not wait
+(`SYS_IPC_REPLY_RECV` at `WAIT_TRY_ONCE`), so no caller waits for a freed object's teardown, a
+drain, a clock slice, a donation or a broadcast. A plain `SYS_IPC_REPLY` would not do: a caller the
+call placed on memmgr's CPU, which memmgr outranks, would have its reply wake queued there behind
+memmgr until it parks, while the reply of a `SYS_IPC_REPLY_RECV` whose receive does not park wakes
+the caller off memmgr's CPU (core/kernel/docs/scheduler.md § Thread Assignment). A call that receive
+binds is the next turn's request, served once the turn's work is done, which it would have waited
+for in the endpoint's queue in any case. The checks are: an object queued for retirement; a job slot
+marked done, or a clock slice due (the clock runs and `SWEEP_INTERVAL_US` has passed since the
+last); the headroom or the growth budget low enough to call for a top-up; a change of the level or
+an opening of the draw room. A reply that rides the receive therefore waits behind the request's own
+handling and, past it, only these checks (an atomic load per job slot, a clock read while the clock
+runs, the three `cap_info` reads of the headroom, and the pressure computation) and step 3's sends,
+one Notification send per node of the charged chain that is at its limit or refused the charge,
+which never block. A job the worker finishes after step 4 looked is drained by the next turn: the
+receive waits a bounded time while a job is in flight. A turn that sent its reply before its work
+ends in a plain receive, or in none when that send bound a call, so after a plain receive the kernel
+predicts no serving receiver for the next caller; such turns are those that do memmgr's background
+work.
 
 **A reply not delivered.** The kernel wakes a caller that is gone, or whose `CSpace` cannot take a
 reply's caps, with a transfer failure instead of the reply, and moves none of the reply's caps. Each

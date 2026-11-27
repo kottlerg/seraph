@@ -75,6 +75,13 @@ impl Reply
         self.lost
     }
 
+    /// Whether a reply is set and not yet sent.
+    #[must_use]
+    pub const fn is_set(&self) -> bool
+    {
+        self.pending
+    }
+
     /// Leave `msg` as the reply to this thread's pending caller, for the
     /// loop's next [`next_request`] (or [`Self::flush`]) to send. A turn
     /// sets at most one reply.
@@ -139,7 +146,13 @@ impl Reply
 
     /// Send the reply now, alone (`SYS_IPC_REPLY`), when one is set, and
     /// empty the slot: for a loop with work before its next receive, which
-    /// the reply would otherwise wait behind.
+    /// the reply would otherwise wait behind. A server that outranks its
+    /// caller and last received through `SYS_IPC_REPLY_RECV` may run on the
+    /// caller's CPU, where a plain reply leaves the caller's wake queued
+    /// behind the server until it parks
+    /// (`core/kernel/docs/scheduler.md` § Thread Assignment); such a loop sends
+    /// with a receive that does not wait instead, [`next_request_timeout`]
+    /// with `WAIT_TRY_ONCE`, and serves the call that receive binds next.
     ///
     /// # Safety
     /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer
@@ -705,12 +718,15 @@ mod tests
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         kernel.reply = Err(err(SyscallError::InvalidCapability));
         let mut reply = with_reply();
+        assert!(reply.is_set());
         assert_eq!(next_with(&mut kernel, EP, &mut reply, 0), Ok(NEXT));
         assert!(reply.undelivered());
+        assert!(!reply.is_set());
         assert_eq!(next_with(&mut kernel, EP, &mut reply, 0), Ok(NEXT));
         assert!(!reply.undelivered());
 
         reply.set(reply_msg());
+        assert!(reply.is_set());
         assert_eq!(
             reply.flush_with(&mut kernel),
             Err(err(SyscallError::InvalidCapability))

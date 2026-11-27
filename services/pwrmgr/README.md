@@ -16,7 +16,8 @@ pwrmgr/
     ├── guard.rs      # The allocation guard the core-death power-off runs under
     ├── core_death.rs # The core-death queue's entries: the member and the exit reason
     ├── power_off.rs  # The register the x86-64 core-death power-off writes, from QUERY_SLEEP
-    ├── caps.rs       # svcmgr bootstrap: the service endpoint, the two seeds, the core-death queue
+    ├── log_flush.rs  # The steps of the wait on logd's flush barrier before a power-off
+    ├── caps.rs       # svcmgr bootstrap: the service endpoint, three seeds, the core-death queue
     └── arch/
         ├── mod.rs         # Arch dispatch: `arch::current` (Actuator, resolve,
         │                  # watch_events, shutdown, reboot, PowerOff,
@@ -117,10 +118,10 @@ on logd:
   it, then with `SLP_EN`, as acpid's `SLEEP` does, or writes the one byte that enters S5 to
   `SLEEP_CONTROL_REG`, a port write or a store to the page mapped at its start, but without the
   `\_PTS(5)`, the event quiescing and the clearing of `WAK_STS` acpid runs first. Before the
-  power-off it waits on logd's flush barrier for at most logd's stall bound of 1 s
-  (`SINK_STALL_MS`; Log flush below), the one service the path calls; a failure or no answer only
-  ends that wait. Nothing on the path allocates, frees or logs; an allocation there fails, which
-  ends pwrmgr without a power-off.
+  power-off it waits on logd's flush barrier, as before `SHUTDOWN` (above), for at most logd's
+  stall bound of 1 s (`SINK_STALL_MS`), the one service the path calls; a failure or no answer
+  only ends that wait. Nothing on the path allocates, frees or logs; an allocation there fails,
+  which ends pwrmgr without a power-off.
 - Only when the platform keeps running, or no immediate power-off is held, does pwrmgr drain what
   was posted since, log each entry of the dead member as the end it is, `<member>: its main thread
   ended (exit reason <reason>)` or `<member>: its address space ended (exit reason <reason>)`, then

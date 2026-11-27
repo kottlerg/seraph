@@ -621,7 +621,9 @@ reclamation step inserts back into the free pool.
 memmgr and procmgr are in the core set: neither is restarted, and the
 death of either is system death: their death observers post to the
 core-death queue, on whose entry the shutdown actuator, pwrmgr, powers
-the system off at once, with no call on any service. Before svcmgr's
+the system off at once: it logs and allocates nothing, and its one call on
+a service is logd's flush barrier, for at most logd's stall bound
+(`SINK_STALL_MS`, 1 s). Before svcmgr's
 handover, a death during the service's own bootstrap rounds is init's
 logged halt, and a later one hangs the boot with no line (see
 [Supervision § Core Set and System

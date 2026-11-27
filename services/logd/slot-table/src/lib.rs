@@ -642,6 +642,40 @@ impl History
         self.entries.range(..seq).rev().map(|(&s, e)| (s, e))
     }
 
+    /// The emergency walk back from entry `seq` (`services/logd/docs/sinks.md`
+    /// § Device sinks): into `out`, oldest first, the `seq`s of the newest
+    /// `out.len()` entries before `seq`, and at or after `from`, that
+    /// `walks` accepts, the entries the sink has not written and writes
+    /// before the emergency entry. The number written.
+    pub fn walk_back(
+        &self,
+        seq: u64,
+        from: u64,
+        walks: impl Fn(&HistoryEntry) -> bool,
+        out: &mut [u64],
+    ) -> usize
+    {
+        let mut len = 0usize;
+        for (at, entry) in self.before(seq)
+        {
+            if at < from || len >= out.len()
+            {
+                break;
+            }
+            if walks(entry)
+                && let Some(slot) = out.get_mut(len)
+            {
+                *slot = at;
+                len = len.saturating_add(1);
+            }
+        }
+        if let Some(found) = out.get_mut(..len)
+        {
+            found.reverse();
+        }
+        len
+    }
+
     /// The entries retained from `from` on and before `to`, oldest first;
     /// none when `to` is not past `from`.
     pub fn between(&self, from: u64, to: u64) -> impl Iterator<Item = (u64, &HistoryEntry)>
@@ -1553,6 +1587,43 @@ mod tests
         let range: Vec<u64> = table.history.between(1, 4).map(|(s, _)| s).collect();
         assert_eq!(range, [1, 2, 3]);
         assert_eq!(table.history.between(4, 1).count(), 0);
+    }
+
+    // Defect caught: an emergency walk that writes an entry its predicate
+    // refuses, one before the last walk's end, more than its backlog, or its
+    // entries out of order, or that keeps the oldest of more than its backlog
+    // in place of the newest.
+    #[test]
+    fn the_emergency_walk_takes_the_newest_entries_it_walks_within_its_bounds()
+    {
+        let mut table = SlotTable::default();
+        let levels = [INFO, DEBUG, CRIT, INFO, DEBUG, INFO, INFO];
+        for level in levels
+        {
+            push(&mut table, 1, level, b"line");
+        }
+        let emergency = push(&mut table, 1, ipc::stream_labels::LEVEL_EMERGENCY, b"down");
+        // A sink at critical walks what it would show at info and does not.
+        let walks = |entry: &HistoryEntry| (CRIT + 1..=INFO).contains(&level_or_info(entry.level));
+        let mut out = [u64::MAX; 8];
+        let n = table.history.walk_back(emergency, 0, walks, &mut out);
+        assert_eq!(out.get(..n), Some(&[0, 3, 5, 6][..]));
+        let mut two = [0; 2];
+        let n = table.history.walk_back(emergency, 0, walks, &mut two);
+        assert_eq!(
+            two.get(..n),
+            Some(&[5, 6][..]),
+            "the newest within the backlog"
+        );
+        let n = table.history.walk_back(emergency, 4, walks, &mut out);
+        assert_eq!(
+            out.get(..n),
+            Some(&[5, 6][..]),
+            "none before the last walk's end"
+        );
+        assert_eq!(table.history.walk_back(emergency, 0, walks, &mut []), 0);
+        let n = table.history.walk_back(emergency, 0, |_| false, &mut out);
+        assert_eq!(n, 0, "nothing the predicate takes");
     }
 
     // Defect caught: a sink's cursor reading a dropped entry, skipping a held

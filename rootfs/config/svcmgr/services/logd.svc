@@ -25,6 +25,11 @@
 # which a debugger, and svctest's logd_reserve and logd_restart phases, find
 # it.
 #
+# No `env` line: each sink takes its built-in settings, serial at info and the
+# framebuffer at critical. An `env` line of LOGD_SINK_SERIAL=<settings>,
+# LOGD_SINK_FRAMEBUFFER=<settings> and LOGD_HOSTNAME=<name> sets them per
+# distribution (services/logd/docs/sinks.md § Settings).
+#
 # `reserve = yes` makes logd's budget node a system-reserve node, which may
 # take the free pages memmgr keeps in reserve. oomd, crashd and sessiond, the
 # reserve services that end a memory-pressure episode, write their lines

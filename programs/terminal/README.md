@@ -120,7 +120,7 @@ and a further source would be just another producer.
 ## Known limitations
 
 - Framebuffer and serial are shared, unbrokered sinks: terminal output
-  interleaves with logd on both (serial, and logd's framebuffer mirror).
+  interleaves with logd on both (serial, and logd's framebuffer sink).
   Cosmetic until a broker exists.
 - Non-printable named keys (arrows, Home/End/Delete, Tab, Escape) are ignored.
 - Backspace is byte-wise: it erases one byte of the current line, so

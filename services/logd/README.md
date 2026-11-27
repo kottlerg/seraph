@@ -69,17 +69,25 @@ under its sender's name, the first after the restart included
   once (see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Startup ordering). See
   [docs/console-model.md](../../docs/console-model.md).
 
-* **Driver-mediated framebuffer mirror.** logd also mirrors each line
-  it writes to serial onto the framebuffer, resolved via
+* **Driver-mediated framebuffer sink.** logd also writes the lines at or above the framebuffer
+  sink's level to the framebuffer, resolved via
   devmgr's `QUERY_DEVICE` on the `framebuffer` class SEND, under a `WATCH_CLASS` watch handled as
-  the serial driver's, and written with `FB_WRITE_BYTES`,
-  so the steady-state userspace log stream reaches the screen as well as
-  the UART (matching the early-kernel console). The mirror is a sink of its own, with its own
+  the serial driver's, and written with `FB_WRITE_BYTES`, the level tag drawn in its level's colour
+  (`FB_SET_ATTRS`). Its level is critical by default, so a healthy boot shows no log line on the
+  screen, and before an emergency line it writes the lines at info or more severe it did not show,
+  at most its `backlog` (64 by default). The sink has its own
   cursor and writer, so a framebuffer driver that does not answer holds neither the log stream nor
-  the serial output, and the mirror never holds a sender. When no framebuffer driver is present
-  (headless boot) the mirror writes nothing; a driver that comes up later starts at the newest
-  `SKIP_BACKLOG` (64) entries and counts the rest as dropped, leaving serial the authoritative
-  channel; the emit path never queries devmgr.
+  the serial output, and it never holds a sender. When no framebuffer driver is present
+  (headless boot) the sink writes nothing; a driver that comes up later starts at the newest
+  `backlog` entries and counts the ones before them that it shows as dropped, leaving serial the
+  authoritative channel; the emit path never queries devmgr.
+
+* **Sink settings.** Each sink's level, format (the console format with a field list, or
+  rfc5424), pace, backlog, `relayed` and colour come from the `LOGD_SINK_SERIAL` and
+  `LOGD_SINK_FRAMEBUFFER` `env` entries of logd's recipe over built-in defaults, serial at info
+  and the framebuffer at critical; an entry that does not parse keeps the defaults and is logged at
+  warning. The history keeps every entry whatever the sinks show (see
+  [`docs/sinks.md`](docs/sinks.md) § Settings).
   See [docs/console-model.md](../../docs/console-model.md).
 
 * **Log records.** Beside the text stream, a sender can send a log record,
@@ -97,10 +105,10 @@ under its sender's name, the first after the restart included
   [`docs/handover-protocol.md`](docs/handover-protocol.md) § `LINE`). The history of every
   sender together is bounded by a byte bound fixed at start, the machine's RAM over 2048 within
   `HISTORY_BYTES_MIN` (256 KiB) and `HISTORY_BYTES_MAX` (2 MiB): an entry retained past it drops
-  the oldest entry the serial sink has written, else the oldest entry of the slot with the most
-  unwritten entries. A sender keeps at most its last `PER_SLOT_HISTORY_MIN` (32) entries, scaled by
+  the oldest entry no `hold` sink (serial by default) shows and has not written, else the oldest
+  entry of the slot with the most entries. A sender keeps at most its last `PER_SLOT_HISTORY_MIN` (32) entries, scaled by
   the byte bound's ratio to the floor; the kernel's slot and logd's own, which no window paces, also
-  keep past it the entries the serial sink has not written, within the byte bound. The history is
+  keep past it the entries a `hold` sink shows and has not written, within the byte bound. The history is
   also the journal the sinks write from. An evicted slot is retired with its name and entries, a
   bounded number of them kept (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Retired slots).

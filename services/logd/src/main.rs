@@ -106,7 +106,7 @@ struct BootCaps
     serial_class: u64,
     /// The `framebuffer` class SEND (svcmgr's `devmgr.class.framebuffer`
     /// publication), through which logd resolves the framebuffer driver
-    /// the same way. Zero disables the framebuffer mirror.
+    /// the same way. Zero disables the framebuffer sink.
     fb_class: u64,
     /// A `KernelLog` cap carrying `Read`, through which logd reads the
     /// kernel's console lines ([`read_kernel_log`]). Zero leaves the kernel
@@ -467,11 +467,7 @@ fn load_settings()
             Err(e) =>
             {
                 let mut buf = SerialFmt::new();
-                let _ = write!(
-                    buf,
-                    "settings refused: {key}: {e}; {} keeps its defaults",
-                    sink.what
-                );
+                let _ = write!(buf, "{key} refused: {e}");
                 retain_own(LEVEL_WARN, buf.as_str().as_bytes());
             }
         }
@@ -485,7 +481,7 @@ fn load_settings()
         else
         {
             let mut buf = SerialFmt::new();
-            let _ = write!(buf, "settings refused: {HOSTNAME_ENV}: not a host name");
+            let _ = write!(buf, "{HOSTNAME_ENV} refused: not a host name");
             retain_own(LEVEL_WARN, buf.as_str().as_bytes());
         }
     }
@@ -1841,31 +1837,20 @@ impl Walk
     }
 
     /// The walk back from the emergency entry `seq` in `history`: the last
-    /// `settings.backlog` entries before it, at or after `walked`, at
-    /// informational or more severe, that the sink in `settings` does not
-    /// show and so has not written.
+    /// `settings.backlog` entries before it, at or after `walked`, that the
+    /// sink in `settings` has not written and writes before it
+    /// ([`SinkSettings::walks`]).
     fn collect(&mut self, history: &History, seq: u64, walked: u64, settings: &SinkSettings)
     {
-        self.len = 0;
         let backlog = usize::from(settings.backlog).min(self.seqs.len());
-        for (at, entry) in history.before(seq)
-        {
-            if at < walked || self.len >= backlog
-            {
-                break;
-            }
-            if level_or_info(entry.level) <= LEVEL_INFO
-                && !settings.shows(entry.level, entry.origin == Origin::Relayed)
-                && let Some(slot) = self.seqs.get_mut(self.len)
-            {
-                *slot = at;
-                self.len = self.len.saturating_add(1);
-            }
-        }
-        if let Some(seqs) = self.seqs.get_mut(..self.len)
-        {
-            seqs.reverse();
-        }
+        self.len = self.seqs.get_mut(..backlog).map_or(0, |out| {
+            history.walk_back(
+                seq,
+                walked,
+                |entry| settings.walks(entry.level, entry.origin == Origin::Relayed),
+                out,
+            )
+        });
     }
 
     /// The walk's `seq`s, oldest first.

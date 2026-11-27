@@ -562,6 +562,9 @@ jobs:
           # bracketed with `serial-burst begin` and `serial-burst end`, and of
           # the probe lines svctest's `logd_flood` phase logs under a flood,
           # bracketed with `log-flood begin` and `log-flood end`.
+          # The svctest boot also fails on the debug line svctest's `logd_sinks`
+          # phase logs, which the serial sink, at its default level of info,
+          # must not write (services/logd/docs/sinks.md § Settings).
           # The usertest boot also checks the log-level configuration its
           # staging packed: a debug line of vfsd and of the fatfs vfsd spawns,
           # and none of devmgr or procmgr. The ktest boot also checks the
@@ -572,7 +575,8 @@ jobs:
           case "${{ matrix.tester }}" in
             svctest)
               checks=(--whole-lines whole-lines --whole-lines serial-burst
-                      --whole-lines log-flood) ;;
+                      --whole-lines log-flood
+                      --fail-also 'logd_sinks: a debug line no default sink shows') ;;
             usertest)
               checks=(--require 'DEBUG  \[vfsd\] ' --require 'DEBUG  \[fatfs\] '
                       --fail-also 'DEBUG  \[(devmgr|procmgr)\] ') ;;
@@ -731,8 +735,9 @@ jobs:
       - name: Stage the ubench suite (${{ matrix.arch }})
         # The init harness's services-layer image with ubench's recipe staged
         # (`mkdisk --ubench`): it holds no program, so no terminal adds output
-        # of its own to the framebuffer console_write measures (logd's mirror
-        # of the log lines still does) (services/ubench/README.md § Running).
+        # of its own to the framebuffer console_write measures (logd's
+        # framebuffer sink, at critical, draws no line of a run that fails
+        # nothing) (services/ubench/README.md § Running).
         run: |
           xtask mkdisk --arch ${{ matrix.arch }} --harness init --ubench
 

@@ -49,8 +49,7 @@ pub const FB_WRITE_BYTES: u64 = 1;
 ///
 /// The default (never set) is full-white-on-black, matching the
 /// pre-colour monochrome output, so callers that never send
-/// `FB_SET_ATTRS` (logd's framebuffer mirror, pre-terminal callers)
-/// render unchanged.
+/// `FB_SET_ATTRS` (pre-terminal callers) render unchanged.
 ///
 /// # Label encoding
 /// - Bits 0-15: label ID (`FB_SET_ATTRS`)

@@ -109,7 +109,10 @@ rejects a recipe whose packing the child could not receive:
 An `env` entry `SERAPH_LOG=<level>` sets the most verbose level a std-built service's
 `seraph::log!` sends ([logd IPC interface](../../logd/docs/ipc-interface.md) § Levels). It
 reaches only a service svcmgr launches: svcmgr only binds the services init spawns (procmgr,
-devmgr, vfsd; § Reconciliation), so an `env` key in their recipes reaches nothing.
+devmgr, vfsd; § Reconciliation), so an `env` key in their recipes reaches nothing. logd, which
+svcmgr launches, reads its sinks' settings from the `LOGD_SINK_SERIAL` and `LOGD_SINK_FRAMEBUFFER`
+entries and the host name from `LOGD_HOSTNAME` ([logd sinks](../../logd/docs/sinks.md)
+§ Settings).
 
 ## `restart`
 

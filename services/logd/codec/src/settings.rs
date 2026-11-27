@@ -308,6 +308,26 @@ impl SinkSettings
             .is_some_and(|least| level_or_info(level) <= least)
     }
 
+    /// Whether the emergency walk (`services/logd/docs/sinks.md` § Device
+    /// sinks) writes an entry at `level`, of a `relayed` origin or not,
+    /// that the sink has not written: one these settings would show at
+    /// informational and do not show at their level. A `relayed` entry a
+    /// sink passes is never one: init-logd wrote it to the sink's device
+    /// itself, or the sink hides those.
+    #[must_use]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "relayed is data: the entry's origin"
+    )]
+    pub fn walks(&self, level: u64, relayed: bool) -> bool
+    {
+        let at_info = Self {
+            level: Some(LEVEL_INFO),
+            ..*self
+        };
+        at_info.shows(level, relayed) && !self.shows(level, relayed)
+    }
+
     /// These settings with each `key=value` of `text` applied, items
     /// separated by `,`; the error names the first item that does not
     /// apply, and then nothing of `text` is applied. Each key is given at
@@ -655,6 +675,25 @@ mod tests
         let fb = SinkKind::Framebuffer.defaults();
         assert!(fb.shows(LEVEL_CRITICAL, true));
         assert!(!fb.shows(LEVEL_ERROR, true));
+    }
+
+    // Defect caught: the emergency walk writing an entry the sink showed, a
+    // debug entry, or a relayed one the sink passes (on serial, a line
+    // init-logd already wrote to the UART), or missing one below the level.
+    #[test]
+    fn the_emergency_walk_takes_what_info_shows_and_the_level_hides()
+    {
+        let fb = SinkKind::Framebuffer.defaults();
+        assert!(fb.walks(LEVEL_INFO, false));
+        assert!(fb.walks(LEVEL_ERROR, true), "the framebuffer shows relayed");
+        assert!(!fb.walks(LEVEL_CRITICAL, false), "shown already");
+        assert!(!fb.walks(LEVEL_DEBUG, false));
+        let warn = serial("level=warn,backlog=8").unwrap();
+        assert!(warn.walks(LEVEL_NOTICE, false));
+        assert!(!warn.walks(LEVEL_NOTICE, true), "init-logd wrote it");
+        assert!(!warn.walks(LEVEL_WARN, false));
+        let off = serial("level=off").unwrap();
+        assert!(off.walks(LEVEL_INFO, false));
     }
 
     // Defect caught: a malformed string half applied, or applied at all, or

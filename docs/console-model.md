@@ -165,18 +165,22 @@ direct console paths remain as fallbacks for the life of the system.
    Consumers:
    - **real-logd** (`services/logd/src/main.rs`) resolves the framebuffer
      write cap via `devmgr_labels::QUERY_DEVICE` sent on its framebuffer class SEND, under a
-     `WATCH_CLASS` watch handled as the serial driver's, and mirrors
-     every log line it writes to serial onto the framebuffer too, so the
-     steady-state userspace log stream reaches the screen as well as the UART. The mirror is a sink
-     of its own, with its own cursor into the journal and its own writer, and it never holds a
-     sender, so a framebuffer driver that is stopped or dead holds neither the serial output nor the
-     log stream; what the journal drops before the mirror reaches it is counted in a notice line.
+     `WATCH_CLASS` watch handled as the serial driver's, and writes the log lines at or above
+     the framebuffer sink's level to it: critical and more severe by default, so a healthy boot
+     shows no log line on the screen, and on an emergency line the sink first writes the
+     informational and more severe lines before it that it did not show, up to its `backlog`
+     (64 by default), so the screen of a dead machine carries its context. The level, the
+     backlog and the tag's colour are settings of logd's recipe
+     ([services/logd/docs/sinks.md](../services/logd/docs/sinks.md) § Settings). The sink has its
+     own cursor into the journal and its own writer, and it never holds a sender, so a framebuffer
+     driver that is stopped or dead holds neither the serial output nor the log stream; what the
+     journal drops before the sink reaches it, of the lines it shows, is counted in a notice line.
      The framebuffer driver, when present, is spawned from the root filesystem in devmgr's
      drivers-directory pass, which svcmgr posts with `SET_DRIVERS_DIR` before it launches logd, and
      a `QUERY_DEVICE` of logd's that would find no driver waits for that pass; logd's emit path
      never calls devmgr and, while no framebuffer driver is resolved (headless boot), writes the
-     mirror nowhere: a driver resolved later starts at the newest `SKIP_BACKLOG` (64) lines and
-     counts the ones before them as dropped, so serial stays the authoritative channel. The driver
+     sink nowhere: a driver resolved later starts at the newest `backlog` lines and counts the
+     ones before them that the sink shows as dropped, so serial stays the authoritative channel. The driver
      clears the screen when it starts (`FramebufferWriter::new`), so the kernel's console stays on
      it until then.
    - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
@@ -202,10 +206,10 @@ direct console paths remain as fallbacks for the life of the system.
    24-bit foreground/background colour). The terminal owns ANSI SGR parsing
    (`ESC[…m` → `FB_SET_ATTRS`); the driver never interprets control sequences,
    so replacing the terminal does not touch the driver. The colour state is a
-   single global, shared by the terminal and logd's concurrent log mirror like
-   the single cursor — a log line written while the terminal holds a non-default
-   colour inherits it; per-client attribute state arrives with the compositor
-   (#153). Graphical primitives are listed in
+   single global, shared by the terminal and logd's framebuffer sink like
+   the single cursor: the sink sets its level tag's colour and then the default colour back, so a
+   colour the terminal had set is reset by a log line; per-client attribute state arrives with the
+   compositor (#153). Graphical primitives are listed in
    [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md)
    § Planned future surface.
 
@@ -253,7 +257,8 @@ primitives, no input. The driver's IPC contract is specified in
 ## Logging constraint on the serial and framebuffer drivers
 
 The serial driver and the framebuffer driver MUST NOT emit `std::os::seraph::log!`. logd writes
-every log line to both, so a line either driver logged would be written back through it: a
+log lines to both, each at its sink's level, so a line either driver logged would be written back
+through it: a
 diagnostic on its write path would feed itself, one more line per line written. Both drivers
 therefore drop diagnostics, and fatal bootstrap failures end the driver's thread without output.
 Neither driver's service thread waits on logd, and no thread of logd's but a sink's writer waits
@@ -285,9 +290,8 @@ serial-only class, and while the reader is stalled.
 
 ## Test-harness output
 
-The in-tree harnesses send their markers and diagnostics to the
-framebuffer as well as serial, matching the early-kernel console — by two
-different routes:
+ktest sends its markers and diagnostics to the framebuffer as well as serial, matching the
+early-kernel console; svctest's and usertest's reach serial only:
 
 - **ktest** (`core/ktest/`) is a monolithic init replacement: its bundle
   carries no devmgr and no framebuffer driver, so it renders directly,
@@ -297,12 +301,12 @@ different routes:
   no driver in its bundle to route through — so it does not contradict the
   framebuffer driver's sole ownership in a normally-composed boot.
 - **svctest / usertest** are std-built services whose output flows through
-  the system log stream, so they reach the framebuffer through real-logd's
-  driver-mediated mirror (path 5 above) once logd is up. No
-  harness-specific framebuffer path exists.
+  the system log stream at informational, below the framebuffer sink's default level of critical
+  (path 5 above), so it reaches the screen only through that sink's emergency walk, or when a
+  recipe lowers its level. No harness-specific framebuffer path exists.
 
-Serial remains the authoritative marker channel: CI scrapes serial and
-runs the harnesses headless, where the framebuffer mirrors write nothing (see
+Serial is the authoritative marker channel: CI scrapes serial and
+runs the harnesses headless, where logd's framebuffer sink writes nothing (see
 [docs/testing.md](testing.md)).
 
 Every framebuffer renderer — the bootloader, kernel, and ktest direct

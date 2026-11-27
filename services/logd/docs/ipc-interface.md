@@ -163,21 +163,23 @@ that sets no level logs at info.
   `services/init/log-levels.conf`), which init reads at boot and passes to each as its `SERAPH_LOG`
   entry ([init bootstrap](../../init/docs/bootstrap.md) § Log levels); svcmgr only binds the
   services init spawns, so an `env` key in their `.svc` recipes reaches nothing. A driver devmgr
-  spawns and a fatfs instance vfsd spawns inherit their spawner's level. Neither receiver
-  filters: each renders every line it receives. An error line is sent at
-  every level.
+  spawns and a fatfs instance vfsd spawns inherit their spawner's level. init-logd does not
+  filter: it writes every line it receives. logd retains every line it receives, and each of its
+  sinks shows those at or above the sink's own level, serial's info by default (§ Output sinks;
+  [sinks.md](sinks.md) § Settings). An error line is sent at every level.
 - **Line level.** The stream carries bytes, not lines, so a receiver gives a
   line the level of the message that carried its first byte; later chunks
   of the same line do not change it. A line split at `LINE_BUF_SIZE` keeps
   that level for each part. Two threads of one process share the process's
   badge and slot, so lines they interleave mix as their bytes do.
-- **Rendering.** Both init-logd and logd render every line as
-  `[sec.usfrac] LEVEL  [name] <line>`, writing the prefix with one function
-  (`logd_codec::prefix::write`): the stamp, the level's tag padded with
-  spaces to six columns and a space, then `[name] `. The tags are `EMERG`,
-  `ALERT`, `CRIT`, `ERROR`, `WARN`, `NOTICE`, `INFO`, and `DEBUG`
-  (`logd_codec::level::tag`), so the names of lines at different levels line
-  up: `[6.000457] WARN   [svcmgr] <line>`. A line's name and text stay
+- **Rendering.** Both init-logd and logd render a line as
+  `[sec.usfrac] LEVEL  [name] <line>`, logd in a sink's default console fields
+  ([sinks.md](sinks.md) § The console format), each writing the prefix's fields with the
+  functions of `logd_codec::prefix`: the stamp, its seconds right-aligned to five columns, a space,
+  the level's tag padded with spaces to six columns and a space, then `[name] `. The tags are
+  `EMERG`, `ALERT`, `CRIT`, `ERROR`, `WARN`, `NOTICE`, `INFO`, and `DEBUG`
+  (`logd_codec::level::tag`), so the names of lines at different levels and times line
+  up: `[    6.000457] WARN   [svcmgr] <line>`. A line's name and text stay
   together, so a pattern that starts at `[name] ` (`[svctest] ALL TESTS
   PASSED`, the `reclaim:` line below) matches at every level.
 - **History.** Each history entry keeps its level, init-logd's across the
@@ -519,46 +521,55 @@ again.
 logd writes the history to two output drivers, the serial driver and, when one is resolved, the
 framebuffer driver. Each is a sink with a cursor, the `seq` of the next entry it writes, and a
 writer thread that writes from the history at its own pace (`services/logd/src/main.rs` `Sink`;
-the contract is [sinks.md](sinks.md) § Sinks). No receive worker, and no other thread of logd's,
+the contract is [sinks.md](sinks.md) § Sinks). Each sink's settings, its level, format, pace,
+backlog, `relayed` and colour, come from logd's recipe over the defaults of
+[sinks.md](sinks.md) § Device sinks, and live in logd's state (`LogdState::settings`,
+[sinks.md](sinks.md) § Settings); a sink writes the entries at or above its level and passes the
+others. No receive worker, and no other thread of logd's,
 waits on a driver: a driver that is slow, stopped by a debugger, or dead costs logd its own
 writer, and the entries the history drops before the writer reaches them.
 
 - **Writer.** The writer takes the state lock, copies the entry at its cursor, releases the lock,
   renders and writes the entry, then moves the cursor past it under the lock. It sleeps on a
-  condition variable of the state lock, signalled on each retention. Entries the history evicted
-  before the writer reached them are a gap in `seq`, counted as dropped. The writers are spawned
+  condition variable of the state lock, signalled on each retention. The history counts, for each
+  sink, the entries the sink shows that it evicted before the writer reached them, and the writer
+  reports them as dropped. The writers are spawned
   beside the receive workers, before the handover pull, and write once init-logd has acknowledged
   the release (at once on a restart).
-- **Serial: `hold`.** The serial sink writes an entry's chunks as plain writes, then one zero-length
+- **Serial: `hold` by default, at info.** The serial sink writes an entry's chunks as plain writes, then one zero-length
   write with `serial_labels::SERIAL_WRITE_SENT`, a barrier the driver answers once every byte before
   it has left the UART ([serial driver](../../drivers/serial/README.md#label-1-serial_write_bytes) §
   Label 1), and moves its cursor only then, so an entry counts as written when it is on the wire. A
   step the driver answers `STALLED` (its `TX_STALL_MS`, 1000 ms, without progress) is made again and
   the cursor does not move; a call that fails, as every call to a driver devmgr has withdrawn does,
   writes the entry again from its first chunk to the next driver resolved. Any other refusal gives
-  the entry up, counted. The serial sink holds senders (§ Hold window), a flush (§ Flush barrier)
-  and the kernel reader while it is *holding*: its class SEND was delivered, its writer runs, devmgr
-  serves a driver of its class, and its current write is not older than `SINK_STALL_MS` (1000 ms,
-  [docs/limits.md](../../../docs/limits.md) § init and logd). A sink that is stalled, unserved or
-  absent holds nobody, so no driver is required: a stopped driver holds senders for `SINK_STALL_MS`
-  once.
-- **Framebuffer: `skip`.** The framebuffer sink holds nobody. When its driver comes up behind,
-  its cursor starts `SKIP_BACKLOG` (64) entries before the newest, and the entries it passes are
-  counted as dropped.
+  the entry up, counted. A `hold` sink, serial by default, holds senders (§ Hold window), a flush
+  (§ Flush barrier) and the kernel reader while it is *holding*: its level is not `off`, its class
+  SEND was delivered, its writer runs, devmgr serves a driver of its class, and its current write is
+  not older than `SINK_STALL_MS` (1000 ms, [docs/limits.md](../../../docs/limits.md) § init and
+  logd). It holds them only for the entries it shows. A sink that is stalled, unserved, absent or
+  `off` holds nobody, so no driver is required: a stopped driver holds senders for
+  `SINK_STALL_MS` once.
+- **Framebuffer: `skip` by default, at critical.** The framebuffer sink holds nobody. When its
+  driver comes up behind, its cursor starts `backlog` (64 by default) entries before the newest,
+  and the entries it passes that it shows are counted as dropped. Before an emergency entry it
+  writes the entries at info or more severe before it that it did not show, at most `backlog` of
+  them ([sinks.md](sinks.md) § Device sinks), and it draws its level tag in the level's colour
+  (`FB_SET_ATTRS`, [sinks.md](sinks.md) § Colour).
 - **Drops.** The serial sink writes the count of a gap as one notice-level logd line,
   `serial: <n> lines dropped`, ahead of the next entry. The framebuffer sink retains its count as
   a notice line of logd's in the history, `framebuffer: <n> lines dropped`, so the serial console
   and the history carry it too; while that notice is still ahead of its cursor, a further count is
   added to it ([sinks.md](sinks.md) § Drops).
 - **Relayed entries.** The entries of init-logd's handover table (§ History) were written to the
-  serial console by init-logd already: the serial sink passes them, its cursor starting at the
-  table's next `seq`, and the framebuffer writes them as its backlog.
+  serial console by init-logd already: the serial sink passes them (`relayed=no`), its cursor
+  starting at the table's next `seq`, and the framebuffer (`relayed=yes`) writes those it shows.
 - **Inline.** A sink whose writer cannot be spawned is written by the thread that retains an entry,
   one thread at a time, each write bounded by `SINK_STALL_MS` from its start; such a sink holds
   nobody.
 - **Kernel reader.** The thread that reads the kernel's log ring retains each record, and before
-  it acknowledges a read waits until the serial sink's cursor has passed the read's last entry, or
-  the sink holds nobody, so the kernel's ring does not run ahead of the serial console.
+  it acknowledges a read waits until every holding `hold` sink's cursor, serial's by default, has
+  passed the read's last entry, so the kernel's ring does not run ahead of the serial console.
 - **Panic sink.** logd's own panic and allocation-failure output goes to the serial driver
   directly, outside the history and with no lock taken, each call bounded by `SINK_STALL_MS`.
 

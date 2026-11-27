@@ -764,7 +764,10 @@ the `logd_sinks` phases, logs probe lines `log-flood t=0 n=<n> len=<len> <payloa
 them. The svctest cell's CI boot passes
 `--whole-lines whole-lines --whole-lines serial-burst --whole-lines log-flood`
 ([docs/console-model.md](console-model.md);
-[xtask/README.md](../xtask/README.md#classified-boots---runs)).
+[xtask/README.md](../xtask/README.md#classified-boots---runs)). It also passes
+`--fail-also 'logd_sinks: a debug line no default sink shows'`: svctest's `logd_sinks` phase logs
+that line at debug and requires it in logd's history, and the serial sink, at its default level of
+info, must not write it ([services/logd/docs/sinks.md](../services/logd/docs/sinks.md) § Settings).
 
 The crash service cannot cover every process. init, memmgr, and procmgr are not created by procmgr,
 and the debug port's virtio-console driver and crashd declare themselves undebuggable, as svctest

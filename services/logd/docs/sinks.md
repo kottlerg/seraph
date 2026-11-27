@@ -268,7 +268,7 @@ each entry, each write bounded by `SINK_STALL_MS`.
 - **framebuffer.** For the person at the screen. Its level is critical, so a healthy boot shows no
   log line on it. When an emergency entry reaches it, the sink first writes the last `backlog`
   entries at info or more severe that precede the emergency entry in the history and that it has
-  not written, then the emergency entry, so the screen of a dead machine carries its context. The
+  not written (a `relayed` entry only when the sink shows those), then the emergency entry, so the screen of a dead machine carries its context. The
   backlog is a walk back through the history, not a buffer of the sink's own. On a (re)attach, its
   cursor starts `backlog` entries before the newest, `relayed` ones included, when it is further
   behind than that.

@@ -31,7 +31,10 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use death_set::OverflowWatch;
-use ipc::log_labels::{LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS};
+use ipc::log_flush::{FLUSH_DENIED, FlushAnswer};
+use ipc::log_labels::{
+    LOG_FLUSH, LOG_FLUSH_AUTHORITY, LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS,
+};
 use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal};
 use ipc::log_record::{RECORD_MAX_BYTES, Record};
 use ipc::serve::Reply;
@@ -823,6 +826,10 @@ fn serve_request(logd: &Logd, msg: &IpcMessage, reply: &mut Reply)
     {
         reply.set(answer_query(&logd.lock().table, msg));
     }
+    else if label_id == LOG_FLUSH
+    {
+        reply.set(answer_flush(msg));
+    }
     else
     {
         // Unknown / legacy label (e.g. GET_LOG_CAP from a hypothetical
@@ -865,6 +872,24 @@ fn answer_query(table: &SlotTable, msg: &IpcMessage) -> IpcMessage
             }
             Err(status) => refusal(status),
         }
+    }
+}
+
+/// Answer a `LOG_FLUSH` request (`services/logd/docs/ipc-interface.md`
+/// § Flush barrier) from the serial sink, the one sink that holds the log
+/// (`services/logd/docs/sinks.md`), at once: from its queue's line numbers
+/// and its writer's state, under its queue's lock alone, so a flush waits on
+/// nothing. `FLUSH_DENIED` for a badge without `LOG_FLUSH_AUTHORITY`.
+fn answer_flush(msg: &IpcMessage) -> IpcMessage
+{
+    if msg.badge & LOG_FLUSH_AUTHORITY == 0
+    {
+        return ipc::log_flush::refusal(FLUSH_DENIED);
+    }
+    match ipc::log_flush::decode_request(msg)
+    {
+        Ok(token) => SERIAL.flush_answer(token).reply(),
+        Err(status) => ipc::log_flush::refusal(status),
     }
 }
 
@@ -1377,7 +1402,16 @@ struct Sink
     /// Lines an inline write did not write whole by its deadline, reported
     /// ahead of the next line an inline write starts.
     inline_dropped: AtomicU32,
+    /// When the writer started the write it is in, on [`elapsed_us`]'s clock;
+    /// [`NOT_WRITING`] while it writes nothing ([`Self::flush_answer`]).
+    write_started_us: AtomicU64,
+    /// How long the writer's last completed write took, in microseconds: the
+    /// time per line of a flush's retry hint.
+    line_us: AtomicU64,
 }
+
+/// [`Sink::write_started_us`] while the writer writes nothing.
+const NOT_WRITING: u64 = u64::MAX;
 
 /// What [`Sink::take_next`] found for the writer.
 enum Taken
@@ -1418,6 +1452,8 @@ impl Sink
             inline_busy: Mutex::new(false),
             inline_free: Condvar::new(),
             inline_dropped: AtomicU32::new(0),
+            write_started_us: AtomicU64::new(NOT_WRITING),
+            line_us: AtomicU64::new(0),
         }
     }
 
@@ -1672,7 +1708,51 @@ impl Sink
             return Wrote::Lost;
         }
         let cap = self.driver.await_cap();
-        write_line(cap, self.op, self.sent, bytes, ipc_buf, Bound::Unbounded)
+        let started = elapsed_us();
+        self.write_started_us.store(started, Ordering::Relaxed);
+        let wrote = write_line(cap, self.op, self.sent, bytes, ipc_buf, Bound::Unbounded);
+        self.write_started_us.store(NOT_WRITING, Ordering::Relaxed);
+        if wrote == Wrote::All
+        {
+            self.line_us
+                .store(elapsed_us().saturating_sub(started), Ordering::Relaxed);
+        }
+        wrote
+    }
+
+    /// The answer to a flush for `token`, or for a new one (`None`): the
+    /// number of the last line queued (`services/logd/docs/ipc-interface.md`
+    /// § Flush barrier). Flushed once the writer has written or given up
+    /// every line up to the token, and at once while the sink is stalled
+    /// (the writer gave its last write up, or its current write is past
+    /// [`SINK_STALL_MS`]),
+    /// unserved, or absent (no class SEND, so no line is ever queued); pending
+    /// otherwise, with the lines' expected time as the retry hint.
+    fn flush_answer(&self, token: Option<u64>) -> FlushAnswer
+    {
+        if self.driver.class() == 0
+        {
+            return FlushAnswer::Flushed {
+                token: token.unwrap_or(0),
+            };
+        }
+        let queue = self.lock();
+        let token = token.unwrap_or_else(|| queue.last_queued());
+        let lines = queue.unwritten_through(token);
+        drop(queue);
+        let started = self.write_started_us.load(Ordering::Relaxed);
+        let overdue = logd_codec::sink::write_overdue(
+            (started != NOT_WRITING).then_some(started),
+            elapsed_us(),
+        );
+        if lines == 0 || self.driver.cap() == 0 || overdue
+        {
+            return FlushAnswer::Flushed { token };
+        }
+        FlushAnswer::Pending {
+            token,
+            retry_ms: logd_codec::sink::flush_hint_ms(lines, self.line_us.load(Ordering::Relaxed)),
+        }
     }
 
     /// Write one logd line naming the `dropped` lines this sink did not

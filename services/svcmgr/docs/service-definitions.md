@@ -283,6 +283,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `sessiond.operator` | svcmgr (`sessiond.svc` provider) | `:grant`-badged `SEND\|GRANT` on sessiond's service endpoint, the operator authority, which carries no stop bit (seeded by terminal and svctest) | no |
 | `crashd.core` | svcmgr (`crashd.svc` provider) | `:grant`-badged (`LIVE_CORE_AUTHORITY`) `SEND\|GRANT` on crashd's live-core endpoint, the authority to ask for a live core, whose request moves the account the capture is charged to (seeded by usertest only) | no |
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
+| `logd.flush` | svcmgr (minted from the reserved master-log source) | `LOG_FLUSH_AUTHORITY`-badged SEND on the master log endpoint: logd's `LOG_FLUSH` barrier ([logd IPC interface](../../logd/docs/ipc-interface.md) § Flush barrier; seeded by pwrmgr and svctest) | no |
 
 ## `provides`
 
@@ -412,7 +413,7 @@ Pager](../../../docs/fault-handling.md#default-system-pager)); the role sets the
 recipe key does. On each launch it also serves the actuator a derivation carrying only the receive
 right of the core-death queue, which the death observers of svcmgr's, memmgr's and procmgr's main
 threads and address spaces post to, in the bootstrap slot after the `seed` caps and after any
-debug-authority, stop-authority and entropy-authority slots (`cap[3]` for pwrmgr). A derive that
+debug-authority, stop-authority and entropy-authority slots (`cap[4]` for pwrmgr). A derive that
 fails, or a queue svcmgr could not make, leaves the slot absent. A recipe that declares the key but
 is not recognised is created demand-paged and gets no such slot.
 

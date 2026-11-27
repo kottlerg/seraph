@@ -55,6 +55,7 @@ lifetime and reads the kernel log through it.
 | logd's receive workers | `RECV` | each receives on the endpoint with `ipc_recv` (§ Receive pool) |
 | every userspace sender | `SEND` (badged) | `STREAM_BYTES`, `STREAM_RECORD`, `STREAM_REGISTER_NAME` |
 | a service that seeds `logd.query` | `SEND` badged `LOG_QUERY_AUTHORITY` | `QUERY_SLOTS`, `QUERY_HISTORY` (§ Queries) |
+| a service that seeds `logd.flush` | `SEND` badged `LOG_FLUSH_AUTHORITY` | `LOG_FLUSH` (§ Flush barrier) |
 | real-logd on its first launch, or on a restart before procmgr reports init reaped | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); repeated after a further drain while init-logd defers it), then deleted via `cap_delete` whether or not it was acked. Absent (`cap[1]` reads as `0`) on a later restart. Each call is bounded by `HANDOVER_CALL_TIMEOUT_MS` (1 s) |
 
 ## Labels accepted
@@ -378,7 +379,7 @@ A receive worker answers a query from the table and the history logd owns, as it
 serves the stream labels (§ Receive pool), and calls no other service to answer
 it, so a query never waits on another service (§ Death-queue resync gives the
 deadlock a call to procmgr would risk). The wire format is defined in
-`ipc::log_query`. Every request carries `ipc::LOG_LABELS_VERSION` (6) in
+`ipc::log_query`. Every request carries `ipc::LOG_LABELS_VERSION` (7) in
 `data[0]`, which logd checks on every query. The reply's label carries the
 status in bits 0-15, the reply's entry count in bits 16-31, and in bit 32 whether
 more entries follow this page:
@@ -573,6 +574,74 @@ implemented).
   other sink.
 - **Panic sink.** logd's own panic and allocation-failure output goes to the serial driver
   directly, outside the queue and with no lock taken, each call bounded by `SINK_STALL_MS`.
+
+## Flush barrier
+
+`log_labels::LOG_FLUSH` (18) lets a process that is about to stop the machine wait until the
+lines logd has taken are on the console. pwrmgr waits on it before every power-off and reset
+([pwrmgr](../../pwrmgr/README.md)), so the lines logged just before, a test's pass marker and
+crash reports among them, are not cut off. Without it, the last lines are lost whenever they are
+still queued when the machine stops. The serial sink is the one sink that holds the log
+([sinks.md](sinks.md) § Device sinks): a flush waits on it alone, never on the framebuffer.
+
+The label is served only on a badge carrying `log_labels::LOG_FLUSH_AUTHORITY` (`1 << 62`, a
+[verb bit](../../../docs/capability-model.md#verb-bit-authority-pattern)). svcmgr mints a SEND on
+the master log endpoint with that badge from its master-log source and publishes it seed-only as
+`logd.flush` ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `seed`).
+pwrmgr's recipe seeds it, and svctest's. A request on any other badge, `logd.query`'s included,
+is refused `FLUSH_DENIED`, and a query on `logd.flush` is refused `QUERY_DENIED` (§ Queries).
+
+A receive worker answers at once and waits on nothing. It reads the serial sink's queue under the
+queue's lock and its writer's state, and calls no service. A flush does not wait inside logd: the
+caller asks again. The wire format is defined in `ipc::log_flush`.
+
+| Request word | Content |
+|---|---|
+| `data[0]` | `LOG_LABELS_VERSION` (7), checked on every request |
+| `data[1]` | 0 for a new flush, 1 to ask again for the token in `data[2]`; any other value: `FLUSH_INVALID` |
+| `data[2]` | the token of an earlier answer, with `data[1]` = 1 |
+
+The reply's label is its status:
+
+| Status | Value | Reply words |
+|---|---|---|
+| `FLUSHED` | 0 | `data[0]`: the token |
+| `FLUSH_PENDING` | 1 | `data[0]`: the token; `data[1]`: the retry hint, in milliseconds |
+| `FLUSH_DENIED` | 2 | none: the badge carries no `LOG_FLUSH_AUTHORITY` |
+| `FLUSH_VERSION_MISMATCH` | 3 | none: `data[0]` is not logd's `LOG_LABELS_VERSION` |
+| `FLUSH_INVALID` | 4 | none: `data[1]` is neither 0 nor 1 |
+
+- **Token.** A new flush's token marks the end of the log as logd holds it when it answers. Today
+  that is the number of the last line queued to the serial sink (`SinkQueue::last_queued`). A
+  client never reads the token. It hands it back unchanged when it asks again. A token holds only
+  for the logd instance that issued it, since the lines it marked went with the instance that held
+  them. An instance reads every token as a number of its own: one above every number it has
+  issued (from before logd restarted, while the new instance has queued fewer lines) answers
+  `FLUSHED`, and a lower one waits on the new instance's lines up to it, within the same bounds.
+  `FLUSHED` is 0, so the empty reply that init-logd gives a label it does not serve reads as
+  flushed.
+- **Flushed.** The log is flushed for a token once the serial writer has written, or given up,
+  every line up to it (§ Output sinks, Writer). It is also flushed at once in four cases:
+  - the serial sink is stalled: the writer gave its last write up and has completed none since,
+    or its current write is older than `SINK_STALL_MS`. A producer that waited out its own bound
+    behind a long queue does not stall the sink for a flush, since the writer may still be working
+    through the lines ahead of it;
+  - the sink is unserved;
+  - the sink is absent (the bootstrap carried no serial class SEND);
+  - there is no hold sink.
+
+  So no driver is required, and one that does not answer holds a flush for `SINK_STALL_MS` at
+  most. Written means sent, as for a line's producer: the serial writer ends each line with its
+  `SERIAL_WRITE_SENT` barrier.
+- **Retry hint.** A pending answer's hint is the expected time of the unwritten lines up to the
+  token: their count times the writer's last completed write, rounded up to whole milliseconds,
+  clamped to 1 ms and `SINK_STALL_MS`. A client sleeps it, then asks again with the token. Its own
+  bound on the whole wait is its own. pwrmgr uses a log call's bound (`log::LOG_CALL_TIMEOUT_MS`)
+  before a requested power-off or reset, and `SINK_STALL_MS` before its core-death power-off.
+- **Coverage.** A flush covers every line queued to the serial sink before it: senders' lines,
+  logd's own lines and the kernel's. A line whose producer is still writing it when the flush is
+  answered, or one still waiting for queue space, is not covered. Neither is a line sent after.
+  Such a line races the power-off however the barrier is built.
 
 ## Wait-set
 

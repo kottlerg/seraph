@@ -164,7 +164,10 @@ detection](../services/svcmgr/docs/restart-protocol.md#death-detection)). For a 
 holds the requirement by construction. pwrmgr is pinned: svcmgr creates the shutdown actuator with
 `CREATE_PINNED`, so no page of it is demand-paged on memmgr or evicted by it ([Fault Handling
 § Default System Pager](fault-handling.md#default-system-pager)). Its power-off on an entry of the
-core-death queue allocates nothing, logs nothing and calls no service: on riscv64 the SBI SRST call,
+core-death queue allocates nothing and logs nothing, and the one service it calls is logd's flush
+barrier, for at most logd's stall bound of 1 s, whose failure or silence only ends that wait
+([logd IPC interface § Flush barrier](../services/logd/docs/ipc-interface.md#flush-barrier)). The
+power-off itself is on riscv64 the SBI SRST call,
 on x86-64 a write of the S5 sleep type from pwrmgr itself to the register acpid's `SLEEP` writes,
 `PM1a_CNT` or, on a hardware-reduced platform, `SLEEP_CONTROL_REG`, which acpid hands it at its
 start with the `SLP_TYPa` (`acpid_labels::QUERY_SLEEP`); a port is bound to pwrmgr's main thread

@@ -22,7 +22,8 @@
 //! five `devmgr.*` names, [`published_names::VFSD_MOUNT`](crate::published_names::VFSD_MOUNT),
 //! [`published_names::VFSD_SWAP`](crate::published_names::VFSD_SWAP),
 //! [`published_names::MEMMGR_SWAP`](crate::published_names::MEMMGR_SWAP),
-//! [`published_names::LOGD_QUERY`](crate::published_names::LOGD_QUERY), and each
+//! [`published_names::LOGD_QUERY`](crate::published_names::LOGD_QUERY),
+//! [`published_names::LOGD_FLUSH`](crate::published_names::LOGD_FLUSH), and each
 //! provider name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; the
 //! `:auth` and `:grant` entries, today `pwrmgr.shutdown`, `acpid.power`,
 //! `swapd.restore`, `sessiond.operator` and `crashd.core`) resolve only
@@ -157,6 +158,13 @@ pub const MEMMGR_SWAP: &[u8] = b"memmgr.swap";
 /// Seed-only; seeded only by svctest, whose `logd_death_forward` phase
 /// reads a dead child's retired slot through it.
 pub const LOGD_QUERY: &[u8] = b"logd.query";
+
+/// SEND on the master log endpoint badged
+/// `log_labels::LOG_FLUSH_AUTHORITY`: logd's `LOG_FLUSH` barrier. svcmgr
+/// mints it from its master-log source. Seed-only; seeded by pwrmgr, which
+/// waits on it before it powers the system off or resets it, and by svctest,
+/// whose `logd_flush` phase checks it.
+pub const LOGD_FLUSH: &[u8] = b"logd.flush";
 
 /// SEND on sessiond's service endpoint badged
 /// `sessiond_labels::OPERATOR_AUTHORITY`: the interface labels, through

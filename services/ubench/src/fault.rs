@@ -18,10 +18,10 @@ use std::os::seraph::{
 };
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
-use bench::{Counters, Value};
+use bench::{Counters, HALTED, MOVED, Value, WINDOW_OPS_KEY, WindowEnd, WindowShape, WindowTally};
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
-use crate::harness::{IdleSpan, Outcome, cpu_count, pin_to, report, skip};
+use crate::harness::{BENCH_CPU, IdleSpan, Outcome, cpu_count, pin_to, report, skip};
 
 /// Pages in one chunk: `DEMAND_CHUNK_PAGES`.
 const CHUNK_PAGES: u64 = 16;
@@ -55,11 +55,32 @@ const fn chunk_va(base: u64, chunk: u64) -> u64
     base.wrapping_add(chunk.wrapping_mul(CHUNK_BYTES))
 }
 
-/// `fault_fill`: one result line per path, `path=fault` and `path=grant`.
+/// Timed grants of the `path=grant affinity=any` row, split into windows
+/// ([`WindowShape::for_ops`]).
+const ANY_GRANTS: u32 = 128;
+
+/// `SYS_THREAD_SET_AFFINITY`'s value for no affinity (`AFFINITY_ANY`).
+const AFFINITY_ANY: u32 = u32::MAX;
+
+/// The extra counting the measuring thread's wakes linked on another CPU than
+/// its waker's over the counted windows (`CAP_INFO_THREAD_PLACEMENT`).
+const REMOTE_WAKES: &str = "remote_wakes";
+
+/// `fault_fill`: one result line per path, `path=fault` and `path=grant`,
+/// and, at more than one CPU, the window row `path=grant affinity=any`.
 pub fn fill(counters: &Counters, cpus: u32) -> Outcome
 {
     fill_by_fault(counters, cpus)?;
-    fill_by_grant(counters, cpus)
+    fill_by_grant(counters, cpus)?;
+    if cpus < 2
+    {
+        skip(
+            "fault_fill",
+            &format!("path=grant affinity=any: needs 2 CPUs, {cpus} online"),
+        );
+        return Ok(());
+    }
+    fill_by_grant_unpinned(counters, cpus)
 }
 
 /// The fault path: the first store into each chunk of a fresh demand region.
@@ -183,6 +204,143 @@ fn fill_by_grant(counters: &Counters, cpus: u32) -> Outcome
         &[],
         idle_halts,
     )
+}
+
+/// The grant path from a thread with no affinity, in the window form
+/// (shared/bench/README.md § Window rows): what memmgr's placement beside an
+/// unpinned caller saves, which the pinned `path=grant` row, kept apart from
+/// memmgr by the synchronous wake rule, cannot show
+/// (core/kernel/docs/scheduler.md § Thread Assignment).
+///
+/// Each window, pinned to [`BENCH_CPU`], the thread makes one untimed grant,
+/// whose call blocks and so leaves it on that CPU, opens its idle-halt span,
+/// reads the counters, and clears its affinity; it makes the window's grants,
+/// reads again, closes the span and pins itself once more. Clearing an
+/// affinity, and naming the CPU the thread is on, move nothing, and no
+/// blocking call falls between the closing read and the span's close, so a
+/// window counts when the span closes with no halt ([`WindowEnd::from_close`]).
+/// The line carries `remote_wakes=`, the thread's wakes linked on another CPU
+/// than its waker's over the counted windows: one per grant's reply when
+/// memmgr stays apart from the thread, none when it runs beside it.
+fn fill_by_grant_unpinned(counters: &Counters, cpus: u32) -> Outcome
+{
+    let shape = WindowShape::for_ops(ANY_GRANTS)
+        .ok_or_else(|| "path=grant affinity=any: no window".to_string())?;
+    let info = startup_info();
+    // The warm-up, each window's untimed grant and its timed ones, and the
+    // untimed grant after the last window.
+    let chunks = u64::from(shape.windows)
+        .saturating_mul(u64::from(shape.ops).saturating_add(1))
+        .saturating_add(WARMUP_CHUNKS)
+        .saturating_add(1);
+    let reservation = reserve_pages(chunks.saturating_mul(CHUNK_PAGES))
+        .map_err(|e| format!("path=grant affinity=any: reserve the chunks' pages: {e:?}"))?;
+    let base = reservation.va_start();
+    let mut next = 0u64;
+    let mut grant = || -> Outcome {
+        let chunk = next;
+        next = next.saturating_add(1);
+        if chunk >= chunks
+        {
+            return Err(format!(
+                "path=grant affinity=any: chunk {chunk} past the reservation"
+            ));
+        }
+        let va = chunk_va(base, chunk);
+        let cap = request_contiguous(info.memmgr_endpoint, CHUNK_PAGES).ok_or_else(|| {
+            format!("path=grant affinity=any: chunk {chunk}: memmgr granted no chunk")
+        })?;
+        // SAFETY: the chunk lies in this process's own reservation, which
+        // nothing else maps and where no Rust object or IPC page lies.
+        let mapped = unsafe {
+            std::os::seraph::mem_map_funded(cap, info.self_aspace, va, 0, CHUNK_PAGES, MAP_WRITABLE)
+        };
+        mapped.map_err(|e| format!("path=grant affinity=any: chunk {chunk}: map: error {e}"))?;
+        // SAFETY: the chunk was just mapped read-write in this process's own
+        // reservation and holds no Rust object.
+        unsafe { core::ptr::write_volatile(va as *mut u64, 1) };
+        Ok(())
+    };
+    for _ in 0..WARMUP_CHUNKS
+    {
+        grant()?;
+    }
+    let thread = std::os::seraph::thread::current_thread_cap();
+    let mut samples = Vec::with_capacity(shape.windows as usize);
+    let mut tally = WindowTally::default();
+    let mut idle_halts = 0u64;
+    let mut remote = Some(0u64);
+    for _ in 0..shape.windows
+    {
+        grant()?;
+        let wakes_before = remote_wakes(thread);
+        let idle = IdleSpan::open();
+        let start = counters.read();
+        set_affinity(thread, AFFINITY_ANY)?;
+        let ran = (0..shape.ops).try_for_each(|_| grant());
+        let elapsed = counters.read().since(&start).cycles;
+        let halts = idle.close();
+        set_affinity(thread, BENCH_CPU)?;
+        ran?;
+        let wakes_after = remote_wakes(thread);
+        idle_halts = idle_halts.saturating_add(halts.unwrap_or(0));
+        let end = WindowEnd::from_close(halts);
+        tally.record(end);
+        if end == WindowEnd::Counted
+        {
+            samples.push(elapsed);
+            // The counter is a wrapping 32-bit count.
+            let wakes = wakes_before
+                .zip(wakes_after)
+                .map(|(before, after)| after.wrapping_sub(before) & u64::from(u32::MAX));
+            remote = remote.zip(wakes).map(|(sum, w)| sum.saturating_add(w));
+        }
+    }
+    // Back on BENCH_CPU before the next benchmark reads its counters.
+    grant()?;
+    if !tally.reaches_floor(shape)
+    {
+        std::os::seraph::log!(
+            warn: "fault_fill path=grant affinity=any: counted windows below the floor, counted={} windows={} floor={} moved={} halted={}",
+            tally.counted,
+            shape.windows,
+            shape.floor(),
+            tally.moved,
+            tally.halted
+        );
+        return Ok(());
+    }
+    let mut extras = vec![
+        (WINDOW_OPS_KEY, u64::from(shape.ops)),
+        (MOVED, u64::from(tally.moved)),
+        (HALTED, u64::from(tally.halted)),
+    ];
+    extras.extend(remote.map(|w| (REMOTE_WAKES, w)));
+    report(
+        "fault_fill",
+        &[
+            ("path", Value::Word("grant")),
+            PAGES,
+            ("affinity", Value::Word("any")),
+        ],
+        cpus,
+        &mut samples,
+        &extras,
+        Some(idle_halts),
+    )
+}
+
+/// Set the affinity of `thread`, the calling thread, to `cpu`.
+fn set_affinity(thread: u64, cpu: u32) -> Outcome
+{
+    syscall::thread_set_affinity(thread, cpu)
+        .map_err(|e| format!("path=grant affinity=any: set affinity to {cpu:#x}: error {e}"))
+}
+
+/// The thread's remote wakes so far; `None` when the read failed.
+fn remote_wakes(thread: u64) -> Option<u64>
+{
+    syscall::cap_info_thread_placement(thread, syscall_abi::THREAD_PLACEMENT_REMOTE_WAKES).ok()
 }
 
 /// One Memory cap of `pages` contiguous pages from memmgr

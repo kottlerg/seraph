@@ -140,7 +140,8 @@ one that returns halts saw the CPU halt (`Halted`), and one that returns `0` cou
 `halted=` (`HALTED`), and a row whose counted windows are fewer than half its windows
 (`WindowShape::floor`) does not measure its case, only the windows that happened to stay on the CPU,
 so the benchmark logs no result line for it. fsbench's `affinity=any` rows are such rows
-([services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md)).
+([services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md)), as is ubench's
+`fault_fill path=grant affinity=any` ([services/ubench/README.md](../../services/ubench/README.md)).
 
 ---
 

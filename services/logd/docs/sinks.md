@@ -11,8 +11,10 @@ a program reads, follows and steers the log.
 Built: the eight severities and their console tags, the console prefix
 `[sec.usfrac] LEVEL  [name] ` that both receivers write, the kernel's records read and written as
 `[kernel]` lines, the serial and framebuffer outputs as two sinks with a bounded queue and a writer
-thread each, and the serial sink's writes of a line as plain chunks and then a zero-length
-`SERIAL_WRITE_SENT` barrier ([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks).
+thread each, the serial sink's writes of a line as plain chunks and then a zero-length
+`SERIAL_WRITE_SENT` barrier, and `LOG_FLUSH` over the serial sink's queue, whose token is the
+number of the queue's last line until the journal gives the sink a cursor
+([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks, § Flush barrier).
 
 Everything else this document states is design intent, not yet implemented, unless a sentence names
 it as built. Each section names the Issue that builds it. Until an Issue lands,

@@ -16,7 +16,8 @@ pwrmgr/
     ├── guard.rs      # The allocation guard the core-death power-off runs under
     ├── core_death.rs # The core-death queue's entries: the member and the exit reason
     ├── power_off.rs  # The register the x86-64 core-death power-off writes, from QUERY_SLEEP
-    ├── caps.rs       # svcmgr bootstrap: the service endpoint, the two seeds, the core-death queue
+    ├── log_flush.rs  # The steps of the wait on logd's flush barrier before a power-off
+    ├── caps.rs       # svcmgr bootstrap: the service endpoint, three seeds, the core-death queue
     └── arch/
         ├── mod.rs         # Arch dispatch: `arch::current` (Actuator, resolve,
         │                  # watch_events, shutdown, reboot, PowerOff,
@@ -79,6 +80,15 @@ after its writes ([acpid § Power requests](../acpid/README.md#power-requests)),
 so a power-off the platform does not act on fails about 11 s after it was
 issued, and a reboot about one second after.
 
+Before it acts on `SHUTDOWN`, `REBOOT` or the power button, pwrmgr waits on logd's flush barrier
+(`log_labels::LOG_FLUSH`, through its `logd.flush` seed; [logd IPC interface § Flush
+barrier](../logd/docs/ipc-interface.md#flush-barrier)) until logd answers that the sinks holding the
+log have written the lines it had taken, for at most 5 s (`log::LOG_CALL_TIMEOUT_MS`), so the lines
+logged before the request, a harness's pass marker and crash reports among them, reach the serial
+console before the platform stops. logd answers at once when no sink holds the log or the one that
+does is stalled; without the seed, on a refusal, or with no answer, pwrmgr acts without the wait
+(`pwrmgr::log_flush` holds the steps).
+
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.
 
@@ -88,7 +98,8 @@ Death). It waits on one wait set over its service endpoint and the receive-only 
 core-death queue that svcmgr serves it (Cap flow below), on which svcmgr has bound the death
 observers of all three ([docs/supervision.md](../../docs/supervision.md#observing-the-core-set)
 § Observing the Core Set). An entry on the queue is a core death, and pwrmgr powers the platform
-off at once, by a path that needs no other service and none of the dead member's pages:
+off at once, by a path that needs none of the dead member's pages and no service but a bounded wait
+on logd:
 
 - svcmgr creates pwrmgr pinned (`CREATE_PINNED`), so none of its pages is demand-paged on memmgr
   or evicted by it.
@@ -106,9 +117,11 @@ off at once, by a path that needs no other service and none of the dead member's
   powers off: SBI SRST on RISC-V; on x86-64 it reads `PM1a_CNT` and writes the S5 sleep type to
   it, then with `SLP_EN`, as acpid's `SLEEP` does, or writes the one byte that enters S5 to
   `SLEEP_CONTROL_REG`, a port write or a store to the page mapped at its start, but without the
-  `\_PTS(5)`, the event quiescing and the clearing of `WAK_STS` acpid runs first. Nothing on that
-  path allocates, frees, logs or calls a service; an allocation there fails, which ends pwrmgr
-  without a power-off.
+  `\_PTS(5)`, the event quiescing and the clearing of `WAK_STS` acpid runs first. Before the
+  power-off it waits on logd's flush barrier, as before `SHUTDOWN` (above), for at most logd's
+  stall bound of 1 s (`SINK_STALL_MS`), the one service the path calls; a failure or no answer
+  only ends that wait. Nothing on the path allocates, frees or logs; an allocation there fails,
+  which ends pwrmgr without a power-off.
 - Only when the platform keeps running, or no immediate power-off is held, does pwrmgr drain what
   was posted since, log each entry of the dead member as the end it is, `<member>: its main thread
   ended (exit reason <reason>)` or `<member>: its address space ended (exit reason <reason>)`, then
@@ -135,11 +148,13 @@ its power-off is armed, and checks the power-off
    (`SHUTDOWN_AUTHORITY`-badged) and `pwrmgr.deny` (a no-authority twin).
    The endpoint persists across restarts. Both behaviours are specified in
    [`provides`](../svcmgr/docs/service-definitions.md#provides).
-2. `seed = devmgr.shutdown acpid.power` delivers, per
+2. `seed = devmgr.shutdown acpid.power logd.flush` delivers, per
    [`seed`](../svcmgr/docs/service-definitions.md#seed), a `REGISTRY_QUERY_AUTHORITY |
    SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry as bootstrap `cap[1]`, and the
-   `POWER_AUTHORITY`-badged SEND on acpid's endpoint as `cap[2]`; pwrmgr is the only recipe
-   seeding either. RISC-V uses the first and x86-64 the second (see Responsibilities). svcmgr
+   `POWER_AUTHORITY`-badged SEND on acpid's endpoint as `cap[2]`, and the
+   `LOG_FLUSH_AUTHORITY`-badged SEND on logd's master log endpoint as `cap[3]`, the flush barrier
+   pwrmgr waits on before every power-off and reset; pwrmgr is the only recipe seeding the first
+   two. RISC-V uses the first and x86-64 the second (see Responsibilities). svcmgr
    publishes `acpid.power` once acpid has launched, and launches acpid before pwrmgr because
    pwrmgr seeds it ([Reconciliation](../svcmgr/docs/service-definitions.md#reconciliation)).
 3. Consumers permitted to power the platform off seed `pwrmgr.shutdown`
@@ -157,7 +172,7 @@ its power-off is armed, and checks the power-off
 4. svcmgr creates pwrmgr, the recognised shutdown actuator, pinned, and serves
    it a RECV-only derivation of the core-death queue, which the death
    observers of svcmgr's, memmgr's and procmgr's main threads and address
-   spaces post to, as bootstrap `cap[3]`, on its first launch and on every
+   spaces post to, as bootstrap `cap[4]`, on its first launch and on every
    restart
    ([`shutdown_actuator`](../svcmgr/docs/service-definitions.md#shutdown_actuator)).
    The queue is svcmgr's, so its death observers outlive every pwrmgr

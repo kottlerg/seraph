@@ -182,8 +182,8 @@ well-known names it owns into its own registry
 `GRANT`), `DEVMGR_REGISTRY`,
 `DEVMGR_SHUTDOWN`, `DEVMGR_BIND` (seed-only, a name whose seeds receive `SEND|GRANT`),
 `DEVMGR_ACPI`, the `DEVMGR_CLASS_PREFIX` class names, `VFSD_MOUNT`, `VFSD_DENY`, `VFSD_SWAP`,
-`MEMMGR_SWAP` (seed-only, its seeds keeping `GRANT`), `LOGD_QUERY`, minted from the endowed
-sources) and
+`MEMMGR_SWAP` (seed-only, its seeds keeping `GRANT`), `LOGD_QUERY`, `LOGD_FLUSH`, minted from the
+endowed sources) and
 installs devmgr's `/services/drivers/` cap via
 `devmgr_labels::SET_DRIVERS_DIR`.
 The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`, `acpid.power`, `acpid.deny`) are
@@ -621,7 +621,9 @@ reclamation step inserts back into the free pool.
 memmgr and procmgr are in the core set: neither is restarted, and the
 death of either is system death: their death observers post to the
 core-death queue, on whose entry the shutdown actuator, pwrmgr, powers
-the system off at once, with no call on any service. Before svcmgr's
+the system off at once: it logs and allocates nothing, and its one call on
+a service is logd's flush barrier, for at most logd's stall bound
+(`SINK_STALL_MS`, 1 s). Before svcmgr's
 handover, a death during the service's own bootstrap rounds is init's
 logged halt, and a later one hangs the boot with no line (see
 [Supervision § Core Set and System

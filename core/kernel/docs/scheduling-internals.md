@@ -431,7 +431,8 @@ hint, by an RT wake's placement on any CPU (`PerCpuScheduler::ranks`, § Target 
 RT rule"). `outranking`, the `non_empty` bits of the queues above `current_level`'s, is written with
 it by the same CPU, and by `sys_thread_set_priority` on any CPU, with every bit only, under the
 running thread's `sched_lock`; it is read only by its own CPU, by `outranked` at its returns to user
-mode ([scheduler.md](scheduler.md) § Wake Preemption). `saved_lock_flags` is the interrupt word an
+mode ([scheduler.md](scheduler.md) § Wake Preemption) and between two batches of a `SYS_MEMORY_ZERO`
+(§ Return Work). `saved_lock_flags` is the interrupt word an
 all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_flags`,
 `unlock_saved_flags`). `idle_pull_candidate`, the idle pull's confirmation sample,
 `idle_pull_episode`, the backlog episode that sample read, `idle_pull_held`, whether the previous
@@ -1880,7 +1881,9 @@ take no lock:
   as the masked check before it halts.
 - `backlog` (Acquire load of the mask, then a Relaxed load of the episode): another CPU's idle
   pull, in its scan and its confirmation; its re-check under both CPUs' locks reads it exactly.
-- `outranked` (Relaxed): the owning CPU alone, at a return to user mode with interrupts masked.
+- `outranked` (Relaxed): the owning CPU alone, with interrupts masked, at a return to user mode
+  and between two batches of a `SYS_MEMORY_ZERO` (`syscall::mem::sys_memory_zero`, after an
+  interrupt window, when `PREEMPT` is set).
 - `has_queued_thread` (Relaxed), through `has_no_work`: the softlockup watchdog's per-tick idle
   sample (`system_has_no_work`), the SMT core spread, and the idle pull's sibling hold.
 - `ranks` (Relaxed, with `current_level`): an RT wake's placement on any CPU (§ Wake Protocol
@@ -1910,22 +1913,26 @@ Four invariants make their samples sound:
    [scheduler.md § Load Balancing](scheduler.md#load-balancing) states: a sample that races a
    dispatch running the backlog dry and the link that refills it can read the new episode.
 4. **What a sample decides.** The readers that gate on queued work act on a sample only where a
-   later step closes it. The idle loop's masked check is closed by program order for the CPU's
-   own links and, for a link on another CPU, by the wake IPI that invariant 1 of § Wake Protocol
-   Invariants orders after it; `outranked` is closed the same way, the IPI's own return to user
-   mode reading again, and `schedule()` decides under the lock; the idle pull re-reads the
-   episode and both loads under both CPUs' locks. A stale sample costs them a halt the IPI ends,
-   a return to user mode the IPI's return re-decides, a futile lock round, or one pull the idle
-   pull's bound allows, never a lost thread. `has_no_work`'s consumers act on one sample with no
-   locked step after it: a missed thread makes the watchdog count the tick idle and restart its
-   stall clock (§ Softlockup Watchdog states the cost), and makes the core spread or the sibling
-   hold count the sibling idle ([scheduler.md § SMT Awareness](scheduler.md#smt-awareness)).
-   `ranks`' consumer acts on one sample too: a missed thread, or a level the CPU has since left,
-   places an RT wake behind a thread it does not outrank (§ Wake Protocol Invariants, "The RT
-   rule"). The RT push's consumer re-reads the target's ranks under its lock, so a stale sample
-   costs it a futile lock round, save a running level the target records after its lock release,
-   which costs the push's bound again (§ ThreadState Transitions, "The RT push").
-   Invariant 2 keeps `relink` from making any reader miss a thread that stays queued.
+   later step closes it. The idle loop's masked check is closed by program order for the CPU's own
+   links and, for a link on another CPU, by the wake IPI that invariant 1 of § Wake Protocol
+   Invariants orders after it; `outranked` is closed the same way, the IPI's own return to user mode
+   reading again, and `schedule()` decides under the lock; the idle pull re-reads the episode and
+   both loads under both CPUs' locks. A stale sample costs them a halt the IPI ends, a return to
+   user mode the IPI's return re-decides, a futile lock round, or one pull the idle pull's bound
+   allows, never a lost thread. `SYS_MEMORY_ZERO`'s `outranked` sample between batches decides only
+   whether the call ends early: a link it misses is read again after the wake IPI, taken in the next
+   window, at the next batch's test, or at the syscall's own return, which runs the full decision,
+   so a miss costs at most a batch; a false hit, a stale level, ends the call with a short count the
+   caller already handles. `has_no_work`'s consumers act on one sample with no locked step after it:
+   a missed thread makes the watchdog count the tick idle and restart its stall clock (§ Softlockup
+   Watchdog states the cost), and makes the core spread or the sibling hold count the sibling idle
+   ([scheduler.md § SMT Awareness](scheduler.md#smt-awareness)). `ranks`' consumer acts on one
+   sample too: a missed thread, or a level the CPU has since left, places an RT wake behind a thread
+   it does not outrank (§ Wake Protocol Invariants, "The RT rule"). The RT push's consumer re-reads
+   the target's ranks under its lock, so a stale sample costs it a futile lock round, save a running
+   level the target records after its lock release, which costs the push's bound again
+   (§ ThreadState Transitions, "The RT push"). Invariant 2 keeps `relink` from making any reader
+   miss a thread that stays queued.
 
 A new writer of a CPU's run queues MUST keep all four: in particular, it moves a queued thread
 with `relink`, never by an unlink and a re-link, which shows the queues empty to every reader

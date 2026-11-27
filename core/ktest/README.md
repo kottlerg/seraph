@@ -701,8 +701,9 @@ test (`frame_pool::check_slots`, [§ Test infrastructure](#test-infrastructure))
   removes it; each pack copies the selection of the ktest it packs into the image's own record,
   `sysroot/.image-harness`. `cargo xtask run --runs` reads only the image's record, so a later
   build that does not repack changes nothing it decides: it refuses an image of a focused ktest
-  without `--ktest-only-ok`, with which it passes on the focused marker. CI never builds with a
-  selection.
+  without `--ktest-only-ok`, with which it passes on the focused marker. CI builds one
+  selection, the x86_64 debug ktest cell's boot on the monitored idle wait
+  ([docs/testing.md](../../docs/testing.md#idle-wait-ktest-cell) § Idle wait (ktest cell)).
 
 ---
 

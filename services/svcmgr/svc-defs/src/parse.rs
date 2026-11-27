@@ -175,8 +175,8 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// inconsistent combination (`cwd` with `namespace = none`, a `cwd` of the
 /// root under `namespace = universal`, a `cwd` outside a
 /// `namespace = subtree:` path or under one whose rights lack `LOOKUP`,
-/// `log_sink` with `seed`/`provides`, `debug_authority`, `stop_authority` or
-/// `entropy_authority`,
+/// `log_sink` with `seed`/`provides`, `debug_authority`, `stop_authority`,
+/// `entropy_authority` or `pmu_authority`,
 /// a `shutdown_actuator` that names no `:auth` `provides` entry of the recipe
 /// or sits on a `restart = never` service, `oom_stop = yes` on a recipe the
 /// stop rule refuses (`super::stop::stop_refusal`), `stop_source` on a
@@ -227,6 +227,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut oom_stop: Option<bool> = None;
     let mut stop_authority: Option<bool> = None;
     let mut entropy_authority: Option<bool> = None;
+    let mut pmu_authority: Option<bool> = None;
     let mut reserve: Option<bool> = None;
     let mut private_image: Option<bool> = None;
     let mut stop_source: Option<StopClass> = None;
@@ -491,6 +492,16 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     "entropy_authority must be yes or no",
                 )?;
             }
+            "pmu_authority" =>
+            {
+                set_yes_no(
+                    &mut pmu_authority,
+                    lineno,
+                    value,
+                    "pmu_authority",
+                    "pmu_authority must be yes or no",
+                )?;
+            }
             "stop_source" =>
             {
                 if stop_source.is_some()
@@ -651,6 +662,16 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         ));
     }
 
+    let pmu_authority = pmu_authority.unwrap_or(false);
+    if log_sink && pmu_authority
+    {
+        // As for debug_authority: the log sink's round has no slot for it.
+        return Err(ParseError::InvalidValue(
+            0,
+            "log_sink is exclusive of pmu_authority",
+        ));
+    }
+
     let shutdown_actuator = match &shutdown_name
     {
         Some(name) => Some(check_shutdown_actuator(name, restart, &provides)?),
@@ -678,6 +699,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 debug_authority,
                 stop_authority,
                 entropy_authority,
+                pmu_authority,
                 reserve,
                 shutdown_actuator.is_some(),
                 stop_source.is_some(),
@@ -719,6 +741,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         oom_stop,
         stop_authority,
         entropy_authority,
+        pmu_authority,
         reserve,
         private_image,
         stop_source,
@@ -796,7 +819,7 @@ const fn oom_stop_refusal(refusal: StopRefusal) -> &'static str
         StopRefusal::CoreRole =>
         {
             "oom_stop is exclusive of log_sink, debug_authority, stop_authority, \
-             entropy_authority, reserve, shutdown_actuator and stop_source"
+             entropy_authority, pmu_authority, reserve, shutdown_actuator and stop_source"
         }
         StopRefusal::NotLaunched | StopRefusal::NotOptedIn => "oom_stop refused by the stop rule",
     }
@@ -1169,6 +1192,7 @@ sched_max = 12\n";
             "debug_authority = yes\n",
             "stop_authority = yes\n",
             "entropy_authority = yes\n",
+            "pmu_authority = yes\n",
             "reserve = yes\n",
             "provides = p:auth\nshutdown_actuator = p\n",
         ]
@@ -1351,6 +1375,42 @@ sched_max = 12\n";
         assert!(matches!(
             parse_with("log_sink = yes\nentropy_authority = yes\n"),
             Err(ParseError::InvalidValue(0, _))
+        ));
+    }
+
+    #[test]
+    fn pmu_authority_is_off_unless_the_recipe_sets_it()
+    {
+        assert!(!parse_with("").expect("default").pmu_authority);
+        assert!(
+            parse_with("pmu_authority = yes\n")
+                .expect("set")
+                .pmu_authority
+        );
+        assert!(
+            !parse_with("pmu_authority = no\n")
+                .expect("cleared")
+                .pmu_authority
+        );
+        assert!(matches!(
+            parse_with("pmu_authority = maybe\n"),
+            Err(ParseError::InvalidValue(_, _))
+        ));
+        assert!(matches!(
+            parse_with("pmu_authority = yes\npmu_authority = yes\n"),
+            Err(ParseError::DuplicateKey(_, "pmu_authority"))
+        ));
+    }
+
+    #[test]
+    fn the_log_sink_cannot_hold_the_pmu_authority()
+    {
+        assert!(matches!(
+            parse_with("log_sink = yes\npmu_authority = yes\n"),
+            Err(ParseError::InvalidValue(
+                0,
+                "log_sink is exclusive of pmu_authority"
+            ))
         ));
     }
 

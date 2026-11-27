@@ -74,6 +74,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `stop_authority` | no | `yes` or `no` (default `no`). Endows the service with svcmgr's stop authority, a `STOP_AUTHORITY` SEND on svcmgr's service endpoint, in the bootstrap slot after its `seed` caps and its debug-authority slot. Mutually exclusive with `log_sink`. See [`stop_authority`](#stop_authority). |
 | `entropy_authority` | no | `yes` or `no` (default `no`). Endows the service with the kernel's entropy-contribution authority, an `EntropyControl` capability carrying `Contribute`, in the bootstrap slot after its `seed` caps and its debug- and stop-authority slots. One service holds it: the first recipe in launch order that sets it. Mutually exclusive with `log_sink`. A core role. See [`entropy_authority`](#entropy_authority). |
+| `pmu_authority` | no | `yes` or `no` (default `no`). Endows the service with the kernel's performance-counter authority, a `PmuControl` capability carrying `Configure`, in the bootstrap slot after its `seed` caps and its debug-, stop- and entropy-authority slots. One service holds it: the first recipe in launch order that sets it. With no recipe holding it, svcmgr deletes its source once the recipes are read. Mutually exclusive with `log_sink`. A core role. See [`pmu_authority`](#pmu_authority). |
 | `stop_source` | no | `program`. Makes the service a stop source of that class: svcmgr creates it contained and lists it, with a stop-badged SEND on its endpoint, to a stop-authority holder. A core role. Needs `provides` with every entry badged, and `restart` other than `never`. See [`stop_source`](#stop_source). |
 | `oom_stop` | no | `yes` or `no` (default `no`). Opts the service in to being stopped by a stop-authority holder. Refused, as a parser error, on a recipe the eligibility rule refuses. See [`oom_stop`](#oom_stop). |
 | `reserve` | no | `yes` or `no` (default `no`). Creates the service inside memmgr's system reserve. A core role: the eligibility rule never stops it. See [`reserve`](#reserve). |
@@ -506,6 +507,31 @@ seed              = devmgr.class.hwrng
 entropy_authority = yes
 ```
 
+## `pmu_authority`
+
+`yes` endows the service with the kernel's performance-counter authority: on its first launch and
+on every restart, svcmgr derives a copy of the `PmuControl` source init endows it
+([ipc-interface.md § Handover endowment](ipc-interface.md#handover-endowment-bootstrap-rounds)),
+carrying `Configure`, the type's one right, and delivers it in the bootstrap slot after the `seed`
+caps and, for a service that sets them, after the debug-, stop- and entropy-authority slots. A
+source init could not endow, a source svcmgr has deleted, or a derive that fails, leaves the slot
+absent. The capability serves `SYS_PMU_INFO`, `SYS_PMU_CONFIGURE` and `SYS_PMU_BIND`, through
+which the holder programs a CPU's counters and grants its own threads their reads
+([docs/capability-model.md § `PmuControl`](../../../docs/capability-model.md#pmucontrol)); this key
+is the only path that delivers it, and svcmgr never publishes the source.
+
+One service holds the authority. svcmgr keeps the key on the first recipe that sets it in launch
+order (`svcmgr_defs::keep_one_pmu_holder`) and clears it on every later one, which it launches
+without the capability and logs (`<name> also declares pmu_authority; not given`).
+
+Once it has read the recipes at the handover, whatever the scan's outcome, svcmgr deletes the
+source when no recipe it keeps sets the key, and logs `PmuControl source deleted`: a system that
+measures nothing keeps no counter authority past the scan. The default image sets the key on no
+recipe, so it holds none; svctest's recipe sets it, for its `pmu_authority` phase.
+
+`pmu_authority = yes` alongside `log_sink = yes` is a parser error, as for `debug_authority`. The
+key is a core role, so the [`oom_stop`](#oom_stop) rule never stops the holder.
+
 ## `stop_source`
 
 `program` makes the service a stop source of the program class
@@ -558,7 +584,7 @@ refusing for the first row that applies:
 | 1 | was started by init (memmgr, procmgr, devmgr, vfsd), so svcmgr only binds it | not launched by svcmgr |
 | 2 | has `restart = never`, so a stop would end it for good | never restarted |
 | 3 | has `critical = yes` | the system is not viable without it |
-| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `entropy_authority`, `reserve`, `shutdown_actuator` or `stop_source` | the system's log, crash reporting, stopping, shutdown and entropy contribution rest on it |
+| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `entropy_authority`, `pmu_authority`, `reserve`, `shutdown_actuator` or `stop_source` | the system's log, crash reporting, stopping, shutdown, entropy contribution and measurement rest on it |
 | 5 | does not set `oom_stop = yes` | not opted in |
 
 Eligibility is read from the recipe's keys alone, never from the service's name. The parser

@@ -4,16 +4,18 @@
 // shared/bench/src/lib.rs
 
 //! What every Seraph benchmark shares: the counters it reads around a
-//! measured operation ([`Counters`]), the samples it records and their
+//! measured operation ([`Counters`], and with the `pmu` feature the hardware
+//! event counters, `EventCounters`), the samples it records and their
 //! summary ([`Samples`], [`Summary`]), and the one result line it reports,
 //! with the parser a comparison reads it back with ([`Report`],
 //! [`parse_line`]), the windows of a window row ([`WindowShape`]), and the
 //! check that a window whose CPU may halt counted its elapsed time
 //! ([`CycleRate`]). `shared/bench/README.md` specifies the line.
 //!
-//! `no_std`, no allocation, no dependency. The architecture-specific counter
-//! reads live under `arch/`, built with the default `counters` feature; a
-//! reader of result lines on any host builds without it.
+//! `no_std`, no allocation. The architecture-specific counter reads live under
+//! `arch/`, built with the default `counters` feature, which adds the
+//! dependency on `shared/pmu` for the event columns; a reader of result lines
+//! on any host builds without it, and with no dependency.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -21,6 +23,8 @@
 mod arch;
 #[cfg(feature = "counters")]
 mod counters;
+#[cfg(feature = "counters")]
+mod events;
 mod line;
 mod rate;
 mod stats;
@@ -30,6 +34,10 @@ mod window;
 pub use arch::current::ARCH;
 #[cfg(feature = "counters")]
 pub use counters::{Counters, EVENT_SLOTS, Reading};
+#[cfg(feature = "pmu")]
+pub use events::EventCounters;
+#[cfg(feature = "counters")]
+pub use events::{Column, ColumnPlan, EVENT_COUNTERS};
 pub use line::{
     IDLE_HALTS, LineError, ParseError, Parsed, RESERVED_KEYS, Report, TAG, Unit, Value, parse_line,
 };

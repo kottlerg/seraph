@@ -147,6 +147,38 @@ pub(crate) fn mint_entropy_authority(ctx: &RestartCtx) -> u64
     syscall::cap_derive(ctx.entropy_source, syscall::RIGHTS_ENTROPY_CONTRIBUTE).unwrap_or(0)
 }
 
+/// Derive the `PmuControl` copy carrying `Configure` for the `pmu_authority`
+/// service's bootstrap round, from the source init endows. `0` when the
+/// source is absent or deleted or the derive fails, and the slot is then
+/// absent.
+pub(crate) fn mint_pmu_authority(ctx: &RestartCtx) -> u64
+{
+    let source = ctx.pmu_source.get();
+    if source == 0
+    {
+        return 0;
+    }
+    syscall::cap_derive(source, syscall::RIGHTS_PMU_CONFIGURE).unwrap_or(0)
+}
+
+/// Delete the `PmuControl` source once the recipes are read, when no
+/// recipe svcmgr keeps sets `pmu_authority`: no launch can then ask for a
+/// copy, and svcmgr holds no authority it does not hand on. A later
+/// [`mint_pmu_authority`] finds it absent.
+pub(crate) fn delete_unheld_pmu_source(ctx: &RestartCtx, recipes: &[Option<RestartRecipe>])
+{
+    if recipes.iter().flatten().any(|r| r.pmu_authority)
+    {
+        return;
+    }
+    let source = ctx.pmu_source.replace(0);
+    if source != 0
+    {
+        let _ = syscall::cap_delete(source);
+        std::os::seraph::log!("PmuControl source deleted");
+    }
+}
+
 /// Mint a receive-only derivation of the core-death queue, which the death
 /// observers of svcmgr, memmgr and procmgr post to, for the bootstrap round
 /// of the shutdown actuator, which powers the system off on an entry
@@ -493,6 +525,12 @@ pub struct RestartCtx
     /// derives the `entropy_authority = yes` service's copy on every launch
     /// ([`mint_entropy_authority`]). `0` when init endowed none.
     pub entropy_source: u64,
+    /// `PmuControl` source carrying `Configure`, from which svcmgr derives
+    /// the `pmu_authority = yes` service's copy on every launch
+    /// ([`mint_pmu_authority`]). `0` when init endowed none, and from the
+    /// end of the recipe scan when no recipe holds the key
+    /// ([`delete_unheld_pmu_source`]).
+    pub pmu_source: core::cell::Cell<u64>,
     /// The core-death queue, which the death observers of svcmgr's own main
     /// thread and address space and of memmgr's and procmgr's post to
     /// (`observe_core_deaths` in `main.rs`), from which svcmgr mints the
@@ -1076,6 +1114,11 @@ fn restart_boot_caps(
     if matches!(recipe, Some(r) if r.entropy_authority)
     {
         restart_caps.push(mint_entropy_authority(ctx));
+    }
+    // The PMU-authority holder's cap rides the slot after those.
+    if matches!(recipe, Some(r) if r.pmu_authority)
+    {
+        restart_caps.push(mint_pmu_authority(ctx));
     }
     // The shutdown actuator's receive-only derivation of the core-death queue
     // rides the slot after those, so each instance observes the core set.

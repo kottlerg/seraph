@@ -168,8 +168,9 @@ endpoints plus the publish-role source caps (a `SEND` on vfsd's synthetic
 root, derived from init's system-root cap, a badge-0 `SEND|GRANT` source
 on devmgr's registry endpoint, three badged SENDs on vfsd's service
 endpoint, and a `SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's
-endpoint) and the `EntropyControl` source svcmgr derives the entropy
-authority service's copy from; each
+endpoint), the `EntropyControl` source svcmgr derives the entropy
+authority service's copy from, and the `PmuControl` source it derives the `pmu_authority`
+service's copy from; each
 subsequent `SUBSTRATE` round carries one `(name, thread_cap, observer)`
 triple for a substrate service init bootstrapped (`memmgr`, `procmgr`,
 `devmgr`, `vfsd`), and a terminal `LOGD_SOURCES` round carries the

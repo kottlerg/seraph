@@ -113,8 +113,9 @@ svcmgr/
   the publish-role source caps (`rootfs.root` SEND, devmgr-registry
   `SEND|GRANT` source, the `vfsd.mount`, `vfsd.deny` and `vfsd.swap` SENDs on vfsd's
   service endpoint), the `EntropyControl` source carrying `Contribute`, which svcmgr never
-  publishes and derives the `entropy_authority` service's copy from, the `memmgr.swap`
-  `SEND|GRANT` on memmgr's endpoint, one
+  publishes and derives the `entropy_authority` service's copy from, the `PmuControl` source
+  carrying `Configure`, which svcmgr never publishes and derives the `pmu_authority` service's copy
+  from, the `memmgr.swap` `SEND|GRANT` on memmgr's endpoint, one
   `(name, thread_cap, observer)` round per substrate service init bootstrapped before svcmgr
   existed (the observer is a Control-only address-space cap or a process handle), and a terminal
   `LOGD_SOURCES` round carrying the log-sink source caps svcmgr holds
@@ -228,9 +229,8 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
 (required), `critical` (required), `namespace` (required), `cwd`,
 `seed`, `provides`, `log_sink`, `shutdown_actuator`, `debug_authority`,
-`stop_authority`, `entropy_authority`, `oom_stop`, `reserve`, `priority`, `sched_max`. Unknown
-keys are hard
-errors. Restart values: `never | on_failure | always`.
+`stop_authority`, `entropy_authority`, `pmu_authority`, `oom_stop`, `reserve`, `priority`,
+`sched_max`. Unknown keys are hard errors. Restart values: `never | on_failure | always`.
 Critical values: `yes | no`. Namespace forms:
 `none | universal | subtree:<path>:<rights>`. `priority` / `sched_max`
 are the service's scheduling placement (level and `SchedControl` band

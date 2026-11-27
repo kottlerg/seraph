@@ -104,6 +104,8 @@ services/svctest/
         │                      #   the skip line of a phase whose fixture is not declared
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
         ├── entropyd.rs        # entropyd's first contribution accepted by the kernel
+        ├── pmu.rs             # The `pmu_authority` copy svcmgr delivers; a loop counted
+        │                      #   through `bench::EventCounters`, or the open refused
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
         ├── recv_pool.rs       # Worker-pool receive helper under concurrent nested IPC;
         │                      #   concurrent logging through logd
@@ -292,7 +294,8 @@ phase and the `oom_policy` phase's session case (`caps[15]` and `caps[26]`), the
 `memmgr_swap_raw`, `swapd`, `vfsd_driver_death`, `rtc_create_retry`, `procmgr_snapshot`, and
 `timed_rtc_restart` phases, and the drivers hwrng restart phase (`caps[25]`), the
 `svcmgr_stop_service` phase (`caps[26]`, and `caps[25]` with `stopsrc` staged), and the no-stop
-cases of the `oom_policy`, `logd_reserve` and `rtc_create_retry` phases (`caps[26]`), instead fail
+cases of the `oom_policy`, `logd_reserve` and `rtc_create_retry` phases (`caps[26]`), and the
+`pmu_authority` phase (`caps[27]`), instead fail
 their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before the terminal
 pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached; the panic hook's `SHUTDOWN`
 is then skipped for the same zero cap, and the run ends idle.
@@ -308,8 +311,9 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, four slots
 to a round (`caps[0]` to `caps[3]`, `caps[4]` to `caps[7]`, `caps[8]` to `caps[11]`,
 `caps[12]` to `caps[15]`, `caps[16]` to `caps[19]`, `caps[20]` to `caps[23]`, and `caps[24]` to
-`caps[26]`), the last two (`caps[25]` and `caps[26]`) being the debug-authority cap the recipe's
-`debug_authority = yes` grants and the stop-authority cap its `stop_authority = yes` grants;
+`caps[27]`), the last three (`caps[25]` to `caps[27]`) being the debug-authority cap the recipe's
+`debug_authority = yes` grants, the stop-authority cap its `stop_authority = yes` grants and the
+`PmuControl` copy its `pmu_authority = yes` grants;
 [service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed) defines each name's
 cap shape and the zero slot an unresolved name leaves. With no creator endpoint, every slot stays
 zero.
@@ -343,6 +347,7 @@ zero.
 | `caps[24]` | `logd.control` (`SEND`) | `logd_control` phase: `SINK_LIST` and `SINK_SET`, which sets the framebuffer sink's level and back and turns it off and on again; `logd_follow` phase: `LOG_SUBSCRIBE` on it must refuse `QUERY_DENIED`; svcmgr seed-only check |
 | `caps[25]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_flush` phase: finds, attaches to, stops, and starts the serial driver; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; `serial_transmit` phase: finds and attaches to the serial driver, and stops and starts its transmitter thread; drivers hwrng restart phase: kills the virtio-rng driver; `rtc_create_retry` phase: finds devmgr and the RTC driver, attaches to devmgr, stops and starts its main thread, and kills the RTC driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times, the first time by pointing two of its threads at exit syscalls; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_node_reclaim` phase: sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `memmgr_swap_raw` phase: the same, and `MAKE_RESIDENT` of one chunk of its fixture child; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; `memmgr_memory_object_text` phase: finds its child and svctest itself, and sends `MAKE_PRIVATE` for each; `procmgr_image_sharing` phase: finds its children, and sends `MAKE_RESIDENT` and `MAKE_PRIVATE` for them; `procmgr_snapshot` phase: finds its child and sends `SNAPSHOT` for it, and for its badge once it has exited; `memmgr_swap` and `swapd` phases: send `SNAPSHOT` for the fixture child; svctest declares itself undebuggable at startup |
 | `caps[26]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy`, `logd_reserve` and `rtc_create_retry` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
+| `caps[27]` | (`pmu_authority`) | `pmu_authority` phase: checks the copy carries `Configure` alone, refuses an event set a reading cannot hold, and, pinned, counts a loop's instructions and core cycles through `bench::EventCounters` where the CPU has counters (riscv64 under QEMU), or requires the open refused `NotSupported` where it has none (x86-64 under QEMU) |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the ten `devmgr.class.*` names, `logd.follow`, `logd.control` and

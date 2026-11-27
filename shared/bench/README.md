@@ -1,8 +1,8 @@
 # shared/bench
 
 What every Seraph benchmark shares: the counters it reads around a measured operation, the
-samples it records and their summary, and the one result line it reports, with the parser that
-reads the line back.
+hardware event counters it may read with them, the samples it records and their summary, and the
+one result line it reports, with the parser that reads the line back.
 
 ---
 
@@ -15,6 +15,7 @@ bench/
 └── src/
     ├── lib.rs              # Crate root and re-exports
     ├── counters.rs         # Counters, Reading
+    ├── events.rs           # ColumnPlan, Column, EventCounters (feature `pmu`)
     ├── stats.rs            # Samples, Summary, summarize
     ├── rate.rs             # CycleRate: the window rate check
     ├── line.rs             # Report, Unit, Value, parse_line, Parsed, LineError, ParseError
@@ -25,13 +26,16 @@ bench/
         └── riscv64/mod.rs  # ARCH, the cycle read
 ```
 
-`no_std`, no allocation, no dependency. Host-tested (`cargo xtask test`).
+`no_std`, no allocation. Host-tested (`cargo xtask test`).
 
 The counters, the architecture's name (`ARCH`) and `Report::write`, which writes that name,
-exist only on the architectures Seraph runs on and come with the default `counters` feature. A
-reader of result lines builds without it, on any host: xtask's `bench-check` and `bench-baseline`
+exist only on the architectures Seraph runs on and come with the default `counters` feature,
+which adds the dependency on [`shared/pmu`](../pmu/README.md) for the event columns' events and
+their width-masked difference. A reader of result lines builds without it, with no dependency, on
+any host: xtask's `bench-check` and `bench-baseline`
 ([xtask/README.md](../../xtask/README.md#cargo-xtask-bench-check)) take the crate with
-`default-features = false`.
+`default-features = false`. The `pmu` feature adds `EventCounters` (§ Event counters), which
+makes the PMU syscalls through `shared/pmu`'s `client` feature.
 
 ---
 
@@ -41,8 +45,10 @@ A thread opens its own `Counters` with `Counters::open()` after it is pinned to 
 measures on, and reads them only there: each counter is a per-CPU register, and riscv64 keeps no
 two harts' `cycle` counters in step. The handle is neither `Send` nor `Sync`. `read()`
 returns a `Reading` of every column a result line can report: `cycles`, `instret`, and four
-programmable `events`. The cycle counter is the only one read; the others read `None`.
-`Reading::since` subtracts an earlier reading, column by column.
+programmable `events` (`EVENT_SLOTS`). `Counters` reads the cycle counter alone; the others read
+`None`, and `EventCounters` fills them (§ Event counters). `Reading::since` subtracts an earlier
+reading, column by column, each wrapping at 64 bits; `Reading::since_width` subtracts the
+`instret` and `events` columns across at most one wrap of a counter of a given width.
 
 The kernel reads the same counter: a kernel built with its `sched-stages` feature calls
 `Counters::open()` and `read()` from `schedule()`, in kernel mode with interrupts disabled
@@ -61,6 +67,36 @@ A read bounds the region between two reads as
 assembly declares that it may read and write memory, so the compiler keeps each load and store on
 the side of the read where the program puts it. On x86-64 the read is `mfence; lfence; rdtsc;
 lfence`, so that the CPU orders it too. On riscv64 the hart orders `csrr cycle` only with itself.
+
+---
+
+## Event counters
+
+`EventCounters` (the `pmu` feature) reads the cycle counter and up to five hardware counters
+(`EVENT_COUNTERS`) through a `PmuControl` capability
+([docs/capability-model.md § `PmuControl`](../../docs/capability-model.md#pmucontrol)), which svcmgr
+gives the one service whose recipe sets
+[`pmu_authority = yes`](../../services/svcmgr/docs/service-definitions.md#pmu_authority). A
+thread pinned to the CPU it measures on, and running there, opens them with
+`EventCounters::open(pmu, thread_cap, events, mode)`, which configures the CPU's counters with the
+portable events (`pmu::PmuEvent`) and grants the thread their reads; `close` revokes the reads and
+releases the counters, on the same CPU. The handle is neither `Send` nor `Sync`.
+
+Each event fills one `Reading` column, by the `ColumnPlan` of the events in the order given:
+`Instructions` fills `instret`, and every other event fills the next `events` slot. `Cycles` is
+one of those: the PMU's core clock cycles, beside the `cycles` column's cycle counter of
+§ Counters, which on x86-64 counts reference cycles. A set of events that a reading cannot hold
+(an event given twice, or more than four besides `Instructions`) is refused `InvalidArgument`
+before any syscall; a CPU with no counters, or one that does not count an event, refuses the open
+`NotSupported`, as `SYS_PMU_CONFIGURE` does. A benchmark that counts more events runs once for
+each group of them.
+
+`read` reads the cycle counter, then each hardware counter in the order of the events, with no
+syscall, so the span between two reads holds the hardware counters' reads of the first and the
+cycle counter's read of the second. The hardware counters are as wide as `SYS_PMU_INFO` reports,
+which may be narrower than 64 bits, so two of their readings are subtracted with
+`EventCounters::since`, which is `Reading::since_width` at the counters' width. `Counters`, which
+the kernel's `sched-stages` build reads, makes no PMU call in either build.
 
 ---
 

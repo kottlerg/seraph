@@ -19,7 +19,10 @@
 //!   `WINDOW_FULL`, and must have been refused.
 //!
 //! On a boot with a framebuffer driver the phase also stops that driver for
-//! the flooded calls, so logd's `skip` framebuffer sink drops lines.
+//! the flooded calls: logd's `skip` framebuffer sink holds nobody, so the
+//! probe's times hold with it stopped. Its default level, critical, shows
+//! none of the flood's lines, so it drops none of them; the `logd_sinks`
+//! phase's framebuffer-stopped case checks its drops.
 //!
 //! The phase requires:
 //!
@@ -30,9 +33,7 @@
 //!   the resender's refusals at logd's state lock, whose waiter parks in
 //!   steps of a millisecond (`runtime/ruststd/spin-wait`);
 //! - no probe call refused: only the flooders' own lines are refused;
-//! - both children still flooding when the probe's last call returns;
-//! - on the framebuffer cell, logd's notice counting the lines its
-//!   framebuffer sink dropped once the driver runs again.
+//! - both children still flooding when the probe's last call returns.
 //!
 //! Each probe line is numbered, `log-flood t=0 n=<n> len=<len> <payload>`, and
 //! the end line names them all, so the boot's `cargo xtask run --whole-lines
@@ -131,9 +132,7 @@ fn logd_flood_phase(caps: &Caps)
         .spawn()
         .expect("logd_flood: spawning the resender failed");
     std::thread::sleep(FLOOD_SETTLE);
-    let before = super::logd_sinks::newest_seq(caps.logd_query);
     let fb = stop_framebuffer(caps.debug_authority);
-    let fb_stopped = fb.is_some();
     let flooded = probe(PROBE_CALLS, FLOODED_GAP);
     let flooding =
         matches!(flood_child.try_wait(), Ok(None)) && matches!(resend_child.try_wait(), Ok(None));
@@ -201,13 +200,6 @@ fn logd_flood_phase(caps: &Caps)
         flooded_median.as_micros(),
         median.as_micros()
     );
-    if fb_stopped
-    {
-        let dropped = super::logd_sinks::await_fb_notice(caps.logd_query, before, "the flood");
-        std::os::seraph::log!(
-            "logd_flood: logd counted {dropped} lines its framebuffer sink dropped"
-        );
-    }
 }
 
 /// Stop every thread of the framebuffer driver, when the boot has one: its

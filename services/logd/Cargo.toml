@@ -12,6 +12,9 @@ test = false
 [dependencies]
 # The overflow watch of the death-queue drain (`OverflowWatch`).
 death-set = { path = "../../shared/death-set" }
+# The terminal's palette, which the framebuffer sink colours a level tag
+# from.
+ansi = { path = "../../shared/ansi" }
 ipc = { path = "../../shared/ipc" }
 # Pure handover decoding and diagnostic formatting, extracted so it is
 # host-testable.

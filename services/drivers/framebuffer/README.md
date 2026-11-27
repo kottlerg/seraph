@@ -65,7 +65,8 @@ are gated by `WRITE_AUTHORITY`: a request whose badge lacks it is answered
 `UNAUTHORIZED` and has no effect.
 
 The driver is debuggable, and a fault of it reaches the crash service like any driver's. logd
-mirrors every log line to it from its framebuffer sink's writer thread, the only logd thread that
+writes the log lines at or above its framebuffer sink's level to it from that sink's writer
+thread, the only logd thread that
 waits on the driver; a debug-authority holder that stops it holds the log stream for at most
 logd's `SINK_STALL_MS` once, after which logd queues and then drops and counts the lines meant
 for the framebuffer until the driver writes again, and keeps writing them to serial and retaining
@@ -143,8 +144,8 @@ handed and holds no palette — mapping the 16 ANSI SGR colours to RGB is the
 terminal's job ([`shared/ansi`](../../../shared/ansi/README.md)).
 
 The default (never set) is full-white-on-black, matching the pre-colour
-monochrome output, so callers that never send `FB_SET_ATTRS` — logd's
-framebuffer log mirror, any pre-terminal caller — render unchanged.
+monochrome output, so callers that never send `FB_SET_ATTRS`, any pre-terminal caller, render
+unchanged.
 
 **Request:**
 
@@ -163,10 +164,13 @@ The terminal owns ANSI SGR parsing (`ESC[…m` → `FB_SET_ATTRS`); the driver
 never sees `ESC`. See [docs/console-model.md](../../../docs/console-model.md).
 
 > **v1 limitation:** the attribute pair is a single global state shared by
-> every client of the one framebuffer (the terminal and logd's concurrent log
-> mirror), like the single global cursor. A log line written while the terminal
-> holds a non-default colour inherits it. Per-client attribute/cursor state
-> arrives with the compositor (#153).
+> every client of the one framebuffer (the terminal and logd's framebuffer
+> sink), like the single global cursor. logd sets the colour of a line's level
+> tag and then the default colour back, so the bytes of a log line before its
+> tag, and a line whose tag it does not colour, take the colour the terminal
+> holds, and the terminal's colour is reset by a line whose tag it colours
+> ([logd sinks](../../logd/docs/sinks.md) § Colour). Per-client
+> attribute/cursor state arrives with the compositor (#153).
 
 ---
 

@@ -58,6 +58,32 @@ pub fn sbi_call(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> Sbi
     SbiRet { error, value }
 }
 
+/// Issue an SBI ecall of five arguments, `a0`–`a4` (`sbi_pmu_counter_config_matching`
+/// takes five); otherwise as [`sbi_call`].
+#[cfg(not(test))]
+pub fn sbi_call5(extension: u64, function: u64, args: [u64; 5]) -> SbiRet
+{
+    let error: i64;
+    let value: u64;
+    // SAFETY: as for sbi_call: ecall is available in supervisor mode, an
+    // unknown extension or function returns SBI_ERR_NOT_SUPPORTED, and
+    // `nomem` stays absent for the same reason.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inout("a0") args[0] => error,
+            inout("a1") args[1] => value,
+            in("a2") args[2],
+            in("a3") args[3],
+            in("a4") args[4],
+            inout("a6") function => _,
+            inout("a7") extension => _,
+            options(nostack),
+        );
+    }
+    SbiRet { error, value }
+}
+
 #[cfg(test)]
 pub fn sbi_call(_extension: u64, _function: u64, _a0: u64, _a1: u64, _a2: u64) -> SbiRet
 {

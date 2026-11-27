@@ -26,6 +26,7 @@ pub mod init_layout;
 pub mod ipc;
 pub mod klog;
 pub mod locked_windows;
+pub mod memory_zero;
 pub mod mm;
 pub mod notification;
 pub mod retype;
@@ -473,6 +474,32 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "mm::aspace_harvest_kernel_copy_sets_accessed",
         mm::aspace_harvest_kernel_copy_sets_accessed(ctx)
+    );
+
+    // ── Kernel zero of a Memory cap's pages (SYS_MEMORY_ZERO) ─────────────────
+    run_test!(
+        "memory_zero::zeroes_the_range_and_nothing_else",
+        memory_zero::zeroes_the_range_and_nothing_else(ctx)
+    );
+    run_test!(
+        "memory_zero::refuses_without_map_and_write",
+        memory_zero::refuses_without_map_and_write(ctx)
+    );
+    run_test!(
+        "memory_zero::refuses_a_malformed_range",
+        memory_zero::refuses_a_malformed_range(ctx)
+    );
+    run_test!(
+        "memory_zero::refuses_below_the_retype_cursor",
+        memory_zero::refuses_below_the_retype_cursor(ctx)
+    );
+    run_test!(
+        "memory_zero::refuses_a_deleted_handle",
+        memory_zero::refuses_a_deleted_handle(ctx)
+    );
+    run_test!(
+        "memory_zero::zero_takes_interrupts",
+        memory_zero::zero_takes_interrupts(ctx)
     );
 
     // ── Notification syscalls ───────────────────────────────────────────────────────

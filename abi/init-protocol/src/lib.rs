@@ -130,7 +130,12 @@ pub mod property;
 ///     [`CapDescriptor`] alone (no [`InitInfo`] field). Field layout
 ///     unchanged; an init built against v20 would read the new descriptor's
 ///     type byte as no [`CapType`] at all.
-pub const INIT_PROTOCOL_VERSION: u32 = 21;
+/// v22: Added [`CapType::PmuControl`]: the root `CSpace` carries one
+///     `PmuControl` capability, on both architectures, named by its
+///     [`CapDescriptor`] alone (no [`InitInfo`] field). Field layout
+///     unchanged; an init built against v21 would read the new descriptor's
+///     type byte as no [`CapType`] at all.
+pub const INIT_PROTOCOL_VERSION: u32 = 22;
 
 /// Length of [`InitModuleName::name`], matching
 /// `boot_protocol::BOOT_MODULE_NAME_LEN` (256, `objsig::NAME_MAX`) so the
@@ -561,6 +566,9 @@ pub enum CapType
     /// Authority to read the kernel log. Matches `CapTag::KernelLog = 15`.
     /// `aux0 = aux1 = 0`.
     KernelLog = 15,
+    /// Authority to program performance counters for user mode. Matches
+    /// `CapTag::PmuControl = 16`. `aux0 = aux1 = 0`.
+    PmuControl = 16,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

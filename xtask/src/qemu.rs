@@ -1618,6 +1618,12 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec, execution: Execut
     // rv64 model enables Svadu, under which the hart sets A and D itself and
     // the kernel's software A/D update (`user_fault_is_spurious`) never runs.
     //
+    // `sscofpmf=on` gives the hart Sscofpmf, with which QEMU describes its
+    // programmable counters' events to the firmware (OpenSBI), so the SBI PMU
+    // extension configures them and the kernel offers user counters
+    // (core/kernel/docs/perfmon.md); without it no programmable counter counts
+    // an event, and the kernel reports no counters.
+    //
     // The `zawrs` property (`IdleWait::riscv_cpu_prop`, off by default) gives
     // the hart Zawrs, whose `WRS.NTO` the kernel's idle loop waits in.
     //
@@ -1627,7 +1633,7 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec, execution: Execut
         "-cpu".into(),
         format!(
             "rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,\
-             ssaia=on,smaia=on,smstateen=on,svadu=off,svade=on{}{}{}",
+             ssaia=on,smaia=on,smstateen=on,svadu=off,svade=on,sscofpmf=on{}{}{}",
             spec.riscv_zkr.cpu_zkr_prop(),
             spec.idle_wait.riscv_cpu_prop(),
             spec.riscv_mmu.cpu_satp_props()
@@ -2214,6 +2220,15 @@ mod tests
         // and D itself and the kernel's Svade A/D update is never exercised.
         let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
         assert!(cpu_arg(&argv).contains(",svadu=off,svade=on"));
+    }
+
+    #[test]
+    fn riscv_cpu_presents_counter_events()
+    {
+        // Without Sscofpmf QEMU describes no programmable counter's events to
+        // the firmware, and the kernel offers no user counters.
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        assert!(cpu_arg(&argv).contains(",sscofpmf=on"));
     }
 
     #[test]

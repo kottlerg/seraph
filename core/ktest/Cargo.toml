@@ -17,6 +17,7 @@ crypto         = { path = "../../shared/crypto" }
 font           = { workspace = true }
 init-protocol  = { path = "../../abi/init-protocol" }
 ipc            = { path = "../../shared/ipc" }
+pmu            = { path = "../../shared/pmu", features = ["client"] }
 process-layout = { workspace = true }
 riscv-step     = { path = "../../shared/riscv-step" }
 syscall        = { path = "../../shared/syscall" }

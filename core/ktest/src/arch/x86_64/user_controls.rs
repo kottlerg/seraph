@@ -11,7 +11,8 @@
 //! on every CPU (`cpu::enable_smep_smap`). Each entry of [`DENIED`] fails the
 //! case where its control is left set:
 //!
-//! - `CR4.PCE` clear: `RDPMC` raises `#GP(0)`. With it set, `RDPMC` of
+//! - `CR4.PCE` clear while a thread `SYS_PMU_BIND` has not granted counter
+//!   reads runs (ktest's children are never bound): `RDPMC` raises `#GP(0)`. With it set, `RDPMC` of
 //!   counter 0 completes where the CPU has that counter (CPUID leaf 0AH reports
 //!   at least one general-purpose counter), and raises `#UD` under QEMU's TCG.
 //! - `CR4.PVI` clear: `CLI` under `IOPL` 0 (the kernel clears `IOPL` in every

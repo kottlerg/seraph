@@ -145,12 +145,14 @@ fn console_text(line: &str) -> Option<&str>
         .strip_prefix(' ')
 }
 
-/// `line` after a leading `[<digits>.<6 digits>] ` stamp.
+/// `line` after a leading `[<digits>.<6 digits>] ` stamp, its seconds
+/// right-aligned with spaces or not.
 fn strip_stamp(line: &str) -> Option<&str>
 {
     let rest = line.strip_prefix('[')?;
     let (stamp, after) = rest.split_once("] ")?;
     let (sec, frac) = stamp.split_once('.')?;
+    let sec = sec.trim_start_matches(' ');
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     (digits(sec) && frac.len() == 6 && digits(frac)).then_some(after)
 }
@@ -244,6 +246,22 @@ mod tests
         assert_eq!(strip_level_tag("INFO [a] b"), None);
         assert_eq!(strip_level_tag("TRACE  [a] b"), None);
         assert_eq!(strip_level_tag("[a] b"), None);
+    }
+
+    // Defect caught: a stamp whose seconds logd right-aligns with spaces not
+    // read as a stamp, so none of logd's lines is a console line.
+    #[test]
+    fn a_stamp_is_read_with_its_seconds_padded_or_not()
+    {
+        assert_eq!(
+            strip_stamp("[    1.000100] INFO   [a] b"),
+            Some("INFO   [a] b")
+        );
+        assert_eq!(strip_stamp("[123456.000100] x"), Some("x"));
+        assert_eq!(strip_stamp("[1.000100] x"), Some("x"));
+        assert_eq!(strip_stamp("[     .000100] x"), None);
+        assert_eq!(strip_stamp("[ 1 .000100] x"), None);
+        assert_eq!(console_text("[    1.000100] INFO   [a] b"), Some("b"));
     }
 
     #[test]

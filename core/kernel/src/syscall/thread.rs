@@ -2002,7 +2002,7 @@ unsafe fn control_thread(
 /// # Safety
 /// `cspace` must be the calling thread's `CSpace`; no lock is held.
 #[cfg(not(test))]
-unsafe fn thread_with_rights(
+pub(super) unsafe fn thread_with_rights(
     cspace: *mut crate::cap::cspace::CSpace,
     idx: u64,
     rights: crate::cap::slot::ThreadRights,

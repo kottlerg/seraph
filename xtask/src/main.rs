@@ -118,12 +118,20 @@ fn main()
         std::process::exit(1);
     }
 
-    if let Some(host) = cli.command.build_host()
-        && let Err(err) = host_lock::admit_build(&ctx, host)
+    // A build's admission is held until the command ends, so the host's
+    // holders show it and a timing grant waits for it.
+    let _build = match cli
+        .command
+        .build_host()
+        .map(|host| host_lock::admit_build(&ctx, host))
     {
-        eprintln!("error: {err:#}");
-        std::process::exit(1);
-    }
+        Some(Err(err)) =>
+        {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
+        }
+        admitted => admitted.map(Result::ok),
+    };
 
     let result = match &cli.command
     {

@@ -25,12 +25,6 @@ use crate::BoundedStr;
 /// transmitter that makes no progress `STALLED`.
 pub const SINK_STALL_MS: u32 = 1000;
 
-/// Entries before the newest a `skip` sink's cursor starts at when its
-/// driver comes up, when it is further behind than that
-/// (`services/logd/docs/sinks.md` § Device sinks, the framebuffer's
-/// `backlog`): the context a screen shows when it attaches.
-pub const SKIP_BACKLOG: u64 = 64;
-
 /// Whether a write the writer started at `started_us` (`None` while it
 /// writes nothing) has run past [`SINK_STALL_MS`] at `now_us`, on one
 /// microsecond clock: the sink is then stalled.
@@ -58,14 +52,16 @@ pub fn hint_ms(entries: u64, entry_us: u64) -> u32
 }
 
 /// The cursor of a `skip` sink at `cursor` when its driver comes up, with
-/// `next` the `seq` the next retained entry takes: [`SKIP_BACKLOG`]
-/// entries before it when the cursor is further behind than that, otherwise
-/// where it is. The entries passed are counted as dropped, as an evicted gap
-/// is.
+/// `next` the `seq` the next retained entry takes: `backlog` entries
+/// before it (the sink's `backlog` setting,
+/// `services/logd/docs/sinks.md` § Device sinks) when the cursor is further
+/// behind than that, otherwise where it is: the context a screen shows when
+/// it attaches. The entries passed that the sink shows are counted as
+/// dropped.
 #[must_use]
-pub const fn attach_cursor(cursor: u64, next: u64) -> u64
+pub const fn attach_cursor(cursor: u64, next: u64, backlog: u64) -> u64
 {
-    let start = next.saturating_sub(SKIP_BACKLOG);
+    let start = next.saturating_sub(backlog);
     if cursor < start { start } else { cursor }
 }
 
@@ -116,8 +112,9 @@ mod tests
     #[test]
     fn an_attaching_skip_sink_starts_at_most_its_backlog_behind()
     {
-        assert_eq!(attach_cursor(0, 1000), 1000 - SKIP_BACKLOG);
-        assert_eq!(attach_cursor(990, 1000), 990);
-        assert_eq!(attach_cursor(0, 10), 0);
+        assert_eq!(attach_cursor(0, 1000, 64), 1000 - 64);
+        assert_eq!(attach_cursor(990, 1000, 64), 990);
+        assert_eq!(attach_cursor(0, 10, 64), 0);
+        assert_eq!(attach_cursor(0, 1000, 0), 1000);
     }
 }

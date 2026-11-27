@@ -463,6 +463,7 @@ dependencies = [
  "font",
  "init-protocol",
  "mmio",
+ "pmu",
  "process-layout",
  "syscall-abi",
  "text",
@@ -478,6 +479,7 @@ dependencies = [
  "font",
  "init-protocol",
  "ipc",
+ "pmu",
  "process-layout",
  "riscv-step",
  "syscall",
@@ -503,6 +505,7 @@ dependencies = [
 name = "logd"
 version = "0.1.5"
 dependencies = [
+ "ansi",
  "death-set",
  "ipc",
  "logd-codec",
@@ -517,6 +520,7 @@ name = "logd-codec"
 version = "0.1.5"
 dependencies = [
  "ipc",
+ "log",
  "syscall-abi",
 ]
 
@@ -604,6 +608,14 @@ name = "oomd-policy"
 version = "0.1.5"
 dependencies = [
  "ipc",
+]
+
+[[package]]
+name = "pmu"
+version = "0.1.5"
+dependencies = [
+ "syscall",
+ "syscall-abi",
 ]
 
 [[package]]

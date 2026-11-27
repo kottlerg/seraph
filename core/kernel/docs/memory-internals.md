@@ -164,7 +164,10 @@ capability would read the dead object's state
 ([cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state in donated memory).
 The clear runs before the free takes the object's locks, in batches of 16 pages with the interrupts
 pending on the CPU taken between batches, so the clear masks interrupts for one batch at a time
-whatever the free's size. The only kernel-written bytes left in free space are the allocator's own
+whatever the free's size. `SYS_MEMORY_ZERO`, which zeroes a holder's pages above the cursor through
+the direct map, uses the same batch (`cap::retype::CLEAR_BATCH_PAGES`;
+[syscalls.md](syscalls.md) § `SYS_MEMORY_ZERO` (79)). The only kernel-written bytes left in free
+space are the allocator's own
 free-list words, written after the clear: a free sub-page slot's first 8 bytes (the next slot's
 offset) and the 16-byte header (page count and next run's offset) at the start of every free block
 on the page list, each list ending at an all-ones sentinel. A freed block that joins the free run
@@ -220,7 +223,9 @@ fails the retype with `OutOfMemory` before the ledger, free lists, or region byt
 `SYS_MEM_MAP` pins its range first (raises each frame's count), issues a `SeqCst` fence, then
 reads the cursor and refuses a range below it; the pins drop when the call returns, after each
 installed leaf has raised its own count. With the fences on both sides, of a racing retype and map
-at least one observes the other, so a page is never both carved and mapped. Retypes served from a
+at least one observes the other, so a page is never both carved and mapped. `SYS_MEMORY_ZERO` makes
+the same pin, fence and cursor read for each 16-page batch before it stores, so a page is never
+both carved and zeroed. Retypes served from a
 free list need no check: their bytes lie below the cursor, which no mapping can reach once the
 cursor has passed them, and the cursor passed them only after the check.
 
@@ -232,7 +237,11 @@ Memory handle a second time, and it refuses the map with `InvalidCapability` if 
 longer names the same object. A revoke clears the slot under its CSpace's lock before the
 issuer's later `CAP_INFO_MEMORY_MAPPINGS`, which fences before it reads the counts. Either the
 second lookup sees the cleared slot, or the issuer's count sees the pins and then every leaf
-the map installs. The query reads one count per page of the window it names, at most 512 pages
+the map installs. `SYS_MEMORY_ZERO` resolves its handle again for each batch, after its pins and
+fence, and stores only when the slot still names the same object with Map and Write: either the
+revoke stops the next batch, or the issuer's count sees the pins of the batch in flight, which drop
+only after its stores, so a server that waits for a zero count sees no later write to the pages.
+The query reads one count per page of the window it names, at most 512 pages
 of the region; a larger region is read window by window.
 
 **Text-write check.** `SYS_THREAD_WRITE_MEM` with `THREAD_MEM_TEXT` writes a page the thread's
@@ -651,15 +660,17 @@ hart has run one; on x86-64 nothing. The call sites are:
 The fence is placed per call that makes a mapping executable or writes through a debugger, not at
 every store, for these reasons:
 
-- **Every kernel route to executing written bytes passes a call site.** Bytes stored through a
-  data path become executable through a new executable mapping or a protect to executable, and
-  both synchronise. The kernel's own stores to a user frame through the direct map are the zeroing
-  and filling of frames before they are mapped (the same case), the Phase-9 relocation, and
-  `sys_thread_write_mem`. That call synchronises after every write, not only one that reaches an
-  executable leaf of the target, since a writable page's frame may be mapped executable in
-  another mapping no leaf of the target shows. A frame freed with stale instruction lines and
-  reused for new code is reached only through a new executable mapping, so frame reuse needs no
-  call of its own.
+- **Every kernel route to executing written bytes passes a call site, `SYS_MEMORY_ZERO` aside.**
+  Bytes stored through a data path become executable through a new executable mapping or a
+  protect to executable, and both synchronise. The kernel's own stores to a user frame through the
+  direct map are the zeroing and filling of frames before they are mapped (the same case), the
+  Phase-9 relocation, `sys_thread_write_mem`, and `SYS_MEMORY_ZERO`. `sys_thread_write_mem`
+  synchronises after every write, not only one that reaches an executable leaf of the target,
+  since a writable page's frame may be mapped executable in another mapping no leaf of the target
+  shows. `SYS_MEMORY_ZERO` needs the Write right a writable mapping needs and synchronises
+  nothing: zeroing a frame a mapping shows executable is a store through a writable alias, the
+  next point's case. A frame freed with stale instruction lines and reused for new code is reached
+  only through a new executable mapping, so frame reuse needs no call of its own.
 - **Code written through a writable alias is the process's to synchronise.** W^X holds per mapping,
   not per frame: a Memory capability may carry both `Write` and `Execute`, so one frame can be
   mapped writable at one address and executable at another, in one space or two. A store through the

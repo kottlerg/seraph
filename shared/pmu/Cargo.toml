@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "pmu"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# `no_std`, no allocation: the portable events, the syscalls' register
+# packing and the per-vendor counter decode, shared by the kernel and its
+# callers and host-tested.
+[lib]
+doctest = false
+
+[dependencies]
+syscall-abi = { path = "../../abi/syscall" }
+syscall = { path = "../syscall", optional = true }
+
+[features]
+# The user API (`Pmu`, `Counters`), which makes the syscalls and reads the
+# counters. The kernel takes the crate without it.
+client = ["dep:syscall"]
+
+[lints]
+workspace = true

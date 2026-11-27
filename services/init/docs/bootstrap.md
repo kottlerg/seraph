@@ -69,7 +69,10 @@ process creation to procmgr IPC.
   wait set (the log endpoint and the notification) from init's arena, writes each kernel record to
   the UART as a `[kernel]` line between the senders' lines, keeps it in its history under
   `LOG_BADGE_KERNEL`, and stops reading at real-logd's first `HANDOVER_PULL`
-  ([console-model.md](../../../docs/console-model.md) item 3).
+  ([console-model.md](../../../docs/console-model.md) item 3). It writes every line it receives,
+  whatever its level: it reads no recipe, so the sender's level ([Log levels](#log-levels)) alone
+  filters what reaches the UART before the handover, and logd's serial level applies from the
+  handover on ([logd sinks](../../logd/docs/sinks.md) § Settings).
 - Read the log-level configuration from the `/config/init/log-levels.conf` boot module
   (`log_levels::read`, `../src/log_levels.rs`; see [Log levels](#log-levels)), taking its body
   through `init_log_levels::parse_module` (`objsig::split`, parse-only); a module whose trailer
@@ -452,10 +455,10 @@ from there into the boot bundle as the module of that name, so an edit needs no 
   vfsd's level sets its drivers' too. A spawner at info passes no env.
   svcmgr passes nothing on: a service it launches takes its env from its
   `.svc` recipe alone.
-- **Check.** The usertest cell packs `services/init/log-levels-vfsd-debug.conf`
-  (`cargo xtask mkdisk --repack-only --log-levels`), boots the bundle with vfsd at
-  debug and checks that vfsd's and fatfs's debug lines appear and devmgr's
-  and procmgr's do not
+- **Check.** The usertest cell packs `services/init/log-levels-vfsd-debug.conf` (`cargo xtask mkdisk
+  --repack-only --log-levels`), boots the bundle with vfsd at debug and logd's serial sink at debug
+  ([logd sinks](../../logd/docs/sinks.md) § Settings), and checks that vfsd's and fatfs's debug
+  lines appear and devmgr's and procmgr's do not
   ([docs/testing.md](../../../docs/testing.md#log-levels-usertest-cell)).
 
 ---
@@ -478,6 +481,7 @@ The kernel populates init's CSpace before transferring control (see
 | Firmware tables | Read-only `Memory` caps covering the ACPI RSDP page, each `AcpiReclaimable` region, and the DTB blob |
 | Scheduler | `SchedControl` cap |
 | Entropy | `EntropyControl` cap (`Contribute`) |
+| Performance counters | `PmuControl` cap (`Configure`) |
 | Boot modules | `Memory` caps for each boot-module image inside `bootstrap.bundle` (procmgr, memmgr, devmgr, vfsd, …) — resolved by name via the `init_protocol` module-name table |
 
 The roots of the hardware and control authority init delegates stay in

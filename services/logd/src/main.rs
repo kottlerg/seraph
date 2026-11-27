@@ -42,22 +42,26 @@ use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal
 use ipc::log_record::{RECORD_MAX_BYTES, Record};
 use ipc::serve::Reply;
 use ipc::stream_labels::{
-    LEVEL_INFO, LEVEL_NOTICE, LEVEL_WARN, NAME_UNKNOWN, RECORD_ACCEPTED, RECORD_REJECTED,
-    STREAM_BYTES, STREAM_RECORD, STREAM_REGISTER_NAME, WINDOW_FULL, level_of, sender_named,
+    LEVEL_EMERGENCY, LEVEL_INFO, LEVEL_NOTICE, LEVEL_WARN, NAME_UNKNOWN, RECORD_ACCEPTED,
+    RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD, STREAM_REGISTER_NAME, WINDOW_FULL, level_of,
+    level_or_info, sender_named,
 };
 use ipc::{IpcMessage, memmgr_labels, procmgr_errors, procmgr_labels};
 use logd_codec::history::ENTRY_MAX_BYTES;
 use logd_codec::kernel::{Accept, KERNEL_NAME, KernelLine};
 use logd_codec::reclaim::{Cause, ReclaimLine};
 use logd_codec::record::RENDERED_MAX_BYTES;
+use logd_codec::settings::{
+    BACKLOG_MAX, Colour, Format, HOSTNAME_ENV, HostName, Pace, Relayed, SinkKind, SinkSettings,
+};
 use logd_codec::sink::SINK_STALL_MS;
 use recv_pool::{IpcBuf, RecvPool, SpawnError};
 use std::os::seraph::startup_info;
 use syscall::RIGHTS_EQ_POST;
 
 use logd_slot_table::{
-    Admit, Bounds, Eviction, History, HistoryEntry, LINE_BUF_SIZE, MAX_NAME_LEN, Origin, Slot,
-    SlotTable, admit, lines_completed,
+    Admit, Bounds, Eviction, History, HistoryEntry, LINE_BUF_SIZE, MARKS, MAX_NAME_LEN, Mark,
+    Origin, Slot, SlotTable, admit, lines_completed,
 };
 
 /// `WaitSet` badge for the death-notification event queue.
@@ -102,7 +106,7 @@ struct BootCaps
     serial_class: u64,
     /// The `framebuffer` class SEND (svcmgr's `devmgr.class.framebuffer`
     /// publication), through which logd resolves the framebuffer driver
-    /// the same way. Zero disables the framebuffer mirror.
+    /// the same way. Zero disables the framebuffer sink.
     fb_class: u64,
     /// A `KernelLog` cap carrying `Read`, through which logd reads the
     /// kernel's console lines ([`read_kernel_log`]). Zero leaves the kernel
@@ -177,6 +181,9 @@ fn main() -> !
     // The journal's bounds, before the first line logd retains.
     let bounds = history_bounds(startup.memmgr_endpoint, ipc_buf);
     let _ = STATE.set(Mutex::new(LogdState::new(bounds)));
+    // Each sink's settings and the host name, from logd's recipe, before a
+    // sink writes.
+    load_settings();
 
     // logd serves the log endpoint, so it must never emit through it. Route
     // panic / alloc-error / precondition output to the serial driver (the
@@ -197,9 +204,9 @@ fn main() -> !
     // sink's cursor, within the history's bounds; the main thread resolves it
     // again when devmgr signals its class's watch.
     let watches = resolve_output_drivers(caps.serial_class, caps.fb_class, ipc_buf);
-    // The serial sink's class is known now: its cursor is the hold mark
-    // from here, on a restart too, where no handover install sets it.
-    state().sync_hold_mark();
+    // The sinks' classes are known now: each served sink's cursor is its mark
+    // from here, on a restart too, where no handover install sets them.
+    state().sync_marks();
 
     let mut table = SlotTable::with_bounds(bounds);
 
@@ -362,7 +369,11 @@ struct LogdState
     /// would take them ([`drain_deaths`]).
     deaths: OverflowWatch,
     /// Each device sink's place in the journal, in [`SINKS`]' order.
-    cursors: [Cursor; 2],
+    cursors: [Cursor; MARKS],
+    /// Each device sink's settings, in [`SINKS`]' order: the one place they
+    /// live, which the sink's writer reads under this lock
+    /// (`services/logd/docs/sinks.md` § Settings).
+    settings: [SinkSettings; MARKS],
     /// Whether the sinks write the journal: set once init-logd writes the
     /// UART no more ([`open_output`]).
     open: bool,
@@ -379,24 +390,106 @@ impl LogdState
         let mut state = Self {
             table,
             deaths: OverflowWatch::new(DEATH_EQ_CAPACITY),
-            cursors: [Cursor::default(); 2],
+            cursors: [Cursor::default(); MARKS],
+            settings: SINKS.map(|sink| sink.kind.defaults()),
             open: false,
         };
-        state.sync_hold_mark();
+        state.sync_marks();
         state
     }
 
-    /// Tell the history where the `hold` sink's cursor is, so its eviction
-    /// drops written entries first and a sender's window counts from it; no
-    /// mark when the bootstrap carried no serial class.
-    fn sync_hold_mark(&mut self)
+    /// Tell the history where each sink's cursor is and what it shows
+    /// ([`Mark`]), so its eviction spares what a `hold` sink owes, a
+    /// sender's window counts it, and each sink's drops are counted.
+    fn sync_marks(&mut self)
     {
-        let held = (SERIAL.driver.class() != 0)
-            .then(|| self.cursors.get(SERIAL.index).map(|c| c.next))
-            .flatten();
-        self.table.history_mut().set_held_from(held);
+        for sink in SINKS
+        {
+            let mark = self.mark_of(sink);
+            self.table.history_mut().set_mark(sink.index, mark);
+        }
+    }
+
+    /// `sink`'s mark: none for a sink whose class the bootstrap carried
+    /// not, or whose level is `off`.
+    fn mark_of(&self, sink: &Sink) -> Option<Mark>
+    {
+        let settings = self.settings.get(sink.index)?;
+        let cursor = self.cursors.get(sink.index)?;
+        let least = settings.level?;
+        (sink.driver.class() != 0).then_some(Mark {
+            from: cursor.next,
+            taken: cursor.taken,
+            least,
+            relayed: settings.relayed,
+            pace: settings.pace,
+        })
+    }
+
+    /// Which sinks hold senders, a flush and the kernel reader now
+    /// ([`Sink::holding`]), by index.
+    fn holding(&self) -> [bool; MARKS]
+    {
+        SINKS.map(|sink| {
+            self.settings
+                .get(sink.index)
+                .is_some_and(|settings| sink.holding(settings))
+        })
     }
 }
+
+/// Read each sink's settings and the host name from logd's recipe
+/// (`services/logd/docs/sinks.md` § Settings) into the state: a sink's
+/// `LOGD_SINK_<NAME>` entry over its defaults, an entry that does not parse
+/// leaving them whole and logged at warning, as is a host name that is not
+/// one.
+fn load_settings()
+{
+    for sink in SINKS
+    {
+        let key = sink.kind.env_key();
+        let Ok(text) = std::env::var(key)
+        else
+        {
+            continue;
+        };
+        match sink.kind.defaults().parse_over(sink.kind, &text)
+        {
+            Ok(settings) =>
+            {
+                let mut st = state();
+                if let Some(slot) = st.settings.get_mut(sink.index)
+                {
+                    *slot = settings;
+                }
+                drop(st);
+            }
+            Err(e) =>
+            {
+                let mut buf = SerialFmt::new();
+                let _ = write!(buf, "{key} refused: {e}");
+                retain_own(LEVEL_WARN, buf.as_str().as_bytes());
+            }
+        }
+    }
+    if let Ok(text) = std::env::var(HOSTNAME_ENV)
+    {
+        if let Some(host) = HostName::parse(&text)
+        {
+            let _ = HOST.set(host);
+        }
+        else
+        {
+            let mut buf = SerialFmt::new();
+            let _ = write!(buf, "{HOSTNAME_ENV} refused: not a host name");
+            retain_own(LEVEL_WARN, buf.as_str().as_bytes());
+        }
+    }
+}
+
+/// The host name the `host` field and the rfc5424 HOSTNAME show, from
+/// `LOGD_HOSTNAME`; unset while the recipe sets none.
+static HOST: OnceLock<HostName> = OnceLock::new();
 
 impl Logd
 {
@@ -422,15 +515,17 @@ fn install_table(table: SlotTable)
     let relayed_end = table.history().next_seq();
     let earlier = core::mem::replace(&mut st.table, table);
     st.table.absorb(earlier);
-    for sink in SINKS
+    let LogdState {
+        cursors, settings, ..
+    } = &mut *st;
+    for (cursor, settings) in cursors.iter_mut().zip(settings.iter())
     {
-        if sink.relayed == Relayed::Pass
-            && let Some(cursor) = st.cursors.get_mut(sink.index)
+        if settings.relayed == Relayed::Pass
         {
             cursor.next = cursor.next.max(relayed_end);
         }
     }
-    st.sync_hold_mark();
+    st.sync_marks();
 }
 
 /// The history's bounds for the machine's RAM, as memmgr reports it
@@ -977,24 +1072,38 @@ impl Consumed
 
 /// The refusal of a message from `badge` at `level` that completes `lines`
 /// lines, read under the state lock `st`: `WINDOW_FULL` with its retry hint
-/// when the `hold` sink holds senders and the message would take the
-/// sender's unwritten entries past its window ([`admit`]); `None` when the
-/// message is taken. Allocates nothing and calls nothing, so a refusal costs
-/// logd no more than its reply.
+/// when a `hold` sink holds senders and the message would take the sender's
+/// entries one of them shows and has not written past its window
+/// ([`admit`]); `None` when the message is taken. Allocates nothing and
+/// calls nothing, so a refusal costs logd no more than its reply.
 fn window_refusal(st: &LogdState, badge: u64, lines: usize, level: u64) -> Option<Consumed>
 {
-    if lines == 0 || !SERIAL.holding()
+    let holding = st.holding();
+    if lines == 0 || !holding.contains(&true)
     {
         return None;
     }
-    match admit(st.table.unwritten_of(badge), lines, level)
+    match admit(st.table.unwritten_of(badge, &holding), lines, level)
     {
         Admit::Accept => None,
         Admit::Refuse { excess } => Some(Consumed::WindowFull(logd_codec::sink::hint_ms(
             excess as u64,
-            SERIAL.entry_us.load(Ordering::Relaxed),
+            slowest_entry_us(holding),
         ))),
     }
+}
+
+/// The longest time per entry ([`Sink::entry_us`]) of the sinks
+/// `holding` names: the pace a retry hint is reckoned at.
+fn slowest_entry_us(holding: [bool; MARKS]) -> u64
+{
+    SINKS
+        .iter()
+        .zip(holding)
+        .filter(|&(_, holds)| holds)
+        .map(|(sink, _)| sink.entry_us.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Answer a `QUERY_SLOTS` or `QUERY_HISTORY` request from the slot table
@@ -1052,30 +1161,37 @@ fn answer_flush(msg: &IpcMessage) -> IpcMessage
 }
 
 /// The answer to a flush for `token`, or for a new one (`None`): the `seq`
-/// the next retained entry takes. Flushed once the `hold` sink's cursor is at
-/// or past the token, and at once while that sink holds nobody (stalled,
-/// unserved, absent, or written inline, [`Sink::holding`]), or for a token
-/// past every entry retained, one of an earlier logd instance's; pending
-/// otherwise, with the entries' expected time as the retry hint.
+/// the next retained entry takes. Flushed once every `hold` sink's cursor is
+/// at or past the token, a sink that holds nobody (stalled, unserved,
+/// absent, `off`, or written inline, [`Sink::holding`]) not waited for, and
+/// at once for a token past every entry retained, one of an earlier logd
+/// instance's; pending otherwise, with the entries' expected time as the
+/// retry hint.
 fn flush_answer(token: Option<u64>) -> FlushAnswer
 {
-    let (token, next, cursor) = {
+    let (token, next, behind, holding) = {
         let st = state();
         let next = st.table.history().next_seq();
-        let cursor = st.cursors.get(SERIAL.index).map_or(next, |c| c.next);
+        let holding = st.holding();
+        let behind = SINKS
+            .iter()
+            .zip(&holding)
+            .filter(|&(_, &holds)| holds)
+            .filter_map(|(sink, _)| st.cursors.get(sink.index).map(|c| c.next))
+            .min();
         drop(st);
-        (token.unwrap_or(next), next, cursor)
+        (token.unwrap_or(next), next, behind, holding)
     };
-    if cursor >= token || token > next || !SERIAL.holding()
+    match behind
     {
-        return FlushAnswer::Flushed { token };
-    }
-    FlushAnswer::Pending {
-        token,
-        retry_ms: logd_codec::sink::hint_ms(
-            token.saturating_sub(cursor),
-            SERIAL.entry_us.load(Ordering::Relaxed),
-        ),
+        Some(cursor) if cursor < token && token <= next => FlushAnswer::Pending {
+            token,
+            retry_ms: logd_codec::sink::hint_ms(
+                token.saturating_sub(cursor),
+                slowest_entry_us(holding),
+            ),
+        },
+        _ => FlushAnswer::Flushed { token },
     }
 }
 
@@ -1547,25 +1663,12 @@ impl OutputDriver
     }
 }
 
-/// How a sink's progress holds senders back (`services/logd/docs/sinks.md`
-/// § Pace).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Pace
-{
-    /// Its progress holds senders back, a flush, and the kernel reader's
-    /// acknowledgement, while it is served and not stalled; the entries it
-    /// has not written are kept from eviction while a written one is left.
-    Hold,
-    /// It holds nobody, and loses the entries the history evicts before it
-    /// reaches them.
-    Skip,
-}
-
 /// A device sink: an output driver and the cursor through which its writer
 /// thread reads logd's journal ([`Sink::run_writer`]), the only thread that
 /// calls the driver once it runs, so a driver that is slow, stopped by a
 /// debugger, or dead holds that thread alone
-/// (`services/logd/docs/ipc-interface.md` § Output sinks).
+/// (`services/logd/docs/ipc-interface.md` § Output sinks). Its settings are
+/// in [`LogdState::settings`].
 struct Sink
 {
     /// The driver, as resolved through devmgr.
@@ -1577,14 +1680,16 @@ struct Sink
     /// the driver answers once the entry has left the device
     /// (`SERIAL_WRITE_SENT`); 0 for a driver that takes none ([`write_line`]).
     sent: u64,
+    /// The driver's colour label (`FB_SET_ATTRS`), which a coloured level tag
+    /// is written between two calls of ([`write_coloured`]); 0 for a driver
+    /// that takes none.
+    attrs: u64,
     /// The sink's name in logd's lines about it.
     what: &'static str,
-    /// The sink's pace.
-    pace: Pace,
-    /// What the sink does with `relayed` entries, which init-logd wrote to
-    /// the console before the handover.
-    relayed: Relayed,
-    /// The sink's cursor in [`LogdState::cursors`].
+    /// Which sink it is: its settings' defaults and recipe key.
+    kind: SinkKind,
+    /// The sink's cursor in [`LogdState::cursors`] and its settings in
+    /// [`LogdState::settings`].
     index: usize,
     /// Whether the writer thread runs; until it does, or when it could not be
     /// spawned, the entries are written by the thread that retains each
@@ -1606,17 +1711,6 @@ struct Sink
     entry_us: AtomicU64,
 }
 
-/// What a sink does with a `relayed` entry (`services/logd/docs/sinks.md`
-/// § The record).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Relayed
-{
-    /// Writes it: the sink did not show it when init-logd wrote it.
-    Write,
-    /// Passes it: init-logd wrote it to this sink's device itself.
-    Pass,
-}
-
 /// [`Sink::write_started_us`] while the writer writes nothing.
 const NOT_WRITING: u64 = u64::MAX;
 
@@ -1627,6 +1721,16 @@ struct Cursor
     /// The `seq` of the next entry the sink writes or passes: every entry
     /// before it is written, passed, or dropped.
     next: u64,
+    /// The entry the sink's writer has copied and is writing, whose eviction
+    /// is no drop of the sink's ([`Mark::taken`]).
+    taken: Option<u64>,
+    /// The `seq` after the last emergency entry the sink moved past: its next
+    /// emergency walk looks back no further, so no entry is walked twice.
+    walked: u64,
+    /// The [`Self::walked`] the emergency entry being written sets once the
+    /// sink moves past it ([`Sink::advance`]); an entry a driver lost with
+    /// its endpoint is taken, and walked, again for the next driver.
+    walk_end: Option<u64>,
     /// Entries the sink has dropped and not yet reported.
     dropped: u64,
     /// A `skip` sink's drop notice the journal holds and the sink has not
@@ -1641,23 +1745,27 @@ enum Step
     /// Nothing is left above the cursor.
     Idle,
     /// Write the line naming this many dropped entries to the sink's own
-    /// output: a `hold` sink's drops, at the gap.
-    Drops(u64),
-    /// Write the entry of this `seq`, copied into the writer's [`Taken`].
+    /// output, in these settings: a `hold` sink's drops, before the next
+    /// entry it writes.
+    Drops(u64, SinkSettings),
+    /// Write the entries of the writer's [`Walk`], then the entry of this
+    /// `seq`, copied into the writer's [`Taken`].
     Entry(u64),
 }
 
 /// An entry a writer copied out of the journal under the state lock, to
-/// render outside it.
+/// render outside it, with the settings of its sink at the copy.
 struct Taken
 {
     us: u64,
     level: u64,
+    badge: u64,
     record: bool,
     bytes: [u8; ENTRY_MAX_BYTES],
     len: usize,
     name: [u8; MAX_NAME_LEN],
     name_len: usize,
+    settings: SinkSettings,
 }
 
 impl Taken
@@ -1667,45 +1775,184 @@ impl Taken
         Self {
             us: 0,
             level: 0,
+            badge: 0,
             record: false,
             bytes: [0; ENTRY_MAX_BYTES],
             len: 0,
             name: [0; MAX_NAME_LEN],
             name_len: 0,
+            settings: SinkKind::Serial.defaults(),
         }
     }
 
-    /// Copy `entry`, to be rendered under `name`.
-    fn copy(&mut self, entry: &HistoryEntry, name: &[u8])
+    /// Copy `entry`, to be rendered under `name` in `settings`.
+    fn copy(&mut self, entry: &HistoryEntry, name: &[u8], settings: SinkSettings)
     {
         self.us = entry.us;
         self.level = entry.level;
+        self.badge = entry.badge;
         self.record = matches!(entry.kind, logd_slot_table::EntryKind::Record { .. });
         self.len = copy_into(&mut self.bytes, &entry.bytes);
         self.name_len = copy_into(&mut self.name, name);
+        self.settings = settings;
     }
 
-    /// Render the entry as its console line into `out`.
-    fn render(&self, out: &mut LineBuf)
+    /// Render the entry as its sink's line into `out`, in place of what it
+    /// held ([`render_line`]).
+    fn render(&self, out: &mut LineBuf) -> Option<Tag>
     {
-        let name = self.name.get(..self.name_len).unwrap_or_default();
+        out.clear();
+        let entry = logd_codec::console::Entry {
+            us: self.us,
+            level: self.level,
+            badge: self.badge,
+            name: self.name.get(..self.name_len).unwrap_or_default(),
+            host: HOST.get().map(HostName::as_bytes),
+        };
         let bytes = self.bytes.get(..self.len).unwrap_or_default();
-        if self.record
+        let body = if self.record
         {
-            out.push_prefix_at(name, self.level, self.us);
-            // A record is retained only once it decodes.
-            if let Ok(record) = Record::decode(bytes)
-            {
-                logd_codec::record::render(&record, |b| out.push(b));
-            }
-            out.push(b'\r');
-            out.push(b'\n');
+            Body::Record(bytes)
         }
         else
         {
-            out.push_text_line(name, self.level, self.us, bytes);
+            Body::Text(bytes)
+        };
+        render_line(&self.settings, &entry, body, out)
+    }
+}
+
+/// The `seq`s of the entries an emergency walk writes before the emergency
+/// entry, oldest first (`services/logd/docs/sinks.md` § Device sinks).
+struct Walk
+{
+    seqs: [u64; BACKLOG_MAX as usize],
+    len: usize,
+}
+
+impl Walk
+{
+    const fn new() -> Self
+    {
+        Self {
+            seqs: [0; BACKLOG_MAX as usize],
+            len: 0,
         }
     }
+
+    /// The walk back from the emergency entry `seq` in `history`: the last
+    /// `settings.backlog` entries before it, at or after `walked`, that the
+    /// sink in `settings` has not written and writes before it
+    /// ([`SinkSettings::walks`]).
+    fn collect(&mut self, history: &History, seq: u64, walked: u64, settings: &SinkSettings)
+    {
+        let backlog = usize::from(settings.backlog).min(self.seqs.len());
+        self.len = self.seqs.get_mut(..backlog).map_or(0, |out| {
+            history.walk_back(
+                seq,
+                walked,
+                |entry| settings.walks(entry.level, entry.origin == Origin::Relayed),
+                out,
+            )
+        });
+    }
+
+    /// The walk's `seq`s, oldest first.
+    fn seqs(&self) -> &[u64]
+    {
+        self.seqs.get(..self.len).unwrap_or_default()
+    }
+}
+
+/// What a line shows as its message: a text line's bytes or a record's
+/// payload.
+#[derive(Clone, Copy)]
+enum Body<'a>
+{
+    Text(&'a [u8]),
+    Record(&'a [u8]),
+}
+
+impl Body<'_>
+{
+    /// Write the message: a text line's bytes with each `\n` written `\r\n`,
+    /// or a record's rendering (`logd_codec::record::render`).
+    fn write(self, out: &mut dyn FnMut(u8))
+    {
+        match self
+        {
+            Self::Text(bytes) =>
+            {
+                for &b in bytes
+                {
+                    if b == b'\n'
+                    {
+                        out(b'\r');
+                    }
+                    out(b);
+                }
+            }
+            Self::Record(bytes) =>
+            {
+                // A record is retained only once it decodes.
+                if let Ok(record) = Record::decode(bytes)
+                {
+                    logd_codec::record::render(&record, out);
+                }
+            }
+        }
+    }
+}
+
+/// Where a line's level tag is and the colours it is drawn in
+/// ([`write_coloured`]).
+#[derive(Clone, Copy)]
+struct Tag
+{
+    start: usize,
+    end: usize,
+    colour: logd_codec::level::TagColour,
+}
+
+// The default colours a line is drawn in and a tag's colour is reset to are
+// the terminal's, so a log line leaves the terminal's colours as it found them.
+const _: () = assert!(
+    logd_codec::level::DEFAULT_COLOUR.fg == ansi::DEFAULT_FG
+        && logd_codec::level::DEFAULT_COLOUR.bg == ansi::DEFAULT_BG
+);
+
+/// Render `entry` with message `body` as one line in `settings`' format
+/// (`logd_codec::console`, `logd_codec::rfc5424`) into `out`, ending it with
+/// `\r\n`. The level tag to colour, when the settings colour it and its
+/// colours are not the default ones.
+fn render_line(
+    settings: &SinkSettings,
+    entry: &logd_codec::console::Entry<'_>,
+    body: Body<'_>,
+    out: &mut LineBuf,
+) -> Option<Tag>
+{
+    let span = match settings.format
+    {
+        Format::Console =>
+        {
+            logd_codec::console::write(&settings.fields, entry, &mut |b| out.push(b), |w| {
+                body.write(w);
+            })
+        }
+        Format::Rfc5424 =>
+        {
+            logd_codec::rfc5424::write(entry, settings.facility, &mut |b| out.push(b), |w| {
+                body.write(w);
+            });
+            None
+        }
+    };
+    out.push(b'\r');
+    out.push(b'\n');
+    let colour = logd_codec::level::colour(entry.level);
+    span.filter(|_| settings.colour == Colour::On && colour != logd_codec::level::DEFAULT_COLOUR)
+        .map(|(start, end)| Tag { start, end, colour })
 }
 
 /// Copy as much of `src` as fits into `dst`; the bytes copied.
@@ -1731,9 +1978,9 @@ impl Sink
     const fn new(
         op: u64,
         sent: u64,
+        attrs: u64,
         what: &'static str,
-        pace: Pace,
-        relayed: Relayed,
+        kind: SinkKind,
         index: usize,
     ) -> Self
     {
@@ -1741,9 +1988,9 @@ impl Sink
             driver: OutputDriver::new(),
             op,
             sent,
+            attrs,
             what,
-            pace,
-            relayed,
+            kind,
             index,
             writer: AtomicBool::new(false),
             inline_busy: Mutex::new(false),
@@ -1753,14 +2000,15 @@ impl Sink
         }
     }
 
-    /// Whether the sink holds senders, a flush and the kernel reader now: a
-    /// `hold` sink whose class the bootstrap carried, whose writer runs and
-    /// is served, and whose current write is not older than
-    /// [`SINK_STALL_MS`]. A sink that is stalled, unserved, absent, or written
-    /// inline holds nobody.
-    fn holding(&self) -> bool
+    /// Whether the sink holds senders, a flush and the kernel reader now, in
+    /// `settings`: a `hold` sink not `off` whose class the bootstrap carried,
+    /// whose writer runs and is served, and whose current write is not older
+    /// than [`SINK_STALL_MS`]. A sink that is stalled, unserved, absent,
+    /// `off`, or written inline holds nobody.
+    fn holding(&self, settings: &SinkSettings) -> bool
     {
-        if self.pace != Pace::Hold
+        if settings.pace != Pace::Hold
+            || settings.level.is_none()
             || self.driver.class() == 0
             || !self.writer.load(Ordering::Acquire)
             || self.driver.cap() == 0
@@ -1771,52 +2019,97 @@ impl Sink
         !logd_codec::sink::write_overdue((started != NOT_WRITING).then_some(started), elapsed_us())
     }
 
-    /// The writer's next step from its cursor, under the state lock `st`:
-    /// count the gap before the next entry as dropped, pass the entries the
-    /// sink does not write, report drops (a `hold` sink's at the gap, before
-    /// the next entry it writes, a `skip` sink's as its notice in the
-    /// journal, [`retain_notice`], which wakes the writers), and copy the
-    /// next entry into `taken`.
-    fn next(&self, st: &mut LogdState, taken: &mut Taken) -> Step
+    /// The writer's next step from its cursor, under the state lock `st`
+    /// ([`Self::step`]), then the sink's mark moved with the cursor, and the
+    /// kernel reader woken when the cursor passed entries.
+    fn next(&self, st: &mut LogdState, taken: &mut Taken, walk: &mut Walk) -> Step
     {
-        let LogdState { table, cursors, .. } = st;
-        let Some(cursor) = cursors.get_mut(self.index)
+        let before = st.cursors.get(self.index).map(|c| c.next);
+        let step = self.step(st, taken, walk);
+        st.sync_marks();
+        if st.cursors.get(self.index).map(|c| c.next) != before
+        {
+            PROGRESS.notify_all();
+        }
+        step
+    }
+
+    /// The writer's next step from its cursor: take the drops the history
+    /// counted for the sink, pass the entries it does not show (below its
+    /// level, or `relayed` ones it passes), report drops (a `hold` sink's
+    /// before the next entry it writes, a `skip` sink's as its notice in the
+    /// journal, [`retain_notice`], which wakes the writers), and copy the
+    /// next entry it shows into `taken`, and for an emergency entry the
+    /// walk back before it into `walk`. An `off` sink's cursor follows the
+    /// newest entry, and it counts no drops.
+    fn step(&self, st: &mut LogdState, taken: &mut Taken, walk: &mut Walk) -> Step
+    {
+        let LogdState {
+            table,
+            cursors,
+            settings,
+            ..
+        } = st;
+        let (Some(cursor), Some(&settings)) =
+            (cursors.get_mut(self.index), settings.get(self.index))
         else
         {
             return Step::Idle;
         };
+        if settings.level.is_none()
+        {
+            cursor.next = table.history().next_seq();
+            cursor.taken = None;
+            cursor.walk_end = None;
+            cursor.dropped = 0;
+            return Step::Idle;
+        }
+        cursor.dropped = cursor
+            .dropped
+            .saturating_add(table.history_mut().take_evicted(self.index));
+        let mut found = None;
         while let Some((seq, entry)) = table.history().entry_from(cursor.next)
         {
-            cursor.dropped = cursor
-                .dropped
-                .saturating_add(seq.saturating_sub(cursor.next));
             cursor.next = seq;
-            if cursor.dropped > 0 && self.pace == Pace::Hold
+            if cursor.dropped > 0 && settings.pace == Pace::Hold
             {
-                return Step::Drops(core::mem::take(&mut cursor.dropped));
+                return Step::Drops(core::mem::take(&mut cursor.dropped), settings);
             }
-            if entry.origin == Origin::Relayed && self.relayed == Relayed::Pass
+            if !settings.shows(entry.level, entry.origin == Origin::Relayed)
             {
                 cursor.next = seq.saturating_add(1);
                 continue;
             }
-            taken.copy(entry, table.name_of(entry.badge));
-            if cursor.dropped > 0
+            taken.copy(entry, table.name_of(entry.badge), settings);
+            found = Some(seq);
+            break;
+        }
+        let Some(seq) = found
+        else
+        {
+            if cursor.dropped > 0 && settings.pace == Pace::Skip
             {
                 retain_notice(self.what, cursor, table);
+                RETAINED.notify_all();
             }
-            return Step::Entry(seq);
+            return Step::Idle;
+        };
+        cursor.taken = Some(seq);
+        walk.len = 0;
+        if level_or_info(taken.level) == LEVEL_EMERGENCY
+        {
+            walk.collect(table.history(), seq, cursor.walked, &settings);
+            cursor.walk_end = Some(seq.saturating_add(1));
         }
-        if cursor.dropped > 0 && self.pace == Pace::Skip
+        if cursor.dropped > 0
         {
             retain_notice(self.what, cursor, table);
-            RETAINED.notify_all();
         }
-        Step::Idle
+        Step::Entry(seq)
     }
 
     /// Move the cursor past entry `seq`, counting it as dropped when the
-    /// driver did not take it whole (`wrote`), and move the hold mark with
+    /// driver did not take it whole (`wrote`), and move the sink's mark with
     /// it.
     fn advance(&self, seq: u64, wrote: Wrote)
     {
@@ -1825,28 +2118,52 @@ impl Sink
             if let Some(cursor) = st.cursors.get_mut(self.index)
             {
                 cursor.next = cursor.next.max(seq.saturating_add(1));
+                cursor.taken = None;
+                if let Some(end) = cursor.walk_end.take()
+                {
+                    cursor.walked = cursor.walked.max(end);
+                }
                 cursor.dropped = cursor
                     .dropped
                     .saturating_add(u64::from(wrote != Wrote::All));
             }
-            st.sync_hold_mark();
+            st.sync_marks();
         }
         PROGRESS.notify_all();
     }
 
+    /// Give up the entry the writer copied, which a driver lost with its
+    /// endpoint: the writer takes it again from the journal for the next
+    /// driver, and its eviction meanwhile is the sink's drop.
+    fn release_taken(&self)
+    {
+        let mut st = state();
+        if let Some(cursor) = st.cursors.get_mut(self.index)
+        {
+            cursor.taken = None;
+            cursor.walk_end = None;
+        }
+        st.sync_marks();
+    }
+
     /// The writer thread: wait until the sinks open and a driver is served,
-    /// take each entry above the cursor in `seq` order, render it outside
-    /// every lock, and write it with calls that have no bound ([`write_line`]),
-    /// so an entry is written once, when the driver answers, however long it
-    /// is stopped. A `skip` sink's cursor starts at most its backlog behind
-    /// the newest entry each time a driver comes up ([`Self::attach`]). An
-    /// entry the driver lost with its endpoint is written again, whole, to the
-    /// driver resolved next; until one is, the sink counts as writing it, so
-    /// it stalls past [`SINK_STALL_MS`].
+    /// take each entry above the cursor that the sink shows, in `seq` order,
+    /// render it outside every lock, and write it with calls that have no
+    /// bound ([`write_line`]), so an entry is written once, when the driver
+    /// answers, however long it is stopped. Before an emergency entry it
+    /// writes the entries of its walk back ([`Walk`]). A `skip` sink's cursor
+    /// starts at most its `backlog` behind the newest entry each time a
+    /// driver comes up ([`Self::attach`]). An entry the driver lost with its
+    /// endpoint is written again, whole, to the driver resolved next; until
+    /// one is, the sink counts as writing it, so it stalls past
+    /// [`SINK_STALL_MS`].
     fn run_writer(&self) -> !
     {
         let ipc_buf = emit_ipc_buf();
         let mut taken = Taken::new();
+        let mut context = Taken::new();
+        let mut walk = Walk::new();
+        let mut out = LineBuf::new();
         let mut held = 0u64;
         loop
         {
@@ -1862,11 +2179,11 @@ impl Sink
                 {
                     if st.open
                     {
-                        match self.next(&mut st, &mut taken)
+                        match self.next(&mut st, &mut taken, &mut walk)
                         {
                             Step::Idle =>
                             {}
-                            step @ (Step::Drops(_) | Step::Entry(_)) => break step,
+                            step @ (Step::Drops(..) | Step::Entry(_)) => break step,
                         }
                     }
                     st = RETAINED.wait(st).unwrap_or_else(PoisonError::into_inner);
@@ -1878,20 +2195,35 @@ impl Sink
             {
                 Step::Idle =>
                 {}
-                Step::Drops(dropped) =>
+                Step::Drops(dropped, settings) =>
                 {
-                    let line = drop_line(self.what, dropped);
-                    let _ = self.write_driver(cap, line.bytes(), ipc_buf);
+                    let tag = drop_line(self.what, dropped, &settings, &mut out);
+                    let _ = self.write_driver(cap, &out, tag, ipc_buf);
                 }
                 Step::Entry(seq) =>
                 {
-                    let mut out = LineBuf::new();
-                    taken.render(&mut out);
-                    match self.write_driver(cap, out.bytes(), ipc_buf)
+                    let walked = Self::write_walk(
+                        &walk,
+                        &taken.settings,
+                        &mut context,
+                        &mut out,
+                        |line, tag| self.write_driver(cap, line, tag, ipc_buf),
+                    );
+                    let wrote = if walked == Wrote::Gone
                     {
-                        wrote @ (Wrote::All | Wrote::Lost) => self.advance(seq, wrote),
+                        Wrote::Gone
+                    }
+                    else
+                    {
+                        let tag = taken.render(&mut out);
+                        self.write_driver(cap, &out, tag, ipc_buf)
+                    };
+                    match wrote
+                    {
+                        Wrote::All | Wrote::Lost => self.advance(seq, wrote),
                         Wrote::Gone =>
                         {
+                            self.release_taken();
                             self.write_started_us.store(elapsed_us(), Ordering::Relaxed);
                             self.driver.await_other(cap);
                             self.write_started_us.store(NOT_WRITING, Ordering::Relaxed);
@@ -1902,30 +2234,87 @@ impl Sink
         }
     }
 
-    /// A driver came up: a `skip` sink's cursor starts at most
-    /// [`logd_codec::sink::SKIP_BACKLOG`] entries before the newest, the
-    /// entries passed counted as dropped.
-    fn attach(&self)
+    /// Write the entries of `walk` the journal still holds, each copied into
+    /// `context` under the state lock and rendered in `settings` into `out`
+    /// outside it,
+    /// through `write`; `Wrote::Gone` once a write finds the driver gone,
+    /// which ends the walk.
+    fn write_walk(
+        walk: &Walk,
+        settings: &SinkSettings,
+        context: &mut Taken,
+        out: &mut LineBuf,
+        mut write: impl FnMut(&LineBuf, Option<Tag>) -> Wrote,
+    ) -> Wrote
     {
-        if self.pace != Pace::Skip
+        for &seq in walk.seqs()
         {
-            return;
+            let held = {
+                let st = state();
+                match st.table.history().entry_from(seq)
+                {
+                    Some((at, entry)) if at == seq =>
+                    {
+                        context.copy(entry, st.table.name_of(entry.badge), *settings);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if !held
+            {
+                continue;
+            }
+            let tag = context.render(out);
+            if write(out, tag) == Wrote::Gone
+            {
+                return Wrote::Gone;
+            }
         }
-        let mut st = state();
-        let next = st.table.history().next_seq();
-        if let Some(cursor) = st.cursors.get_mut(self.index)
-        {
-            let start = logd_codec::sink::attach_cursor(cursor.next, next);
-            cursor.dropped = cursor
-                .dropped
-                .saturating_add(start.saturating_sub(cursor.next));
-            cursor.next = start;
-        }
+        Wrote::All
     }
 
-    /// The writer's write of `bytes` to the driver behind `cap`, unbounded,
-    /// timed for [`Self::holding`] and the retry hint.
-    fn write_driver(&self, cap: u64, bytes: &[u8], ipc_buf: *mut u64) -> Wrote
+    /// A driver came up: a `skip` sink's cursor starts at most its `backlog`
+    /// entries before the newest ([`logd_codec::sink::attach_cursor`]), the
+    /// entries passed that it shows counted as dropped.
+    fn attach(&self)
+    {
+        let mut st = state();
+        {
+            let LogdState {
+                table,
+                cursors,
+                settings,
+                ..
+            } = &mut *st;
+            let (Some(cursor), Some(settings)) =
+                (cursors.get_mut(self.index), settings.get(self.index))
+            else
+            {
+                return;
+            };
+            if settings.pace != Pace::Skip || settings.level.is_none()
+            {
+                return;
+            }
+            let next = table.history().next_seq();
+            let start =
+                logd_codec::sink::attach_cursor(cursor.next, next, u64::from(settings.backlog));
+            let passed = table
+                .history()
+                .between(cursor.next, start)
+                .filter(|(_, entry)| settings.shows(entry.level, entry.origin == Origin::Relayed))
+                .count();
+            cursor.dropped = cursor.dropped.saturating_add(passed as u64);
+            cursor.next = cursor.next.max(start);
+        }
+        st.sync_marks();
+    }
+
+    /// The writer's write of `line` to the driver behind `cap`, its level tag
+    /// coloured when `tag` says so ([`write_coloured`]), unbounded, timed for
+    /// [`Self::holding`] and the retry hint.
+    fn write_driver(&self, cap: u64, line: &LineBuf, tag: Option<Tag>, ipc_buf: *mut u64) -> Wrote
     {
         if ipc_buf.is_null()
         {
@@ -1933,7 +2322,7 @@ impl Sink
         }
         let started = elapsed_us();
         self.write_started_us.store(started, Ordering::Relaxed);
-        let wrote = write_line(cap, self.op, self.sent, bytes, ipc_buf, Bound::Unbounded);
+        let wrote = self.write_coloured(cap, line.bytes(), tag, ipc_buf, Bound::Unbounded);
         self.write_started_us.store(NOT_WRITING, Ordering::Relaxed);
         if wrote == Wrote::All
         {
@@ -1941,6 +2330,76 @@ impl Sink
                 .store(elapsed_us().saturating_sub(started), Ordering::Relaxed);
         }
         wrote
+    }
+
+    /// Write `bytes`, one line, to the driver behind `cap` ([`write_line`]),
+    /// with the level tag `tag` names drawn in its colours on a driver that
+    /// takes colour: the bytes before the tag, the colours
+    /// ([`Sink::attrs`]), the tag, the default colour, then the rest, so a
+    /// terminal's colour is reset by the line
+    /// (`services/logd/docs/sinks.md` § Colour). Every call is bounded by
+    /// `bound`; the first that does not succeed ends the write.
+    fn write_coloured(
+        &self,
+        cap: u64,
+        bytes: &[u8],
+        tag: Option<Tag>,
+        ipc_buf: *mut u64,
+        bound: Bound,
+    ) -> Wrote
+    {
+        let parts = tag.filter(|_| self.attrs != 0).and_then(|tag| {
+            Some((
+                bytes.get(..tag.start)?,
+                bytes.get(tag.start..tag.end)?,
+                bytes.get(tag.end..)?,
+                tag.colour,
+            ))
+        });
+        let Some((head, text, tail, colour)) = parts
+        else
+        {
+            return write_line(cap, self.op, self.sent, bytes, ipc_buf, bound);
+        };
+        let attrs = |colour: logd_codec::level::TagColour| {
+            let [r, g, b] = ansi::ansi_rgb(colour.fg);
+            let [br, bg, bb] = ansi::ansi_rgb(colour.bg);
+            [r, g, b, br, bg, bb]
+        };
+        let steps = [
+            write_line(cap, self.op, 0, head, ipc_buf, bound),
+            call_step(
+                cap,
+                self.attrs,
+                &attrs(colour),
+                ipc_buf,
+                bound,
+                Step2::Chunk,
+            ),
+        ];
+        if let Some(&failed) = steps.iter().find(|&&w| w != Wrote::All)
+        {
+            return failed;
+        }
+        let wrote = write_line(cap, self.op, 0, text, ipc_buf, bound);
+        // The default colour is set back whatever became of the tag.
+        let reset = call_step(
+            cap,
+            self.attrs,
+            &attrs(logd_codec::level::DEFAULT_COLOUR),
+            ipc_buf,
+            bound,
+            Step2::Chunk,
+        );
+        if wrote != Wrote::All
+        {
+            return wrote;
+        }
+        if reset != Wrote::All
+        {
+            return reset;
+        }
+        write_line(cap, self.op, self.sent, tail, ipc_buf, bound)
     }
 
     /// Write the entries above the cursor from the calling thread, for a sink
@@ -1965,6 +2424,9 @@ impl Sink
         }
         let bound = Bound::By(deadline);
         let mut taken = Taken::new();
+        let mut context = Taken::new();
+        let mut walk = Walk::new();
+        let mut out = LineBuf::new();
         while bound.next_ms().is_some()
         {
             let cap = self.driver.cap();
@@ -1978,7 +2440,7 @@ impl Sink
                 {
                     break;
                 }
-                let step = self.next(&mut st, &mut taken);
+                let step = self.next(&mut st, &mut taken, &mut walk);
                 drop(st);
                 step
             };
@@ -1986,16 +2448,22 @@ impl Sink
             match step
             {
                 Step::Idle => break,
-                Step::Drops(dropped) =>
+                Step::Drops(dropped, settings) =>
                 {
-                    let line = drop_line(self.what, dropped);
-                    let _ = write_line(cap, self.op, self.sent, line.bytes(), ipc_buf, bound);
+                    let tag = drop_line(self.what, dropped, &settings, &mut out);
+                    let _ = self.write_coloured(cap, out.bytes(), tag, ipc_buf, bound);
                 }
                 Step::Entry(seq) =>
                 {
-                    let mut out = LineBuf::new();
-                    taken.render(&mut out);
-                    let wrote = write_line(cap, self.op, self.sent, out.bytes(), ipc_buf, bound);
+                    let _ = Self::write_walk(
+                        &walk,
+                        &taken.settings,
+                        &mut context,
+                        &mut out,
+                        |line, tag| self.write_coloured(cap, line.bytes(), tag, ipc_buf, bound),
+                    );
+                    let tag = taken.render(&mut out);
+                    let wrote = self.write_coloured(cap, out.bytes(), tag, ipc_buf, bound);
                     self.advance(seq, wrote);
                 }
             }
@@ -2079,48 +2547,51 @@ fn retain_notice(what: &str, cursor: &mut Cursor, table: &mut SlotTable)
     cursor.notice = Some((seq, total));
 }
 
-/// The line naming `dropped` entries sink `what` did not write, as logd's
-/// notice, stamped now (`services/logd/docs/sinks.md` § Drops).
-fn drop_line(what: &str, dropped: u64) -> LineBuf
+/// Build in `line` the line naming `dropped` entries sink `what` did not
+/// write, as logd's notice, stamped now, in the sink's `settings`; its tag to
+/// colour (`services/logd/docs/sinks.md` § Drops).
+fn drop_line(what: &str, dropped: u64, settings: &SinkSettings, line: &mut LineBuf) -> Option<Tag>
 {
     let text = logd_codec::sink::drop_text(what, dropped);
-    let mut line = LineBuf::new();
-    line.push_text_line(
-        b"logd",
-        LEVEL_NOTICE,
-        elapsed_us(),
-        text.as_str().as_bytes(),
-    );
-    line
+    line.clear();
+    let entry = logd_codec::console::Entry {
+        us: elapsed_us(),
+        level: LEVEL_NOTICE,
+        badge: LOG_BADGE_LOGD,
+        name: b"logd",
+        host: HOST.get().map(HostName::as_bytes),
+    };
+    render_line(settings, &entry, Body::Text(text.as_str().as_bytes()), line)
 }
 
-/// The serial driver: the `hold` sink. Each entry's write ends with a barrier
-/// the driver answers once its bytes have left the UART (`SERIAL_WRITE_SENT`,
+/// The serial driver. Each entry's write ends with a barrier the driver
+/// answers once its bytes have left the UART (`SERIAL_WRITE_SENT`,
 /// [`write_line`]), so its cursor passes an entry only once the entry is on
-/// the wire (`services/logd/docs/sinks.md` § Device sinks). It passes the
-/// `relayed` entries init-logd wrote to the UART itself.
+/// the wire (`services/logd/docs/sinks.md` § Device sinks). By default a
+/// `hold` sink at informational that passes the `relayed` entries
+/// init-logd wrote to the UART itself.
 static SERIAL: Sink = Sink::new(
     ipc::serial_labels::SERIAL_WRITE_BYTES,
     ipc::serial_labels::SERIAL_WRITE_SENT,
+    0,
     "serial",
-    Pace::Hold,
-    Relayed::Pass,
+    SinkKind::Serial,
     0,
 );
-/// The framebuffer driver: a `skip` sink, which shows `relayed` entries in
-/// its backlog. A headless boot runs none, so the sink stays unserved and
-/// writes nothing.
+/// The framebuffer driver, which takes colour (`FB_SET_ATTRS`). By default a
+/// `skip` sink at critical that shows `relayed` entries in its backlog. A
+/// headless boot runs none, so the sink stays unserved and writes nothing.
 static FB: Sink = Sink::new(
     ipc::fb_labels::FB_WRITE_BYTES,
     0,
+    ipc::fb_labels::FB_SET_ATTRS,
     "framebuffer",
-    Pace::Skip,
-    Relayed::Write,
+    SinkKind::Framebuffer,
     1,
 );
 
 /// Every device sink, in [`LogdState::cursors`]' order.
-static SINKS: [&Sink; 2] = [&SERIAL, &FB];
+static SINKS: [&Sink; MARKS] = [&SERIAL, &FB];
 
 /// Maximum payload bytes per `SERIAL_WRITE_BYTES` or `FB_WRITE_BYTES` (one
 /// full IPC data area).
@@ -2206,7 +2677,7 @@ fn write_inline_sinks()
 }
 
 /// Wait until every holding `hold` sink's cursor has passed entry `seq`, or
-/// the sink stops holding (stalled, unserved, absent): the kernel log
+/// the sink stops holding (stalled, unserved, absent, `off`): the kernel log
 /// reader's wait before it acknowledges the records it retained
 /// (`services/logd/docs/sinks.md` § The kernel's lines).
 fn await_hold_passed(seq: u64)
@@ -2214,8 +2685,9 @@ fn await_hold_passed(seq: u64)
     let mut st = state();
     loop
     {
-        let waiting = SINKS.iter().any(|sink| {
-            sink.holding()
+        let holding = st.holding();
+        let waiting = SINKS.iter().zip(holding).any(|(sink, holds)| {
+            holds
                 && st
                     .cursors
                     .get(sink.index)
@@ -2415,16 +2887,25 @@ fn call_chunk(cap: u64, op: u64, chunk: &[u8], ipc_buf: *mut u64, timeout_ms: u3
 const WRITE_SUCCESS: u64 = ipc::serial_errors::SUCCESS;
 const _: () = assert!(WRITE_SUCCESS == ipc::fb_errors::SUCCESS);
 
-/// Longest frame of a line: the prefix [`LineBuf::push_prefix_at`] writes
-/// (`logd_codec::prefix::PREFIX_MAX`) and the line's `\r\n`.
-const LINE_FRAME_MAX: usize = logd_codec::prefix::PREFIX_MAX + 2;
+/// Longest frame of a line: the longer of what the console and the rfc5424
+/// formats write around the message, and the line's `\r\n`.
+const LINE_FRAME_MAX: usize = if logd_codec::console::FRAME_MAX > logd_codec::rfc5424::HEADER_MAX
+{
+    logd_codec::console::FRAME_MAX
+}
+else
+{
+    logd_codec::rfc5424::HEADER_MAX
+} + 2;
 
-/// Bytes of a [`LineBuf`]: the frame of any logd line with its longest body,
-/// a rendered record ([`RENDERED_MAX_BYTES`]), which is longer than any text
-/// line (`LINE_BUF_SIZE`), so no line is cut.
+/// Bytes of a [`LineBuf`]: the frame of any logd line with its longest
+/// message, a rendered record ([`RENDERED_MAX_BYTES`]), which is longer than
+/// any text line, its `\n`s written `\r\n` or each of its bytes escaped
+/// `\xNN` in the rfc5424 format (four times `LINE_BUF_SIZE`), so no line is
+/// cut.
 const LINE_OUT_BYTES: usize = LINE_FRAME_MAX + RENDERED_MAX_BYTES;
 
-const _: () = assert!(RENDERED_MAX_BYTES >= LINE_BUF_SIZE);
+const _: () = assert!(RENDERED_MAX_BYTES >= 4 * LINE_BUF_SIZE);
 
 /// Fixed-capacity line builder, sized to hold any logd line
 /// ([`LINE_OUT_BYTES`]); the serial and framebuffer writes split it into
@@ -2456,34 +2937,10 @@ impl LineBuf
         }
     }
 
-    /// Push a byte, expanding a bare `\n` to `\r\n` for terminal output.
-    fn push_escaped(&mut self, b: u8)
+    /// Empty the line, to build the next in its place.
+    fn clear(&mut self)
     {
-        if b == b'\n'
-        {
-            self.push(b'\r');
-        }
-        self.push(b);
-    }
-
-    /// Push a line's prefix (`logd_codec::prefix::write`), stamped `us`
-    /// microseconds of the monotonic clock.
-    fn push_prefix_at(&mut self, name: &[u8], level: u64, us: u64)
-    {
-        logd_codec::prefix::write(us, level, name, |b| self.push(b));
-    }
-
-    /// Push a text line: the prefix stamped `us`, the line's bytes with each
-    /// `\n` written `\r\n`, and the closing `\r\n`.
-    fn push_text_line(&mut self, name: &[u8], level: u64, us: u64, line: &[u8])
-    {
-        self.push_prefix_at(name, level, us);
-        for &b in line
-        {
-            self.push_escaped(b);
-        }
-        self.push(b'\r');
-        self.push(b'\n');
+        self.len = 0;
     }
 
     /// The line as pushed so far.

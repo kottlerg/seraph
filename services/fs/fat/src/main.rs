@@ -48,6 +48,16 @@
 //! loop itself receives on the service endpoint alone, so a revocation of
 //! the endpoint ends the driver at its next receive.
 //!
+//! Helper start: the eviction worker, the pressure thread and the
+//! donation-end thread each touch [`HELPER_STACK_TOUCH_BYTES`] of their
+//! demand-paged stack as their first action and then report that they have
+//! started ([`helper_start`]); `main` enters the dispatch loop, and so
+//! answers `FS_MOUNT`, only once every helper it started has reported. A
+//! helper acts when memory is short, and the first touch of a thread's stack
+//! takes pages from memmgr, so each takes its stack pages at start, before
+//! the driver serves, and needs no new memory to start acting. A helper whose
+//! spawn failed reports nothing and is not waited for.
+//!
 //! Session end: the donation-end thread waits on a Notification registered
 //! with memmgr (`memmgr_labels::REGISTER_DONATION_END`), which memmgr
 //! signals when the handle state of a node fatfs holds a charged grant on
@@ -83,6 +93,7 @@ mod session;
 use core::num::NonZeroU64;
 use std::os::seraph::{MemoryPressure, StartupInfo, startup_info};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use alloc::{FatError, allocate_cluster};
@@ -186,6 +197,11 @@ fn main() -> !
 
     let eviction = Arc::new(EvictionState::new());
 
+    // Each helper started holds a clone of `started` and reports on it once
+    // its stack is backed (module docs, Helper start); one whose spawn fails
+    // drops its clone unsent.
+    let (started, helpers_started) = channel::<()>();
+
     // Spawn the cache-pressure eviction worker. The worker owns
     // outbound `FS_RELEASE_MEMORY` issuance and the cooperative-
     // release watchdog; main only enqueues. Spawn failure is
@@ -195,9 +211,13 @@ fn main() -> !
     {
         let ev = eviction.clone();
         let f = opens.clone();
+        let report = started.clone();
         if std::thread::Builder::new()
             .name("fatfs-eviction-worker".into())
-            .spawn(move || eviction::worker_loop(&ev, &f, cache))
+            .spawn(move || {
+                helper_start(report);
+                eviction::worker_loop(&ev, &f, cache)
+            })
             .is_err()
         {
             std::os::seraph::log!(error: "eviction worker spawn failed");
@@ -205,12 +225,53 @@ fn main() -> !
         }
     }
 
-    spawn_pressure_thread(caps.service);
-    spawn_donation_end_thread(caps.service, ipc_buf);
+    spawn_pressure_thread(caps.service, &started);
+    spawn_donation_end_thread(caps.service, ipc_buf, &started);
+
+    // Serve only once every helper started has its stack: the receive ends
+    // with an error once each clone of `started` is gone.
+    drop(started);
+    while helpers_started.recv().is_ok()
+    {}
 
     service_loop(
         &caps, &mut state, &mut nodes, &opens, cache, ipc_buf, &eviction,
     );
+}
+
+// ── Helper start ───────────────────────────────────────────────────────────
+
+/// Bytes of stack each helper thread touches at start, below the frame of
+/// its loop: more than its waits, its wake call, an eviction's watchdog spawn
+/// and a log line go down. Each helper's stack is demand-paged, and this
+/// lies within the stack's first demand chunk, which the thread's first
+/// instruction backs.
+const HELPER_STACK_TOUCH_BYTES: usize = 32 * 1024;
+
+/// A helper thread's first action (module docs, Helper start): touch
+/// [`HELPER_STACK_TOUCH_BYTES`] of its stack, so the pages it runs on are
+/// backed before the driver serves, then report on `started`.
+fn helper_start(started: Sender<()>)
+{
+    touch_stack();
+    // The receiver lives until every helper has reported or gone.
+    let _ = started.send(());
+    // Dropped here rather than when the helper ends: `main`'s receive ends
+    // once every clone is gone.
+    drop(started);
+}
+
+/// Touch [`HELPER_STACK_TOUCH_BYTES`] of the stack below this frame.
+#[inline(never)]
+#[expect(
+    clippy::large_stack_arrays,
+    clippy::large_stack_frames,
+    reason = "the probe exists to occupy and touch this much of the stack"
+)]
+fn touch_stack()
+{
+    let mut probe = [0u8; HELPER_STACK_TOUCH_BYTES];
+    std::hint::black_box(&mut probe);
 }
 
 // ── Memory pressure ────────────────────────────────────────────────────────
@@ -231,7 +292,7 @@ const _: () = assert!(LOOP_WAKE != fs_labels::FS_MOUNT && LOOP_WAKE != fs_labels
 /// SEND derived from `service`. Logged and skipped when the process is not
 /// registered for pressure or the cap or the thread cannot be had: the cache
 /// is then kept whatever the level, since the level is advisory.
-fn spawn_pressure_thread(service: u64)
+fn spawn_pressure_thread(service: u64, started: &Sender<()>)
 {
     if std::os::seraph::memory_pressure_notification().is_none()
     {
@@ -244,9 +305,13 @@ fn spawn_pressure_thread(service: u64)
         std::os::seraph::log!(warn: "no wake cap; cache kept under memory pressure");
         return;
     };
+    let report = started.clone();
     if std::thread::Builder::new()
         .name("fatfs-pressure".into())
-        .spawn(move || pressure_thread(wake))
+        .spawn(move || {
+            helper_start(report);
+            pressure_thread(wake);
+        })
         .is_err()
     {
         std::os::seraph::log!(warn: "pressure thread spawn failed; cache kept under memory pressure");
@@ -340,7 +405,7 @@ const DONATION_END_BIT: u64 = 1;
 /// the registration, the cap, or the thread cannot be had: sessions whose
 /// client is gone are then ended only by the sweeps `FS_SESSION` and
 /// `FS_UNMOUNT` make.
-fn spawn_donation_end_thread(service: u64, ipc_buf: *mut u64)
+fn spawn_donation_end_thread(service: u64, ipc_buf: *mut u64, started: &Sender<()>)
 {
     let Some(signal) =
         std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
@@ -364,9 +429,13 @@ fn spawn_donation_end_thread(service: u64, ipc_buf: *mut u64)
         let _ = syscall::cap_delete(signal);
         return;
     };
+    let report = started.clone();
     if std::thread::Builder::new()
         .name("fatfs-donation-end".into())
-        .spawn(move || donation_end_thread(signal, wake))
+        .spawn(move || {
+            helper_start(report);
+            donation_end_thread(signal, wake);
+        })
         .is_err()
     {
         std::os::seraph::log!(warn: "donation-end thread spawn failed; sessions swept on schedule only");
@@ -582,9 +651,12 @@ fn service_loop(
         // ends (fs-driver-protocol.md § Loss of the block device).
         if cache::device_gone()
         {
-            // The last turn's reply goes out before this work.
+            // The last turn's reply goes out before the exit, alone: a
+            // receive could bind a call the exit would fail. A call an
+            // earlier flush bound is answered as a failed block access
+            // (`Reply::send_last`).
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { reply.flush(ipc_buf) };
+            unsafe { reply.send_last(device_gone_refusal, ipc_buf) };
             std::process::exit(fs_labels::EXIT_DEVICE_GONE.cast_signed());
         }
         // The last request may have met a full cache on a path that does
@@ -593,7 +665,7 @@ fn service_loop(
         {
             // The last turn's reply goes out before this work.
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { reply.flush(ipc_buf) };
+            unsafe { reply.flush(caps.service, ipc_buf) };
             let req = opens
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -609,7 +681,7 @@ fn service_loop(
         {
             // The last turn's reply goes out before this work.
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { reply.flush(ipc_buf) };
+            unsafe { reply.flush(caps.service, ipc_buf) };
             sweep_sessions(opens, &mut session_sweeps, cache);
         }
         // The pressure thread marked a release and woke the loop with a
@@ -618,7 +690,7 @@ fn service_loop(
         {
             // The last turn's reply goes out before this work.
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { reply.flush(ipc_buf) };
+            unsafe { reply.flush(caps.service, ipc_buf) };
             release_under_pressure(cache, ipc_buf);
         }
         // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -644,7 +716,16 @@ fn service_loop(
         if msg.badge == 0 && opcode == fs_labels::FS_UNMOUNT
         {
             drop_caps(msg.caps());
-            let unmounted = handle_unmount(&msg, state, opens, cache, caps.block_dev, ipc_buf);
+            let unmounted = handle_unmount(
+                &msg,
+                state,
+                opens,
+                cache,
+                caps.block_dev,
+                ipc_buf,
+                &mut reply,
+                caps.service,
+            );
             if unmounted
             {
                 // The turn ends with the process, which runs no destructor:
@@ -873,7 +954,17 @@ fn service_loop(
             }
             fs_labels::FS_REMOVE =>
             {
-                handle_remove_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                handle_remove_node_cap(
+                    node_id,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps.block_dev,
+                    ipc_buf,
+                    &mut reply,
+                    caps.service,
+                );
                 release_orphaned_open_files(nodes, opens, cache);
                 continue;
             }
@@ -894,7 +985,17 @@ fn service_loop(
             }
             fs_labels::FS_RENAME =>
             {
-                handle_rename_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                handle_rename_node_cap(
+                    node_id,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps.block_dev,
+                    ipc_buf,
+                    &mut reply,
+                    caps.service,
+                );
                 release_orphaned_open_files(nodes, opens, cache);
                 continue;
             }
@@ -1487,8 +1588,7 @@ fn handle_session_node_cap(
         .cap(session_cap)
         .cap(liveness.child)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&answer, ipc_buf) }.is_err()
+    if !reply_now(answer, reply, caps.service, ipc_buf)
     {
         let _ = syscall::cap_delete(session_cap);
         end();
@@ -1661,8 +1761,7 @@ fn open_in_session(
     let answer = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .cap(open_cap)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&answer, ipc_buf) }.is_err()
+    if !reply_now(answer, reply, open.service, ipc_buf)
     {
         let _ = syscall::cap_delete(open_cap);
         close();
@@ -1832,6 +1931,10 @@ impl Liveness
 /// dispatch thread runs this between requests, so no request of this driver
 /// is in flight; the eviction worker finds the opens gone when it next takes
 /// their lock.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is state the handler reads or the reply slot it answers through"
+)]
 fn handle_unmount(
     msg: &IpcMessage,
     state: &mut FatState,
@@ -1839,17 +1942,18 @@ fn handle_unmount(
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
+    service: u64,
 ) -> bool
 {
     if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
     {
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe {
-            ipc::ipc_reply(
-                &IpcMessage::new(ipc::fs_errors::LABEL_VERSION_MISMATCH),
-                ipc_buf,
-            )
-        };
+        let _ = reply_now(
+            IpcMessage::new(ipc::fs_errors::LABEL_VERSION_MISMATCH),
+            reply,
+            service,
+            ipc_buf,
+        );
         return false;
     }
     let mut opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1858,11 +1962,10 @@ fn handle_unmount(
     if live != 0 && msg.label & fs_labels::UNMOUNT_FORCE == 0
     {
         drop(opens_g);
-        let reply = IpcMessage::builder(ipc::fs_errors::BUSY)
+        let busy = IpcMessage::builder(ipc::fs_errors::BUSY)
             .word(0, live as u64)
             .build();
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        let _ = reply_now(busy, reply, service, ipc_buf);
         return false;
     }
     opens_g.release_all(cache);
@@ -2028,12 +2131,56 @@ fn reply_err(code: u64, reply: &mut Reply)
     reply.set_status(code);
 }
 
-/// Reply `code` at once: for the handlers whose dispatch turn does more after the reply.
-fn reply_err_now(code: u64, ipc_buf: *mut u64)
+/// Send `msg` now, through the loop's slot, for a handler with work after
+/// its reply or a turn the loop's pre-receive work may follow
+/// ([`Reply::flush`]: a caller fatfs outranks waits behind none of it);
+/// whether it reached the caller.
+#[expect(
+    clippy::large_types_passed_by_value,
+    reason = "`Reply::set` takes the message by value and stores it in the slot, so the move is the hand-off"
+)]
+fn reply_now(msg: IpcMessage, reply: &mut Reply, service: u64, ipc_buf: *mut u64) -> bool
 {
-    let reply = IpcMessage::new(code);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply.set(msg);
+    // A request that found the device gone ends the driver once it is
+    // answered, so its reply takes up no further request.
+    if cache::device_gone()
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { reply.send_last(device_gone_refusal, ipc_buf) };
+    }
+    else
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { reply.flush(service, ipc_buf) };
+    }
+    !reply.undelivered()
+}
+
+/// The status a request the driver took up but will not serve, since the
+/// block device is gone, is answered with: a failed block access's, in the
+/// wire codes of the request's protocol (fs-driver-protocol.md § Loss of the
+/// block device).
+fn device_gone_refusal(call: &IpcMessage) -> u64
+{
+    if matches!(
+        call.label & 0xFFFF,
+        ns_labels::NS_LOOKUP | ns_labels::NS_STAT | ns_labels::NS_READDIR
+    )
+    {
+        namespace_protocol::NsError::IoError.as_label()
+    }
+    else
+    {
+        ipc::fs_errors::IO_ERROR
+    }
+}
+
+/// Send the refusal `code` now, through the slot: for the handlers whose dispatch turn does more
+/// after the reply.
+fn reply_err_now(code: u64, reply: &mut Reply, service: u64, ipc_buf: *mut u64)
+{
+    let _ = reply_now(IpcMessage::new(code), reply, service, ipc_buf);
 }
 
 /// Resolve a parent-dir `NodeId` to the directory's cluster number.
@@ -2963,8 +3110,7 @@ fn create_and_open(
         .word(1, u64::from(size))
         .cap(prepared.open_cap)
         .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&answer, ipc_buf) }.is_err()
+    if !reply_now(answer, reply, caps.service, ipc_buf)
     {
         let _ = syscall::cap_delete(prepared.open_cap);
         opens
@@ -3141,6 +3287,10 @@ fn file_to_open(
 
 /// `FS_REMOVE`: unlink a file or empty directory. Badge = parent-dir
 /// cap (must carry `MUTATE_DIR`). Name in label[16..32] + data bytes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is state the handler reads or the reply slot it answers through"
+)]
 fn handle_remove_node_cap(
     node_id: NodeId,
     msg: &IpcMessage,
@@ -3149,6 +3299,8 @@ fn handle_remove_node_cap(
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
+    service: u64,
 )
 {
     let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
@@ -3156,7 +3308,7 @@ fn handle_remove_node_cap(
         Ok(cluster) => cluster,
         Err(code) =>
         {
-            reply_err_now(code, ipc_buf);
+            reply_err_now(code, reply, service, ipc_buf);
             return;
         }
     };
@@ -3164,7 +3316,7 @@ fn handle_remove_node_cap(
     let Some(name) = msg.data_bytes().get(..name_len).filter(|_| name_len != 0)
     else
     {
-        reply_err_now(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
         return;
     };
 
@@ -3178,7 +3330,7 @@ fn handle_remove_node_cap(
     )
     else
     {
-        reply_err_now(ipc::fs_errors::NOT_FOUND, ipc_buf);
+        reply_err_now(ipc::fs_errors::NOT_FOUND, reply, service, ipc_buf);
         return;
     };
     let is_dir = entry.attr & 0x10 != 0;
@@ -3190,12 +3342,12 @@ fn handle_remove_node_cap(
             {}
             Ok(false) =>
             {
-                reply_err_now(ipc::fs_errors::NOT_EMPTY, ipc_buf);
+                reply_err_now(ipc::fs_errors::NOT_EMPTY, reply, service, ipc_buf);
                 return;
             }
             Err(e) =>
             {
-                reply_err_now(fat_error_to_wire(e), ipc_buf);
+                reply_err_now(fat_error_to_wire(e), reply, service, ipc_buf);
                 return;
             }
         }
@@ -3213,7 +3365,7 @@ fn handle_remove_node_cap(
                 DeviceSlotState::Live =>
                 {
                     restore_lfn_slots(&failure, removed_loc, cache, block_dev, ipc_buf);
-                    reply_err_now(fat_error_to_wire(failure.error), ipc_buf);
+                    reply_err_now(fat_error_to_wire(failure.error), reply, service, ipc_buf);
                     return;
                 }
                 DeviceSlotState::Deleted => RemovedEntry {
@@ -3222,7 +3374,7 @@ fn handle_remove_node_cap(
                 DeviceSlotState::Unreadable =>
                 {
                     nodes.invalidate_for_loc(removed_loc);
-                    reply_err_now(ipc::fs_errors::IO_ERROR, ipc_buf);
+                    reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
                     return;
                 }
             }
@@ -3232,7 +3384,7 @@ fn handle_remove_node_cap(
     if let Err(e) = free_entry_data(state, &removed, cache, block_dev, ipc_buf)
     {
         nodes.invalidate_for_loc(removed_loc);
-        reply_err_now(fat_error_to_wire(e), ipc_buf);
+        reply_err_now(fat_error_to_wire(e), reply, service, ipc_buf);
         return;
     }
 
@@ -3243,9 +3395,8 @@ fn handle_remove_node_cap(
     let _ = removed;
     nodes.invalidate_for_loc(removed_loc);
 
-    let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    let reply_msg = IpcMessage::new(ipc::fs_errors::SUCCESS);
+    let _ = reply_now(reply_msg, reply, service, ipc_buf);
 }
 
 /// Where a failed removal of the entry whose 8.3 slot is `sfn_loc` left
@@ -3300,6 +3451,10 @@ fn restore_lfn_slots(
 }
 
 /// `FS_RENAME`: rename an entry within a single directory.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is state the handler reads or the reply slot it answers through"
+)]
 fn handle_rename_node_cap(
     node_id: NodeId,
     msg: &IpcMessage,
@@ -3308,6 +3463,8 @@ fn handle_rename_node_cap(
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
+    reply: &mut Reply,
+    service: u64,
 )
 {
     let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
@@ -3315,7 +3472,7 @@ fn handle_rename_node_cap(
         Ok(cluster) => cluster,
         Err(code) =>
         {
-            reply_err_now(code, ipc_buf);
+            reply_err_now(code, reply, service, ipc_buf);
             return;
         }
     };
@@ -3333,14 +3490,14 @@ fn handle_rename_node_cap(
     })
     else
     {
-        reply_err_now(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
         return;
     };
 
     if namespace_protocol::validate_name(src_name).is_err()
         || namespace_protocol::validate_name(dst_name).is_err()
     {
-        reply_err_now(ipc::fs_errors::IO_ERROR, ipc_buf);
+        reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
         return;
     }
 
@@ -3354,7 +3511,7 @@ fn handle_rename_node_cap(
     )
     else
     {
-        reply_err_now(ipc::fs_errors::NOT_FOUND, ipc_buf);
+        reply_err_now(ipc::fs_errors::NOT_FOUND, reply, service, ipc_buf);
         return;
     };
 
@@ -3381,7 +3538,7 @@ fn handle_rename_node_cap(
         ipc_buf,
     )
     {
-        reply_err_now(fat_error_to_wire(e), ipc_buf);
+        reply_err_now(fat_error_to_wire(e), reply, service, ipc_buf);
         return;
     }
     if let Err(failure) = remove_entry(state, parent_cluster, src_name, cache, block_dev, ipc_buf)
@@ -3400,7 +3557,7 @@ fn handle_rename_node_cap(
                     std::os::seraph::log!(warn: "could not undo a failed rename's destination");
                 }
                 restore_lfn_slots(&failure, src_loc, cache, block_dev, ipc_buf);
-                reply_err_now(fat_error_to_wire(failure.error), ipc_buf);
+                reply_err_now(fat_error_to_wire(failure.error), reply, service, ipc_buf);
                 return;
             }
             DeviceSlotState::Deleted =>
@@ -3408,7 +3565,7 @@ fn handle_rename_node_cap(
             DeviceSlotState::Unreadable =>
             {
                 nodes.invalidate_for_loc(src_loc);
-                reply_err_now(ipc::fs_errors::IO_ERROR, ipc_buf);
+                reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
                 return;
             }
         }
@@ -3419,9 +3576,8 @@ fn handle_rename_node_cap(
     // patch a `0xE5`-marked entry.
     nodes.invalidate_for_loc(src_loc);
 
-    let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    let reply_msg = IpcMessage::new(ipc::fs_errors::SUCCESS);
+    let _ = reply_now(reply_msg, reply, service, ipc_buf);
 }
 
 /// `FS_TRUNCATE`: shrink a file to a new length.

@@ -74,11 +74,11 @@
 //!   1 ms to the stall bound, before the stall bound has passed. Asked again
 //!   with its token, it is answered `FLUSHED` while the driver is still
 //!   stopped, once the sink is stalled, within twice the stall bound: logd
-//!   does not hold a flush on a sink that writes nothing. A stop that cuts
-//!   off a write in flight makes logd's writer give it up, which stalls the
-//!   sink at once, and every flush is then answered `FLUSHED`; the phase
-//!   starts the driver, lets a write end the stall, and stops it again, at
-//!   most three stops in all.
+//!   does not hold a flush on a sink that writes nothing. A stop can find
+//!   the sink already stalled (its writer's last write given up, none
+//!   completed since), and every flush is then answered `FLUSHED`; the
+//!   phase then starts the driver, lets a write end the stall, and stops it
+//!   again, at most three stops in all.
 
 use std::time::{Duration, Instant};
 
@@ -148,9 +148,9 @@ const DEATH_TIMEOUT: Duration = Duration::from_secs(30);
 const STALL_SEEN: Duration = Duration::from_millis(SINK_STALL_MS as u64 / 2);
 
 /// How many times the flush phase stops the serial driver, at most, for a
-/// stop that finds logd's serial writer not stalled: a stop that cuts off a
-/// write in flight (logd's own, or a kernel line's) makes the writer give it
-/// up, which stalls the sink, and a flush then rightly reads it as flushed.
+/// stop that finds logd's serial sink not stalled. A stop can find it
+/// stalled, its writer's last write given up and none completed since, and
+/// every flush is then rightly answered `FLUSHED`.
 const STOP_ATTEMPTS: u32 = 3;
 
 /// How long the flush phase lets the restarted serial driver run before it

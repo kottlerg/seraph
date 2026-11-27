@@ -636,7 +636,7 @@ unsafe fn kernel_entry_post_rebase(
     // active; called once during initialization; dependencies (Phases 2-4)
     // completed.
     unsafe {
-        arch::current::interrupts::init();
+        arch::current::interrupts::init(allocator);
     }
     kprintln!("interrupts ok");
     // Size the IRQ routing table from the interrupt controllers the init above
@@ -1726,6 +1726,9 @@ unsafe fn kernel_entry_post_rebase(
                         upcall_cookie: core::sync::atomic::AtomicU64::new(0),
                         upcall_any_instruction: core::sync::atomic::AtomicBool::new(false),
                         upcall_masked: core::sync::atomic::AtomicBool::new(false),
+                        run_limit: core::sync::atomic::AtomicU32::new(0),
+                        run_count: core::sync::atomic::AtomicU32::new(0),
+                        run_limit_pending: core::sync::atomic::AtomicBool::new(false),
                         is_user: true,
                         saved_state: init_saved,
                         kernel_stack_top: kstack_top,

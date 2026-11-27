@@ -473,11 +473,14 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
     if sstatus_at_entry & (1 << 8) == 0 && scause != 8
     {
         let deliver = || {
-            // The interrupt delivery point of an upcall posted with
-            // UPCALL_ANY_INSTRUCTION (docs/fault-handling.md § Asynchronous
-            // Upcalls): the trap is handled and completed.
+            // A pending run-limit fault (core/kernel/docs/scheduler.md § Run
+            // Limit), then the interrupt delivery point of an upcall posted
+            // with UPCALL_ANY_INSTRUCTION (docs/fault-handling.md
+            // § Asynchronous Upcalls): the trap is handled and completed.
             // SAFETY: U-mode origin, so frame is the thread's live frame on
             // its kernel stack; no lock is held, SIE = 0.
+            unsafe { crate::sched::run_limit::deliver_at_interrupt(frame) };
+            // SAFETY: as for the delivery above.
             unsafe { crate::ipc::upcall::deliver_at_interrupt(frame) };
         };
         if scause >> 63 != 0
@@ -1338,13 +1341,14 @@ unsafe fn set_user_counters()
 
 /// Initialise supervisor trap infrastructure for the BSP, and the APLIC
 /// domain. The BSP's IMSIC file is initialised by [`init_bsp_local`], once its
-/// per-CPU pointer is installed.
+/// per-CPU pointer is installed. `allocator` is unused: the APLIC keeps no state
+/// the kernel allocates (the x86-64 item allocates its I/O APICs' kept entries).
 ///
 /// # Safety
 /// Must execute in supervisor mode with the direct physical map active, once,
 /// on the BSP.
 #[cfg(not(test))]
-pub unsafe fn init()
+pub unsafe fn init(_allocator: &mut crate::mm::BuddyAllocator)
 {
     // Install trap vector (stvec is a per-hart CSR; also called from init_ap).
     // SAFETY: caller ensures execution in S-mode; trap_entry is valid.

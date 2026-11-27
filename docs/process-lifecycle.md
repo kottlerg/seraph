@@ -514,7 +514,7 @@ a fault or kill reason — defined once in `syscall_abi`:
 |---|---|---|
 | `0` (`EXIT_VOLUNTARY`) | Voluntary, clean | success — `sys_aspace_exit(0)`, `sys_thread_exit`, `ExitCode::SUCCESS` |
 | `1 ..= 0x0FFF` | Voluntary, code | `sys_aspace_exit(code)` via `encode_exit_code` (saturating); `std::process::exit(n)` / non-zero `ExitCode` |
-| `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) | Fault | unhandled CPU/VM fault; kernel-terminated |
+| `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64, or `EXIT_RUN_LIMIT`, `EXIT_FAULT_BASE + 0x100`) | Fault | unhandled CPU/VM fault or run-limit fault; kernel-terminated |
 | `0x2000` (`EXIT_KILLED`) | Killed | recorded by the kernel as the retained reason of a thread stopped by its `CSpace`/`AddressSpace` teardown (that stop posts no death event; an observer bound afterwards receives the retained reason through the bind); posted by procmgr to a death relay and an end queue for a process a destroy stopped |
 
 The address space's death surface is the process's terminal-end surface. A process ends at the first

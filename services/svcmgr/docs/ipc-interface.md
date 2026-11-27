@@ -472,7 +472,7 @@ Exit reason encoding:
 |---|---|
 | `0` | clean exit (`SYS_THREAD_EXIT`) |
 | `1..=0x0FFF` | voluntary exit code |
-| `0x1000..=0x1FFF` (`EXIT_FAULT_BASE + vector`) | fault (exception vector / scause + base) |
+| `0x1000..=0x1FFF` (`EXIT_FAULT_BASE + vector`, or `EXIT_RUN_LIMIT`) | fault (exception vector / scause + base, or a run-limit fault) |
 | `0x2000` (`EXIT_KILLED`) | killed, by procmgr or by svcmgr's [`STOP_CANDIDATE`](#label-5-stop_candidate) |
 
 The full space is defined in

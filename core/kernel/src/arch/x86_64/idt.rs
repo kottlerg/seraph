@@ -700,8 +700,12 @@ extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64
     if from_user
     {
         let deliver = || {
+            // A pending run-limit fault, then an upcall
+            // (core/kernel/docs/scheduler.md § Run Limit).
             // SAFETY: ring-3 origin, so tf is the thread's live user frame
             // on its kernel stack; no lock is held, IF=0.
+            unsafe { crate::sched::run_limit::deliver_at_interrupt(tf) };
+            // SAFETY: as for the delivery above.
             unsafe { crate::ipc::upcall::deliver_at_interrupt(tf) };
         };
         // SAFETY: the end of an exception from ring 3 that resolve_exception
@@ -1095,9 +1099,11 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
     if !user_frame.is_null()
     {
         // The return to ring 3, when this CPU's return-work word owes it work:
-        // a sole-reference pass, the interrupt delivery point of an upcall
-        // posted with UPCALL_ANY_INSTRUCTION (docs/fault-handling.md
-        // § Asynchronous Upcalls), each handler above having sent its EOI,
+        // a sole-reference pass, the delivery of a pending run-limit fault
+        // (core/kernel/docs/scheduler.md § Run Limit), the interrupt delivery
+        // point of an upcall posted with UPCALL_ANY_INSTRUCTION
+        // (docs/fault-handling.md § Asynchronous Upcalls), each handler above
+        // having sent its EOI,
         // then the wake preemption of a thread the handler, or a wake IPI's
         // sender, linked on this CPU above the interrupted one
         // (core/kernel/docs/scheduler.md § Wake Preemption;
@@ -1106,6 +1112,8 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
             // SAFETY: ring-3 origin, so user_frame is the interrupted
             // thread's live frame on its kernel stack; no lock is held,
             // IF=0.
+            unsafe { crate::sched::run_limit::deliver_at_interrupt(user_frame) };
+            // SAFETY: as for the delivery above.
             unsafe { crate::ipc::upcall::deliver_at_interrupt(user_frame) };
         };
         // SAFETY: the end of an interrupt from ring 3 on the interrupted
@@ -1323,8 +1331,12 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
     if from_user
     {
         let deliver = || {
+            // A pending run-limit fault, then an upcall
+            // (core/kernel/docs/scheduler.md § Run Limit).
             // SAFETY: ring-3 origin, so tf is the thread's live user frame
             // on its kernel stack; no lock is held, IF=0.
+            unsafe { crate::sched::run_limit::deliver_at_interrupt(tf) };
+            // SAFETY: as for the delivery above.
             unsafe { crate::ipc::upcall::deliver_at_interrupt(tf) };
         };
         // SAFETY: the end of a page fault from ring 3 that resolve_page_fault

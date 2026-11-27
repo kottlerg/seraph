@@ -2394,8 +2394,11 @@ while `tlb_shootdown::any_pending()` reports any per-CPU request slot with
 CPUs still to ack. The shootdown's own escalation ladder (§ IPI Watchdog
 Ladder: at 0.75 s an NMI backtrace on x86-64 or a single logged warning on
 RISC-V, `crate::fatal` at 5 s in arch `wait_for_ack`) is the authoritative detector
-for a genuinely stuck IPI; a non-shootdown stall re-checks on the next tick
-once the pending slots drain.
+for a genuinely stuck IPI. A non-shootdown stall is decided again once the
+pending slots drain: by the all-idle detector at the end of its next sweep (the
+next tick up to 128 CPUs), and by the AP-silence check when its sweep next reads
+the silent AP. The detection bounds stated above count no tick or scan that a
+pending shootdown defers.
 
 **Why kernel-side:** when every CPU is in kernel mode, no userspace monitor
 gets dispatched. The dump, like the stop drain's slow-drain warning below,

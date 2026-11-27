@@ -116,6 +116,11 @@ programs VT-d on x86-64 through the `iommu-vtd` driver and the RISC-V IOMMU on r
 `iommu-riscv` driver; every device a remapping unit translates runs IOMMU-isolated, and a device
 no unit translates runs DMA-unsafe.
 
+In either mode a block device reaches a buffer its client registered with the block driver from
+the registration's reply to the unregistration's reply, not only during one request (§ DMA
+Authorisation). The unmapping is synchronous, so no deferred-unmap window exists: once the
+unregistration replies, the device reaches no frame of the region.
+
 The kernel is agnostic to DMA mode: it does not read or write IOMMU
 registers, does not track per-device DMA state, and does not return a
 DMA-safety verdict.
@@ -194,9 +199,9 @@ driver's own procmgr capability (procmgr's
 token with the device and passes it to no one, so a compromised driver that granted its procmgr
 capability onward before it died cannot have its frames freed early.
 
-A frame a client lends a driver for one transfer (the memory capability a virtio-blk caller
-supplies) is on the client's memmgr record, which no hold covers. memmgr pools it only once no
-other process holds a capability to it
+A frame a client lends a driver, for one transfer or for a registered region (the memory
+capability a virtio-blk caller supplies or registers), is on the client's memmgr record, which no
+hold covers. memmgr pools it only once no other process holds a capability to it
 ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#reclamation)
 § Reclamation), so it stays out of the pool, even after the client releases it or dies, while
 devmgr's reference to it lives, and that one lives until the device can no longer write it.
@@ -206,7 +211,9 @@ A driver programs its device only with the device address of a DMA mapping of th
 - **While the driver lives.** The driver maps the frame for the transfer and unmaps it only once
   the transfer completed or the device acknowledged its reset, and it holds the lent capability
   until then too. It moves the capability back in its reply; a reply that fails (the client is
-  gone) has it delete the capability, the transfer being over.
+  gone) has it delete the capability, the transfer being over. A registered region's frame stays
+  mapped, and the driver keeps its capability, until the region is unregistered: by its client,
+  or by the driver once the client holds no liveness capability for it, its process gone.
 - **When the driver is gone.** A driver that dies mid-transfer, or exits after an unacknowledged
   reset, leaves the mapping standing, and its own capability goes with its `CSpace`. When devmgr
   withdraws the device it deletes its mapping capabilities only once the IOMMU blocks the device,
@@ -248,8 +255,13 @@ the access it needs (the device reads, or reads and writes); the cap must carry 
 and `MAP|WRITE` for a device that writes. devmgr keeps the cap while the mapping stands and
 replies the device address of its first byte, which is what the driver writes into descriptors
 and rings. `DMA_UNMAP` withdraws a mapping by that address, and devmgr deletes the cap it kept.
-A driver maps its own rings and buffers once at setup; a block driver maps each client-lent
-buffer for the duration of the one request that uses it.
+A driver maps its own rings and buffers once at setup. A block driver maps a client-lent buffer
+for the duration of the one request that uses it, or, for a staging buffer the client registers
+with it, once, at the registration: the registered region's transfers name it by a region cap and
+an offset and make no call to devmgr, and unmapping stays synchronous, the unregistration replying
+only after its `DMA_UNMAP` has
+([services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md#dma-discipline)
+§ DMA Discipline).
 
 devmgr returns every device address; no driver chooses one. With an IOMMU confining the device,
 the address is an IOVA in the device's domain, which devmgr allocates first fit from 1 MiB below

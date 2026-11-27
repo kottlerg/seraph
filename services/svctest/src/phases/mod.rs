@@ -124,6 +124,7 @@ pub(crate) fn concurrent(name: &str) -> bool
 pub(crate) const PROGRAM_MODES_PATH: &str = "/tests/fixtures/programs/program-modes";
 
 pub mod acpi;
+pub mod blk_regions;
 pub mod budget;
 pub mod charge_node;
 pub mod checkpoint;
@@ -293,6 +294,7 @@ fn ordered() -> Vec<Phase>
     out.extend_from_slice(fs_sessions::phases());
     out.extend_from_slice(fs_create_open::phases());
     out.extend_from_slice(fs_faults::phases());
+    out.extend_from_slice(blk_regions::phases());
     out.extend_from_slice(verified_read::phases());
     out.extend_from_slice(namespace::late());
     out.extend_from_slice(procmgr::command_phases());

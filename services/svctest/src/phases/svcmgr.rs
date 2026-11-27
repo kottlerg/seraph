@@ -596,7 +596,7 @@ fn check_source_contained(authority: u64, phase: &str)
     use ipc::stopsrc_labels as src;
     assert_ne!(
         authority, 0,
-        "{phase}: no debug-authority cap in slot 21 (debug_authority = yes)"
+        "{phase}: no debug-authority cap in slot 24 (debug_authority = yes)"
     );
     let fixture = provided_endpoint(src::NAME, phase);
     let before = badges_named(authority, STOPSRC_PATH);
@@ -675,7 +675,7 @@ fn svcmgr_stop_service_phase(caps: &Caps)
     let stop_cap = caps.stop_authority;
     assert_ne!(
         stop_cap, 0,
-        "{phase}: no stop-authority cap in slot 24 (stop_authority = yes)"
+        "{phase}: no stop-authority cap in slot 25 (stop_authority = yes)"
     );
 
     for (label, want, what) in [

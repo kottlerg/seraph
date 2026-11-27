@@ -68,9 +68,11 @@ use syscall_abi::{
 //                             vfsd_labels::GET_SWAP_PARTITION
 //                             (swap service ↔ vfsd), and every
 //                             vfsd_labels::UNMOUNT request
-//     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk)
-//                             and blk_labels::BLK_GET_GEOMETRY
-//                             (vfsd, fatfs ↔ virtio-blk)
+//     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk),
+//                             blk_labels::BLK_GET_GEOMETRY
+//                             (vfsd, fatfs ↔ virtio-blk), and every
+//                             blk_labels region request (block client ↔
+//                             virtio-blk)
 //     MEMMGR_LABELS_VERSION — memmgr_labels::REGISTER_PROCESS   (procmgr ↔ memmgr)
 //     SVCMGR_LABELS_VERSION — every svcmgr handover endowment `CAPS` round,
 //                             in `data[1]` after the round kind (init ↔ svcmgr)
@@ -295,7 +297,7 @@ pub mod iommu_errors;
 
 /// Wire-protocol version of [`blk_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const BLK_LABELS_VERSION: u32 = 3;
+pub const BLK_LABELS_VERSION: u32 = 4;
 pub mod blk_labels;
 
 /// Wire-protocol version of [`serial_labels`]; bumped as the block comment above

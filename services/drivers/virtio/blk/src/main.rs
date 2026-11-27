@@ -12,8 +12,11 @@
 //! Initialises the `VirtIO` device via the modern PCI transport,
 //! sets up a split virtqueue, and serves block reads
 //! (`BLK_READ_INTO_MEMORY`), block writes (`BLK_WRITE_FROM_MEMORY`),
-//! partition registration (`REGISTER_PARTITION`), and the device geometry
-//! (`BLK_GET_GEOMETRY`) over IPC.
+//! partition registration (`REGISTER_PARTITION`), the device geometry
+//! (`BLK_GET_GEOMETRY`), and registered regions (`BLK_REGISTER_REGION`,
+//! `BLK_READ_REGION`, `BLK_WRITE_REGION`, `BLK_UNREGISTER_REGION`) over IPC.
+//! A sweeper thread unregisters the region of a client that holds no
+//! liveness cap any more ([`start_sweeper`]).
 
 mod io;
 
@@ -22,7 +25,10 @@ use ipc::{IpcMessage, blk_labels, devmgr_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
-use virtio_blk::{Geometry, IoOutcome, PartitionTable, RequestTiming};
+use virtio_blk::{
+    Caller, Geometry, IoOutcome, PartitionTable, Post, Region, RegionAccess, RegionId, RegionTable,
+    RequestTiming,
+};
 use virtio_core::bootstrap::{DeliveredDevice, DeviceInterrupt};
 use virtio_core::pci::{ConfigError, PciTransport};
 use virtio_core::virtqueue::{self, SplitVirtqueue};
@@ -592,9 +598,17 @@ pub struct BlkRuntime<'a>
     /// MOUNT_AUTHORITY-badged cap).
     pub service_ep: u64,
     /// The device's DMA capability, through which each request's data
-    /// segment is mapped for the device for the request's duration.
+    /// segment is mapped for the device for the request's duration, and each
+    /// registered region for its registration.
     dma_ep: u64,
     partitions: PartitionTable,
+    /// The registered regions, with the capabilities the driver keeps for
+    /// each. Only this thread touches it: the sweeper thread hands it each
+    /// post as a request ([`start_sweeper`]).
+    regions: RegionTable<RegionCaps>,
+    /// The event queue every region's liveness binding posts to, which the
+    /// sweeper thread waits on.
+    sweep_queue: u64,
     /// Logical block size and capacity; every wire LBA and count is in
     /// these blocks.
     geometry: Geometry,
@@ -701,6 +715,26 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
             blk_labels::BLK_GET_GEOMETRY =>
             {
                 handle_get_geometry(&msg, rt, &mut reply);
+            }
+            blk_labels::BLK_REGISTER_REGION =>
+            {
+                handle_register_region(&msg, ipc_buf, rt, &mut reply);
+            }
+            blk_labels::BLK_READ_REGION =>
+            {
+                handle_region_transfer(&msg, rt, io::IoDirection::Read, &mut reply);
+            }
+            blk_labels::BLK_WRITE_REGION =>
+            {
+                handle_region_transfer(&msg, rt, io::IoDirection::Write, &mut reply);
+            }
+            blk_labels::BLK_UNREGISTER_REGION =>
+            {
+                handle_unregister_region(&msg, ipc_buf, rt, &mut reply);
+            }
+            virtio_blk::SWEEP if Caller::of(msg.badge) == Caller::Sweeper =>
+            {
+                handle_sweep(&msg, ipc_buf, rt, &mut reply);
             }
             _ =>
             {
@@ -906,6 +940,14 @@ fn run_transfer(rt: &mut BlkRuntime, transfer: &Transfer, mem_cap: u64, ipc_buf:
         unmap: unmap_start.elapsed(),
         waits,
     };
+    log_if_slow(transfer, &timing);
+    outcome.reply_label()
+}
+
+/// Log `transfer` when its `timing` reached [`virtio_blk::SLOW_REQUEST`]
+/// (README § Slow requests).
+fn log_if_slow(transfer: &Transfer, timing: &RequestTiming)
+{
     if timing.is_slow()
     {
         std::os::seraph::log!(
@@ -916,7 +958,6 @@ fn run_transfer(rt: &mut BlkRuntime, transfer: &Transfer, mem_cap: u64, ipc_buf:
             transfer.badge
         );
     }
-    outcome.reply_label()
 }
 
 /// Check the data-segment Memory cap of a transfer of `data_len` bytes;
@@ -927,6 +968,24 @@ fn run_transfer(rt: &mut BlkRuntime, transfer: &Transfer, mem_cap: u64, ipc_buf:
 /// (the device only reads it).
 fn validate_memory_cap(mem_cap: u64, dir: io::IoDirection, data_len: u32) -> Result<(), u64>
 {
+    let required = match dir
+    {
+        io::IoDirection::Read => syscall::RIGHTS_MEM_MAP_RW,
+        io::IoDirection::Write => syscall::RIGHTS_MEM_MAP,
+    };
+    let size = memory_cap_size(mem_cap, required)?;
+    if size < u64::from(data_len)
+    {
+        return Err(ipc::blk_errors::INVALID_MEMORY_CAP);
+    }
+    Ok(())
+}
+
+/// The size in bytes of the Memory cap `mem_cap`, checked to carry the
+/// `required` rights: `MAP`, and `MAP|WRITE` when the device writes into it;
+/// `Err` carries `INVALID_MEMORY_CAP` for any other cap.
+fn memory_cap_size(mem_cap: u64, required: u64) -> Result<u64, u64>
+{
     let invalid = ipc::blk_errors::INVALID_MEMORY_CAP;
     let tag_rights =
         syscall::cap_info(mem_cap, syscall::CAP_INFO_TAG_RIGHTS).map_err(|_| invalid)?;
@@ -934,21 +993,11 @@ fn validate_memory_cap(mem_cap: u64, dir: io::IoDirection, data_len: u32) -> Res
     // `u8` set names no Memory cap, rather than truncating to one.
     let tag = tag_rights >> 32;
     let rights = tag_rights & 0xFFFF_FFFF;
-    let required = match dir
-    {
-        io::IoDirection::Read => syscall::RIGHTS_MEM_MAP_RW,
-        io::IoDirection::Write => syscall::RIGHTS_MEM_MAP,
-    };
     if tag != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
     {
         return Err(invalid);
     }
-    let size = syscall::cap_info(mem_cap, syscall::CAP_INFO_MEMORY_SIZE).map_err(|_| invalid)?;
-    if size < u64::from(data_len)
-    {
-        return Err(invalid);
-    }
-    Ok(())
+    syscall::cap_info(mem_cap, syscall::CAP_INFO_MEMORY_SIZE).map_err(|_| invalid)
 }
 
 /// Resolve the run of `block_count` logical blocks starting at
@@ -1150,7 +1199,513 @@ fn handle_get_geometry(msg: &IpcMessage, rt: &BlkRuntime, out: &mut Reply)
     out.set(reply);
 }
 
+// ── Registered regions ─────────────────────────────────────────────────────
+
+/// What the driver keeps for a registered region: the Memory cap the client
+/// sent, from which devmgr's copy for the mapping is derived; the region root,
+/// the badged SEND the client's region cap is derived from; and the parent of
+/// the region's liveness Notification, whose rights-less child the client
+/// holds.
+#[derive(Debug, PartialEq, Eq)]
+struct RegionCaps
+{
+    memory: u64,
+    root: u64,
+    liveness: u64,
+}
+
+/// Handle a `BLK_REGISTER_REGION` request (README § Label 6:
+/// `BLK_REGISTER_REGION`): register the region the Memory cap in `caps[0]`
+/// covers ([`register_region`]) and reply its region cap and its liveness
+/// cap. A refused request deletes the Memory cap, of which the client keeps
+/// its own copy.
+fn handle_register_region(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, out: &mut Reply)
+{
+    let mem_cap = msg.caps().first().copied().unwrap_or(0);
+    drop_caps(msg.caps().get(1..).unwrap_or(&[]));
+    match register_region(msg, mem_cap, ipc_buf, rt)
+    {
+        // A reply the client cannot take deletes both caps; the liveness
+        // child's deletion leaves its parent the sole reference, whose post
+        // unregisters the region.
+        Ok((region_cap, liveness_cap)) => out.set_or_delete_caps(
+            IpcMessage::builder(ipc::blk_errors::SUCCESS)
+                .cap(region_cap)
+                .cap(liveness_cap)
+                .build(),
+        ),
+        Err(code) =>
+        {
+            drop_caps(&[mem_cap]);
+            out.set_status(code);
+        }
+    }
+}
+
+/// Register the region `mem_cap` covers for the caller's partition, and
+/// return the client's region cap and liveness cap; `Err` carries the
+/// `blk_errors` code to reply.
+///
+/// The caller is a partition or whole-disk badge, and the access `data[1]`
+/// names needs `MAP`, and `MAP|WRITE` when the device writes. The region
+/// takes a slot of the [`RegionTable`], is mapped for the device once
+/// (`DMA_MAP`), and gets its capabilities ([`region_caps`]); each step that
+/// fails undoes the ones before it. The driver keeps `mem_cap` while the
+/// region stands.
+fn register_region(
+    msg: &IpcMessage,
+    mem_cap: u64,
+    ipc_buf: *mut u64,
+    rt: &mut BlkRuntime,
+) -> Result<(u64, u64), u64>
+{
+    if msg.word(0) != u64::from(ipc::BLK_LABELS_VERSION)
+    {
+        return Err(ipc::blk_errors::LABEL_VERSION_MISMATCH);
+    }
+    let partition = match Caller::of(msg.badge)
+    {
+        Caller::WholeDisk(badge) => badge,
+        Caller::Partition(badge) if rt.partitions.lookup(badge).is_some() => badge,
+        Caller::Partition(_)
+        | Caller::Unbadged
+        | Caller::Region(_)
+        | Caller::Sweeper
+        | Caller::Unknown => return Err(ipc::blk_errors::OUT_OF_BOUNDS),
+    };
+    if rt.device_faulted
+    {
+        return Err(ipc::blk_errors::DEVICE_FAULT);
+    }
+    let access = RegionAccess::from_wire(msg.word(1)).ok_or(ipc::blk_errors::INVALID_MEMORY_CAP)?;
+    let required = if access.device_writes()
+    {
+        syscall::RIGHTS_MEM_MAP_RW
+    }
+    else
+    {
+        syscall::RIGHTS_MEM_MAP
+    };
+    let len = memory_cap_size(mem_cap, required)?;
+    if len == 0
+    {
+        return Err(ipc::blk_errors::INVALID_MEMORY_CAP);
+    }
+    let id = rt
+        .regions
+        .admit(partition)
+        .ok_or(ipc::blk_errors::REGION_LIMIT)?;
+    let dma_access = if access.device_writes()
+    {
+        virtio_core::dma::DEVICE_READS_WRITES
+    }
+    else
+    {
+        virtio_core::dma::DEVICE_READS
+    };
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let device_addr =
+        match unsafe { virtio_core::dma::map(rt.dma_ep, mem_cap, dma_access, ipc_buf) }
+        {
+            Ok(addr) => addr,
+            Err(ipc::DmaError::Refused(ipc::devmgr_dma_errors::TOO_MANY_MAPPINGS)) =>
+            {
+                return Err(ipc::blk_errors::REGION_LIMIT);
+            }
+            Err(e) =>
+            {
+                std::os::seraph::log!(warn: "region not mapped for the device ({e:?})");
+                return Err(ipc::blk_errors::DEVICE_FAULT);
+            }
+        };
+    let region = Region {
+        partition,
+        device_addr,
+        len,
+        access,
+    };
+    let Some((kept, region_cap, liveness_cap)) = region_caps(rt, id, mem_cap)
+    else
+    {
+        unmap_region(rt.dma_ep, &region, ipc_buf);
+        return Err(ipc::blk_errors::REGION_LIMIT);
+    };
+    if let Err(kept) = rt.regions.insert(id, region, kept)
+    {
+        // `admit` found the slot free and nothing has changed the table
+        // since; refused all the same, the binding's post finds the slot at
+        // another generation and is dropped.
+        // The caller deletes `mem_cap` with the refusal.
+        drop_caps(&[region_cap, liveness_cap]);
+        release_region(
+            rt.dma_ep,
+            &region,
+            &RegionCaps { memory: 0, ..kept },
+            ipc_buf,
+        );
+        return Err(ipc::blk_errors::REGION_LIMIT);
+    }
+    Ok((region_cap, liveness_cap))
+}
+
+/// Make the capabilities of the region `id` names: the region root, a SEND
+/// on the service endpoint badged [`RegionId::badge`], and the client's copy
+/// of it; and the liveness Notification's parent and its rights-less child,
+/// the parent bound to the sweeper's queue with the region's correlator
+/// (`SYS_CAP_BIND_SOLE_REFERENCE`) last, so a region whose capabilities exist
+/// is always bound. Returns what the driver keeps, with `memory` among it,
+/// and the client's two caps; `None`, with every cap made here deleted, when
+/// a derivation, the Notification's funding, or the binding fails.
+fn region_caps(rt: &BlkRuntime, id: RegionId, memory: u64) -> Option<(RegionCaps, u64, u64)>
+{
+    let root =
+        syscall::cap_derive_badge(rt.service_ep, syscall::RIGHTS_EP_SEND, id.badge()).ok()?;
+    let Ok(region_cap) = syscall::cap_derive(root, syscall::RIGHTS_EP_SEND)
+    else
+    {
+        drop_caps(&[root]);
+        return None;
+    };
+    let liveness =
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        });
+    let Some(liveness) = liveness
+    else
+    {
+        drop_caps(&[region_cap, root]);
+        return None;
+    };
+    // Zero rights: the client's copy can neither signal nor wait; holding it
+    // is its only use.
+    let child = syscall::cap_derive(liveness, 0).ok();
+    let bound = child.is_some()
+        && syscall::cap_bind_sole_reference(liveness, rt.sweep_queue, id.correlator()).is_ok();
+    let Some(child) = child.filter(|_| bound)
+    else
+    {
+        drop_caps(&[child.unwrap_or(0), liveness, region_cap, root]);
+        return None;
+    };
+    Some((
+        RegionCaps {
+            memory,
+            root,
+            liveness,
+        },
+        region_cap,
+        child,
+    ))
+}
+
+/// Withdraw `region`'s mapping for the device (`DMA_UNMAP`), which replies
+/// once the device reaches none of its frames. A failure is logged: devmgr
+/// then still holds its copy of the region's Memory cap, so the frames stay
+/// out of memmgr's pool.
+fn unmap_region(dma_ep: u64, region: &Region, ipc_buf: *mut u64)
+{
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if let Err(e) = unsafe { virtio_core::dma::unmap(dma_ep, region.device_addr, ipc_buf) }
+    {
+        std::os::seraph::log!(warn: "region not unmapped for the device ({e:?})");
+    }
+}
+
+/// Unregister `region`, which has left the table: unmap it for the device,
+/// delete the Memory cap kept for it, and revoke and delete the region root and
+/// the liveness parent, so no copy of the client's region cap or liveness cap
+/// is left. The revocation of the liveness child is the fall to one reference
+/// that the binding of a region its client unregistered posts on.
+fn release_region(dma_ep: u64, region: &Region, kept: &RegionCaps, ipc_buf: *mut u64)
+{
+    unmap_region(dma_ep, region, ipc_buf);
+    let _ = syscall::cap_delete(kept.memory);
+    let _ = syscall::cap_revoke_all(kept.root);
+    let _ = syscall::cap_delete(kept.root);
+    let _ = syscall::cap_revoke_all(kept.liveness);
+    let _ = syscall::cap_delete(kept.liveness);
+}
+
+/// Handle a `BLK_READ_REGION` (`dir` = [`io::IoDirection::Read`]) or
+/// `BLK_WRITE_REGION` (`dir` = [`io::IoDirection::Write`]) request on a
+/// region cap (README § Label 7: `BLK_READ_REGION`), whose reply carries no
+/// cap; one the request carries is deleted.
+fn handle_region_transfer(
+    msg: &IpcMessage,
+    rt: &mut BlkRuntime,
+    dir: io::IoDirection,
+    out: &mut Reply,
+)
+{
+    drop_caps(msg.caps());
+    out.set_status(region_transfer(msg, rt, dir));
+}
+
+/// Run the transfer a region request names, and return the reply label.
+///
+/// `data[1]` is the LBA within the region's partition, `data[2]` the block
+/// count and `data[3]` the byte offset in the region; the run must lie within
+/// the partition and within the region ([`Region::span`]), and a read needs a
+/// region the device writes. The chain is programmed at the region's device
+/// address plus the offset, with no call to devmgr. A request the device
+/// loses quiesces it as for any transfer ([`quiesce_device`]); the region
+/// stays registered. A slow request's line reports its device time, its map
+/// and unmap being 0.
+fn region_transfer(msg: &IpcMessage, rt: &mut BlkRuntime, dir: io::IoDirection) -> u64
+{
+    if msg.word(0) != u64::from(ipc::BLK_LABELS_VERSION)
+    {
+        return ipc::blk_errors::LABEL_VERSION_MISMATCH;
+    }
+    let Caller::Region(id) = Caller::of(msg.badge)
+    else
+    {
+        return ipc::blk_errors::OUT_OF_BOUNDS;
+    };
+    let Some(region) = rt.regions.get(id).copied()
+    else
+    {
+        return ipc::blk_errors::OUT_OF_BOUNDS;
+    };
+    if rt.device_faulted
+    {
+        return ipc::blk_errors::DEVICE_FAULT;
+    }
+    if matches!(dir, io::IoDirection::Read) && !region.access.device_writes()
+    {
+        return ipc::blk_errors::INVALID_MEMORY_CAP;
+    }
+    let (lba, block_count, offset) = (msg.word(1), msg.word(2), msg.word(3));
+    let Some((data_addr, data_len)) = region.span(rt.geometry, offset, block_count)
+    else
+    {
+        return ipc::blk_errors::INVALID_MEMORY_CAP;
+    };
+    // The run's first LBA is below the capacity, so its sector fits.
+    let sector = resolve_run(region.partition, lba, block_count, rt).and_then(|absolute| {
+        rt.geometry
+            .device_sector(absolute)
+            .ok_or(ipc::blk_errors::OUT_OF_BOUNDS)
+    });
+    let sector = match sector
+    {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let transfer = Transfer {
+        dir,
+        sector,
+        block_count,
+        data_len,
+        badge: msg.badge,
+    };
+    let submitted = Instant::now();
+    let (outcome, waits) = io::submit_and_wait(
+        rt.layout,
+        dir,
+        sector,
+        data_addr,
+        data_len,
+        rt.vq,
+        rt.transport,
+        rt.queue_notify_off,
+        rt.completion,
+    );
+    let ended = Instant::now();
+    if outcome == IoOutcome::Lost
+    {
+        quiesce_device(rt);
+    }
+    let timing = RequestTiming {
+        map: core::time::Duration::ZERO,
+        device: ended.duration_since(submitted),
+        unmap: core::time::Duration::ZERO,
+        waits,
+    };
+    log_if_slow(&transfer, &timing);
+    outcome.reply_label()
+}
+
+/// Handle a `BLK_UNREGISTER_REGION` request on a region cap (README § Label
+/// 9: `BLK_UNREGISTER_REGION`): take the region from the table, its slot
+/// retiring until its binding's post, and release it ([`release_region`])
+/// before the reply, so the device reaches none of its frames once the client
+/// has the reply. Served after a lost request too, since the reset device
+/// reaches nothing. A badge naming no live region is answered `OUT_OF_BOUNDS`.
+fn handle_unregister_region(
+    msg: &IpcMessage,
+    ipc_buf: *mut u64,
+    rt: &mut BlkRuntime,
+    out: &mut Reply,
+)
+{
+    drop_caps(msg.caps());
+    let code = if msg.word(0) == u64::from(ipc::BLK_LABELS_VERSION)
+    {
+        let removed = match Caller::of(msg.badge)
+        {
+            Caller::Region(id) => rt.regions.remove(id),
+            Caller::Unbadged
+            | Caller::WholeDisk(_)
+            | Caller::Partition(_)
+            | Caller::Sweeper
+            | Caller::Unknown => None,
+        };
+        if let Some((region, kept)) = removed
+        {
+            release_region(rt.dma_ep, &region, &kept, ipc_buf);
+            ipc::blk_errors::SUCCESS
+        }
+        else
+        {
+            ipc::blk_errors::OUT_OF_BOUNDS
+        }
+    }
+    else
+    {
+        ipc::blk_errors::LABEL_VERSION_MISMATCH
+    };
+    out.set_status(code);
+}
+
+/// Handle the sweeper's [`virtio_blk::SWEEP`] request: apply the
+/// sole-reference post whose correlator `data[0]` carries
+/// ([`RegionTable::post`]). A live region's post means its client holds no
+/// liveness cap any more, its process gone or its cap deleted, so the region
+/// is released ([`release_region`]); a retiring slot is freed; a stale post
+/// is dropped.
+fn handle_sweep(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, out: &mut Reply)
+{
+    drop_caps(msg.caps());
+    if let Post::Ended(region, kept) = rt.regions.post(msg.word(0))
+    {
+        release_region(rt.dma_ep, &region, &kept, ipc_buf);
+    }
+    out.set_status(ipc::blk_errors::SUCCESS);
+}
+
+/// Create the event queue every region's liveness binding posts to, and start
+/// the sweeper thread, which waits on it and hands each post to the service
+/// loop as a [`virtio_blk::SWEEP`] request on a SEND of its own, badged
+/// [`virtio_blk::SWEEPER_BADGE`], so every change to the region table is made
+/// on the service loop's thread and no lock is held across a device wait or a
+/// call to devmgr. The queue holds [`virtio_blk::MAX_REGIONS`] entries and
+/// observer nodes: each slot has at most one binding awaiting its post
+/// ([`RegionTable`]), so neither runs out. Returns the queue; exits when the
+/// queue, the SEND or the thread cannot be made, since a region would then
+/// outlive its client.
+fn start_sweeper(service_ep: u64) -> u64
+{
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "MAX_REGIONS is 32, which every `u32` holds"
+    )]
+    const SLOTS: u32 = virtio_blk::MAX_REGIONS as u32;
+    let queue = std::os::seraph::object_slab_retype(
+        std::os::seraph::event_queue_retype_bytes(u64::from(SLOTS), u64::from(SLOTS)),
+        |slab| syscall::event_queue_create_observed(slab, SLOTS, SLOTS).ok(),
+    );
+    let Some(queue) = queue
+    else
+    {
+        std::os::seraph::log!(error: "failed to create the region sweep queue");
+        syscall::thread_exit();
+    };
+    let Ok(sweep_ep) = syscall::cap_derive_badge(
+        service_ep,
+        syscall::RIGHTS_EP_SEND,
+        virtio_blk::SWEEPER_BADGE,
+    )
+    else
+    {
+        std::os::seraph::log!(error: "failed to derive the region sweeper's endpoint cap");
+        syscall::thread_exit();
+    };
+    let started = std::thread::Builder::new()
+        .name("blk-sweep".into())
+        .spawn(move || sweep(queue, sweep_ep));
+    if started.is_err()
+    {
+        std::os::seraph::log!(error: "failed to start the region sweeper thread");
+        syscall::thread_exit();
+    }
+    queue
+}
+
+/// The sweeper thread ([`start_sweeper`]): receive each post and forward its
+/// correlator to the service loop, which replies once it has applied it. An
+/// interrupted wait is retried. Any other failure of the wait ends the thread
+/// with an error line: the regions registered then stay until their clients
+/// unregister them.
+fn sweep(queue: u64, sweep_ep: u64)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    loop
+    {
+        match syscall::event_recv_entry(queue, 0)
+        {
+            Ok(entry) =>
+            {
+                let request = IpcMessage::builder(virtio_blk::SWEEP)
+                    .word(0, entry.tag)
+                    .build();
+                // SAFETY: ipc_buf is this thread's IPC buffer page, which the
+                // runtime's thread start registered.
+                if let Err(e) = unsafe { ipc::ipc_call(sweep_ep, &request, ipc_buf) }
+                {
+                    std::os::seraph::log!(warn: "region post {:#x} not delivered (err={e})", entry.tag);
+                }
+            }
+            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 =>
+            {}
+            Err(e) =>
+            {
+                std::os::seraph::log!(error: "region sweep queue wait failed (err={e}); sweeper exiting");
+                return;
+            }
+        }
+    }
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────
+
+/// Bind the device's `interrupt` to a new notification and start the
+/// interrupt-service thread over it, with a copy of the register window at
+/// `window_va` laid out as `layout` says; returns the completion notification
+/// the thread signals. Exits on any failure, since the driver cannot wait for
+/// its device without it.
+fn start_interrupts(interrupt: DeviceInterrupt, window_va: u64, layout: &RegisterLayout) -> u64
+{
+    let irq_notification = create_notification("IRQ notification");
+    let completion = create_notification("completion notification");
+    if syscall::irq_register(interrupt.cap(), irq_notification, interrupt.mode()).is_err()
+    {
+        std::os::seraph::log!(error: "irq_register failed");
+        syscall::thread_exit();
+    }
+    // The interrupt-service thread acknowledges every delivery of a wired
+    // line from here on, a request in flight or not, so this driver never
+    // holds a shared line masked. Its transport is a copy over the same
+    // register window.
+    if !start_isr_thread(
+        PciTransport::new(window_va, layout),
+        interrupt,
+        irq_notification,
+        completion,
+    )
+    {
+        std::os::seraph::log!(error: "failed to start the interrupt-service thread");
+        syscall::thread_exit();
+    }
+    // Unmask a wired line at the controller (I/O APIC / APLIC): irq_register
+    // leaves the entry masked, and the first irq_ack unmasks it. An MSI-X
+    // target is never masked.
+    if let DeviceInterrupt::Wired { cap, .. } = interrupt
+    {
+        let _ = syscall::irq_ack(cap);
+    }
+    completion
+}
 
 /// Create a notification object; exits, logging `what`, when it cannot be
 /// created, since the driver cannot wait for its device without it.
@@ -1262,36 +1817,8 @@ fn main() -> !
         .set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
     std::os::seraph::log!("device ready");
 
-    // Set up interrupt-driven completion: create a notification and bind it
-    // to the interrupt.
-    let irq_notification = create_notification("IRQ notification");
-    let completion = create_notification("completion notification");
-    if syscall::irq_register(interrupt.cap(), irq_notification, interrupt.mode()).is_err()
-    {
-        std::os::seraph::log!(error: "irq_register failed");
-        syscall::thread_exit();
-    }
-    // The interrupt-service thread acknowledges every delivery of a wired
-    // line from here on, a request in flight or not, so this driver never
-    // holds a shared line masked. Its transport is a copy over the same
-    // register window.
-    if !start_isr_thread(
-        PciTransport::new(window_va, &layout),
-        interrupt,
-        irq_notification,
-        completion,
-    )
-    {
-        std::os::seraph::log!(error: "failed to start the interrupt-service thread");
-        syscall::thread_exit();
-    }
-    // Unmask a wired line at the controller (I/O APIC / APLIC): irq_register
-    // leaves the entry masked, and the first irq_ack unmasks it. An MSI-X
-    // target is never masked.
-    if let DeviceInterrupt::Wired { cap, .. } = interrupt
-    {
-        let _ = syscall::irq_ack(cap);
-    }
+    // Set up interrupt-driven completion.
+    let completion = start_interrupts(interrupt, window_va, &layout);
 
     // Set up I/O buffer (driver-owned page hosting request header at offset
     // 0 and status byte at offset 1024). Data segments live in caller-supplied
@@ -1310,6 +1837,7 @@ fn main() -> !
         }
     }
 
+    let sweep_queue = start_sweeper(caps.service_ep);
     let mut rt = BlkRuntime {
         layout: &layout,
         vq: &mut vq,
@@ -1319,6 +1847,8 @@ fn main() -> !
         service_ep: caps.service_ep,
         dma_ep: caps.dma_ep,
         partitions: PartitionTable::new(),
+        regions: RegionTable::new(),
+        sweep_queue,
         geometry,
         device_faulted: false,
     };

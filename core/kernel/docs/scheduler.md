@@ -186,7 +186,8 @@ pub struct PerCpuScheduler
     idle_pull_held: AtomicBool,
 
     /// Where the idle pull's scan starts: past the last candidate on which a pull
-    /// found nothing it could take (§ Load Balancing).
+    /// found nothing it could take, or past a window in which a tick found no
+    /// backlog (§ Load Balancing, "Scan windows").
     idle_pull_cursor: AtomicUsize,
 }
 
@@ -540,7 +541,10 @@ cache-friendly — a thread's TCB is typically hot in CPU N's caches.
 unconditionally. Otherwise a fair thread stays on `preferred_cpu` if that CPU's load
 (`current_load()`) is within `LOAD_BALANCE_IMBALANCE_THRESHOLD` of the least-loaded CPU's,
 and goes to the least-loaded CPU if not, a tie going to the CPU with the fewest busy SMT
-siblings (§ SMT Awareness); an RT thread is placed by level first (below). The placement is
+siblings (§ SMT Awareness), then to the first read; an RT thread is placed by level first
+(below). The least-loaded CPU is that of the window the waker CPU's placement scan reads: every
+CPU in a boot of up to `CPU_SCAN_WINDOW` (128) CPUs, in index order, so a tie goes to the lowest
+index there, and 128 of them in a larger boot (§ Load Balancing, "Scan windows"). The placement is
 recorded in `tcb.preferred_cpu` and used for subsequent wakeups.
 
 An RT thread is placed where it runs at once. A CPU's rank is the higher of its running thread's
@@ -548,16 +552,18 @@ level and its highest queued thread's, as run queues order them: the idle level 
 level alike above it, the RT levels above those in level order (`run_queue::CpuRanks`). An RT
 thread stays on `preferred_cpu` when its level ranks above that CPU's, so that it preempts or
 runs ahead of everything there (§ Wake Preemption), and otherwise goes to the CPU of the lowest
-rank, a tie going to the lower load, then to the fewest busy SMT siblings, then to the lowest
-index. So an RT wake waits behind a thread of its own level or above only when every eligible CPU
-runs or queues one, and then on the CPU whose thread ranks lowest. A CPU's load does not tell
+rank in the placement scan's window, a tie going to the lower load, then to the fewest busy SMT
+siblings, then to the first read. So an RT wake waits behind a thread of its own level or above
+only when every eligible CPU of that window runs or queues one, and then on the CPU whose thread
+ranks lowest; in a boot of up to 128 CPUs the window holds every CPU. A CPU's load does not tell
 these apart: it counts the threads linked on the CPU, not the level of the one it runs, so a CPU
 running an RT thread reads as loaded as one running a fair thread, and the load rule would keep
 an RT thread behind the first while the second could take it at once. A fair thread is placed by
 load alone, every fair level sharing one queue. The ranks are sampled without the CPUs' locks, so
 a dispatch or a link after the sample can leave the thread behind a thread it does not outrank,
 whence the RT push of that CPU's tick moves it (§ Load Balancing, "RT push"; § Wake Preemption,
-"Latency bound").
+"Latency bound"), as it does a thread a narrowed window placed behind such a thread while a CPU
+outside the window ran a lower level.
 
 A synchronous wake places its thread by its waker. A call that finds a receiver parked, and a
 fault delivery that finds a handler parked, wake it with `WakeHint::Sync` when the caller's park
@@ -644,62 +650,95 @@ The balancer counts queued threads without weighing them by class or level (§ S
 Classes): it evens out the number of queued threads per CPU, and `find_runnable` scans the
 victim's queues from the highest, so an RT thread is pulled before a fair one.
 
+**Scan windows.** Each scan of the CPUs on a wake or a tick path reads at most `CPU_SCAN_WINDOW`
+(128) of them (`sched::ScanWindow`): consecutive CPUs in index order from a cursor of the
+scanning CPU, wrapping. A wake's placement scans (§ Thread Assignment) read from the waker CPU's
+`wake_cursor`, a busy CPU's empty-queue scan from its `balance_cursor`, the idle scan from its
+`idle_pull_cursor`, and the RT push's scan from its `rt_push_cursor` (below); the scans of the
+balancer and the push leave their own CPU out and do not count it. In a boot whose window holds
+every CPU the scan may read, up to 128 CPUs for a wake and 129 for the others, a scan reads them
+all in index order from its cursor, and no scan moves its cursor past a window: a wake's cursor
+stays at CPU 0 and a wake does not load it, the busy pull's stays at CPU 0, the idle pull's moves
+only past a candidate as the idle rule below says, and the RT push's miss stores its cursor
+unchanged. In a larger boot every placement scan, and each balancer or push scan that finds
+nothing to act on (as each says below), moves its cursor to the CPU after its window, so
+successive scans of one CPU read successive windows and every CPU they may read within
+ceil(m / 128) scans, m being those CPUs' count. Each CPU's cursors start there at the CPU after
+its own, so the first windows of the CPUs
+read each CPU equally often, rather than every idle CPU reading CPUs 0 to 127 at the same tick and
+contending for their locks. After `sched::init` sets them at boot, only the CPU a cursor belongs
+to writes or reads it. The window caps a
+scan's cost at 128 CPUs' reads whatever the CPU count, where a full scan at the 8192 CPUs of
+`MAX_CPUS` reads 8192 remote cache lines at every wake and at every tick of every idle CPU. What
+it costs a boot above 128 CPUs is reach: a wake sees the least load or the lowest rank of its
+window rather than of every CPU, and a pull's bound gains one tick per window read before the one
+that holds its victim (below).
+
 Victim selection is mode-dependent:
 
 - **Busy CPU, `my_load > 0`** — pick a pseudo-random victim
   (splitmix-style hash of the global `LOAD_BALANCE_TICK` counter and the
   local CPU id). Skip if the victim is not significantly busier than us
   (`their_load <= my_load + LOAD_BALANCE_IMBALANCE_THRESHOLD`).
-- **Busy CPU, `my_load == 0`** — scan all other CPUs and pull from
-  the heaviest, when its load exceeds `LOAD_BALANCE_IMBALANCE_THRESHOLD`. Scanning is
-  cheap (one Relaxed atomic load per CPU) and guarantees the CPU finds work on the first
-  tick that sees an imbalance. Pure random victim selection converges only
-  probabilistically and on small topologies sometimes wastes many ticks
-  before picking the busy CPU.
-- **Idle CPU** (running its idle thread, its own queue empty) — a scan of the other CPUs
-  in index order from its cursor (`PerCpuScheduler::idle_pull_cursor`), wrapping, and a
-  pull whatever the victim's load. The heaviest CPU's load above
-  `LOAD_BALANCE_IMBALANCE_THRESHOLD` is pulled at once. A smaller backlog, a thread other
-  than the idle thread queued on a CPU (a bit of the run-queue mask above the idle queue's),
-  is pulled once it has stood for a tick without a break: the idle CPU records the first
-  such CPU in its scan's order as its candidate (`PerCpuScheduler::idle_pull_candidate`),
-  with that CPU's backlog episode (`PerCpuScheduler::backlog`), and, at its next idle tick,
-  pulls from that CPU if its backlog is still the same episode, else moves its cursor to the CPU
-  after that one and records afresh, another CPU's backlog first when there is one. A CPU's
-  backlog episode is a wrapping count, advanced under the CPU's run-queue lock, that ends a
-  backlog only when the CPU's own dispatch runs it dry: the link that queues a thread other than
-  the idle thread into queues holding none starts a new episode, unless a removal from the
-  queues (`remove_from_queue`) emptied them, which makes the count odd so that the link
-  restores the episode the removal broke off. So the same episode at both ticks is one backlog
-  that the CPU did not run dry between them, and the dispatch (`dequeue_highest`) leaves the
-  count alone. A priority change moves a queued thread between its CPU's run queues
-  (`relocate_ready_priority`) with `PerCpuScheduler::relink`, which sets the new queue's bit
-  before it clears the old one's and changes neither the load nor the episode, so no reader,
-  the lock-free sample included, sees that backlog break. A removal ends no episode either: a
-  thread unlinked and linked again without running keeps its episode, and a backlog that a
-  pull, a migration or a stop empties and a link refills reads as the one before, which can
-  cost one pull of a backlog that did not stand a tick, a pull the bound below allows. The
-  lock-free sample has one imprecision of its own: a sample whose two loads (the run-queue mask,
-  then the episode) straddle a dispatch running the backlog dry and the link that refills it
-  reads the refilled backlog's episode for the one it saw. The next idle tick confirms it only
-  if that backlog stood unbroken from the refill, inside the sample, to that tick, so the pull
-  takes a backlog that stood a tick less two loads; a pair that runs the queues dry on every
-  round trip has moved its episode on by that tick, and the race never confirms it. The bound
-  still holds: the early pull is a pull of a queued thread by an idle CPU, which leaves that
-  CPU busy, so it adds no tick to any thread's wait and never makes two busy CPUs trade
-  threads. Threads
-  time-slicing behind one another on a CPU stay one episode, since `schedule()` requeues
-  the outgoing thread before it dequeues the next. An idle CPU with a busy SMT sibling holds a
-  confirmed candidate one tick more before it pulls (§ SMT Awareness). A CPU whose queue
-  holds only its idle thread is no backlog. The candidate is cleared after every attempt,
-  when no CPU has a backlog, and on every tick the CPU runs another thread. A pull from the
-  candidate that finds no thread it can take (`sched::PullOutcome::NothingPullable`: the
-  backlog is pinned, or still mid-handoff) moves the cursor to the CPU after the candidate,
-  so the next backlog recorded is another CPU's, and so does one whose re-check under the
-  candidate's lock finds its backlog in a later episode (below). So neither a CPU whose
-  backlog no pull can take nor one whose backlog keeps breaking within a tick, which would be
-  recorded afresh at every tick, hides a backlog behind it. The scan is `sched::idle_scan`, the
-  decision `sched::idle_pull_step`, and the tick `sched::idle_pull_tick`.
+- **Busy CPU, `my_load == 0`** — scan the other CPUs of its window (from
+  `PerCpuScheduler::balance_cursor`) and pull from a CPU whose load exceeds
+  `LOAD_BALANCE_IMBALANCE_THRESHOLD` (`sched::empty_queue_victim`). In a boot of up to 129 CPUs the
+  window holds every other CPU and the scan pulls from the heaviest, a tie going to the first read,
+  at the first tick that sees it past the threshold; a heaviest CPU with nothing pullable on it is
+  chosen again at each tick, so it hides a lighter one there. In a larger boot the scan pulls from
+  the first CPU of its window past the threshold; a scan that finds none moves the cursor past its
+  window, and a pull that finds nothing it can take on its victim (`PullOutcome::NothingPullable`)
+  moves the cursor to the CPU after the victim (`sched::balance_cursor_after_pull`). The CPUs before
+  the victim in the window are below the threshold, so the move skips no CPU past it, and a CPU
+  whose pinned threads keep its load past the threshold does not hold the scan on its window.
+  Scanning is cheap (one Relaxed atomic load per CPU of the window, in a larger boot up to the first
+  past the threshold). A pullable load past the threshold, which stays so and which no heavier CPU
+  hides in a boot of up to 129 CPUs, is found within ceil((n - 1) / 128) ticks in a boot of n CPUs,
+  plus a tick for each CPU ahead of it in the cursor's order whose load is past the threshold with
+  nothing pullable on it, and one for each pull a contended try-lock defers or the re-check under
+  the locks refuses, which reads the same window again. Pure random victim selection converges only
+  probabilistically and on small topologies sometimes wastes many ticks before picking the busy CPU.
+- **Idle CPU** (running its idle thread, its own queue empty) — a scan of the other CPUs of its
+  window, from its cursor (`PerCpuScheduler::idle_pull_cursor`), and a pull whatever the victim's
+  load; a tick whose scan finds no backlog moves the cursor past its window. The heaviest CPU's load
+  above `LOAD_BALANCE_IMBALANCE_THRESHOLD` is pulled at once. A smaller backlog, a thread other than
+  the idle thread queued on a CPU (a bit of the run-queue mask above the idle queue's), is pulled
+  once it has stood for a tick without a break: the idle CPU records the first such CPU in its
+  scan's order as its candidate (`PerCpuScheduler::idle_pull_candidate`), with that CPU's backlog
+  episode (`PerCpuScheduler::backlog`), and, at its next idle tick, pulls from that CPU if its
+  backlog is still the same episode, else moves its cursor to the CPU after that one and records
+  afresh, another CPU's backlog first when there is one. A CPU's backlog episode is a wrapping
+  count, advanced under the CPU's run-queue lock, that ends a backlog only when the CPU's own
+  dispatch runs it dry: the link that queues a thread other than the idle thread into queues holding
+  none starts a new episode, unless a removal from the queues (`remove_from_queue`) emptied them,
+  which makes the count odd so that the link restores the episode the removal broke off. So the same
+  episode at both ticks is one backlog that the CPU did not run dry between them, and the dispatch
+  (`dequeue_highest`) leaves the count alone. A priority change moves a queued thread between its
+  CPU's run queues (`relocate_ready_priority`) with `PerCpuScheduler::relink`, which sets the new
+  queue's bit before it clears the old one's and changes neither the load nor the episode, so no
+  reader, the lock-free sample included, sees that backlog break. A removal ends no episode either:
+  a thread unlinked and linked again without running keeps its episode, and a backlog that a pull, a
+  migration or a stop empties and a link refills reads as the one before, which can cost one pull of
+  a backlog that did not stand a tick, a pull the bound below allows. The lock-free sample has one
+  imprecision of its own: a sample whose two loads (the run-queue mask, then the episode) straddle a
+  dispatch running the backlog dry and the link that refills it reads the refilled backlog's episode
+  for the one it saw. The next idle tick confirms it only if that backlog stood unbroken from the
+  refill, inside the sample, to that tick, so the pull takes a backlog that stood a tick less two
+  loads; a pair that runs the queues dry on every round trip has moved its episode on by that tick,
+  and the race never confirms it. The bound still holds: the early pull is a pull of a queued thread
+  by an idle CPU, which leaves that CPU busy, so it adds no tick to any thread's wait and never
+  makes two busy CPUs trade threads. Threads time-slicing behind one another on a CPU stay one
+  episode, since `schedule()` requeues the outgoing thread before it dequeues the next. An idle CPU
+  with a busy SMT sibling holds a confirmed candidate one tick more before it pulls (§ SMT
+  Awareness). A CPU whose queue holds only its idle thread is no backlog. The candidate is cleared
+  after every attempt, when no CPU has a backlog, and on every tick the CPU runs another thread. A
+  pull from the candidate that finds no thread it can take (`sched::PullOutcome::NothingPullable`:
+  the backlog is pinned, or still mid-handoff) moves the cursor to the CPU after the candidate, so
+  the next backlog recorded is another CPU's, and so does one whose re-check under the candidate's
+  lock finds its backlog in a later episode (below). So neither a CPU whose backlog no pull can take
+  nor one whose backlog keeps breaking within a tick, which would be recorded afresh at every tick,
+  hides a backlog behind it. The scan is `sched::idle_scan`, the decision `sched::idle_pull_step`,
+  and the tick `sched::idle_pull_tick`.
 
 The idle CPU's pull below the threshold is what keeps a thread from starving while a CPU
 idles. A thread queued behind a running thread that never blocks or yields to its level
@@ -709,11 +748,16 @@ the RT push below moves to a CPU running a lower level when one exists; a fair o
 and an RT thread while every other CPU runs at or above its level, stays. The threshold does not see
 one queued thread as an imbalance (a load of 2 with the linked idle thread), and
 `select_target_cpu` keeps a woken thread on its preferred CPU at that load. An idle CPU
-therefore pulls it, or another queued thread, within 2 + 2k + 2d + 2r idle ticks: one tick to
-record it and one to pull it, plus what each other outcome of an idle tick costs. An idle CPU
+therefore pulls it, or another queued thread, within 2 + 2k + 2d + 2r + w idle ticks: one tick
+to record it and one to pull it, plus what each other outcome of an idle tick costs. An idle CPU
 with a busy SMT sibling holds each confirmed candidate one tick before it pulls (§ SMT
-Awareness), so each two-tick cost below is three for it, and its bound is 3 + 3k + 3d + 3r;
-the outcomes that cost no tick still cost none, since a pull above the threshold is not held.
+Awareness), so each two-tick cost below is three for it, and its bound is
+3 + 3k + 3d + 3r + w; the outcomes that cost no tick still cost none, since a pull above the
+threshold is not held.
+
+- A window read ahead of the one holding the thread's CPU that holds no backlog costs one tick,
+  after which the cursor passes it ("Scan windows" above). w counts these windows: none in a boot
+  of up to 129 CPUs, and at most ceil((n - 1) / 128) - 1 in a boot of n CPUs above that.
 
 - Recording a CPU ahead of it in the cursor's order whose queued threads no pull can take
   (pinned, or mid-handoff) costs two ticks: one to record that CPU and one to find nothing
@@ -818,12 +862,12 @@ runs at once:
    own return does. A hit walks those queues from the highest for the first thread a pull
    may take (unpinned, `context_saved == 1`; `find_runnable` over that mask), whose level is the
    push's. So a CPU whose waiting threads are all pinned scans no other CPU.
-2. With the lock released, `try_push_waiting_rt` reads the other CPUs' ranks lock-free
-   (`PerCpuScheduler::ranks`), at most `RT_PUSH_SCAN_CPUS` (128) of them, in index order from the
-   CPU's `rt_push_cursor`, wrapping, and picks as an RT wake's placement does (§ Thread
+2. With the lock released, `try_push_waiting_rt` reads the ranks of the other CPUs of its window
+   lock-free (`PerCpuScheduler::ranks`), at most `CPU_SCAN_WINDOW` (128) of them from the CPU's
+   `rt_push_cursor` ("Scan windows" above), and picks as an RT wake's placement does (§ Thread
    Assignment): of the CPUs whose effective rank is below the level, the lowest rank, then the
    lower load, then the fewest busy SMT siblings, then the first read. A scan that finds none moves
-   the cursor past the CPUs it read.
+   the cursor past its window.
 3. On a target, `pull_unpinned_ready(this CPU, target, PullRule::Waiting)` moves the thread: the
    same try-locks in the same order as every pull, and the rule decided again under both run-queue
    locks. The pick is the highest movable thread of the push window, `run_queue::push_window`: the
@@ -844,7 +888,7 @@ back-off after a miss, rather than a window, would break the bound below: a CPU 
 during the back-off would not be read until it ended. The window keeps the bound and caps the cost.
 
 The bound for a movable waiting thread is one tick of the CPU it waits on in a boot of up to
-`RT_PUSH_SCAN_CPUS + 1` (129) CPUs, since the window then reads every other CPU. In a boot of n
+`CPU_SCAN_WINDOW + 1` (129) CPUs, since the window then reads every other CPU. In a boot of n
 CPUs above that it is ceil((n - 1) / 128) ticks: successive misses read successive windows, so a CPU
 whose level is below the thread's at all of those ticks is read by one of them; that is 64 ticks at
 8192 CPUs. Each push that a contended try-lock defers (`PullOutcome::Deferred`), or that the
@@ -926,22 +970,25 @@ deferred to a later tick. Pinned threads (`cpu_affinity != AFFINITY_ANY`)
 are invisible to the `find_runnable` predicate and are never migrated.
 
 Hot-path cost per CPU per tick:
-- Idle CPU: one Relaxed load of its own load, one Relaxed load of the load per remote CPU to find
-  the heaviest victim, one Acquire load of the run-queue mask per remote CPU whose load is non-zero
-  up to the first with a queued thread and one Relaxed load of that CPU's backlog episode, one
-  Relaxed load each of its own candidate, its episode and its cursor, one Acquire load of the
-  candidate's run-queue mask and one Relaxed load of its backlog episode, and a Relaxed store of its
-  own candidate and episode (and of its cursor when a pull from the candidate found nothing
-  pullable), fields only this CPU writes. A pull above the threshold that finds nothing pullable
-  adds a second scan of the same cost. Each idle tick also loads its own `idle_pull_held` (Relaxed)
-  and stores it with its candidate, and a confirmed candidate not held the tick before adds a
-  `has_no_work` read of each of the idle CPU's SMT siblings (§ SMT Awareness).
-- Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick
-  after an idle one) and one of its own load, plus, with an empty queue, one Relaxed load
-  per remote CPU, or, with queued threads, one Relaxed increment + one Relaxed load for the
-  victim. Before the balancer, the RT push's waiting test makes two Relaxed loads of its own
-  run-queue mask and `outranking` under the lock the tick already holds; only a hit costs more
-  (above, "RT push").
+- Idle CPU: one Relaxed load of its own load, one Relaxed load of the load per CPU of its window
+  (at most `CPU_SCAN_WINDOW`) to find the heaviest victim, one Acquire load of the run-queue mask
+  per CPU of the window whose load is non-zero up to the first with a queued thread and one
+  Relaxed load of that CPU's backlog episode, one Relaxed load each of its own candidate, its
+  episode and its cursor, one Acquire load of the candidate's run-queue mask and one Relaxed load
+  of its backlog episode, and a Relaxed store of its own candidate and episode (and of its cursor
+  when a pull from the candidate found nothing pullable or, in a boot above 129 CPUs, the scan
+  found no backlog), fields only this CPU writes. A pull above the threshold that finds nothing
+  pullable adds a second scan of the same cost. Each idle tick also loads its own
+  `idle_pull_held` (Relaxed) and stores it with its candidate, and a confirmed candidate not held
+  the tick before adds a `has_no_work` read of each of the idle CPU's SMT siblings (§ SMT
+  Awareness).
+- Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick after an idle
+  one) and one of its own load, plus, with an empty queue, one Relaxed load of its `balance_cursor`
+  and one per CPU of its window (at most `CPU_SCAN_WINDOW`), and in a boot above 129 CPUs a Relaxed
+  store of the cursor when the scan finds no load past the threshold or its pull finds nothing
+  pullable, or, with queued threads, one Relaxed increment + one Relaxed load for the victim. Before
+  the balancer, the RT push's waiting test makes two Relaxed loads of its own run-queue mask and
+  `outranking` under the lock the tick already holds; only a hit costs more (above, "RT push").
 - Scheduler locks are try-acquired: by a busy CPU only when an imbalance above
   `LOAD_BALANCE_IMBALANCE_THRESHOLD` is observed, and by an idle CPU when the idle rule
   above decides a pull (a second time in the tick when a pull above the threshold moves
@@ -1037,8 +1084,9 @@ than its idle thread, or queues one. The read is lockless and Relaxed, and a sib
 changes state under it costs one placement its tie-break, never correctness.
 
 - **Placement** (`select_target_cpu`, § Thread Assignment): a tie on the least load goes to
-  the CPU with the fewest busy siblings, then to the lowest index. An RT thread's key is its rank
-  first and the load second, and its ties go the same way. The rings are walked only for the CPUs
+  the CPU with the fewest busy siblings, then to the first read, the lowest index in a boot of
+  up to 128 CPUs. An RT thread's key is its rank first and the load second, and its ties go the
+  same way. The rings are walked only for the CPUs
   that tie on the least key seen so far, and no more once a CPU of an idle core holds it. A fair
   thread's sticky preferred CPU is still taken first when its load is within the threshold, since
   the caches it holds outweigh the spread. An RT thread keeps its preferred CPU only when it runs
@@ -1050,7 +1098,7 @@ changes state under it costs one placement its tie-break, never correctness.
   (`sched::IdlePullStep::Hold`, recorded in `PerCpuScheduler::idle_pull_held`); an idle CPU
   of an idle core that confirms the same backlog in that tick pulls it first. A pull above the
   threshold is not held, since a load past it is an imbalance rather than a tie. The hold raises
-  that CPU's bound to 3 + 3k + 3d + 3r ticks (§ Load Balancing).
+  that CPU's bound to 3 + 3k + 3d + 3r + w ticks (§ Load Balancing).
 - A busy CPU's pull (`try_pull_balance`) takes no account of siblings: its own core is busy
   already.
 
@@ -1212,24 +1260,25 @@ deadline to CPU 0's next tick (at most one tick), CPU 0's own interval with inte
 and the sleep batch's claims ahead of it
 ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants) § Sleep List
 Invariants, invariant 6). The bound holds for the CPU the wake's placement chose, which for an RT
-thread is one it outranks whenever an eligible CPU runs and queues only lower levels (§ Thread
-Assignment). An RT wake is placed behind a running thread of its own or a higher level when every
-eligible CPU runs or queues such a thread, when hard affinity, the save-window pin or a synchronous
-wake's guard places it, and when the levels its placement sampled went stale before its link (two
-wakes placed on one CPU at once). An unpinned thread so waiting, or one left waiting when another
-CPU's dispatch lowers that CPU's level, is moved by the RT push of the CPU it waits on (§ Load
-Balancing, "RT push") to a CPU whose running and queued threads it outranks, where the pull's wake
-preempts as above: within one tick of the CPU it waits on in a boot of up to 129 CPUs, and within
-ceil((n - 1) / 128) such ticks in a boot of n CPUs above that (64 at the 8192 of `MAX_CPUS`). Each
-push that a contended try-lock defers, or that the re-check under the locks refuses (a thread linked
-on the target, a higher level a dispatch there recorded, or a level that a priority change of its
-running thread raised and the target recorded again, since the push read its ranks), adds one tick;
-each push that such a dispatch or record on the target overtakes adds that bound again, on the
-target; each movable waiting thread that the CPU's pushes
-take ahead of it adds one tick, since a tick pushes one thread; and a priority change of the thread
-it waits behind adds one. A thread waits for the higher one to block, yield or expire only while no
-CPU it may run on runs and queues only lower levels: when every such CPU runs or queues its level or
-above, or when hard affinity pins it.
+thread is one it outranks whenever an eligible CPU of the placement's window runs and queues only
+lower levels (§ Thread Assignment), the window holding every CPU in a boot of up to 128 CPUs
+(§ Load Balancing, "Scan windows"). An RT wake is placed behind a running thread of its own or a
+higher level when every eligible CPU of that window runs or queues such a thread, when hard
+affinity, the save-window pin or a synchronous wake's guard places it, and when the levels its
+placement sampled went stale before its link (two wakes placed on one CPU at once). An unpinned
+thread so waiting, or one left waiting when another CPU's dispatch lowers that CPU's level, is
+moved by the RT push of the CPU it waits on (§ Load Balancing, "RT push") to a CPU whose running and
+queued threads it outranks, where the pull's wake preempts as above: within one tick of the CPU it
+waits on in a boot of up to 129 CPUs, and within ceil((n - 1) / 128) such ticks in a boot of n CPUs
+above that (64 at the 8192 of `MAX_CPUS`). Each push that a contended try-lock defers, or that the
+re-check under the locks refuses (a thread linked on the target, a higher level a dispatch there
+recorded, or a level that a priority change of its running thread raised and the target recorded
+again, since the push read its ranks), adds one tick; each push that such a dispatch or record on
+the target overtakes adds that bound again, on the target; each movable waiting thread that the
+CPU's pushes take ahead of it adds one tick, since a tick pushes one thread; and a priority change
+of the thread it waits behind adds one. A thread waits for the higher one to block, yield or expire
+only while no CPU it may run on runs and queues only lower levels: when every such CPU runs or
+queues its level or above, or when hard affinity pins it.
 
 **Timed wakes** stay on CPU 0's tick (§ Timer-Driven Preemption): every ABI timeout is in
 milliseconds and the tick is 1 ms, so a one-shot timer buys no resolution the ABI can ask for, and
@@ -1444,12 +1493,13 @@ concurrent delete of its last capability frees it only after the call returns.
 
 `tcb.preferred_cpu` records the CPU the thread was last assigned to. The wake-side placement
 (`select_target_cpu`) honours it as a sticky cache- warmth hint. An RT thread keeps it where it runs
-there at once (§ Thread Assignment). For a fair thread the placement scans all CPUs for `min_load`,
-and if `preferred_cpu`'s load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD` of `min_load`, the thread
-is re-placed on its preferred CPU. Beyond that threshold the thread is migrated to the least-loaded
-CPU. The threshold is the same hysteresis a busy CPU's pull uses to decide an imbalance is real, so
-soft affinity, wake placement, and the busy-CPU pull share one knob; an idle CPU pulls below it (§
-Load Balancing).
+there at once (§ Thread Assignment). For a fair thread the placement scans the CPUs of its window
+for `min_load` (all CPUs in a boot of up to 128; § Load Balancing, "Scan windows"), and if
+`preferred_cpu`'s load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD` of `min_load`, the thread is
+re-placed on its preferred CPU. Beyond that threshold the thread is migrated to the least-loaded
+CPU of the window. The threshold is the same hysteresis a busy CPU's pull uses to decide an
+imbalance is real, so soft affinity, wake placement, and the busy-CPU pull share one knob; an
+idle CPU pulls below it (§ Load Balancing).
 
 Hard affinity (`cpu_affinity != AFFINITY_ANY`), save-window pinning (`context_saved == 0`) and a
 synchronous wake whose guard holds (§ Thread Assignment) short-circuit ahead of the soft-affinity

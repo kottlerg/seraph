@@ -1,23 +1,23 @@
 # bench baseline, written by `cargo xtask bench-baseline`
 # Format: xtask/README.md (`cargo xtask bench-check`).
-size=1024 path=frame cpus=1 unit=cycles p50=64044
-size=1024 path=frame cpus=4 unit=cycles p50=72260
-size=1024 path=inline cpus=1 unit=cycles p50=58027
-size=1024 path=inline cpus=4 unit=cycles p50=74459
-size=16 path=frame cpus=1 unit=cycles p50=64044
-size=16 path=frame cpus=4 unit=cycles p50=72260
-size=16 path=inline cpus=1 unit=cycles p50=11446
-size=16 path=inline cpus=4 unit=cycles p50=15554
-size=16 path=inline affinity=any cpus=4 unit=cycles p50=183103
-size=16384 path=frame cpus=1 unit=cycles p50=256876
-size=16384 path=frame cpus=4 unit=cycles p50=290183
-size=16384 path=inline cpus=1 unit=cycles p50=941280
-size=16384 path=inline cpus=4 unit=cycles p50=1205773
-size=4096 path=frame cpus=1 unit=cycles p50=64044
-size=4096 path=frame cpus=4 unit=cycles p50=72260
-size=4096 path=inline cpus=1 unit=cycles p50=231967
-size=4096 path=inline cpus=4 unit=cycles p50=297695
-size=65536 path=frame cpus=1 unit=cycles p50=1028648
-size=65536 path=frame cpus=4 unit=cycles p50=1161473
-size=65536 path=inline cpus=1 unit=cycles p50=3969603
-size=65536 path=inline cpus=4 unit=cycles p50=5028584
+size=1024 path=frame cpus=1 unit=cycles p50=64218
+size=1024 path=frame cpus=4 unit=cycles p50=72538
+size=1024 path=inline cpus=1 unit=cycles p50=58951
+size=1024 path=inline cpus=4 unit=cycles p50=75591
+size=16 path=frame cpus=1 unit=cycles p50=64218
+size=16 path=frame cpus=4 unit=cycles p50=72538
+size=16 path=inline cpus=1 unit=cycles p50=11528
+size=16 path=inline cpus=4 unit=cycles p50=15668
+size=16 path=inline affinity=any cpus=4 unit=cycles p50=184421
+size=16384 path=frame cpus=1 unit=cycles p50=257569
+size=16384 path=frame cpus=4 unit=cycles p50=291297
+size=16384 path=inline cpus=1 unit=cycles p50=956081
+size=16384 path=inline cpus=4 unit=cycles p50=1222494
+size=4096 path=frame cpus=1 unit=cycles p50=64218
+size=4096 path=frame cpus=4 unit=cycles p50=72538
+size=4096 path=inline cpus=1 unit=cycles p50=235663
+size=4096 path=inline cpus=4 unit=cycles p50=302223
+size=65536 path=frame cpus=1 unit=cycles p50=1031435
+size=65536 path=frame cpus=4 unit=cycles p50=1166084
+size=65536 path=inline cpus=1 unit=cycles p50=4028807
+size=65536 path=inline cpus=4 unit=cycles p50=5095948

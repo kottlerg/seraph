@@ -649,6 +649,7 @@ through to the normal run.
 | `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
 | `open-reclaim-child`        | `fs_opens`     | `fs_reclaims_dead_opens` (killed client)    |
 | `session-undeliverable-child` | `fs_opens` | `fs_reclaims_dead_opens` (failed session reply) |
+| `read-undeliverable-child` | `fs_opens` | `fs_reclaims_dead_opens` (failed memory-cap read replies) |
 | `fs-session-client`         | `fs_sessions`  | `fs_sessions` (exits holding a session)     |
 | `fs-create-open-full`       | `fs_create_open` | `fs_create_open` (session full at its max) |
 | `fs-create-open-cwd`        | `fs_create_open` | `fs_create_open` (create in the cwd at its max) |

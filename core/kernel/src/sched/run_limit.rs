@@ -174,13 +174,11 @@ pub unsafe fn set(tcb: *mut ThreadControlBlock, limit: u32)
 pub unsafe fn reset_current()
 {
     // SAFETY: syscall context (contract); current_tcb reads this CPU's
-    // running thread.
+    // running thread, the caller, which a syscall always has.
     let tcb = unsafe { crate::syscall::current_tcb() };
-    if !tcb.is_null()
-    {
-        // SAFETY: tcb is the running thread's live TCB; the field is an atomic.
-        unsafe { (*tcb).run_count.store(0, Ordering::Relaxed) };
-    }
+    debug_assert!(!tcb.is_null(), "a syscall runs on a thread");
+    // SAFETY: tcb is the running thread's live TCB; the field is an atomic.
+    unsafe { (*tcb).run_count.store(0, Ordering::Relaxed) };
 }
 
 /// Take the pending run-limit fault of `tcb`, clearing it: whether one was

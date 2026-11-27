@@ -515,10 +515,16 @@ unsafe fn finish_syscall_work(exit: SyscallExit)
             }
             if exit == SyscallExit::Complete
             {
-                // SAFETY: syscall context on the caller's kernel stack, the
-                // frame holding the syscall's result, no lock held and
-                // interrupts disabled.
-                unsafe { crate::sched::run_limit::deliver_at_syscall() };
+                // Only a pass that took RUN_LIMIT looks for a run-limit
+                // fault: every producer of a pending fault posts the bit, and
+                // a return that does not complete posts it again below.
+                if work & RUN_LIMIT != 0
+                {
+                    // SAFETY: syscall context on the caller's kernel stack,
+                    // the frame holding the syscall's result, no lock held
+                    // and interrupts disabled.
+                    unsafe { crate::sched::run_limit::deliver_at_syscall() };
+                }
                 // SAFETY: as for the delivery above.
                 unsafe { crate::ipc::upcall::deliver_at_syscall() };
             }

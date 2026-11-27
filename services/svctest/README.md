@@ -757,13 +757,16 @@ last cases end their driver themselves, each observed through an event queue bou
 main thread: the block server revokes every capability derived from its endpoint, two more drivers,
 each on a volume of its own, take `FS_UNMOUNT`, and a fourth loses its service endpoint as vfsd ends
 a driver it cannot use and must exit at its next receive. The `fs_pressure_release` phase before it
-starts a fatfs the same way, loses one cache page's cap in a read the block server fails, drives
-memmgr's level to `Low` and back as `memmgr_pressure` does, and checks from the block server's log
-of reads that the driver gave back every idle cache page but the one svctest still maps and the few
-it keeps, the lost cap's page among them, with its children's charge falling to match and memmgr's
-pool total unchanged. The `fs_run_fill` phase after it starts fatfs the same way four times on one
-volume: from the block server's log of reads, a sequential `FS_READ_MEMORY` scan of a file fills
-runs of more than a page and at most `fat_parse::RUN_PAGES` pages, and a read off the sequence fills
+starts a fatfs the same way, drives memmgr's level to `Low` as `memmgr_pressure` does until a read
+of a second file shows that the driver gave pages back, so its pressure thread has run and been
+charged its demand-paged stack, and lets the level return to `Normal`. It then loses one cache
+page's cap in a read the block server fails, drives the level to `Low` and back again, and checks
+from the block server's log of reads that the driver gave back every idle cache page but the one
+svctest still maps and the few it keeps, the lost cap's page among them, with its children's charge
+falling to match and memmgr's pool total unchanged. The `fs_run_fill` phase after it starts fatfs
+the same way four times on one volume: from the block server's log of reads, a sequential
+`FS_READ_MEMORY` scan of a file fills runs of more than a page and at most `fat_parse::RUN_PAGES`
+pages, and a read off the sequence fills
 one page; a scan whose first run read loses its Memory cap fills one page at a time from there, and
 a write after it still succeeds; then an open whose chain cursor stands deep in the file reads the
 file's new bytes after a truncate and rewrite give the file the same first cluster and different

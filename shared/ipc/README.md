@@ -63,10 +63,14 @@ A server loop holds one `serve::Reply` per receiving thread and receives with
 `serve::next_request(ep, &mut reply, ipc_buf)`. A handler whose turn ends with its reply leaves it
 with `Reply::set`, and the next `next_request` sends it with the receive in one
 `SYS_IPC_REPLY_RECV` ([IPC Design](../../docs/ipc-design.md) § The Call/Reply Model); with the slot
-empty, `next_request` is `ipc_recv`. A handler with work after its reply (an IPC call, a syscall,
-a use of the reply's outcome) replies at once with `ipc_reply` and leaves the slot empty, and a
-loop with work before its next receive sends a set reply alone first with `Reply::flush`, so no
-reply waits behind work.
+empty, `next_request` is `ipc_recv`. `serve::next_request_timeout` takes the receive's bound in
+milliseconds as well, for a loop whose receive waits a bounded time; `next_request` waits without
+one. A handler with work after its reply (an IPC call, a syscall) replies at once with `ipc_reply`
+and leaves the slot empty, and a loop with work before its next receive sends a set reply alone
+first with `Reply::flush`, so no reply waits behind work. A loop that uses the reply's outcome reads
+`Reply::undelivered` after the send that carried it, `flush` or the next receive: it is true when
+the reply did not reach its caller (the caller is gone, or its `CSpace` could not take the reply's
+caps), until the next send, so the loop can undo what the reply reported.
 
 `next_request` returns the receive's errors, those of `ipc_recv`, for the loop's `RecvGuard`
 ([IPC Design](../../docs/ipc-design.md) § Receive-Failure Policy). The kernel reports the receive's

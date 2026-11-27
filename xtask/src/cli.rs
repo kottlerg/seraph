@@ -838,8 +838,8 @@ args! {
         /// Check that the console stayed whole in each passing run's log:
         /// between the lines `<TAG> begin` and `<TAG> end ...`, every line is
         /// one console line, and each sender's numbered lines arrive whole, in
-        /// order, none missing (svctest's `console_whole_lines` and
-        /// `serial_transmit` phases); repeatable, each tag's window is
+        /// order, none missing (svctest's `console_whole_lines`,
+        /// `serial_transmit` and `logd_flood` phases); repeatable, each tag's window is
         /// checked. A run whose check fails is FAIL; a QEMU-CRASH run is not
         /// checked.
         #[arg(long, value_name = "TAG", requires = "runs")]

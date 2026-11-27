@@ -53,19 +53,19 @@ under its sender's name, the first after the restart included
   output routes to the serial driver through a
   `std::os::seraph::set_panic_sink` sink rather than the log endpoint,
   and logd deletes its procmgr-seeded `ProcessInfo.log_send_cap` at
-  startup so no path can self-IPC. Each line reaches the driver through the serial sink, a bounded
-  queue drained by one writer thread, the only logd thread that waits on the driver: a line's
-  producer waits for its write for at most `SINK_STALL_MS`, and past that the sink is stalled and
-  its lines queued, then dropped and counted, until the driver writes again, so a driver that is
-  stopped by a debugger or dead does not hold the log stream; a sink whose writer could not be
-  spawned is written by each line's producer, and a stopped driver then costs every line up to that
-  bound (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § Output sinks). The panic sink calls
-  the driver directly, each call bounded by the same bound, and drops its output while no driver is
+  startup so no path can self-IPC. Each line reaches the driver through the serial sink, a cursor
+  into the history and one writer thread that writes from it, the only logd thread that waits on
+  the driver: no producer waits on a sink, and a log call returns once its line is retained, so a
+  driver that is stopped by a debugger or dead costs logd its writer and the entries the history
+  drops before the writer reaches them; a sink whose writer could not be spawned is written by the
+  thread that retains each line, and a stopped driver then costs every line up to `SINK_STALL_MS`
+  (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § Output sinks). The panic sink calls the
+  driver directly, each call bounded by the same bound, and drops its output while no driver is
   resolved. The emit path never calls devmgr: while devmgr serves no driver of a sink's class, the
-  sink queues its lines without a wait, counts those past its queue, and writes both to the driver
-  its class watch resolves next, while history still accrues; early-boot output is covered by
-  init-logd's direct-UART fallback. logd holds its own diagnostics until init-logd, which
-  writes the UART directly, has acknowledged the handover release, so the two never write a line at
+  history keeps the lines, and the sink writes them to the driver its class watch resolves next;
+  early-boot output is covered by init-logd's direct-UART fallback. logd retains its own
+  diagnostics in the history until init-logd, which writes the UART directly, has acknowledged the
+  handover release, so the two never write a line at
   once (see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Startup ordering). See
   [docs/console-model.md](../../docs/console-model.md).
 
@@ -75,11 +75,11 @@ under its sender's name, the first after the restart included
   the serial driver's, and written with `FB_WRITE_BYTES`,
   so the steady-state userspace log stream reaches the screen as well as
   the UART (matching the early-kernel console). The mirror is a sink of its own, with its own
-  queue and writer, so a framebuffer driver that does not answer holds neither the log stream nor
-  the serial output beyond `SINK_STALL_MS`. When no framebuffer driver is present (headless
-  boot) the mirror writes nothing: its sink queues lines up to its queue and counts the rest for a
-  driver that may come up later, leaving serial the authoritative channel; the emit path never
-  queries devmgr.
+  cursor and writer, so a framebuffer driver that does not answer holds neither the log stream nor
+  the serial output, and the mirror never holds a sender. When no framebuffer driver is present
+  (headless boot) the mirror writes nothing; a driver that comes up later starts at the newest
+  `SKIP_BACKLOG` (64) entries and counts the rest as dropped, leaving serial the authoritative
+  channel; the emit path never queries devmgr.
   See [docs/console-model.md](../../docs/console-model.md).
 
 * **Log records.** Beside the text stream, a sender can send a log record,
@@ -95,8 +95,11 @@ under its sender's name, the first after the restart included
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § History, which states the stored form) and
   seeded at startup from init-logd's handover `LINE` and `RECORD` chunks (see
   [`docs/handover-protocol.md`](docs/handover-protocol.md) § `LINE`). The history of every
-  sender together is bounded by `HISTORY_BYTES` (256 KiB): an entry retained past it drops the
-  oldest entries logd-wide. A sender keeps at most its last `PER_SLOT_HISTORY` (16) entries. An
+  sender together is bounded by a byte bound fixed at start, the machine's RAM over 2048 within
+  `HISTORY_BYTES_MIN` (256 KiB) and `HISTORY_BYTES_MAX` (2 MiB): an entry retained past it drops
+  the oldest entry the serial sink has written, else the oldest entry of the slot with the most
+  unwritten entries. A sender keeps at most its last `PER_SLOT_HISTORY_MIN` (32) entries, scaled
+  by the byte bound's ratio to the floor. The history is also the journal the sinks write from. An
   evicted slot is retired with its name and entries, a bounded number of them kept (see
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Retired slots).
 
@@ -165,11 +168,11 @@ under its sender's name, the first after the restart included
   instance after a crash (see
   [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)
   § `reserve`). What logd takes from the reserve is what it grows by while memory is critical:
-  its history, which `HISTORY_BYTES` (256 KiB) bounds whatever the number of senders, each live
-  sender's partial line filling to `LINE_BUF_SIZE`, and a slot of about 0.5 KiB for each sender
-  that sends its first line meanwhile. After a restart while memory is critical that is every live
-  sender, since the new instance's table is empty, and the new instance's whole startup footprint
-  is taken from the reserve as well; its history is bounded the same way
+  its history, which its byte bound (256 KiB to 2 MiB) holds whatever the number of senders,
+  each live sender's partial line filling to `LINE_BUF_SIZE`, and a slot of about 0.5 KiB for each
+  sender that sends its first line meanwhile. After a restart while memory is critical that is
+  every live sender, since the new instance's table is empty, and the new instance's whole startup
+  footprint is taken from the reserve as well; its history is bounded the same way
   ([docs/limits.md](../../docs/limits.md) § init and logd).
 
 * **No core.** logd declares itself on the core path to procmgr
@@ -209,7 +212,7 @@ logd/
 │   └── sinks.md                # sink contract, record, formats, settings
 ├── slot-table/                 # logd-slot-table: SlotTable, the sender
 │                               # slots, their history under
-│                               # HISTORY_BYTES, and the retired slots
+│                               # the history's byte bound, and the retired slots
 │                               # (host-tested)
 └── src/
     ├── main.rs                 # entry, bootstrap, receive-pool

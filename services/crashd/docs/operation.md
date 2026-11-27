@@ -357,25 +357,25 @@ wait for the log before the decline (step 6 of [Per Fault](#per-fault)), with wh
 same deadline, after a dump when one ran: one deadline over the block and the wait. The attach
 request can wait on procmgr, and procmgr can be waiting on the faulting process (an fs driver
 serving a `CREATE_FROM_FILE` read); a log write is refused while a sink that holds the log has not
-written enough of crashd's earlier lines, and is sent again after logd's retry hint
-([logd IPC interface](../../logd/docs/ipc-interface.md#hold-window) § Hold window); the wait for
-the log lasts until the sink holding the log has written the block, or that sink stalls
-(`SINK_STALL_MS`). A fault in a thread of logd that holds logd's state lock leaves logd unable
-to answer the wait: it ends at the deadline, the fault is declined, and the block's lines logd had
-not written are lost with logd. Every call of the step carries the time left as its `SYS_IPC_CALL` timeout, so
-the kernel ends the one waiting at the deadline (`WouldBlock`): crashd's own requests, the attach
-and the stack walk's resident requests (`ipc::ipc_call_within`, `ipc::ResidentBound`), and the
-runtime's, the log writes among them. None is sent once the deadline has passed. The deadline
-bounds only calls: a page fault of crashd's own, a page fault on its pager included, is not cut,
-so the bound cannot end crashd. When the deadline passes, crashd declines the fault at once,
-marking the block `status=timeout` when an attach was the call it ended, and logs the rest of the
-block after the decline, when nothing waits on the faulting thread any more. The deadline ends
-with the step, so nothing of one fault's bound reaches the next fault's handling. The stack scan
-reads at most 8 KiB (`STACK_SCAN_BYTES`); a stack page it asks procmgr to make resident waits on
-the swap service for at most `ipc::PENDING_TRIES` pauses, about a second, over the whole scan,
-and none is asked for once the deadline has passed. The log lines crashd writes about its holds
-([Hold](#hold)) each run under a deadline of the same 2 s, so a write that waits on a stuck driver
-does not stop crashd serving faults and ending holds.
+written enough of crashd's earlier lines, and is sent again after logd's retry hint ([logd IPC
+interface](../../logd/docs/ipc-interface.md#hold-window) § Hold window); the wait for the log lasts
+until the sink holding the log has written the block, or that sink stalls (`SINK_STALL_MS`). A fault
+in a thread of logd that holds logd's state lock leaves logd unable to answer the wait: it ends at
+the deadline, the fault is declined, and the block's lines logd had not written are lost with logd.
+Every call of the step carries the time left as its `SYS_IPC_CALL` timeout, so the kernel ends the
+one waiting at the deadline (`WouldBlock`): crashd's own requests, the attach and the stack walk's
+resident requests (`ipc::ipc_call_within`, `ipc::ResidentBound`), and the runtime's, the log writes
+among them. None is sent once the deadline has passed. The deadline bounds only calls: a page fault
+of crashd's own, a page fault on its pager included, is not cut, so the bound cannot end crashd.
+When the deadline passes, crashd declines the fault at once, marking the block `status=timeout` when
+an attach was the call it ended, and logs the rest of the block after the decline, when nothing
+waits on the faulting thread any more. The deadline ends with the step, so nothing of one fault's
+bound reaches the next fault's handling. The stack scan reads at most 8 KiB (`STACK_SCAN_BYTES`); a
+stack page it asks procmgr to make resident waits on the swap service for at most
+`ipc::PENDING_TRIES` pauses, about a second, over the whole scan, and none is asked for once the
+deadline has passed. The log lines crashd writes about its holds ([Hold](#hold)) each run under a
+deadline of the same 2 s, so a write that waits on a stuck driver does not stop crashd serving
+faults and ending holds.
 
 A dump runs under a call deadline of its own, 60 s (`DUMP_BOUND`), after the report's and outside
 it, and so does a live core ([Live Core](#live-core)), which delays the faults that arrive meanwhile

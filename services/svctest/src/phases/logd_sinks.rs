@@ -28,7 +28,7 @@
 //!   stall bound. Once the stall bound has passed the sink is stalled and
 //!   holds no sender: the refused line, sent again, is taken. The last line
 //!   must be in logd's history. The lines stay within svctest's share of the
-//!   history (`PER_SLOT_HISTORY`), so none is dropped from the console CI
+//!   history (`PER_SLOT_HISTORY_MIN` at the least), so none is dropped from the console CI
 //!   reads; they are written once the phase starts the driver again.
 //! - **Framebuffer stopped**, on a boot with a framebuffer driver (the
 //!   framebuffer cell; otherwise the case logs that it skipped). The

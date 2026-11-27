@@ -14,8 +14,9 @@ fault, the registers, the bytes at the instruction pointer, the image placement,
 in the format [docs/block-format.md](docs/block-format.md) defines. It then waits, within the
 fault's bound, for logd to write the block (logd's flush barrier, through the `logd.flush` seed,
 whose only authority is that barrier), since the decline can end logd itself and the lines logd
-holds unwritten end with it, and declines the fault (`FAULT_REPLY_KILL`), so the thread dies with the exit reason and the death flow it would have had
-with no handler ([docs/fault-handling.md](../../docs/fault-handling.md) § Crash Reports).
+holds unwritten end with it, and declines the fault (`FAULT_REPLY_KILL`), so the thread dies with
+the exit reason and the death flow it would have had with no handler
+([docs/fault-handling.md](../../docs/fault-handling.md) § Crash Reports).
 
 A page fault memmgr declined for want of memory crashd may hold instead, when its recipe sets a
 stall (`CRASHD_OOM_STALL_MS`; the shipped recipe sets 10 000 ms): the fault waits queued on one

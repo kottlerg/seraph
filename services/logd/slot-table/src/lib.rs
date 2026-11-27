@@ -116,7 +116,7 @@ impl Default for Bounds
 }
 
 /// Number of evicted slots logd retains, with their names, for its queries;
-/// their history counts toward [`HISTORY_BYTES`]. A retention tuning value
+/// their history counts toward the history's byte bound ([`Bounds`]). A retention tuning value
 /// that bounds no capacity: retiring a slot into a full set drops the oldest
 /// retired slot and its history, never a live one.
 pub const RETIRED_SLOTS: usize = 64;

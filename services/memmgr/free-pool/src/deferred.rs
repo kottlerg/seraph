@@ -27,6 +27,7 @@ fn deferred_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<DeferredR
         Node::Deferred(d) => Some(d),
         Node::Free
         | Node::Run(_)
+        | Node::Pooled(_)
         | Node::Budget(_)
         | Node::Region(_)
         | Node::Frame(_)

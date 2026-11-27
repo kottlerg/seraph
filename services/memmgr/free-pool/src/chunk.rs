@@ -736,6 +736,7 @@ fn child<S: SlotStore>(arena: &Arena<S>, dir: NodeIdx, pos: usize) -> NodeIdx
         Node::ChunkDir(children) => children.get(pos).copied().unwrap_or(NODE_NULL),
         Node::Free
         | Node::Run(_)
+        | Node::Pooled(_)
         | Node::Deferred(_)
         | Node::Budget(_)
         | Node::Region(_)
@@ -795,6 +796,7 @@ pub fn entry<S: SlotStore>(arena: &Arena<S>, root: NodeIdx, height: u32, index: 
         Some(
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)
@@ -936,6 +938,7 @@ pub fn release<S: SlotStore>(
             // Not a table node: no table links to one, so leave it alone.
             Node::Free
             | Node::Run(_)
+            | Node::Pooled(_)
             | Node::Deferred(_)
             | Node::Budget(_)
             | Node::Region(_)

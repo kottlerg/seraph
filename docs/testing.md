@@ -1531,7 +1531,7 @@ to the tiers below.
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR: the cells its change owes ([conventions.md § CI Gating](conventions.md#ci-gating)) | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots), and every bounded proof whose pass no run of the repository stored at the same inputs (the `kani` jobs, [Bounded verification](#bounded-verification)) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, the svctest boots headless in both profiles, no `cargo xtask test` case or cell boots), and every bounded proof whose pass no run of the repository stored at the same inputs (the `kani` jobs, [Bounded verification](#bounded-verification)) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation, the large-memory cell, and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
 
@@ -1616,15 +1616,16 @@ surface.
   driver adds cells to its own device surface (Device surfaces below), not to the main set.
 - **Tag set.** The main set and every driver with a QEMU-testable device, filesystem drivers
   included, each through its cells: the release host runs boot every device cell before each tag
-  (Release host runs below), and burn-in repeats the canonical cells. The framebuffer driver's
-  device, QEMU std VGA, is outside the main set because the boot with no display is the one every
-  canonical harness makes; the release svctest cells boot it on every change that owes them, and the
-  framebuffer cell (Framebuffer cell below) boots it in the debug profile. The virtio-console
-  driver's device, the debug port, is outside it because only a launch that asks for a debug port
-  attaches it: the debug-port cell (Debug-port cell below) boots it, and in CI the `terminal` case's
-  boots and the `shutdown` case's GDB-stub boots attach it to reach the stub over it. The TPM
-  driver's device, a TPM 2.0 behind QEMU's `tpm-tis` or `tpm-crb` and backed by `swtpm`, is outside
-  it because only the `tpm` case attaches it; the tpm cell (TPM cell below) boots it.
+  (Release host runs below), and burn-in repeats the canonical cells' boots, its svctest boots
+  headless in both profiles. The framebuffer driver's device, QEMU std VGA, is outside the main set
+  because the boot with no display is the one every canonical harness makes; the release svctest
+  cells boot it on every change that owes them, and the framebuffer cell (Framebuffer cell below)
+  boots it in the debug profile. The virtio-console driver's device, the debug port, is outside it
+  because only a launch that asks for a debug port attaches it: the debug-port cell (Debug-port cell
+  below) boots it, and in CI the `terminal` case's boots and the `shutdown` case's GDB-stub boots
+  attach it to reach the stub over it. The TPM driver's device, a TPM 2.0 behind QEMU's `tpm-tis` or
+  `tpm-crb` and backed by `swtpm`, is outside it because only the `tpm` case attaches it; the tpm
+  cell (TPM cell below) boots it.
 - **Hardware only.** A driver whose device QEMU cannot present has no QEMU cell in either set; its
   README documents a hardware test procedure, and it is exercised on real hardware by that
   procedure. No in-tree driver is in this tier.

@@ -761,9 +761,11 @@ jobs:
 
   bench:
     # The benchmark cell: the bench-only ktest image and the userspace ubench
-    # suite of each architecture, booted under QEMU's icount, whose counts
-    # repeat from run to run, and their one-CPU counts held to the checked-in
-    # baselines (xtask/README.md § `cargo xtask bench-check`; docs/testing.md
+    # suite of each architecture, booted under QEMU's icount, under which the
+    # one-CPU count of a window that does not idle repeats from run to run
+    # unless its path's cost depends on the order of earlier host-timed
+    # events (docs/testing.md § Benchmarks), and their one-CPU counts held to
+    # the checked-in baselines (xtask/README.md § `cargo xtask bench-check`; docs/testing.md
     # § Gating). After the
     # build job, whose release entry of the cell's architecture builds its
     # image, and run whatever the other entries' outcomes, as validate is;

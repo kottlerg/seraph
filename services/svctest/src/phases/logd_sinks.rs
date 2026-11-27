@@ -44,9 +44,12 @@
 //!   svctest's share of the history holds at its largest, so the history drops svctest's oldest before the sink
 //!   writes them. A line logd refuses for the running serial sink's window
 //!   is sent again after its hint, as the log client does. Once the driver
-//!   is started again, logd must retain its notice counting the
-//!   framebuffer's drops (`framebuffer: <n> lines dropped`,
-//!   `services/logd/docs/sinks.md` § Drops) after the last line.
+//!   is started again, logd must count the framebuffer's drops in its notice
+//!   (`framebuffer: <n> lines dropped`, `services/logd/docs/sinks.md`
+//!   § Drops): a notice newer than the newest before the case, or that one
+//!   with a larger count, since a sink keeps one notice ahead of its cursor
+//!   and adds later drops to it, wherever the writer's step retained it among
+//!   the case's lines.
 //! - **Framebuffer killed.** The phase then makes the framebuffer driver's main
 //!   thread fault at an unmapped address, waits until procmgr no longer lists
 //!   the driver and devmgr answers its ordinal `WITHDRAWN`, and sends as many
@@ -58,9 +61,9 @@
 //!   within milliseconds, before the lines sent after the kill, so the
 //!   writer may have dropped none of those. The phase therefore stops the new
 //!   instance and sends as many lines again, so the history drops svctest's
-//!   oldest before the sink writes them, and starts it: logd must retain its
-//!   notice of the framebuffer's drops after the last line, which only a
-//!   writer serving the new instance retains.
+//!   oldest before the sink writes them, and starts it: logd must count those
+//!   drops in its notice, as the stopped case requires, which only a writer
+//!   serving the new instance does.
 //!
 //! The serial driver is only stopped, since a kill would end the console the
 //! boot is judged on.
@@ -139,11 +142,13 @@ const SERIAL_STOP_LINES: usize = 9;
 /// than the hold window, so none is refused.
 const RUNNING_BURST: usize = 8;
 
-/// Lines of each framebuffer case: more than a slot's share of the history
-/// at its largest, so svctest's oldest are dropped before the stopped
-/// framebuffer sink writes them whatever logd's bounds, and more than the
-/// sink's backlog on a new driver.
-const FLOOD_LINES: usize = PER_SLOT_HISTORY_MIN * (HISTORY_BYTES_MAX / HISTORY_BYTES_MIN) + 1;
+/// Lines of each framebuffer case: two more than a slot's share of the
+/// history at its largest, so svctest's oldest are dropped before the stopped
+/// framebuffer sink writes them whatever logd's bounds, beyond the one entry
+/// the sink's writer may be writing, which logd never counts as dropped
+/// (`logd_slot_table`'s `remove`), and more than the sink's backlog on a
+/// new driver.
+const FLOOD_LINES: usize = PER_SLOT_HISTORY_MIN * (HISTORY_BYTES_MAX / HISTORY_BYTES_MIN) + 2;
 
 /// The log client's bound on a log call.
 const LOG_CALL_BOUND: Duration = Duration::from_millis(log::LOG_CALL_TIMEOUT_MS as u64);
@@ -209,13 +214,14 @@ pub fn logd_sinks_phase(caps: &Caps)
         return;
     };
     let threads = attach(authority, fb, "framebuffer");
+    let before = newest_fb_notice(caps.logd_query);
     stop(&threads, "framebuffer");
     let sent = send_lines("framebuffer stopped", FLOOD_LINES, LEVEL_CRITICAL);
     start(&threads, "framebuffer");
     detach(authority, fb, threads, "framebuffer");
     let lines = sent.unwrap_or_else(|e| panic!("{e}"));
-    let last = retained_seq(caps.logd_query, &lines, "framebuffer stopped");
-    let dropped = await_fb_notice(caps.logd_query, last, "the stopped driver's start");
+    retained_seq(caps.logd_query, &lines, "framebuffer stopped");
+    let dropped = await_fb_notice(caps.logd_query, before, "the stopped driver's start");
     std::os::seraph::log!(
         "logd_sinks: {FLOOD_LINES} lines taken while the framebuffer driver was stopped, \
          {dropped} counted dropped"
@@ -239,13 +245,14 @@ pub fn logd_sinks_phase(caps: &Caps)
     let restarted = super::crash::badge_named(authority, FRAMEBUFFER_NAME)
         .unwrap_or_else(|| panic!("logd_sinks: procmgr lists no restarted framebuffer driver"));
     let threads = attach(authority, restarted, "restarted framebuffer");
+    let before = newest_fb_notice(caps.logd_query);
     stop(&threads, "restarted framebuffer");
     let sent = send_lines("restarted framebuffer stopped", FLOOD_LINES, LEVEL_CRITICAL);
     start(&threads, "restarted framebuffer");
     detach(authority, restarted, threads, "restarted framebuffer");
     let lines = sent.unwrap_or_else(|e| panic!("{e}"));
-    let last = retained_seq(caps.logd_query, &lines, "restarted framebuffer stopped");
-    let dropped = await_fb_notice(caps.logd_query, last, "the restarted driver's start");
+    retained_seq(caps.logd_query, &lines, "restarted framebuffer stopped");
+    let dropped = await_fb_notice(caps.logd_query, before, "the restarted driver's start");
     std::os::seraph::log!(
         "logd_sinks: logd's framebuffer writer took up the restarted driver, {dropped} lines \
          counted dropped"
@@ -416,25 +423,35 @@ fn retained_seq(query: u64, lines: &[Vec<u8>], case: &str) -> u64
     })
 }
 
-/// Wait until logd's history holds its notice counting lines its
-/// framebuffer sink dropped, retained after the entry `after`, within
-/// [`DEATH_TIMEOUT`]; `what` names the event that lets the sink's writer go
-/// on. The count it names.
-fn await_fb_notice(query: u64, after: u64, what: &str) -> u64
+/// The newest of logd's notices counting lines its framebuffer sink dropped,
+/// read through `query`: its `seq` and count, or `None` when logd's history
+/// holds none.
+fn newest_fb_notice(query: u64) -> Option<(u64, u64)>
+{
+    let mut found = None;
+    super::procmgr::logd_history_each(query, Some(LOG_BADGE_LOGD), |entry| {
+        found = fb_drop_count(entry.bytes).map(|count| (entry.seq, count));
+        found.is_none()
+    });
+    found
+}
+
+/// Wait until logd's history holds a notice counting lines its framebuffer
+/// sink dropped since `before`, the newest such notice when the case began
+/// ([`newest_fb_notice`]): a newer notice, or that one with a larger count,
+/// since the sink adds the drops before it reaches its notice to that notice
+/// (`services/logd/docs/sinks.md` § Drops), within [`DEATH_TIMEOUT`]; `what`
+/// names the event that lets the sink's writer go on. The count the notice
+/// names.
+fn await_fb_notice(query: u64, before: Option<(u64, u64)>, what: &str) -> u64
 {
     let start_at = Instant::now();
     loop
     {
-        let mut count = None;
-        super::procmgr::logd_history_each(query, Some(LOG_BADGE_LOGD), |entry| {
-            if entry.seq <= after
-            {
-                return false;
-            }
-            count = count.or_else(|| fb_drop_count(entry.bytes));
-            count.is_none()
-        });
-        if let Some(count) = count
+        if let Some((seq, count)) = newest_fb_notice(query)
+            && before.is_none_or(|(old_seq, old_count)| {
+                seq > old_seq || (seq == old_seq && count > old_count)
+            })
         {
             return count;
         }

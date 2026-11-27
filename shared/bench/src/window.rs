@@ -3,18 +3,20 @@
 
 // shared/bench/src/window.rs
 
-//! Window-mean measurements: a benchmark whose thread may run on another CPU
-//! between its two counter reads times windows of several operations, each
-//! sample the mean per operation of one window
+//! Window-mean measurements: a benchmark whose measured path may run on
+//! another CPU between two counter reads times windows of several operations,
+//! each sample the mean per operation of one window
 //! (`shared/bench/README.md` § Window-mean rows).
 //!
-//! The thread reads the counters on the CPU it measures on, at the opening and
-//! at the closing of each window. A window counts only when both reads ran on
-//! that CPU and the CPU did not halt between them: the idle-halt span the
-//! thread opens and closes around the window says both, since its close fails
-//! on another CPU than its open's and otherwise returns the halts between them.
-//! The rest are left out and counted. A row whose counted windows fall below
-//! [`WindowShape::floor`] reports no sample.
+//! The counters are read on the CPU measured on, at the opening and at the
+//! closing of each window. A window measures only when both reads ran on that
+//! CPU and the CPU did not halt between them. When the measured thread itself
+//! reads, with no affinity between its reads, it takes the opening read
+//! pinned and closes its idle-halt span right after the closing read, so the
+//! close ([`WindowEnd::from_close`]) says both: it fails on another CPU than
+//! the span's open, and otherwise returns the halts between them. Such a row
+//! leaves the rest out and counts them, and reports no sample when its counted
+//! windows fall below [`WindowShape::floor`].
 
 /// Operations per window when the benchmark runs at least this many.
 pub const WINDOW_OPS: u32 = 16;

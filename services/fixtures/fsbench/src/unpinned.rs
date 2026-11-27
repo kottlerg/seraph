@@ -12,19 +12,19 @@
 //! these measure the client real filesystem clients are, which the rule runs
 //! on one CPU with its server. Each window, pinned to [`BENCH_CPU`], the
 //! thread runs one untimed operation, which blocks and so leaves it on that
-//! CPU, opens its idle-halt span, clears its affinity, and reads the counters;
+//! CPU, opens its idle-halt span, reads the counters, and clears its affinity;
 //! it runs the window's operations, reads again, closes the span and pins
 //! itself once more. Clearing an affinity, and naming the CPU the thread is
-//! on, move nothing, and no blocking call falls between a read and the span's
-//! open or close. The window counts when the span closes with no halt, so
-//! both reads ran on `BENCH_CPU` and that CPU's counter ran throughout
-//! (`docs/testing.md` § Benchmarks).
+//! on, move nothing, and no blocking call falls between the closing read and
+//! the span's close. The window counts when the span closes with no halt, so
+//! the closing read ran on `BENCH_CPU` too and that CPU's counter ran
+//! throughout (`docs/testing.md` § Benchmarks).
 
 use std::fs::File;
 
 use bench::{
-    HALTED, IDLE_HALTS, MOVED, Report, Unit, Value, WINDOW_OPS_KEY, WindowEnd, WindowShape,
-    WindowTally, window_mean,
+    Counters, HALTED, IDLE_HALTS, MOVED, Report, Unit, Value, WINDOW_OPS_KEY, WindowEnd,
+    WindowShape, WindowTally, window_mean,
 };
 
 use crate::open::{OPEN_DEPTH, OPEN_PATH, open};
@@ -70,16 +70,22 @@ fn remote_wakes(thread: u64) -> Option<u64>
 #[derive(Clone, Copy)]
 enum Step
 {
-    /// Run one untimed operation, which blocks on the filesystem.
+    /// Run one untimed operation, which blocks on the filesystem, and any
+    /// untimed work the previous window left.
     Untimed,
-    /// Run this many operations between two counter reads and return their
-    /// difference.
+    /// Run this many operations, the window's, and nothing else.
     Window(u32),
 }
 
 /// Time `shape.windows` windows of `body`, each after one untimed
 /// operation. The thread enters and leaves pinned to [`BENCH_CPU`].
-fn run_windows(shape: WindowShape, mut body: impl FnMut(Step) -> u64) -> Windows
+///
+/// The opening read is taken pinned, so it runs on `BENCH_CPU`; the
+/// affinity is cleared after it. Clearing it, and pinning again to the CPU the
+/// thread runs on, move nothing, and the idle-halt span closes right after
+/// the closing read, so a close on `BENCH_CPU` says the closing read ran
+/// there too.
+fn run_windows(shape: WindowShape, counters: &Counters, mut body: impl FnMut(Step)) -> Windows
 {
     let thread = std::os::seraph::thread::current_thread_cap();
     let mut out = Windows {
@@ -90,11 +96,13 @@ fn run_windows(shape: WindowShape, mut body: impl FnMut(Step) -> u64) -> Windows
     };
     for _ in 0..shape.windows
     {
-        let _ = body(Step::Untimed);
+        body(Step::Untimed);
         let wakes_before = remote_wakes(thread);
         let idle = IdleSpan::open();
+        let start = counters.read();
         set_affinity(thread, AFFINITY_ANY);
-        let elapsed = body(Step::Window(shape.ops));
+        body(Step::Window(shape.ops));
+        let elapsed = counters.read().since(&start).cycles;
         let halts = idle.close();
         set_affinity(thread, BENCH_CPU);
         let wakes_after = remote_wakes(thread);
@@ -115,6 +123,7 @@ fn run_windows(shape: WindowShape, mut body: impl FnMut(Step) -> u64) -> Windows
                 .map(|(sum, w)| sum.saturating_add(w));
         }
     }
+    body(Step::Untimed);
     out
 }
 
@@ -182,22 +191,18 @@ pub(crate) fn measure_read(f: &mut File, buf: &mut [u8], run: &Bench)
         let _ = read_inline(f, READ_SIZE, buf);
     }
     let mut shortest = u64::MAX;
-    let measured = run_windows(shape, |step| match step
+    let measured = run_windows(shape, &run.counters, |step| match step
     {
         Step::Untimed =>
         {
             let _ = read_inline(f, READ_SIZE, buf);
-            0
         }
         Step::Window(ops) =>
         {
-            let start = run.counters.read();
             for _ in 0..ops
             {
-                let got = read_inline(f, READ_SIZE, buf);
-                shortest = shortest.min(got);
+                shortest = shortest.min(read_inline(f, READ_SIZE, buf));
             }
-            run.counters.read().since(&start).cycles
         }
     });
     assert!(
@@ -216,8 +221,10 @@ pub(crate) fn measure_read(f: &mut File, buf: &mut [u8], run: &Bench)
     );
 }
 
-/// The open row: windows of opens of [`OPEN_PATH`], each window's files
-/// closed after its closing read.
+/// The open row: windows of opens of [`OPEN_PATH`]. A window's files stay
+/// open until the next untimed step, so their closes, which block on the
+/// filesystem, fall outside the window and its idle-halt span; that step
+/// also checks that the window's opens made one `NS_LOOKUP` each.
 pub(crate) fn measure_open(run: &Bench)
 {
     let Some(shape) = WindowShape::for_ops(run.read_iters)
@@ -230,30 +237,27 @@ pub(crate) fn measure_open(run: &Bench)
         drop(open());
     }
     let mut files: Vec<File> = Vec::with_capacity(shape.ops as usize);
-    let measured = run_windows(shape, |step| match step
+    let mut lookups = std::os::seraph::fs::ns_lookup_calls();
+    let measured = run_windows(shape, &run.counters, |step| match step
     {
         Step::Untimed =>
         {
+            let opened = files.len() as u64;
+            let made = std::os::seraph::fs::ns_lookup_calls().wrapping_sub(lookups);
+            assert_eq!(
+                made, opened,
+                "fsbench: {opened} opens of {OPEN_PATH} made {made} NS_LOOKUP calls"
+            );
+            files.drain(..).for_each(drop);
             drop(open());
-            0
+            lookups = std::os::seraph::fs::ns_lookup_calls();
         }
         Step::Window(ops) =>
         {
-            let lookups = std::os::seraph::fs::ns_lookup_calls();
-            let start = run.counters.read();
             for _ in 0..ops
             {
                 files.push(open());
             }
-            let elapsed = run.counters.read().since(&start).cycles;
-            let made = std::os::seraph::fs::ns_lookup_calls().wrapping_sub(lookups);
-            files.drain(..).for_each(drop);
-            assert_eq!(
-                made,
-                u64::from(ops),
-                "fsbench: {ops} opens of {OPEN_PATH} made {made} NS_LOOKUP calls"
-            );
-            elapsed
         }
     });
     log_row(

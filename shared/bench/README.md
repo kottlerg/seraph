@@ -113,30 +113,34 @@ whole log can be scanned. A program logs no other text of the form `bench <word>
 
 ## Window-mean rows
 
-A benchmark whose thread may run on another CPU between two counter reads, such as a client with
-no affinity whose server the scheduler may bring to it or keep apart, cannot time one operation
-per sample. It times windows of several operations instead, the thread reading the counters on
-the CPU it measures on at each window's edges, and reports a window-mean row: a result line of
-the form above, each of whose samples is one window's difference divided by its operations,
-rounded down, so `n=` counts windows and the percentiles are of window means. The row carries
-the extra `window_ops=` (`WINDOW_OPS_KEY`), the operations each window ran, and the counts of
-the windows it left out, `moved=` (`MOVED`) and `halted=` (`HALTED`), below.
+A benchmark that cannot time one operation per sample, because a thread of the measured path may
+run on another CPU between two counter reads, times windows of several operations instead and
+reports a window-mean row: a result line of the form above, each of whose samples is one window's
+difference of two counter reads, taken on one CPU, divided by the window's operations, rounded
+down (`window_mean`). `n=` counts windows and the percentiles are of window means. The row
+carries the extra `window_ops=` (`WINDOW_OPS_KEY`), the operations each window ran, and names
+itself by a variant parameter, so it never pairs with a per-operation row of the same case.
+`WindowShape::for_ops` splits a benchmark's operations into windows of `WINDOW_OPS` (16), or
+one window of all of them when there are fewer. Whether a row gates follows the rule of its CPU
+count and benchmark, as for any row
+([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)).
 
-A difference of two reads on one CPU measures the window, wherever the thread ran in between,
-only when both reads ran on that CPU and the CPU did not halt between them
-([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)). The thread
-therefore opens its idle-halt span (§ Idle halts) on the measuring CPU right before the window's
-opening read and closes it right after the closing read, with no blocking call between either
-pair, and `WindowEnd::from_close` classifies the window by the close: a close that fails ran on
-another CPU than the open (`Moved`), a close that returns halts saw the CPU halt (`Halted`), and
-a close that returns `0` counts the window (`Counted`). `WindowShape::for_ops` splits a
-benchmark's operations into windows of `WINDOW_OPS` (16), or one window of all of them when
-there are fewer. A row whose counted windows are fewer than half its windows
-(`WindowShape::floor`) is no mean of its case, only of the windows that happened to stay on the
-CPU, and the benchmark logs no result line for it.
-
-A window-mean row names itself by a variant parameter, so it never pairs with a per-operation
-row of the same case: `affinity=any` for a thread with no affinity.
+A difference of two reads on one CPU measures the window, wherever the measured threads ran in
+between, only when both reads ran on that CPU and the CPU did not halt between them
+([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)). A row whose reads are
+taken by a thread pinned to the measuring CPU, which does not itself run the measured path, meets
+the first condition by its pin. A row whose reads are taken by the measured thread, with no affinity
+between them, cannot, and meets it as fsbench's rows do: pinned to the measuring CPU, the thread
+opens its idle-halt span (§ Idle halts) and takes the opening read, then clears its affinity, which
+moves nothing, so the window holds that syscall too; after the window's operations it takes the
+closing read and closes the span at once, with no blocking call between, and `WindowEnd::from_close`
+classifies the window by the close. A close that fails ran on another CPU than the open (`Moved`),
+one that returns halts saw the CPU halt (`Halted`), and one that returns `0` counts the window
+(`Counted`). Such a row carries the counts of the windows it left out, `moved=` (`MOVED`) and
+`halted=` (`HALTED`), and a row whose counted windows are fewer than half its windows
+(`WindowShape::floor`) is no mean of its case, only of the windows that happened to stay on the CPU,
+so the benchmark logs no result line for it. fsbench's `affinity=any` rows are such rows
+([services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md)).
 
 ---
 

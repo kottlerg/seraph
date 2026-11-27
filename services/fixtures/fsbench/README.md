@@ -110,16 +110,18 @@ each covers a window of 16 operations (all of them when `ITERS` is smaller), and
 iterations make its windows: 16 of 16 in the full benchmark.
 
 After 8 untimed warm-up operations, each window runs one untimed operation pinned to CPU 0,
-which blocks and so leaves the thread running there; then it opens the thread's idle-halt span
-on CPU 0, clears the thread's affinity, reads the counters, runs the window's operations, reads
-the counters again, closes the span, and pins the thread to CPU 0 again. Clearing an affinity, or
-setting the one CPU the thread runs on, moves nothing, so no blocking call falls inside the
-window but the measured operations. The window counts when the span closes on CPU 0 with no
-halt: both reads ran on CPU 0, and its counter ran throughout
+which blocks and so leaves the thread running there; then, still pinned, it opens the thread's
+idle-halt span on CPU 0 and reads the counters, clears the thread's affinity, runs the window's
+operations, reads the counters again, closes the span, and pins the thread to CPU 0 again.
+Clearing an affinity, or setting the one CPU the thread runs on, moves nothing, so no blocking
+call falls inside the window but the measured operations; the window holds the affinity clear's
+syscall. The window counts when the span closes on CPU 0 with no halt: the closing read ran on
+CPU 0 too, and its counter ran throughout
 ([docs/testing.md § Benchmarks](../../../docs/testing.md#benchmarks-bench-cell)). Its sample is
 the window's cycles divided by its operations. A window whose span closed on another CPU, or
-saw CPU 0 halt, is left out and counted. The open window keeps its files open and closes them
-after its closing read, so, as in the pinned case, no close is measured.
+saw CPU 0 halt, is left out and counted. The open window's files stay open until the next
+untimed operation, so, as in the pinned case, no close is measured, and their closes fall outside
+the span and the placement reads too.
 
 ---
 

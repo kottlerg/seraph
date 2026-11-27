@@ -14,9 +14,10 @@
 //! none of these drivers checks. Every gated label sent on such a SEND must
 //! reply the driver's `UNAUTHORIZED` at once, without blocking for input or
 //! consuming a byte. The serial, input, and entropy drivers are part of every
-//! boot's device set; the framebuffer case skips on a headless boot (CI's), where
-//! devmgr runs no framebuffer driver. The svctest image stages no program, so no
-//! terminal reads the input driver or the UART beside the phases.
+//! boot's device set; the framebuffer case skips on a headless boot (CI's debug
+//! svctest cells), where devmgr runs no framebuffer driver. The svctest image
+//! stages no program, so no terminal reads the input driver or the UART beside
+//! the phases.
 //!
 //! The stray-cap flood phase checks the serial, input, entropy, RTC, and
 //! framebuffer drivers' cap hygiene: a cap a request carries that the driver

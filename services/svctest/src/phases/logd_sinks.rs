@@ -20,31 +20,29 @@
 //! waits on a sink, where a logd that wrote a line before it answered would
 //! hold the call until the write ended or the stall bound passed.
 //!
-//! - **Serial stopped.** The phase stops every thread of the serial driver,
-//!   the `hold` sink's, and sends more lines than logd has receive workers,
-//!   each taken. It then sends lines until logd refuses one `WINDOW_FULL`,
-//!   which it must do once svctest's lines the stopped sink has not written
-//!   pass the hold window (`HOLD_WINDOW`), with a retry hint of 1 ms to the
-//!   stall bound. Once the stall bound has passed the sink is stalled and
-//!   holds no sender: the refused line, sent again, is taken. The last line
-//!   must be in logd's history. The lines stay within svctest's share of the
-//!   history (`PER_SLOT_HISTORY_MIN` at the least), so none is dropped from the console CI
-//!   reads; they are written once the phase starts the driver again.
-//! - **Below serial's level.** A line at debug, below the serial sink's
-//!   default level of info, is retained in logd's history, which keeps every
-//!   entry whatever the sinks show. The serial sink must not write it, which
-//!   the svctest cell's boot checks host-side (`--fail-also` on its text,
-//!   [`HIDDEN_LINE`]; `services/logd/docs/sinks.md` § Settings).
-//! - **Framebuffer stopped**, on a boot with a framebuffer driver (the
-//!   framebuffer cell; otherwise the case logs that it skipped). The
-//!   framebuffer sink is `skip` and holds nobody, and shows critical and more
-//!   severe by default, so the framebuffer cases send their lines at
-//!   critical. While its driver is stopped the phase sends more lines than
-//!   svctest's share of the history holds at its largest ([`FLOOD_LINES`]),
-//!   so the history drops svctest's oldest before the sink writes them. A
-//!   line logd refuses for the running serial sink's window is sent again
-//!   after its hint, as the log client does. Once the driver is started
-//!   again, logd must retain a notice counting the framebuffer's drops
+//! The phase runs the framebuffer cases first, then the serial case and the
+//! debug line. Before each of the two groups it waits on logd's flush
+//! barrier, as the flush phase's running case does, until the serial sink,
+//! holding senders, has written every line of svctest's: earlier phases'
+//! floods can leave that sink behind. The serial case then stops the sink's
+//! driver with none of svctest's lines unwritten, and the phases before this
+//! one, whose whole-lines windows the boot checks, have their lines on
+//! serial before it. The framebuffer cases run before the serial case
+//! because it leaves the serial sink stalled, holding no sender, until the
+//! write in flight at its driver's stop returns
+//! (`services/logd/docs/sinks.md` § Pace): their lines, which serial shows
+//! too, would meanwhile evict svctest's lines the sink has not written.
+//!
+//! - **Framebuffer stopped**, on a boot with a framebuffer driver (CI's
+//!   release svctest cells and the framebuffer cell; otherwise the case logs
+//!   that it skipped). The framebuffer sink is `skip` and holds nobody, and
+//!   shows critical and more severe by default, so the framebuffer cases send
+//!   their lines at critical. While its driver is stopped the phase sends
+//!   more lines than svctest's share of the history holds at its largest
+//!   ([`FLOOD_LINES`]), so the history drops svctest's oldest before the sink
+//!   writes them. A line logd refuses for the running serial sink's window is
+//!   sent again after its hint, as the log client does. Once the driver is
+//!   started again, logd must retain a notice counting the framebuffer's drops
 //!   (`framebuffer: <n> lines dropped`, `services/logd/docs/sinks.md`
 //!   § Drops) that its history did not hold before the stop: a new one, or
 //!   one logd updated in place with a new count while the sink had not
@@ -63,6 +61,21 @@
 //!   oldest before the sink writes them, and starts it: logd must retain or
 //!   update its notice of the framebuffer's drops, as for the stopped
 //!   driver, which only a writer serving the new instance does.
+//! - **Serial stopped.** The phase stops every thread of the serial driver,
+//!   the `hold` sink's, and sends more lines than logd has receive workers,
+//!   each taken. It then sends lines until logd refuses one `WINDOW_FULL`,
+//!   which it must do once svctest's lines the stopped sink has not written
+//!   pass the hold window (`HOLD_WINDOW`), with a retry hint of 1 ms to the
+//!   stall bound. Once the stall bound has passed the sink is stalled and
+//!   holds no sender: the refused line, sent again, is taken. The last line
+//!   must be in logd's history. The lines stay within svctest's share of the
+//!   history (`PER_SLOT_HISTORY_MIN` at the least), so none is dropped from the console CI
+//!   reads; they are written once the phase starts the driver again.
+//! - **Below serial's level.** A line at debug, below the serial sink's
+//!   default level of info, is retained in logd's history, which keeps every
+//!   entry whatever the sinks show. The serial sink must not write it, which
+//!   the svctest cell's boot checks host-side (`--fail-also` on its text,
+//!   [`HIDDEN_LINE`]; `services/logd/docs/sinks.md` § Settings).
 //!
 //! The serial driver is only stopped, since a kill would end the console the
 //! boot is judged on.
@@ -184,6 +197,15 @@ pub fn logd_sinks_phase(caps: &Caps)
     let authority = caps.debug_authority;
     assert_ne!(authority, 0, "logd_sinks: no debug authority");
     assert_ne!(caps.logd_query, 0, "logd_sinks: no logd.query seed");
+    assert_ne!(caps.logd_flush, 0, "logd_sinks: no logd.flush seed");
+
+    // Each case starts with logd's serial sink holding senders and holding
+    // none of svctest's lines; see the module documentation.
+    flush_while_running(caps.logd_flush, "logd_sinks", DEATH_TIMEOUT)
+        .unwrap_or_else(|e| panic!("{e}"));
+    framebuffer_cases(caps);
+    flush_while_running(caps.logd_flush, "logd_sinks", DEATH_TIMEOUT)
+        .unwrap_or_else(|e| panic!("{e}"));
 
     let serial = super::crash::badge_named(authority, SERIAL_NAME)
         .expect("logd_sinks: LIST_PROCESSES lists no serial driver");
@@ -204,7 +226,13 @@ pub fn logd_sinks_phase(caps: &Caps)
     send_taken(&hidden, LEVEL_DEBUG, "below serial's level", 0).unwrap_or_else(|e| panic!("{e}"));
     retained_seq(caps.logd_query, &[hidden], "below serial's level");
     std::os::seraph::log!("logd_sinks: the debug line is in logd's history");
+}
 
+/// The framebuffer stopped, killed and restarted cases, on a boot with a
+/// framebuffer driver; the skip line otherwise (see the module documentation).
+fn framebuffer_cases(caps: &Caps)
+{
+    let authority = caps.debug_authority;
     let Some(fb) = super::crash::badge_named(authority, FRAMEBUFFER_NAME)
     else
     {
@@ -505,7 +533,8 @@ pub fn logd_flush_phase(caps: &Caps)
         "logd_flush: a stale version not refused"
     );
 
-    let took = flush_while_running(flush).unwrap_or_else(|e| panic!("{e}"));
+    let took =
+        flush_while_running(flush, "logd_flush", LOG_CALL_BOUND).unwrap_or_else(|e| panic!("{e}"));
     std::os::seraph::log!(
         "logd_flush: flushed in {} ms with the serial driver running",
         took.as_millis()
@@ -532,12 +561,13 @@ pub fn logd_flush_phase(caps: &Caps)
 
 /// With the serial driver running: log [`RUNNING_BURST`] lines and start a
 /// flush, until one is pending, then ask again with its token until it is
-/// flushed, within the log client's bound. A flush answered `FLUSHED` at once
-/// is one the sink did not hold, since it is still stalled from the first
-/// phase or wrote the burst before the call (`services/logd/docs/ipc-interface.md`
-/// § Flush barrier); the burst is repeated after 10 ms for twice the stall
-/// bound. The time from the pending answer to flushed, or the first failure.
-fn flush_while_running(flush: u64) -> Result<Duration, String>
+/// flushed, within `within`. A flush answered `FLUSHED` at once is one the
+/// sink did not hold, since it is still stalled from the serial case or wrote
+/// the burst before the call (`services/logd/docs/ipc-interface.md` § Flush
+/// barrier); the burst is repeated after 10 ms for twice the stall bound.
+/// `phase` names the phase in the burst's lines and the failure. The time
+/// from the pending answer to flushed, or the first failure.
+fn flush_while_running(flush: u64, phase: &str, within: Duration) -> Result<Duration, String>
 {
     let start_at = Instant::now();
     loop
@@ -545,18 +575,18 @@ fn flush_while_running(flush: u64) -> Result<Duration, String>
         for i in 0..RUNNING_BURST
         {
             std::os::seraph::log!(
-                "logd_flush: line {i} before a flush with the serial driver running"
+                "{phase}: line {i} before a flush with the serial driver running"
             );
         }
         let answer = flush_answer(flush, None)?;
         if matches!(answer, FlushAnswer::Pending { .. })
         {
-            return await_flushed(flush, answer, LOG_CALL_BOUND);
+            return await_flushed(flush, answer, within);
         }
         if start_at.elapsed() > STALL_BOUND.saturating_mul(2)
         {
             return Err(format!(
-                "logd_flush: no flush pending with the serial driver running within {} ms",
+                "{phase}: no flush pending with the serial driver running within {} ms",
                 STALL_BOUND.saturating_mul(2).as_millis()
             ));
         }

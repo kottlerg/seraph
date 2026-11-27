@@ -306,8 +306,10 @@ early-kernel console; svctest's and usertest's reach serial only:
   recipe lowers its level. No harness-specific framebuffer path exists.
 
 Serial is the authoritative marker channel: CI scrapes serial and
-runs the harnesses headless, where logd's framebuffer sink writes nothing (see
-[docs/testing.md](testing.md)).
+runs the harnesses headless, where logd's framebuffer sink writes nothing, but for the release
+svctest cells, which attach a framebuffer for svctest's framebuffer cases, and the `bench` cell's
+ubench boots, which attach one for ubench's framebuffer measurements (see
+[docs/testing.md](testing.md#coverage-tiers) § Coverage tiers).
 
 Every framebuffer renderer — the bootloader, kernel, and ktest direct
 renderers and the userspace driver — shares one byte→glyph chain

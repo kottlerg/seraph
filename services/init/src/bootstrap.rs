@@ -243,37 +243,83 @@ pub(crate) fn fund_own_cspace(info: &InitInfo, arena_cap: u64) -> Result<(), i64
     syscall::cap_create_cspace(arena_cap, info.cspace_cap, init_cspace_fund_pages(info)).map(|_| ())
 }
 
+/// Endpoints init retypes from its arena before the log thread's retype:
+/// init's bootstrap endpoint, the service endpoints of procmgr, memmgr and
+/// svcmgr, and the log endpoint (`run` in main.rs).
+const INIT_ENDPOINTS_BEFORE_LOG_THREAD: u64 = 5;
+
+/// Endpoints init retypes from its arena after the log thread's retype:
+/// devmgr's registry and vfsd's service endpoint (`run` in main.rs), and
+/// svcmgr's bootstrap endpoint (service.rs).
+const INIT_ENDPOINTS_AFTER_LOG_THREAD: u64 = 3;
+
+/// Pages of init's arena front that `endpoints` endpoint retypes of
+/// `endpoint_class` bytes each ([`crate::endpoint_retype_class`]) and the
+/// sub-page retypes of the raw debits `small` take. Sub-page retypes pack
+/// byte by byte, each in its size class; a page-class retype page-aligns the
+/// bump first, so with page-class endpoints each sub-page retype is counted a
+/// page of its own.
+fn front_pages(endpoint_class: u64, endpoints: u64, small: &[u64]) -> u64
+{
+    let endpoint_bytes = endpoints.saturating_mul(endpoint_class);
+    if endpoint_class >= PAGE_SIZE
+    {
+        // `small` is a short fixed list; its length fits a `u64`.
+        endpoint_bytes
+            .div_ceil(PAGE_SIZE)
+            .saturating_add(small.len() as u64)
+    }
+    else
+    {
+        small
+            .iter()
+            .fold(endpoint_bytes, |sum, &bytes| {
+                sum.saturating_add(syscall_abi::retype_class_bytes(bytes))
+            })
+            .div_ceil(PAGE_SIZE)
+    }
+}
+
 /// Front region of init's own arena reserved for its kernel-object retypes.
 ///
-/// Unlike a tier-1 service, init retypes only endpoints (byte-granular), one
-/// log thread, and that thread's kernel-log notification and wait set from
-/// this arena, besides its own `CSpace`'s fund; it reuses
-/// the kernel-supplied `AddressSpace`/`CSpace` rather than creating its own.
-/// The reserve is:
+/// Unlike a tier-1 service, init retypes only endpoints, one log thread, and
+/// that thread's kernel-log notification and wait set from this arena,
+/// besides its own `CSpace`'s fund; it reuses the kernel-supplied
+/// `AddressSpace`/`CSpace` rather than creating its own. An endpoint takes
+/// [`crate::endpoint_retype_class`] bytes, which the boot's CPU count sizes:
+/// 128 up to 224 CPUs, 512 up to 1760, a page above. The reserve is:
 ///
 /// * [`init_cspace_fund_pages`] for the donation [`fund_own_cspace`] makes
 ///   first, page-granular,
-/// * 1 page for endpoints created before the log-thread retype (the retype
-///   allocator packs ~32 endpoints per page; init creates well under that),
+/// * the pages of the [`INIT_ENDPOINTS_BEFORE_LOG_THREAD`] endpoints created
+///   before the log-thread retype ([`front_pages`]),
 /// * [`crate::thread_retype_pages`] (seven or more) for the log thread, which
-///   page-aligns the bump upward — splitting endpoint packing across a page
-///   boundary, and
-/// * 1 page for the endpoints created after the log-thread retype and the
-///   log thread's notification and two-member wait set (184 bytes, about
-///   three endpoints' worth), so they never bump into the offset-mapped
-///   backing region even without relying on the allocator reusing the first
-///   page's recovered slack.
+///   page-aligns the bump upward, and
+/// * the pages of the [`INIT_ENDPOINTS_AFTER_LOG_THREAD`] endpoints created
+///   after the log-thread retype with the log thread's notification and
+///   two-member wait set, counted without relying on the allocator reusing
+///   the slack of the pages before them.
 ///
-/// Sound for up to ~32 endpoints on each side of the log-thread retype; init
-/// creates roughly a dozen total. [`finalize_memmgr`] asserts the front bump
-/// never crossed this bound before forwarding the arena.
+/// Up to 224 CPUs each endpoint side takes one page. [`finalize_memmgr`]
+/// asserts the front bump never crossed this bound before forwarding the
+/// arena.
 pub(crate) fn init_retype_reserve_pages(info: &InitInfo) -> u64
 {
-    // Small page-count constants, far below `u64::MAX`.
+    let endpoint_class = crate::endpoint_retype_class();
+    let before = front_pages(endpoint_class, INIT_ENDPOINTS_BEFORE_LOG_THREAD, &[]);
+    let after = front_pages(
+        endpoint_class,
+        INIT_ENDPOINTS_AFTER_LOG_THREAD,
+        &[
+            syscall_abi::NOTIFICATION_RETYPE_BYTES,
+            syscall_abi::wait_set_retype_bytes(2),
+        ],
+    );
+    // Small page counts, far below `u64::MAX`.
     init_cspace_fund_pages(info)
-        .saturating_add(1)
+        .saturating_add(before)
         .saturating_add(crate::thread_retype_pages())
-        .saturating_add(1)
+        .saturating_add(after)
 }
 
 /// A service's contiguous backing arena: one Memory cap plus a page cursor

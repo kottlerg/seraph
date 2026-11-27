@@ -137,10 +137,7 @@ fn park() -> (mpsc::Sender<()>, JoinHandle<()>)
 fn worker(arg: &str)
 {
     let endpoint =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |s| {
-            syscall::cap_create_endpoint(s).ok()
-        })
-        .unwrap_or_else(|| fail("worker: no endpoint"));
+        std::os::seraph::create_endpoint().unwrap_or_else(|| fail("worker: no endpoint"));
     let (held_tx, held_rx) = mpsc::channel::<()>();
     let _holder = std::thread::spawn(move || hold_one_fault(endpoint, held_tx));
 

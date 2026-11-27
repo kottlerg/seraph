@@ -1061,10 +1061,7 @@ struct CreatorEndpoint {
 
 impl CreatorEndpoint {
     fn new() -> Option<CreatorEndpoint> {
-        let endpoint = crate::sys::alloc::seraph::object_slab_retype(
-            syscall_abi::ENDPOINT_RETYPE_BYTES,
-            |slab| syscall::cap_create_endpoint(slab).ok(),
-        )?;
+        let endpoint = crate::sys::alloc::seraph::create_endpoint()?;
         match syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, BOOTSTRAP_BADGE) {
             Ok(send) => Some(CreatorEndpoint { endpoint, send }),
             Err(_) => {

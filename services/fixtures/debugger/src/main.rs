@@ -106,10 +106,7 @@ fn main()
         {}
     }
     let ipc_buf = std::os::seraph::current_ipc_buf();
-    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-        syscall::cap_create_endpoint(slab).ok()
-    })
-    .expect("create the debugger endpoint");
+    let ep = std::os::seraph::create_endpoint().expect("create the debugger endpoint");
 
     let _debuggee = std::thread::spawn(debuggee);
     while DEBUGGEE.load(Ordering::Acquire) == 0

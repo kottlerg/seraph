@@ -137,10 +137,7 @@ fn main()
         std::os::seraph::log!(error: "no debug port served; exiting");
         return;
     };
-    let Some(endpoint) =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
+    let Some(endpoint) = std::os::seraph::create_endpoint()
     else
     {
         std::os::seraph::log!(error: "no fault endpoint; exiting");

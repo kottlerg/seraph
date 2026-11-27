@@ -243,10 +243,7 @@ impl WorkerPool
     /// allocation or any thread spawn fails.
     pub fn new() -> Option<Self>
     {
-        let bootstrap_ep =
-            std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-                syscall::cap_create_endpoint(slab).ok()
-            })?;
+        let bootstrap_ep = std::os::seraph::create_endpoint()?;
         let bootstrap_state = Arc::new(Mutex::new(BootstrapState::new()));
         let active_state = Arc::new(ActiveState::new());
 

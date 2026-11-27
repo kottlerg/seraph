@@ -139,9 +139,10 @@ extern "C" fn worker_entry(arg: u64) -> !
 
     for _ in 0..ITERS_PER_WORKER
     {
-        // Tight retype + reclaim loop. Every Endpoint occupies a BIN_128
-        // slot inside `memory_slot`; concurrent workers compete on the
-        // bin's free list and the per-cap allocator spinlock.
+        // Tight retype + reclaim loop. Every Endpoint occupies a slot of
+        // its size class inside `memory_slot` (BIN_128 up to 224 CPUs);
+        // concurrent workers compete on the bin's free list and the
+        // per-cap allocator spinlock.
         if let Ok(ep) = cap_create_endpoint(memory_slot)
         {
             cap_delete(ep).ok();

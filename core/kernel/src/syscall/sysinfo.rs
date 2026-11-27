@@ -17,7 +17,7 @@ use syscall::SyscallError;
 
 /// One past the highest `SystemInfoType` discriminant `sys_system_info`
 /// answers. A discriminant at or past it is refused before the match.
-const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::IdleHalts as u64 + 1;
+const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::EndpointRetypeBytes as u64 + 1;
 
 /// `SYS_SYSTEM_INFO` (43): query kernel/system information.
 ///
@@ -158,6 +158,12 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         {
             crate::sched::idle_halts_since_mark().ok_or(SyscallError::InvalidState)
         }
+        16 =>
+        // EndpointRetypeBytes — the debit of one Endpoint retype, sized at
+        // boot from the CPU count.
+        {
+            Ok(crate::ipc::endpoint::retype_bytes())
+        }
         _ => Err(SyscallError::InvalidArgument),
     }
 }
@@ -256,6 +262,7 @@ mod tests
             SystemInfoType::SpeculationControls,
             SystemInfoType::SmtSibling,
             SystemInfoType::IdleHalts,
+            SystemInfoType::EndpointRetypeBytes,
         ];
         let max = kinds.iter().map(|&k| k as u64).max();
         assert!(kinds.iter().all(|&k| (k as u64) < SYSTEM_INFO_BOUND));

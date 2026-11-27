@@ -312,10 +312,7 @@ impl TextChild
     /// a thread that serves it a copy of `handle`.
     fn spawn(handle: u64) -> Self
     {
-        let ep =
-            std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-                syscall::cap_create_endpoint(slab).ok()
-            })
+        let ep = std::os::seraph::create_endpoint()
             .expect("memory_object_text: server endpoint creation failed");
         let root = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND)
             .expect("memory_object_text: root SEND");

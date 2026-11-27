@@ -1339,8 +1339,8 @@ pub struct DispatchEntry
 const EVENT_QUEUE_WRAPPER_BYTES: u64 = 24;
 
 // The sub-page wrappers are header (16) + one pointer, and `dispatch_for`
-// budgets them as the literal 24 (this constant, and the Endpoint /
-// Notification / WaitSet entries). Their construction sites write the state
+// budgets them as the literal 24 (this constant, the Notification and WaitSet
+// entries, and `ipc::endpoint`'s debit, which asserts it). Their construction sites write the state
 // at `size_of::<Wrapper>()`, so a field added to a wrapper would silently
 // drift the budget away from the layout; pin both sides here.
 const _: () = assert!(core::mem::size_of::<KernelObjectHeader>() == 16);
@@ -1471,17 +1471,24 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
 {
     match object_type
     {
-        // Sub-page wrappers + state. The Endpoint and Notification debits are
-        // the ABI's retype-cost constants, which userspace sizes its slab
-        // requests from; the const assertions after this function pin them to
-        // the real `24 + size_of::<State>()`, so a field change breaks the
-        // build instead of drifting (a bin overflow is caught by the
-        // const-asserts in endpoint.rs and notification.rs).
-        // Endpoint: 24 wrapper + EndpointState → BIN_128.
-        ObjectType::Endpoint => Some(DispatchEntry {
-            raw_bytes: syscall::ENDPOINT_RETYPE_BYTES,
-            split: false,
-        }),
+        // Endpoint: 24 wrapper + EndpointState + the slot hints, two bits per
+        // CPU of the boot (`ipc::endpoint::retype_bytes`, which userspace
+        // reads through `SystemInfoType::EndpointRetypeBytes`): sub-page in
+        // place while it fits the 512 B bin, page-aligned split beyond.
+        ObjectType::Endpoint =>
+        {
+            let raw_bytes = crate::ipc::endpoint::retype_bytes();
+            Some(DispatchEntry {
+                raw_bytes,
+                split: raw_bytes > BIN_512,
+            })
+        }
+        // Sub-page wrapper + state. The Notification debit is the ABI's
+        // retype-cost constant, which userspace sizes its slab requests from;
+        // the const assertions after this function pin it to the real
+        // `24 + size_of::<State>()`, so a field change breaks the build
+        // instead of drifting (a bin overflow is caught by the const-assert in
+        // notification.rs).
         // Notification: 24 wrapper + NotificationState → BIN_128.
         ObjectType::Notification => Some(DispatchEntry {
             raw_bytes: syscall::NOTIFICATION_RETYPE_BYTES,
@@ -1541,10 +1548,6 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
 // nodes (both bodies are affine in each size, so two points per axis and the
 // largest pin them).
 const _: () = {
-    assert!(
-        24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64
-            == syscall::ENDPOINT_RETYPE_BYTES
-    );
     assert!(NOTIFICATION_RAW_BYTES == syscall::NOTIFICATION_RETYPE_BYTES);
     // The WaitSet formula, at one member, four (where the ring's 8-byte
     // padding steps), and the largest.
@@ -1615,6 +1618,37 @@ mod tests
         assert_eq!(round_to_class(p), p);
         assert_eq!(round_to_class(p + 1), 2 * p);
         assert_eq!(round_to_class(5 * p), 5 * p);
+    }
+
+    // Defect guarded: userspace sizes the Memory it retypes from with
+    // `syscall::retype_class_bytes`; a class that differs from the kernel's
+    // underfunds every retype at that size.
+    #[test]
+    fn round_to_class_matches_the_abi_class()
+    {
+        let p = PAGE_SIZE as u64;
+        let edges = [
+            0,
+            1,
+            BIN_128,
+            BIN_128 + 1,
+            BIN_512,
+            BIN_512 + 1,
+            p,
+            p + 1,
+            5 * p,
+            u64::MAX - p + 1,
+            u64::MAX - p + 2,
+            u64::MAX,
+        ];
+        for bytes in edges
+        {
+            assert_eq!(
+                round_to_class(bytes),
+                syscall::retype_class_bytes(bytes),
+                "bytes {bytes}"
+            );
+        }
     }
 
     // Defect guarded: a size within a page of `u64::MAX` wraps to 0 when
@@ -1699,6 +1733,39 @@ mod tests
         assert_eq!(subpage_bin_for(BIN_512), Some(SubpageBin::Bin512));
         assert_eq!(subpage_bin_for(PAGE_SIZE as u64), None);
         assert_eq!(subpage_bin_for(0), None);
+    }
+
+    #[test]
+    fn an_endpoint_debit_takes_the_class_its_boots_cpu_count_sets()
+    {
+        // 72 bytes of wrapper and state, then a hint byte per four CPUs: the
+        // 128-byte bin up to 224 CPUs, the 512-byte bin up to 1760, and whole
+        // pages, split, above.
+        use crate::ipc::endpoint::retype_bytes_for;
+        use crate::sched::MAX_CPUS;
+        assert_eq!(retype_bytes_for(1), 73);
+        assert_eq!(retype_bytes_for(4), 73);
+        assert_eq!(retype_bytes_for(5), 74);
+        for (cpu_count, class) in [
+            (1, BIN_128),
+            (224, BIN_128),
+            (225, BIN_512),
+            (1760, BIN_512),
+            (1761, PAGE_SIZE as u64),
+        ]
+        {
+            assert_eq!(
+                round_to_class(retype_bytes_for(cpu_count)),
+                class,
+                "{cpu_count} CPUs"
+            );
+        }
+        let widest = retype_bytes_for(MAX_CPUS);
+        assert_eq!(widest, 72 + (MAX_CPUS / 4) as u64);
+        assert_eq!(
+            subpage_bin_for(round_to_class(widest)).is_some(),
+            widest <= BIN_512
+        );
     }
 
     #[test]

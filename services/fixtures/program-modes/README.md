@@ -32,8 +32,8 @@ Unknown mode: with no first argument or one that names no mode above, it prints
 ## capexhaust
 
 Exhausts the process's own `CSpace` general slots, spends its IPC receive reserve on memmgr grants,
-checks memmgr's undo of a grant and a sub-node whose replies fail, and then runs a guarded blocking receive loop. The
-`recv_wedge` phase of [`svctest`](../../svctest/README.md)
+checks memmgr's undo of a grant and a sub-node whose replies fail, and then runs a guarded blocking
+receive loop. The `recv_wedge` phase of [`svctest`](../../svctest/README.md)
 (`services/svctest/src/phases/recv_guard.rs`) spawns `program-modes capexhaust`, waits for it to
 exit, and checks that it died with `EXIT_RECV_WEDGE`. It is not a general-purpose program. Source:
 `src/capexhaust.rs`.

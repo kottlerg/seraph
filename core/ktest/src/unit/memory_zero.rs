@@ -111,11 +111,13 @@ impl<'a> Mapped<'a>
         Ok(mapped)
     }
 
-    /// Whether every word of pages `[first, end)` reads `value`.
-    fn pages_read(&self, first: u64, end: u64, value: u64) -> bool
+    /// Whether every word of pages `[first, end)` reads `value`. The borrow
+    /// of `_mapped` keeps the mapping in place while the words are read.
+    fn pages_read(_mapped: &Self, first: u64, end: u64, value: u64) -> bool
     {
-        (first * PAGE_WORDS..end * PAGE_WORDS).all(|word| {
-            // SAFETY: as in `new`; the mapping lives as long as `self`.
+        // Bounded: `end` <= PIECE_PAGES, so no product overflows.
+        (first.wrapping_mul(PAGE_WORDS)..end.wrapping_mul(PAGE_WORDS)).all(|word| {
+            // SAFETY: as in `new`; the mapping lives as long as `_mapped`.
             unsafe { word_ptr(word).read_volatile() == value }
         })
     }
@@ -137,7 +139,9 @@ impl Drop for Mapped<'_>
 /// The address of word `word` of the mapping at [`ZERO_VA`].
 fn word_ptr(word: u64) -> *mut u64
 {
-    (ZERO_VA + word * 8) as *mut u64
+    // Bounded: `word` < PIECE_PAGES * PAGE_WORDS, so the address lies in the
+    // mapping.
+    ZERO_VA.wrapping_add(word.wrapping_mul(8)) as *mut u64
 }
 
 /// A zero of pages 3 to 40 of a 48-page piece, three batches of 16 pages and
@@ -151,11 +155,12 @@ pub fn zeroes_the_range_and_nothing_else(ctx: &TestContext) -> TestResult
     // SAFETY: the piece's only mapping in ktest is the scratch one at
     // ZERO_VA, which no reference covers.
     unsafe { memory_zero_all(cap, 3, 37) }.map_err(|_| "memory_zero: memory_zero_all failed")?;
-    if !mapped.pages_read(3, 40, 0)
+    if !Mapped::pages_read(&mapped, 3, 40, 0)
     {
         return Err("memory_zero: a page of the zeroed range does not read zero");
     }
-    if !mapped.pages_read(0, 3, PATTERN) || !mapped.pages_read(40, PIECE_PAGES, PATTERN)
+    if !Mapped::pages_read(&mapped, 0, 3, PATTERN)
+        || !Mapped::pages_read(&mapped, 40, PIECE_PAGES, PATTERN)
     {
         return Err("memory_zero: a page outside the zeroed range lost its pattern");
     }
@@ -168,7 +173,8 @@ pub fn zeroes_the_range_and_nothing_else(ctx: &TestContext) -> TestResult
         crate::log_u64("unit::memory_zero: count=", count);
         return Err("memory_zero: one call returned a count outside 1..=page_count");
     }
-    if !mapped.pages_read(40, 40 + count, 0) || !mapped.pages_read(40 + count, PIECE_PAGES, PATTERN)
+    if !Mapped::pages_read(&mapped, 40, count.saturating_add(40), 0)
+        || !Mapped::pages_read(&mapped, count.saturating_add(40), PIECE_PAGES, PATTERN)
     {
         return Err("memory_zero: a call's count does not match the pages it zeroed");
     }
@@ -204,7 +210,7 @@ pub fn refuses_without_map_and_write(ctx: &TestContext) -> TestResult
     {
         return Err("memory_zero: a cap with Map and Write alone was refused");
     }
-    if !mapped.pages_read(0, PIECE_PAGES - 1, PATTERN)
+    if !Mapped::pages_read(&mapped, 0, PIECE_PAGES - 1, PATTERN)
     {
         return Err("memory_zero: a refused call zeroed a page");
     }
@@ -237,7 +243,7 @@ pub fn refuses_a_malformed_range(ctx: &TestContext) -> TestResult
             return Err("memory_zero: a malformed range was not refused with InvalidArgument");
         }
     }
-    if !mapped.pages_read(0, PIECE_PAGES, PATTERN)
+    if !Mapped::pages_read(&mapped, 0, PIECE_PAGES, PATTERN)
     {
         return Err("memory_zero: a refused range zeroed a page");
     }

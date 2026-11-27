@@ -112,13 +112,17 @@ static mut STACKS: [ChildStack; 3] = [const { ChildStack::ZERO }; 3];
 /// The first word of page `page` of the piece's mapping.
 fn first_word(page: u64) -> *mut u64
 {
-    (PIECE_VA + page * PAGE_SIZE) as *mut u64
+    // Bounded: `page` < PIECE_PAGES, so the address lies in the mapping.
+    PIECE_VA.wrapping_add(page.wrapping_mul(PAGE_SIZE)) as *mut u64
 }
 
 /// The last word of page `page` of the piece's mapping.
 fn last_word(page: u64) -> *mut u64
 {
-    (PIECE_VA + page * PAGE_SIZE + PAGE_SIZE - 8) as *mut u64
+    // Bounded: `page` < PIECE_PAGES, so the address lies in the mapping.
+    PIECE_VA
+        .wrapping_add(page.wrapping_mul(PAGE_SIZE))
+        .wrapping_add(PAGE_SIZE - 8) as *mut u64
 }
 
 /// Waiter: block on `wake`, report whether the zeroer's call had returned.
@@ -327,10 +331,9 @@ fn attempt(ctx: &TestContext, piece: u64) -> Result<Attempt, &'static str>
     for page in 0..PIECE_PAGES
     {
         // SAFETY: the piece is mapped at PIECE_VA, which no reference covers.
-        unsafe {
-            first_word(page).write_volatile(PATTERN);
-            last_word(page).write_volatile(PATTERN);
-        }
+        unsafe { first_word(page).write_volatile(PATTERN) };
+        // SAFETY: as above.
+        unsafe { last_word(page).write_volatile(PATTERN) };
     }
     RETURNED.store(0, Ordering::Relaxed);
     COUNT.store(0, Ordering::Relaxed);
@@ -407,7 +410,7 @@ fn judge(bits: u64) -> Result<Attempt, &'static str>
         return Ok(Attempt::Inconclusive);
     }
     crate::log_u64("memory_zero_preempt: count=", count);
-    if count % BATCH_PAGES != 0
+    if !count.is_multiple_of(BATCH_PAGES)
     {
         return Err("memory_zero_preempt: the call stopped inside a batch");
     }
@@ -416,12 +419,9 @@ fn judge(bits: u64) -> Result<Attempt, &'static str>
         let want = if page < count { 0 } else { PATTERN };
         // SAFETY: the piece is mapped at PIECE_VA, which no reference covers,
         // and every child has been reaped.
-        let (first, last) = unsafe {
-            (
-                first_word(page).read_volatile(),
-                last_word(page).read_volatile(),
-            )
-        };
+        let first = unsafe { first_word(page).read_volatile() };
+        // SAFETY: as above.
+        let last = unsafe { last_word(page).read_volatile() };
         if first != want || last != want
         {
             crate::log_u64("memory_zero_preempt: page=", page);

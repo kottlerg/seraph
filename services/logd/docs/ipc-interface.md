@@ -759,7 +759,7 @@ Each holder of the barrier's authority holds it for one such act:
 | pwrmgr | every power-off and reset it acts on, and its power-off on a core service's death ([pwrmgr](../../pwrmgr/README.md)) | the lines logged before the request or the death, a test's pass marker and crash reports among them |
 | acpid | on x86-64, its write of the sleep or reset register (`SLEEP`, `RESET`; [acpid](../../acpid/README.md) § Power requests) | its own line naming the write, which it logs after pwrmgr's flush and right before the write |
 | crashd | its decline of a fault ([crashd operation](../../crashd/docs/operation.md) § Per Fault) | the fault's report, since the decline can end logd itself |
-| svctest | none: its `logd_flush` phase tests the barrier | none |
+| svctest | its `logd_sinks` phase's framebuffer cases, and that phase's stop of the serial driver, which stalls the serial sink ([svctest](../../svctest/README.md)); its `logd_flush` phase tests the barrier itself | the lines of the phases before, the windows the boot's whole-lines checks read among them |
 
 The label is served only on a badge carrying `log_labels::LOG_FLUSH_AUTHORITY` (`1 << 62`, a
 [verb bit](../../../docs/capability-model.md#verb-bit-authority-pattern)). svcmgr mints a SEND on

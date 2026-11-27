@@ -2887,19 +2887,18 @@ shares (in `target/xtask/host/` outside a git checkout):
   leaves nothing to clean up, and its QEMUs keep the host held while they run.
 - `grant.json`: the exclusive grant. `cargo xtask orch grant set` writes it, `orch grant clear`
   (whatever the batch state records) and `orch end` remove it. While it exists, a boot is refused
-  unless it passes `--grant <holder>` naming its holder, and the holder's boots still meet the
-  rules above. A timing grant (`orch grant set --timing`) refuses a build the same way, unless
-  the build was started by a command the host already admitted (one whose process, or an
-  ancestor of it as `/proc` reports them, holds a live record), as `compare-images` starts its
-  nested builds, so a command admitted before the grant finishes. Any other grant leaves builds
-  alone. With `--wait-host` a refused command waits for the grant to end; without it, it fails at
-  once naming the holder. The lock holds only what the host admits: cargo's compile of xtask
-  itself, which any `cargo xtask` command runs first when the checkout's build of xtask is not
-  current (a file it is built from changed: `xtask/`, a crate `xtask/Cargo.toml` depends on,
-  the root `Cargo.toml` or `Cargo.lock`, `.cargo/` or the toolchain; or a worktree that has not
-  built it yet), comes before any
-  admission, and an xtask built from a branch without the timing grant neither registers its
-  builds nor refuses them.
+  unless it passes `--grant <holder>` naming its holder, and the holder's boots still meet the rules
+  above. A timing grant (`orch grant set --timing`) refuses a build the same way, unless the build
+  was started by a command the host already admitted (one whose process, or an ancestor of it as
+  `/proc` reports them, holds a live record), as `compare-images` starts its nested builds, so a
+  command admitted before the grant finishes. Any other grant leaves builds alone. With
+  `--wait-host` a refused command waits for the grant to end; without it, it fails at once naming
+  the holder. The lock holds only what the host admits: cargo's compile of xtask itself, which any
+  `cargo xtask` command runs first when the checkout's build of xtask is not current (a file it is
+  built from changed: `xtask/`, a crate xtask's build reaches, directly or through another (`cargo
+  tree -p xtask -e normal,build`), the root `Cargo.toml` or `Cargo.lock`, `.cargo/` or the
+  toolchain; or a worktree that has not built it yet), comes before any admission, and an xtask
+  built from a branch without the timing grant neither registers its builds nor refuses them.
 
 The options:
 

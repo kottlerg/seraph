@@ -1279,9 +1279,9 @@ impl PerCpuScheduler
 
     /// Whether this CPU has no work: it runs its idle thread and no run queue
     /// other than [`IDLE_QUEUE`] links a thread. Lockless and Relaxed, and
-    /// dereferences no TCB: a snapshot for the softlockup watchdog's per-tick
-    /// idle sample (`sched::system_has_no_work`), which re-decides it on every
-    /// BSP tick, and for the SMT core spread, which counts a sibling for which
+    /// dereferences no TCB: a snapshot for the softlockup watchdog's idle
+    /// sample (`sched::cpu_has_no_work`), which re-decides it on every sweep of
+    /// the CPUs, and for the SMT core spread, which counts a sibling for which
     /// it fails as busy (core/kernel/docs/scheduler.md § SMT Awareness). A
     /// thread between two of its loads (mid-dispatch, mid-link, or
     /// mid-migration) can be missed by one sample;

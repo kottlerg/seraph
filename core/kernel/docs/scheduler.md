@@ -672,7 +672,9 @@ scan's cost at 128 CPUs' reads whatever the CPU count, where a full scan at the 
 `MAX_CPUS` reads 8192 remote cache lines at every wake and at every tick of every idle CPU. What
 it costs a boot above 128 CPUs is reach: a wake sees the least load or the lowest rank of its
 window rather than of every CPU, and a pull's bound gains one tick per window read before the one
-that holds its victim (below).
+that holds its victim (below). The BSP's softlockup watchdog reads the CPUs in windows of the same
+size, a sweep across its ticks and scans rather than a scan of every CPU at each
+([scheduling-internals.md](scheduling-internals.md) § Softlockup Watchdog).
 
 Victim selection is mode-dependent:
 

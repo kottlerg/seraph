@@ -17,8 +17,8 @@ receives on its own IPC buffer page, under a `RecvGuard`
 ([IPC Design](../../docs/ipc-design.md) § Receive-Failure Policy), and calls the handler with the
 received message, its `IpcBuf`, and its `ipc::serve::Reply`: a handler whose turn ends with its
 reply leaves it there, and the worker sends it with its next receive in one `SYS_IPC_REPLY_RECV`
-([shared/ipc/README.md](../ipc/README.md) § Serving); a handler with work after its reply replies
-at once with `ipc_reply`.
+([shared/ipc/README.md](../ipc/README.md) § Serving); a handler with work after its reply sends it
+first, as that section says.
 
 `IpcBuf` is the calling thread's registered IPC buffer page, obtained only through
 `IpcBuf::current()` and neither `Send` nor `Sync`, so a handler can reach no page but its own

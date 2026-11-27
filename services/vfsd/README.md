@@ -66,8 +66,9 @@ vfsd/
   multi-threaded recv so independent requests proceed while one waits on
   a driver spawn; no service-endpoint request waits on another's IPC (a
   `GET_SWAP_PARTITION` waits at most for the discovery lock and the swap
-  lock, held across a discovery of new disks and one call to the block
-  driver; none of devmgr, memmgr and the block drivers calls vfsd), so the thread count
+  lock, held across a discovery of new disks and two calls to the block
+  driver, `BLK_RETIRE_PARTITION` and `REGISTER_PARTITION`; none of devmgr,
+  memmgr and the block drivers calls vfsd), so the thread count
   is a concurrency knob, not a correctness bound. `MOUNT` mounts the root or the data role at a
   path, resolved as the self-mount resolves it, gated on the
   `MOUNT_AUTHORITY` badge bit; root, `/esp`, and the data paths are

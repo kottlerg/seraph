@@ -81,7 +81,9 @@
 # stays zero in a boot that stages no crashd.
 # stop_authority = yes delivers svcmgr's STOP_AUTHORITY SEND in the slot
 # after that, through which the svcmgr_stop_service phase stops and lists
-# services and lists the stop sources.
+# services and lists the stop sources. pmu_authority = yes delivers svcmgr's
+# PmuControl copy in the slot after that, through which the pmu_authority
+# phase counts a loop; no shipped definition sets it.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT
 # scan. `cargo xtask mkdisk --svctest <set>` stages it into
@@ -107,3 +109,4 @@ cwd       = /data
 seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny memmgr.swap devmgr.class.rtc svcmgr.grant crashd.core logd.flush logd.follow logd.control
 debug_authority = yes
 stop_authority  = yes
+pmu_authority   = yes

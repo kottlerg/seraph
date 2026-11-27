@@ -103,6 +103,10 @@ pub struct Caps
     /// recipe's `stop_authority = yes` delivers in slot 26, after the
     /// debug-authority slot.
     pub stop_authority: u64,
+    /// A `PmuControl` copy carrying `Configure`, which the recipe's
+    /// `pmu_authority = yes` delivers in slot 27, after the stop-authority
+    /// slot.
+    pub pmu_authority: u64,
 }
 
 /// Drain the bootstrap rounds from `creator_endpoint` and pull caps out,
@@ -130,8 +134,8 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    // Twenty-five seeds, the debug-authority slot and the stop-authority slot take seven rounds; an
-    // absent slot decodes as `0`, and a round that does not decode leaves every slot `0`.
+    // Twenty-five seeds and the debug-, stop- and PMU-authority slots take seven rounds; an absent
+    // slot decodes as `0`, and a round that does not decode leaves every slot `0`.
     let Ok(
         [
             root_fs,
@@ -161,8 +165,9 @@ fn request_round() -> Caps
             logd_control,
             debug_authority,
             stop_authority,
+            pmu_authority,
         ],
-    ) = (unsafe { ipc::bootstrap::request_slots::<27>(info.creator_endpoint, ipc_buf) })
+    ) = (unsafe { ipc::bootstrap::request_slots::<28>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
@@ -194,6 +199,7 @@ fn request_round() -> Caps
     caps.logd_control = logd_control;
     caps.debug_authority = debug_authority;
     caps.stop_authority = stop_authority;
+    caps.pmu_authority = pmu_authority;
 
     caps
 }

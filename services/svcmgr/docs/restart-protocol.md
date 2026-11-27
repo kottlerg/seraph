@@ -369,9 +369,9 @@ The launch path is documented in
 [service-definitions.md](service-definitions.md#reconciliation). The
 `.svc` recipe is the single source of truth for both paths: the fixed
 fields are recorded on `ServiceEntry` and the argv / env / cwd / seed,
-the log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`,
-`reserve` and `private_image` flags, the `stop_source` class, and the scheduling fields on the
-parallel `RestartRecipe`, so
+the log-sink, debug-authority, stop-authority, entropy-authority, PMU-authority,
+`oom_stop`, `reserve` and `private_image` flags, the `stop_source` class, and the scheduling
+fields on the parallel `RestartRecipe`, so
 a restart reproduces the first-launch spawn shape byte-for-byte, except the
 log-sink round, whose history-pull SEND is absent on a restart once procmgr
 reports init reaped (per
@@ -405,8 +405,8 @@ string at its own length:
 
 The launch surfaces svcmgr replays beyond that record (the
 argv / env / cwd / seed, plus the log-sink, debug-authority,
-stop-authority, entropy-authority, `oom_stop`, `reserve` and `private_image` flags, the
-`stop_source` class and the scheduling fields) are held in a parallel
+stop-authority, entropy-authority, PMU-authority, `oom_stop`, `reserve` and `private_image`
+flags, the `stop_source` class and the scheduling fields) are held in a parallel
 [`RestartRecipe`](../src/service.rs) table
 (`ServiceTable.recipes`), index-aligned with `services` by slot:
 
@@ -420,6 +420,7 @@ stop-authority, entropy-authority, `oom_stop`, `reserve` and `private_image` fla
 | `debug_authority` | `debug_authority = ...` |
 | `stop_authority` | `stop_authority = ...` |
 | `entropy_authority` | `entropy_authority = ...`; cleared on every declaration after the first in launch order |
+| `pmu_authority` | `pmu_authority = ...`; cleared on every declaration after the first in launch order |
 | `oom_stop` | `oom_stop = ...` |
 | `reserve` | `reserve = ...` |
 | `private_image` | `private_image = ...` |
@@ -433,7 +434,8 @@ scheduling fields and the create flags `reserve`, `oom_stop`, `stop_source` and
 `CREATE_PRIVATE_IMAGE`) into
 `CREATE_FROM_FILE`, cwd
 through `apply_namespace_policy`, seeds re-resolved from the discovery
-registry, a fresh `DEBUG_AUTHORITY` and `STOP_AUTHORITY` cap and `EntropyControl` copy after them,
+registry, a fresh `DEBUG_AUTHORITY` and `STOP_AUTHORITY` cap, `EntropyControl` copy and
+`PmuControl` copy after them,
 and `log_sink` selecting the log-sink round — so a restarted child comes
 back with the same surfaces first launch gave it, the log-sink round's
 history-pull SEND aside.

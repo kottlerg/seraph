@@ -74,6 +74,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `stop_authority` | no | `yes` or `no` (default `no`). Endows the service with svcmgr's stop authority, a `STOP_AUTHORITY` SEND on svcmgr's service endpoint, in the bootstrap slot after its `seed` caps and its debug-authority slot. Mutually exclusive with `log_sink`. See [`stop_authority`](#stop_authority). |
 | `entropy_authority` | no | `yes` or `no` (default `no`). Endows the service with the kernel's entropy-contribution authority, an `EntropyControl` capability carrying `Contribute`, in the bootstrap slot after its `seed` caps and its debug- and stop-authority slots. One service holds it: the first recipe in launch order that sets it. Mutually exclusive with `log_sink`. A core role. See [`entropy_authority`](#entropy_authority). |
+| `pmu_authority` | no | `yes` or `no` (default `no`). Endows the service with the kernel's performance-counter authority, a `PmuControl` capability carrying `Configure`, in the bootstrap slot after its `seed` caps and its debug-, stop- and entropy-authority slots. One service holds it: the first recipe in launch order that sets it. With no recipe holding it, svcmgr deletes its source once the recipes are read. Mutually exclusive with `log_sink`. A core role. See [`pmu_authority`](#pmu_authority). |
 | `stop_source` | no | `program`. Makes the service a stop source of that class: svcmgr creates it contained and lists it, with a stop-badged SEND on its endpoint, to a stop-authority holder. A core role. Needs `provides` with every entry badged, and `restart` other than `never`. See [`stop_source`](#stop_source). |
 | `oom_stop` | no | `yes` or `no` (default `no`). Opts the service in to being stopped by a stop-authority holder. Refused, as a parser error, on a recipe the eligibility rule refuses. See [`oom_stop`](#oom_stop). |
 | `reserve` | no | `yes` or `no` (default `no`). Creates the service inside memmgr's system reserve. A core role: the eligibility rule never stops it. See [`reserve`](#reserve). |
@@ -419,7 +420,7 @@ Pager](../../../docs/fault-handling.md#default-system-pager)); the role sets the
 recipe key does. On each launch it also serves the actuator a derivation carrying only the receive
 right of the core-death queue, which the death observers of svcmgr's, memmgr's and procmgr's main
 threads and address spaces post to, in the bootstrap slot after the `seed` caps and after any
-debug-authority, stop-authority and entropy-authority slots (`cap[4]` for pwrmgr). A derive that
+debug-, stop-, entropy- and PMU-authority slots (`cap[4]` for pwrmgr). A derive that
 fails, or a queue svcmgr could not make, leaves the slot absent. A recipe that declares the key but
 is not recognised is created demand-paged and gets no such slot.
 
@@ -506,6 +507,31 @@ seed              = devmgr.class.hwrng
 entropy_authority = yes
 ```
 
+## `pmu_authority`
+
+`yes` endows the service with the kernel's performance-counter authority: on its first launch and
+on every restart, svcmgr derives a copy of the `PmuControl` source init endows it
+([ipc-interface.md § Handover endowment](ipc-interface.md#handover-endowment-bootstrap-rounds)),
+carrying `Configure`, the type's one right, and delivers it in the bootstrap slot after the `seed`
+caps and, for a service that sets them, after the debug-, stop- and entropy-authority slots. A
+source init could not endow, a source svcmgr has deleted, or a derive that fails, leaves the slot
+absent. The capability serves `SYS_PMU_INFO`, `SYS_PMU_CONFIGURE` and `SYS_PMU_BIND`, through
+which the holder programs a CPU's counters and grants its own threads their reads
+([docs/capability-model.md § `PmuControl`](../../../docs/capability-model.md#pmucontrol)); this key
+is the only path that delivers it, and svcmgr never publishes the source.
+
+One service holds the authority. svcmgr keeps the key on the first recipe that sets it in launch
+order (`svcmgr_defs::keep_one_pmu_holder`) and clears it on every later one, which it launches
+without the capability and logs (`<name> also declares pmu_authority; not given`).
+
+Once it has read the recipes at the handover, whatever the scan's outcome, svcmgr deletes the
+source when no recipe it keeps sets the key, and logs `PmuControl source deleted`: a system that
+measures nothing keeps no counter authority past the scan. The default image sets the key on no
+recipe, so it holds none; svctest's recipe sets it, for its `pmu_authority` phase.
+
+`pmu_authority = yes` alongside `log_sink = yes` is a parser error, as for `debug_authority`. The
+key is a core role, so the [`oom_stop`](#oom_stop) rule never stops the holder.
+
 ## `stop_source`
 
 `program` makes the service a stop source of the program class
@@ -558,7 +584,7 @@ refusing for the first row that applies:
 | 1 | was started by init (memmgr, procmgr, devmgr, vfsd), so svcmgr only binds it | not launched by svcmgr |
 | 2 | has `restart = never`, so a stop would end it for good | never restarted |
 | 3 | has `critical = yes` | the system is not viable without it |
-| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `entropy_authority`, `reserve`, `shutdown_actuator` or `stop_source` | the system's log, crash reporting, stopping, shutdown and entropy contribution rest on it |
+| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `entropy_authority`, `pmu_authority`, `reserve`, `shutdown_actuator` or `stop_source` | the system's log, crash reporting, stopping, shutdown, entropy contribution and measurement rest on it |
 | 5 | does not set `oom_stop = yes` | not opted in |
 
 Eligibility is read from the recipe's keys alone, never from the service's name. The parser
@@ -675,7 +701,7 @@ At `HANDOVER_COMPLETE` svcmgr reads the recipes of `/config/svcmgr/services/`, p
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`, `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
+| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, PMU-authority, `oom_stop`, `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop`, `stop_source` and `private_image` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`, `CREATE_PRIVATE_IMAGE`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (whatever the `restart` policy, so they are in place before the thread runs; a bind that fails destroys the child and the launch fails), `START_PROCESS`, serve the seed bootstrap rounds, and record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 

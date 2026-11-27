@@ -1483,6 +1483,11 @@ pub struct SvcmgrEndowment
     /// from it in `endow_svcmgr`; svcmgr derives the one
     /// `entropy_authority = yes` service's copy from that on every launch.
     pub entropy_root: u64,
+    /// The root `PmuControl` capability the kernel minted into init, or `0`
+    /// when none is described. init derives the endowed `Configure` copy from
+    /// it in `endow_svcmgr`; svcmgr derives the one `pmu_authority = yes`
+    /// service's copy from that on every launch.
+    pub pmu_root: u64,
     /// A `Read` copy of the root `KernelLog` capability the kernel minted
     /// into init, or `0` when none is described or the derive failed. svcmgr
     /// derives real-logd's copy from it on every launch.
@@ -1516,7 +1521,7 @@ fn derive_or_absent(source: u64, rights: u64) -> u64
 /// Start svcmgr, then serve the handover endowment over the bootstrap
 /// protocol.
 ///
-/// The `CAPS` rounds (three rounds for the nine slots) deliver
+/// The `CAPS` rounds (three rounds for the ten slots) deliver
 /// svcmgr's service + bootstrap endpoints (full
 /// rights) and the publish-role source caps: a `SEND` on vfsd's synthetic
 /// root derived from the system-root cap (svcmgr publishes it as
@@ -1530,7 +1535,9 @@ fn derive_or_absent(source: u64, rights: u64) -> u64
 /// `SWAP_AUTHORITY`-badged (`vfsd.swap`), and an `EntropyControl` copy
 /// carrying `Contribute`, which svcmgr keeps as a source and never
 /// publishes, and a `SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's
-/// endpoint, which svcmgr publishes seed-only as `memmgr.swap`. An absent source
+/// endpoint, which svcmgr publishes seed-only as `memmgr.swap`, and a
+/// `PmuControl` copy carrying `Configure`, which svcmgr keeps as a source
+/// while a recipe holds `pmu_authority` and never publishes. An absent source
 /// cap is left off its round and its presence bit clear (the
 /// `svcmgr_endowment` encoding), since the kernel refuses a null cap slot.
 ///
@@ -1638,9 +1645,11 @@ fn endow_svcmgr(
     // EntropyControl source: `Contribute`, the type's one right, so svcmgr
     // can derive the holder's copy and nothing more.
     let entropy_source = derive_or_absent(endow.entropy_root, syscall::RIGHTS_ENTROPY_CONTRIBUTE);
+    // PmuControl source: `Configure`, the type's one right, likewise.
+    let pmu_source = derive_or_absent(endow.pmu_root, syscall::RIGHTS_PMU_CONFIGURE);
 
     // The CAPS rounds: the positional slot list [service, bootstrap, rootfs,
-    // devmgr_reg, vfsd_mount, vfsd_deny, vfsd_swap, entropy, memmgr_swap], split over as many
+    // devmgr_reg, vfsd_mount, vfsd_deny, vfsd_swap, entropy, memmgr_swap, pmu], split over as many
     // rounds as it needs, each carrying the present caps of its window, named
     // by its presence word, and the count of CAPS rounds after it. The
     // LOGD_SOURCES round is always terminal, so no earlier round is.
@@ -1654,6 +1663,7 @@ fn endow_svcmgr(
         vfsd_swap,
         entropy_source,
         memmgr_swap,
+        pmu_source,
     });
     for caps_round in &caps_rounds
     {
@@ -1897,6 +1907,7 @@ pub fn phase3_svcmgr_handover(
         master_log_source,
         procmgr_death_auth_source,
         entropy_root: crate::find_cap_by_type(info, CapType::EntropyControl).unwrap_or(0),
+        pmu_root: crate::find_cap_by_type(info, CapType::PmuControl).unwrap_or(0),
         kernel_log_source,
     };
     let svcmgr_endowed = endow_svcmgr(

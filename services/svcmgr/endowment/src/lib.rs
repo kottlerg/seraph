@@ -70,11 +70,16 @@ pub mod caps_slot
     /// The `memmgr_labels::SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's
     /// endpoint (`memmgr.swap`).
     pub const MEMMGR_SWAP: usize = 8;
+    /// The `PmuControl` source carrying `Configure`, derived from the root
+    /// capability the kernel mints into init. Never published: svcmgr derives
+    /// the `pmu_authority = yes` service's copy from it, and deletes it once
+    /// the recipes are read when no recipe holds the key.
+    pub const PMU_SOURCE: usize = 9;
 }
 
 /// Number of slots in the `CAPS` slot list: one per role in [`caps_slot`],
 /// whose roles are fixed, so the list cannot overflow.
-pub const CAPS_SLOTS: usize = 9;
+pub const CAPS_SLOTS: usize = 10;
 
 /// Number of `CAPS` rounds the slot list takes.
 pub const CAPS_ROUNDS: usize = slot_round_count(CAPS_SLOTS);
@@ -139,6 +144,8 @@ pub struct CapsRound
     pub entropy_source: u64,
     /// `SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's endpoint, or `0`.
     pub memmgr_swap: u64,
+    /// `PmuControl` source carrying `Configure`, or `0`.
+    pub pmu_source: u64,
 }
 
 impl CapsRound
@@ -156,6 +163,7 @@ impl CapsRound
         slots[caps_slot::VFSD_SWAP] = self.vfsd_swap;
         slots[caps_slot::ENTROPY_SOURCE] = self.entropy_source;
         slots[caps_slot::MEMMGR_SWAP] = self.memmgr_swap;
+        slots[caps_slot::PMU_SOURCE] = self.pmu_source;
         slots
     }
 
@@ -171,6 +179,7 @@ impl CapsRound
             vfsd_swap: slots[caps_slot::VFSD_SWAP],
             entropy_source: slots[caps_slot::ENTROPY_SOURCE],
             memmgr_swap: slots[caps_slot::MEMMGR_SWAP],
+            pmu_source: slots[caps_slot::PMU_SOURCE],
         }
     }
 }
@@ -635,6 +644,7 @@ mod tests
             vfsd_swap: 0,
             entropy_source: 0,
             memmgr_swap: 0,
+            pmu_source: 0,
         }
     }
 
@@ -654,13 +664,13 @@ mod tests
         last
     }
 
-    // The nine slots take three rounds; each optional source, in any window,
+    // The ten slots take three rounds; each optional source, in any window,
     // round-trips present or absent.
     #[test]
     fn caps_round_trips_with_every_source_present_or_absent()
     {
         assert_eq!(CAPS_ROUNDS, 3);
-        for mask in 0u32..128
+        for mask in 0u32..256
         {
             let pick = |bit: u32, cap: u64| if mask & bit != 0 { cap } else { 0 };
             let sent = CapsRound {
@@ -669,6 +679,7 @@ mod tests
                 vfsd_swap: pick(16, 0x25),
                 entropy_source: pick(32, 0x26),
                 memmgr_swap: pick(64, 0x27),
+                pmu_source: pick(128, 0x28),
                 ..caps_round(pick(1, 0x21), pick(2, 0x22))
             };
             assert_eq!(decode_all(&encode_caps(&sent)), Ok(Some(sent)));

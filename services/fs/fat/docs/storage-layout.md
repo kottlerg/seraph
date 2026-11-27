@@ -24,7 +24,15 @@ each mutation in [crash-safety.md](crash-safety.md).
   free), with an LFN run packed in reverse-sequence order. The long name is
   the UTF-8 name encoded as UTF-16 code units (`fat_parse::encode_lfn`, at
   most 255). The trailing `0x40` LFN sequence flag and `LDIR_Chksum`
-  computation match the Microsoft FAT specification.
+  computation match the Microsoft FAT specification. An insert whose slot
+  run crosses the end-of-directory marker writes a new `0x00` marker into
+  the slot after the run, when the directory has one, since the slots past
+  the old marker may hold any bytes. A directory walk ends with `Corrupt`
+  past the clusters the specification's 65536 entries fill
+  (`fat_parse::dir_chain_limit`), so a cyclic chain ends, and a directory
+  at that limit does not grow. `NS_READDIR` lists an entry whose long
+  name takes more than the protocol's 255-byte name limit in UTF-8 under
+  its short name, which a lookup accepts too.
 * **Page cache** (`src/cache.rs`): up to its slot ceiling of single-page slots, fixed at init from
   the RAM memmgr reports (`QUERY_POOL_STATUS`): one slot per `SLOT_RAM_DIVISOR` (512) pages of RAM,
   never fewer than `SLOT_COUNT` (256; `fat_parse::slot_ceiling`). A lookup finds a cached page
@@ -50,8 +58,9 @@ each mutation in [crash-safety.md](crash-safety.md).
   4 KiB write over a contiguous region is one block request where it was one per sector. Every
   other write (a FAT sector, a directory slot, FSInfo) is a run of one sector. A sector is one
   logical block of the device, whose size `FS_MOUNT` reads with `BLK_GET_GEOMETRY` before the
-  BPB; a page holds `PAGE_SIZE` over it. A slot takes its page from
-  memmgr when a miss finds no slot that holds a page and no sector run, and the cache evicts only
+  BPB, with the partition's length, past which the BPB may declare no sector; a page holds
+  `PAGE_SIZE` over it. A slot takes its page from memmgr when a miss finds no slot that holds a
+  page and no sector run, and the cache evicts only
   once every slot holds a page or memmgr refuses one, so an idle mount pays only for the pages it
   fills. When memmgr's memory-pressure level turns `Low` or `Critical`, a pressure thread, which
   waits on the runtime's pressure Notification, wakes the dispatch loop with an unbadged call on the

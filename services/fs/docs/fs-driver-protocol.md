@@ -104,8 +104,8 @@ its block device endpoint and reply success or a typed error.
 `IO_ERROR` (the block device's `BLK_GET_GEOMETRY` or the BPB read failed),
 or `NOT_FOUND` for a malformed BPB, one whose sector size is not the
 device's logical block size (the driver reads one block per sector, 512 to
-4096 bytes), or one with fewer than 4085 clusters (FAT12, which the driver
-does not read).
+4096 bytes), one that declares more sectors than the partition holds, or
+one with fewer than 4085 clusters (FAT12, which the driver does not read).
 
 The block device endpoint arrives in the driver's bootstrap round;
 see [Bootstrap caps](#bootstrap-caps).

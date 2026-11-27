@@ -228,11 +228,14 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   refuses to register a partition past that capacity (`resolve_lba`, `handle_register_partition` in
   `services/drivers/virtio/blk/src/main.rs`).
 - The FAT decoders are a pure crate, `services/fs/fat/fat-parse`: `parse_bpb_geometry` refuses a bad
-  signature, a zero divisor, a sector size other than the device's, FAT12 and an inconsistent
-  geometry; `is_data_cluster` bounds every cluster number read from disk to the data region. fatfs
-  bounds a directory's chain walk to the volume's cluster count, and a file's to the clusters before
-  the offset it reads, so a cyclic chain ends (`services/fs/fat/src/dir.rs`, `read_file_data` in
-  `services/fs/fat/src/fat.rs`).
+  signature, a zero divisor, a sector size other than the device's, FAT12, an inconsistent
+  geometry, and a volume that declares more sectors than its partition holds, whose length fatfs
+  reads from the block driver (`BLK_GET_GEOMETRY`), so every bound derived from the cluster count
+  follows the disk; `is_data_cluster` bounds every cluster number read from disk to the data
+  region. fatfs bounds a directory's chain walk to the clusters the specification's 65536 entries
+  fill (`fat_parse::dir_chain_limit`), and a file's to the clusters before the offset it reads, so
+  a cyclic chain ends after a bounded number of sector scans (`services/fs/fat/src/dir.rs`,
+  `read_file_data` in `services/fs/fat/src/fat.rs`).
 - A disk's own partition table gives a role on the boot disk alone, the disk at the PCI location
   the bootloader reported that carries the boot ESP it booted (`find_boot_disk` in
   `services/vfsd/gpt/src/lib.rs`). Another disk takes a role only where the storage statement,

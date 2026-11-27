@@ -584,7 +584,7 @@ fn service_loop(
         {
             // The last turn's reply goes out before this work.
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { reply.flush(ipc_buf) };
+            unsafe { reply.flush(caps.service, ipc_buf) };
             std::process::exit(fs_labels::EXIT_DEVICE_GONE.cast_signed());
         }
         // The last request may have met a full cache on a path that does
@@ -593,7 +593,7 @@ fn service_loop(
         {
             // The last turn's reply goes out before this work.
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { reply.flush(ipc_buf) };
+            unsafe { reply.flush(caps.service, ipc_buf) };
             let req = opens
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -609,7 +609,7 @@ fn service_loop(
         {
             // The last turn's reply goes out before this work.
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { reply.flush(ipc_buf) };
+            unsafe { reply.flush(caps.service, ipc_buf) };
             sweep_sessions(opens, &mut session_sweeps, cache);
         }
         // The pressure thread marked a release and woke the loop with a
@@ -618,7 +618,7 @@ fn service_loop(
         {
             // The last turn's reply goes out before this work.
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { reply.flush(ipc_buf) };
+            unsafe { reply.flush(caps.service, ipc_buf) };
             release_under_pressure(cache, ipc_buf);
         }
         // SAFETY: ipc_buf is the registered IPC buffer page.

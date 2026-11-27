@@ -12,11 +12,13 @@
 //! (`docs/ipc-design.md` § The Call/Reply Model). A handler with work after
 //! its reply, or one that must answer before something it does next, replies
 //! at once with [`crate::ipc_reply`] and leaves the slot empty; a loop with
-//! work before its next receive sends the slot's reply alone first
-//! ([`Reply::flush`]). With the slot empty, [`next_request`] is
-//! [`crate::ipc_recv`]. A loop whose receive waits a bounded time uses
-//! [`next_request_timeout`], and one that undoes a request's effect when its
-//! reply does not reach the caller reads [`Reply::undelivered`] after the send.
+//! work before its next receive sends the slot's reply first
+//! ([`Reply::flush`]), with a receive that does not wait, and the call that
+//! receive binds is the one the next [`next_request`] returns. With the slot
+//! empty, [`next_request`] is [`crate::ipc_recv`]. A loop whose receive
+//! waits a bounded time uses [`next_request_timeout`], and one that undoes a
+//! request's effect when its reply does not reach the caller reads
+//! [`Reply::undelivered`] after the send.
 
 // When this crate is compiled as a std dep via rustc-dep-of-std, the
 // crate root is `no_core` and the usual prelude is not auto-imported.
@@ -33,11 +35,15 @@ use crate::IpcMessage;
 /// The reply a server thread's handler leaves for the loop's next receive.
 ///
 /// One per receiving thread, owned by its loop. It holds at most one reply,
-/// to the caller the thread's last receive bound.
+/// to the caller the thread's last receive bound, or, after a
+/// [`Reply::flush`] whose receive bound a call, that call, for the next
+/// receive to return.
 pub struct Reply
 {
     /// The reply, valid while [`Slot::Pending`] and only up to its counts. It
     /// stays in place from its set to its send, so no turn copies the message.
+    /// While [`Slot::Held`] or [`Slot::HeldLost`], the call a flush's receive
+    /// bound, read here once the reply it replaced was sent.
     msg: IpcMessage,
     state: Slot,
     /// Delete the reply's caps from this thread's `CSpace` when the reply is
@@ -56,6 +62,36 @@ enum Slot
     Pending,
     /// No reply is set, and the last one sent was not delivered.
     Lost,
+    /// A flush's receive bound a call, held in the slot for the next receive
+    /// to return; the reply that flush sent was delivered.
+    Held,
+    /// As [`Self::Held`], and the reply that flush sent was not delivered.
+    HeldLost,
+}
+
+impl Slot
+{
+    /// The outcome a held call leaves once it is returned: the state of the
+    /// slot with the call taken out, or `None` when the slot holds none.
+    #[inline]
+    const fn unheld(self) -> Option<Self>
+    {
+        match self
+        {
+            Self::Held => Some(Self::Empty),
+            Self::HeldLost => Some(Self::Lost),
+            Self::Empty | Self::Pending | Self::Lost => None,
+        }
+    }
+}
+
+/// What a receive of the loop returns: a call the kernel delivered, or the
+/// call a flush's receive bound, held in the slot.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum Next<G>
+{
+    Received(G),
+    Held,
 }
 
 impl Reply
@@ -75,13 +111,21 @@ impl Reply
     /// [`next_request`] or [`Self::flush`], did not reach the caller: the
     /// caller is gone, or its `CSpace` could not take the reply's caps, and the
     /// kernel woke it with a transfer failure instead. It holds until the next
-    /// reply is sent; a call with no reply to send leaves it. A server that
+    /// reply is sent; a call with no reply to send leaves it, and so does the
+    /// return of a call a flush held. A server that
     /// undoes a request's effect when its caller never learns of it reads this
     /// after the call that sent that request's reply.
     #[must_use]
     pub const fn undelivered(&self) -> bool
     {
-        matches!(self.state, Slot::Lost)
+        matches!(self.state, Slot::Lost | Slot::HeldLost)
+    }
+
+    /// Whether the slot holds a call a flush's receive bound, which the next
+    /// receive returns.
+    const fn holds_call(&self) -> bool
+    {
+        matches!(self.state, Slot::Held | Slot::HeldLost)
     }
 
     /// Whether a reply is set and not yet sent.
@@ -97,6 +141,10 @@ impl Reply
     pub fn set(&mut self, msg: IpcMessage)
     {
         debug_assert!(!self.is_set(), "a turn sets at most one reply");
+        debug_assert!(
+            !self.holds_call(),
+            "a held call is returned before a reply is set"
+        );
         self.store(&msg);
         self.state = Slot::Pending;
         self.delete_caps = false;
@@ -108,6 +156,10 @@ impl Reply
     pub fn set_status(&mut self, status: u64)
     {
         debug_assert!(!self.is_set(), "a turn sets at most one reply");
+        debug_assert!(
+            !self.holds_call(),
+            "a held call is returned before a reply is set"
+        );
         self.msg.label = status;
         self.msg.data_len = 0;
         self.msg.cap_count = 0;
@@ -122,6 +174,10 @@ impl Reply
     pub fn set_or_delete_caps(&mut self, msg: IpcMessage)
     {
         debug_assert!(!self.is_set(), "a turn sets at most one reply");
+        debug_assert!(
+            !self.holds_call(),
+            "a held call is returned before a reply is set"
+        );
         self.store(&msg);
         self.state = Slot::Pending;
         self.delete_caps = true;
@@ -153,45 +209,57 @@ impl Reply
         }
     }
 
-    /// Send the reply now, alone (`SYS_IPC_REPLY`), when one is set, and
-    /// empty the slot: for a loop with work before its next receive, which
-    /// the reply would otherwise wait behind. A server that outranks its
-    /// caller and last received through `SYS_IPC_REPLY_RECV` may run on the
-    /// caller's CPU, where a plain reply leaves the caller's wake queued
-    /// behind the server until it parks
-    /// (`core/kernel/docs/scheduler.md` § Thread Assignment); such a loop sends
-    /// with a receive that does not wait instead, [`next_request_timeout`]
-    /// with `WAIT_TRY_ONCE`, and serves the call that receive binds next.
+    /// Send the reply now, when one is set, for a loop with work before its
+    /// next receive, which the reply would otherwise wait behind: with a
+    /// receive that does not wait (`SYS_IPC_REPLY_RECV` on `ep` at
+    /// `syscall::WAIT_TRY_ONCE`). A server that outranks its caller and last
+    /// received through `SYS_IPC_REPLY_RECV` may run on the caller's CPU, where
+    /// a plain `SYS_IPC_REPLY` would leave the caller's wake queued behind the
+    /// server until it parks, while the wake of a `SYS_IPC_REPLY_RECV` whose
+    /// receive does not park goes to another CPU
+    /// (`core/kernel/docs/scheduler.md` § Thread Assignment). A call that
+    /// receive binds is held in the slot, and the next [`next_request`] or
+    /// [`next_request_timeout`] returns it with no syscall, so it is served
+    /// once the loop's work is done, as it would have been from the
+    /// endpoint's queue. A receive that finds no call, or fails, holds none,
+    /// and leaves the next receive to report a failure that lasts. The send's
+    /// fallbacks are those of [`next_request_timeout`], and its outcome is
+    /// [`Self::undelivered`]'s; the caps of an undelivered reply set with
+    /// [`Self::set_or_delete_caps`] are deleted.
     ///
     /// # Safety
     /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer
     /// page as registered via `syscall::ipc_buffer_set`.
-    ///
-    /// # Errors
-    /// [`crate::ipc_reply`]'s, which consume the pending reply as there, after
-    /// the caps of a reply set with [`Self::set_or_delete_caps`] are deleted;
-    /// `Ok` when no reply is set.
-    pub unsafe fn flush(&mut self, ipc_buf: *mut u64) -> Result<(), i64>
+    pub unsafe fn flush(&mut self, ep: u64, ipc_buf: *mut u64)
     {
-        self.flush_with(&mut Kernel {
-            ipc_buf,
-            wait: Unbounded,
-        })
+        self.flush_with(
+            &mut Kernel {
+                ipc_buf,
+                wait: syscall::WAIT_TRY_ONCE,
+            },
+            ep,
+        );
     }
 
-    fn flush_with<T: Transport>(&mut self, kernel: &mut T) -> Result<(), i64>
+    fn flush_with<T: Transport>(&mut self, kernel: &mut T, ep: u64)
     {
         if self.state != Slot::Pending
         {
-            return Ok(());
+            return;
         }
-        self.state = Slot::Empty;
-        let sent = kernel.reply(&self.msg);
-        if sent.is_err()
+        if let Ok(Next::Received(got)) = next_with(kernel, ep, self)
         {
-            self.lose(kernel);
+            // The reply was sent from `msg`, so the call is read there.
+            kernel.read(&got, &mut self.msg);
+            self.state = if self.state == Slot::Lost
+            {
+                Slot::HeldLost
+            }
+            else
+            {
+                Slot::Held
+            };
         }
-        sent
     }
 
     /// The reply last set, now sent, was not delivered: record it for
@@ -220,7 +288,7 @@ impl Default for Reply
 /// Receive the next request on `ep`, waiting without bound, after sending
 /// `reply`'s reply when one is set, and empty the slot: the turn of
 /// [`next_request_timeout`] with a `timeout_ms` of `0`, which returns the
-/// request.
+/// request, or the call a [`Reply::flush`] held, with no syscall.
 ///
 /// # Safety
 /// As [`next_request_timeout`].
@@ -232,19 +300,23 @@ impl Default for Reply
 pub unsafe fn next_request(ep: u64, reply: &mut Reply, ipc_buf: *mut u64)
 -> Result<IpcMessage, i64>
 {
-    let delivery = next_with(
+    match next_with(
         &mut Kernel {
             ipc_buf,
             wait: Unbounded,
         },
         ep,
         reply,
-    )?;
-    // The message is read once, here, whichever syscall received it, so no
-    // path moves it again.
-    // SAFETY: ipc_buf is the registered IPC buffer page (this fn's contract);
-    // the kernel wrote the delivered words and cap handles there before return.
-    Ok(unsafe { IpcMessage::from_delivery(ipc_buf, &delivery) })
+    )?
+    {
+        // The message is read once, here, whichever syscall received it, so
+        // no path moves it again.
+        // SAFETY: ipc_buf is the registered IPC buffer page (this fn's
+        // contract); the kernel wrote the delivered words and cap handles there
+        // before return.
+        Next::Received(delivery) => Ok(unsafe { IpcMessage::from_delivery(ipc_buf, &delivery) }),
+        Next::Held => Ok(reply.msg),
+    }
 }
 
 /// Receive the next request on `ep` under `SYS_IPC_RECV`'s `timeout_ms`
@@ -253,7 +325,8 @@ pub unsafe fn next_request(ep: u64, reply: &mut Reply, ipc_buf: *mut u64)
 /// `reply`'s reply when one is set, and empty the slot. The request is read
 /// into `req` in place ([`IpcMessage::read_delivery`]), so a loop that
 /// receives into one buffer copies no whole message; on an error `req` is
-/// left as it was.
+/// left as it was. A call a [`Reply::flush`] held is copied into `req` with
+/// no syscall instead.
 ///
 /// With a reply set this is one [`crate::ipc_reply_recv`]. Its errors come
 /// from three parts, before the reply, of the reply, and after it, and the
@@ -286,17 +359,15 @@ pub unsafe fn next_request_timeout(
     req: &mut IpcMessage,
 ) -> Result<(), i64>
 {
-    let delivery = next_with(
-        &mut Kernel {
-            ipc_buf,
-            wait: timeout_ms,
-        },
-        ep,
-        reply,
-    )?;
-    // SAFETY: ipc_buf is the registered IPC buffer page (this fn's contract);
-    // the kernel wrote the delivered words and cap handles there before return.
-    unsafe { req.read_delivery(ipc_buf, &delivery) };
+    let mut kernel = Kernel {
+        ipc_buf,
+        wait: timeout_ms,
+    };
+    match next_with(&mut kernel, ep, reply)?
+    {
+        Next::Received(delivery) => kernel.read(&delivery, req),
+        Next::Held => *req = reply.msg,
+    }
     Ok(())
 }
 
@@ -313,6 +384,8 @@ trait Transport
     fn reply(&mut self, msg: &IpcMessage) -> Result<(), i64>;
     fn reply_recv(&mut self, ep: u64, msg: &IpcMessage, timeout_ms: u64) -> Result<Self::Got, i64>;
     fn delete_cap(&mut self, cap: u64);
+    /// Read the call `got` delivered into `msg`.
+    fn read(&mut self, got: &Self::Got, msg: &mut IpcMessage);
 }
 
 /// The kernel, through the calling thread's registered IPC buffer page, with
@@ -396,15 +469,33 @@ impl<W: Wait> Transport for Kernel<W>
     {
         let _ = syscall::cap_delete(cap);
     }
+
+    #[inline]
+    fn read(&mut self, got: &syscall::IpcDelivery, msg: &mut IpcMessage)
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page
+        // (next_request_timeout's contract); the kernel wrote the delivered
+        // words and cap handles there before the receive returned, and no
+        // syscall has run on this thread since.
+        unsafe { msg.read_delivery(self.ipc_buf, got) };
+    }
 }
 
 #[inline]
-fn next_with<T: Transport>(kernel: &mut T, ep: u64, reply: &mut Reply) -> Result<T::Got, i64>
+fn next_with<T: Transport>(kernel: &mut T, ep: u64, reply: &mut Reply)
+-> Result<Next<T::Got>, i64>
 {
     let timeout_ms = kernel.timeout_ms();
     if reply.state != Slot::Pending
     {
-        return kernel.recv(ep, timeout_ms);
+        // A held call is tested for only here, off the path of a reply that
+        // rides the receive.
+        if let Some(outcome) = reply.state.unheld()
+        {
+            reply.state = outcome;
+            return Ok(Next::Held);
+        }
+        return kernel.recv(ep, timeout_ms).map(Next::Received);
     }
     // The reply is sent from the slot and only the flag is cleared: no turn
     // copies the message.
@@ -421,9 +512,9 @@ fn next_with<T: Transport>(kernel: &mut T, ep: u64, reply: &mut Reply) -> Result
             }
             // The reply failed and consumed the binding: nothing is owed.
             reply.lose(kernel);
-            kernel.recv(ep, timeout_ms)
+            kernel.recv(ep, timeout_ms).map(Next::Received)
         }
-        _ => got,
+        _ => got.map(Next::Received),
     }
 }
 
@@ -537,6 +628,12 @@ mod tests
         {
             self.log(Call::Delete(cap));
         }
+
+        /// A delivered call is its label alone, with no words or caps.
+        fn read(&mut self, got: &u64, msg: &mut IpcMessage)
+        {
+            *msg = IpcMessage::builder(*got).build();
+        }
     }
 
     fn reply_msg() -> IpcMessage
@@ -565,7 +662,7 @@ mod tests
     {
         let mut kernel = Script::new();
         let got = next_with(&mut kernel, EP, &mut Reply::new());
-        assert_eq!(got, Ok(NEXT));
+        assert_eq!(got, Ok(Next::Received(NEXT)));
         assert_eq!(kernel.calls(), &[Some(Call::Recv)]);
     }
 
@@ -576,9 +673,15 @@ mod tests
     {
         let mut kernel = Script::new();
         let mut reply = with_reply();
-        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut reply),
+            Ok(Next::Received(NEXT))
+        );
         assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))]);
-        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut reply),
+            Ok(Next::Received(NEXT))
+        );
         assert_eq!(
             kernel.calls(),
             &[Some(Call::ReplyRecv(REPLY)), Some(Call::Recv)]
@@ -599,14 +702,20 @@ mod tests
                 .cap(CAP)
                 .build(),
         );
-        assert_eq!(reply.flush_with(&mut kernel), Ok(()));
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut reply),
+            Ok(Next::Received(NEXT))
+        );
 
         reply.set(IpcMessage::builder(NEXT).word(0, 9).build());
         assert_eq!(reply.msg.label, NEXT);
         assert_eq!(reply.msg.word_count(), 1);
         assert_eq!(reply.msg.word(0), 9);
         assert_eq!(reply.msg.caps(), &[] as &[u64]);
-        assert_eq!(reply.flush_with(&mut kernel), Ok(()));
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut reply),
+            Ok(Next::Received(NEXT))
+        );
 
         reply.set_status(REPLY);
         assert_eq!(reply.msg.label, REPLY);
@@ -614,20 +723,83 @@ mod tests
         assert_eq!(reply.msg.caps(), &[] as &[u64]);
     }
 
-    // The defect caught: a flush that sends no reply, sends an empty slot's, or
-    // leaves the reply for the next receive to send again.
+    /// The label of the call a turn returns: one the kernel delivered, or the
+    /// one the slot held.
+    fn label(got: Result<Next<u64>, i64>, reply: &Reply) -> Result<u64, i64>
+    {
+        got.map(|next| match next
+        {
+            Next::Received(label) => label,
+            Next::Held => reply.msg.label,
+        })
+    }
+
+    // The defect caught: a flush that sends a plain reply (whose caller's wake
+    // can queue behind the server), sends an empty slot's, sends a reply
+    // twice, or loses the call its receive bound, or returns that call twice.
     #[test]
-    fn a_flush_sends_a_set_reply_once()
+    fn a_flush_sends_with_a_receive_that_does_not_wait_and_holds_its_call()
     {
         let mut kernel = Script::new();
+        kernel.timeout = syscall::WAIT_TRY_ONCE;
         let mut reply = with_reply();
-        assert_eq!(reply.flush_with(&mut kernel), Ok(()));
-        assert_eq!(reply.flush_with(&mut kernel), Ok(()));
-        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
+        reply.flush_with(&mut kernel, EP);
+        assert!(!reply.is_set());
+        reply.flush_with(&mut kernel, EP);
+        assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))]);
+        let got = next_with(&mut kernel, EP, &mut reply);
+        assert_eq!(label(got, &reply), Ok(NEXT));
         assert_eq!(
             kernel.calls(),
-            &[Some(Call::Reply(REPLY)), Some(Call::Recv)]
+            &[Some(Call::ReplyRecv(REPLY))],
+            "a held call takes no syscall"
         );
+        let got = next_with(&mut kernel, EP, &mut reply);
+        assert_eq!(got, Ok(Next::Received(NEXT)));
+        assert_eq!(
+            kernel.calls(),
+            &[Some(Call::ReplyRecv(REPLY)), Some(Call::Recv)]
+        );
+        Reply::new().flush_with(&mut kernel, EP);
+        assert_eq!(kernel.count, 2, "an empty slot's flush sends nothing");
+    }
+
+    // The defect caught: a flush whose receive found no call, or was refused
+    // before its reply, that holds a call anyway (a stale message served as a
+    // request), or whose reply is not made.
+    #[test]
+    fn a_flush_that_binds_no_call_holds_none()
+    {
+        for (reply_recv, sent) in [
+            (
+                SyscallError::WouldBlock,
+                &[Some(Call::ReplyRecv(REPLY))][..],
+            ),
+            (
+                SyscallError::Interrupted,
+                &[Some(Call::ReplyRecv(REPLY))][..],
+            ),
+            (
+                SyscallError::QuotaExceeded,
+                &[Some(Call::ReplyRecv(REPLY)), Some(Call::Reply(REPLY))][..],
+            ),
+        ]
+        {
+            let mut kernel = Script::new();
+            kernel.timeout = syscall::WAIT_TRY_ONCE;
+            kernel.reply_recv = Err(err(reply_recv));
+            let mut reply = with_reply();
+            reply.flush_with(&mut kernel, EP);
+            assert_eq!(kernel.calls(), sent, "{reply_recv:?}");
+            assert!(!reply.undelivered(), "{reply_recv:?}");
+            let got = next_with(&mut kernel, EP, &mut reply);
+            assert_eq!(got, Ok(Next::Received(NEXT)), "{reply_recv:?}");
+            assert_eq!(
+                kernel.calls().last(),
+                Some(&Some(Call::Recv)),
+                "{reply_recv:?}"
+            );
+        }
     }
 
     // The defect caught: an undelivered reply set to delete its caps that
@@ -640,7 +812,7 @@ mod tests
         kernel.reply_recv = Err(err(SyscallError::InvalidCapability));
         kernel.reply = Err(err(SyscallError::InvalidCapability));
         let got = next_with(&mut kernel, EP, &mut with_owned_reply());
-        assert_eq!(got, Ok(NEXT));
+        assert_eq!(got, Ok(Next::Received(NEXT)));
         assert_eq!(
             kernel.calls(),
             &[
@@ -652,15 +824,25 @@ mod tests
         );
 
         let mut kernel = Script::new();
+        kernel.timeout = syscall::WAIT_TRY_ONCE;
+        kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         kernel.reply = Err(err(SyscallError::QuotaExceeded));
         let mut reply = with_owned_reply();
-        assert_eq!(
-            reply.flush_with(&mut kernel),
-            Err(err(SyscallError::QuotaExceeded))
-        );
+        reply.flush_with(&mut kernel, EP);
         assert_eq!(
             kernel.calls(),
-            &[Some(Call::Reply(REPLY)), Some(Call::Delete(CAP))]
+            &[
+                Some(Call::ReplyRecv(REPLY)),
+                Some(Call::Reply(REPLY)),
+                Some(Call::Delete(CAP)),
+                Some(Call::Recv)
+            ]
+        );
+        assert!(reply.undelivered());
+        assert_eq!(
+            reply.msg.caps(),
+            &[] as &[u64],
+            "the held call replaced the reply"
         );
     }
 
@@ -673,7 +855,7 @@ mod tests
         let mut kernel = Script::new();
         assert_eq!(
             next_with(&mut kernel, EP, &mut with_owned_reply()),
-            Ok(NEXT)
+            Ok(Next::Received(NEXT))
         );
         assert_eq!(kernel.calls(), &[Some(Call::ReplyRecv(REPLY))]);
 
@@ -731,7 +913,7 @@ mod tests
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         kernel.reply = Err(err(SyscallError::InvalidCapability));
         let got = next_with(&mut kernel, EP, &mut with_reply());
-        assert_eq!(got, Ok(NEXT));
+        assert_eq!(got, Ok(Next::Received(NEXT)));
         assert_eq!(
             kernel.calls(),
             &[
@@ -751,11 +933,20 @@ mod tests
         const WAIT: u64 = 2;
         let mut kernel = Script::new();
         kernel.timeout = WAIT;
-        assert_eq!(next_with(&mut kernel, EP, &mut Reply::new()), Ok(NEXT));
-        assert_eq!(next_with(&mut kernel, EP, &mut with_reply()), Ok(NEXT));
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut Reply::new()),
+            Ok(Next::Received(NEXT))
+        );
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut with_reply()),
+            Ok(Next::Received(NEXT))
+        );
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
         kernel.reply = Err(err(SyscallError::InvalidCapability));
-        assert_eq!(next_with(&mut kernel, EP, &mut with_reply()), Ok(NEXT));
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut with_reply()),
+            Ok(Next::Received(NEXT))
+        );
         assert_eq!(
             kernel.calls(),
             &[
@@ -781,10 +972,16 @@ mod tests
         kernel.reply = Err(err(SyscallError::InvalidCapability));
         let mut reply = with_reply();
         assert!(reply.is_set());
-        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut reply),
+            Ok(Next::Received(NEXT))
+        );
         assert!(reply.undelivered());
         assert!(!reply.is_set());
-        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut reply),
+            Ok(Next::Received(NEXT))
+        );
         assert!(
             reply.undelivered(),
             "a call with no reply leaves the outcome"
@@ -792,20 +989,28 @@ mod tests
 
         reply.set(reply_msg());
         assert!(reply.is_set());
-        assert_eq!(
-            reply.flush_with(&mut kernel),
-            Err(err(SyscallError::InvalidCapability))
-        );
+        reply.flush_with(&mut kernel, EP);
         assert!(reply.undelivered());
-        assert_eq!(reply.flush_with(&mut kernel), Ok(()));
+        reply.flush_with(&mut kernel, EP);
         assert!(
             reply.undelivered(),
             "a flush with no reply leaves the outcome"
         );
-        kernel.reply = Ok(());
+        let got = next_with(&mut kernel, EP, &mut reply);
+        assert_eq!(label(got, &reply), Ok(NEXT));
+        assert!(
+            reply.undelivered(),
+            "the return of a held call leaves the outcome"
+        );
+        kernel.reply_recv = Ok(NEXT);
         reply.set(reply_msg());
-        assert_eq!(reply.flush_with(&mut kernel), Ok(()));
+        reply.flush_with(&mut kernel, EP);
         assert!(!reply.undelivered(), "a delivered send clears the outcome");
+        assert_eq!(
+            label(next_with(&mut kernel, EP, &mut reply), &reply),
+            Ok(NEXT)
+        );
+        assert!(!reply.undelivered());
 
         let mut kernel = Script::new();
         kernel.reply_recv = Err(err(SyscallError::QuotaExceeded));
@@ -815,7 +1020,10 @@ mod tests
         assert!(!reply.undelivered());
         reply.set(reply_msg());
         kernel.reply_recv = Ok(NEXT);
-        assert_eq!(next_with(&mut kernel, EP, &mut reply), Ok(NEXT));
+        assert_eq!(
+            next_with(&mut kernel, EP, &mut reply),
+            Ok(Next::Received(NEXT))
+        );
         assert!(!reply.undelivered());
     }
 }

@@ -62,10 +62,11 @@ runs on (it took a queued call)
 [scheduler.md](../core/kernel/docs/scheduler.md) § Thread Assignment). Seraph's server loops join
 them through `ipc::serve` ([shared/ipc/README.md](../shared/ipc/README.md) § Serving): a handler
 whose turn ends with its reply leaves the reply for the loop's next receive to send this way, and a
-handler with work after its reply, or a loop with work before its next receive, sends the reply
-first, so no reply waits behind work: alone, or, from a server that outranks its caller and last
-received through `SYS_IPC_REPLY_RECV`, with a receive that does not wait, since a plain reply from
-it leaves the caller's wake queued on its CPU until it parks.
+handler with work after its reply sends it first, alone, and a loop with work before its next
+receive sends it first with a receive that does not wait, holding any call that receive binds for
+its next turn, so no reply waits behind work: a plain reply from a server that outranks its caller
+and last received through `SYS_IPC_REPLY_RECV` leaves the caller's wake queued on its CPU until it
+parks.
 
 A server that needs to delegate work may make a downstream call before replying: the pending reply
 stays bound to the receiving thread until that thread replies, and the downstream call does not

@@ -5053,20 +5053,15 @@ impl Undo
 
 /// A turn's answer to the caller of its request: the reply its handler sets,
 /// which the receive loop sends with its next receive (`SYS_IPC_REPLY_RECV`),
-/// or before a step of the turn's tail that has work to do with a receive
-/// that does not wait ([`Self::flush`]), and the [`Undo`] of the request's
-/// effect, run as soon as the send reports the reply undelivered
+/// or before a step of the turn's tail that has work to do ([`Self::flush`],
+/// [`ipc::serve::Reply::flush`]), and the [`Undo`] of the request's effect,
+/// run as soon as the send reports the reply undelivered
 /// (services/memmgr/docs/memory-pool.md § Receive loop). Only the receive
 /// loop's thread holds it; a handler sets at most one reply.
 struct Answer
 {
     reply: ipc::serve::Reply,
     undo: Option<Undo>,
-    /// The call a flush's receive bound, the next turn's request, while
-    /// [`Self::bound`].
-    next: IpcMessage,
-    /// A flush's receive bound a call, held in [`Self::next`].
-    bound: bool,
     /// memmgr's service endpoint, on which every receive waits.
     ep: u64,
     /// memmgr's registered IPC buffer page ([`Self::new`]'s contract).
@@ -5086,8 +5081,6 @@ impl Answer
         Self {
             reply: ipc::serve::Reply::new(),
             undo: None,
-            next: IpcMessage::new(0),
-            bound: false,
             ep,
             ipc_buf,
         }
@@ -5133,15 +5126,12 @@ impl Answer
     }
 
     /// Send the reply now, when one is set, before a step of the turn's tail
-    /// that has work to do: with a receive that does not wait
-    /// (`SYS_IPC_REPLY_RECV` at `WAIT_TRY_ONCE`), whose reply wake the kernel
-    /// places off memmgr's CPU, so the caller waits for none of that work
-    /// even when the call placed it there (core/kernel/docs/scheduler.md
-    /// § Thread Assignment). A call that receive binds is the next turn's
-    /// request ([`Self::next_request`]); a receive that finds none, or fails,
-    /// leaves the next turn's receive to report a lasting failure. The undo
-    /// runs here on `l`, the caller's reference to the ledger, when the reply
-    /// is not delivered.
+    /// that has work to do ([`ipc::serve::Reply::flush`]): with a receive that
+    /// does not wait, whose reply wake the kernel places off memmgr's CPU, so
+    /// the caller waits for none of that work even when the call placed it
+    /// there. A call that receive binds is the next turn's request
+    /// ([`Self::next_request`]). The undo runs here on `l`, the caller's
+    /// reference to the ledger, when the reply is not delivered.
     fn flush(&mut self, l: &mut MemLedger)
     {
         if !self.reply.is_set()
@@ -5150,17 +5140,8 @@ impl Answer
         }
         // SAFETY: ipc_buf is memmgr's registered IPC buffer page, and this is
         // the receive loop's thread (Self::new's contract).
-        let got = unsafe {
-            ipc::serve::next_request_timeout(
-                self.ep,
-                &mut self.reply,
-                self.ipc_buf,
-                syscall::WAIT_TRY_ONCE,
-                &mut self.next,
-            )
-        };
+        unsafe { self.reply.flush(self.ep, self.ipc_buf) };
         self.settle(l);
-        self.bound = got.is_ok();
     }
 
     /// The next request, into `req`: the call a flush bound, or else the
@@ -5174,12 +5155,6 @@ impl Answer
     /// [`ipc::serve::next_request_timeout`]'s.
     fn next_request(&mut self, timeout_ms: u64, req: &mut IpcMessage) -> Result<(), i64>
     {
-        if self.bound
-        {
-            self.bound = false;
-            *req = self.next;
-            return Ok(());
-        }
         // SAFETY: as in flush.
         let got = unsafe {
             ipc::serve::next_request_timeout(

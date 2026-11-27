@@ -68,16 +68,18 @@ a loop whose receive waits a bounded time, and reads the request into the loop's
 in place (`IpcMessage::read_delivery`), so the loop copies no whole message; `next_request`
 waits without a bound and returns the request. A handler with work
 after its reply (an IPC call, a syscall) replies at once with `ipc_reply` and leaves the slot empty,
-and a loop with work before its next receive sends a set reply alone first with `Reply::flush`, so
-no reply waits behind work. A server that outranks its caller and last received through
-`SYS_IPC_REPLY_RECV` may run on the caller's CPU, where a plain reply leaves the caller's wake
-queued behind it until it parks ([scheduler.md](../../core/kernel/docs/scheduler.md) § Thread
-Assignment), so such a loop sends a reply before its work with a receive that does not wait,
-`next_request_timeout` with `WAIT_TRY_ONCE`, and serves the call that receive binds next. A loop
-that uses the reply's outcome reads `Reply::undelivered` after the send that carried it, `flush` or
-the next receive: it is true when the reply did not reach its caller (the caller is gone, or its
-`CSpace` could not take the reply's caps), until the next send, so the loop can undo what the reply
-reported.
+and a loop with work before its next receive sends a set reply first with
+`Reply::flush(ep, ipc_buf)`, so no reply waits behind work. `flush` sends it with a receive that
+does not wait (`SYS_IPC_REPLY_RECV` at `WAIT_TRY_ONCE`), not alone: a server that outranks its
+caller and last received through `SYS_IPC_REPLY_RECV` may run on the caller's CPU, where a plain
+reply leaves the caller's wake queued behind it until it parks, while the wake of a reply whose
+receive does not park goes to another CPU ([scheduler.md](../../core/kernel/docs/scheduler.md)
+§ Thread Assignment). A call that receive binds is held in the `Reply`, and the next
+`next_request` or `next_request_timeout` returns it with no syscall, so it is served once the
+loop's work is done, as it would have been from the endpoint's queue. A loop that uses the reply's
+outcome reads `Reply::undelivered` after the send that carried it, `flush` or the next receive:
+it is true when the reply did not reach its caller (the caller is gone, or its `CSpace` could not
+take the reply's caps), until the next send, so the loop can undo what the reply reported.
 
 `next_request` returns the receive's errors, those of `ipc_recv`, for the loop's `RecvGuard`
 ([IPC Design](../../docs/ipc-design.md) § Receive-Failure Policy). The kernel reports the receive's

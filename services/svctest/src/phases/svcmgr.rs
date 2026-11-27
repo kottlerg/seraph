@@ -675,7 +675,7 @@ fn svcmgr_stop_service_phase(caps: &Caps)
     let stop_cap = caps.stop_authority;
     assert_ne!(
         stop_cap, 0,
-        "{phase}: no stop-authority cap in slot 22 (stop_authority = yes)"
+        "{phase}: no stop-authority cap in slot 24 (stop_authority = yes)"
     );
 
     for (label, want, what) in [

@@ -58,9 +58,27 @@
 //!
 //! The serial driver is only stopped, since a kill would end the console the
 //! boot is judged on.
+//!
+//! A second phase checks logd's flush barrier, `LOG_FLUSH`
+//! (`services/logd/docs/ipc-interface.md` § Flush barrier), through the
+//! `logd.flush` seed:
+//!
+//! - **Authority.** `LOG_FLUSH` on `logd.query` is refused `FLUSH_DENIED`,
+//!   `QUERY_SLOTS` on `logd.flush` is refused `QUERY_DENIED`, and a request
+//!   of another version `FLUSH_VERSION_MISMATCH`.
+//! - **Serial running.** After a line of svctest's, a flush is answered
+//!   `FLUSHED` within the log client's bound, asked again with its token.
+//! - **Serial stopped.** With every thread of the serial driver stopped, a
+//!   line logged from another thread is queued and not written, and a flush
+//!   started meanwhile is answered `FLUSH_PENDING`, with a retry hint of
+//!   1 ms to the stall bound, before the stall bound has passed. Asked again
+//!   with its token, it is answered `FLUSHED` while the driver is still
+//!   stopped, once the sink is stalled, within twice the stall bound: logd
+//!   does not hold a flush on a sink that writes nothing.
 
 use std::time::{Duration, Instant};
 
+use ipc::log_flush::{FLUSH_DENIED, FLUSH_VERSION_MISMATCH, FlushAnswer};
 use ipc::stream_labels::{LEVEL_INFO, STREAM_BYTES, level_bits};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use logd_codec::sink::{SINK_QUEUE_BYTES, SINK_STALL_MS};
@@ -73,10 +91,16 @@ use crate::runner::Phase;
 /// The logd sink checks; see [`super::all`] for their place.
 pub fn phases() -> &'static [Phase]
 {
-    &[Phase {
-        name: "logd_sinks",
-        run: logd_sinks_phase,
-    }]
+    &[
+        Phase {
+            name: "logd_sinks",
+            run: logd_sinks_phase,
+        },
+        Phase {
+            name: "logd_flush",
+            run: logd_flush_phase,
+        },
+    ]
 }
 
 /// The serial driver's process name: its bundle entry name, its install
@@ -195,6 +219,155 @@ pub fn logd_sinks_phase(caps: &Caps)
         "logd_sinks: logd writes to the restarted framebuffer driver (a line waited {} ms on it)",
         longest.as_millis()
     );
+}
+
+/// Check logd's flush barrier, with the serial driver running and stopped
+/// (see the module documentation).
+pub fn logd_flush_phase(caps: &Caps)
+{
+    let authority = caps.debug_authority;
+    let flush = caps.logd_flush;
+    assert_ne!(authority, 0, "logd_flush: no debug authority");
+    assert_ne!(flush, 0, "logd_flush: no logd.flush seed");
+    assert_ne!(caps.logd_query, 0, "logd_flush: no logd.query seed");
+
+    let call = |cap: u64, msg: &IpcMessage| flush_call(cap, msg).unwrap_or_else(|e| panic!("{e}"));
+    let denied = call(caps.logd_query, &ipc::log_flush::request(None));
+    assert_eq!(
+        denied.label, FLUSH_DENIED,
+        "logd_flush: LOG_FLUSH on logd.query not refused"
+    );
+    let denied = call(flush, &ipc::log_query::slots_request(None));
+    assert_eq!(
+        ipc::log_query::reply_status(denied.label),
+        ipc::log_query::QUERY_DENIED,
+        "logd_flush: QUERY_SLOTS on logd.flush not refused"
+    );
+    let stale = IpcMessage::builder(ipc::log_labels::LOG_FLUSH)
+        .word(0, u64::from(ipc::LOG_LABELS_VERSION) + 1)
+        .build();
+    assert_eq!(
+        call(flush, &stale).label,
+        FLUSH_VERSION_MISMATCH,
+        "logd_flush: a stale version not refused"
+    );
+
+    std::os::seraph::log!("logd_flush: a line before a flush with the serial driver running");
+    let first = flush_answer(flush, None).unwrap_or_else(|e| panic!("{e}"));
+    let took = await_flushed(flush, first, LOG_CALL_BOUND).unwrap_or_else(|e| panic!("{e}"));
+    std::os::seraph::log!(
+        "logd_flush: flushed in {} ms with the serial driver running",
+        took.as_millis()
+    );
+
+    let serial = super::crash::badge_named(authority, SERIAL_NAME)
+        .expect("logd_flush: LIST_PROCESSES lists no serial driver");
+    let threads = attach(authority, serial, "serial");
+    stop(&threads, "serial");
+    // The line's call waits on the stopped driver up to the stall bound, so
+    // another thread makes it while this one flushes. No assertion panics
+    // until the driver runs again, since its message would wait behind it.
+    let line = std::thread::spawn(|| {
+        std::os::seraph::log!("logd_flush: a line while the serial driver is stopped");
+    });
+    let stopped = flush_while_stopped(flush);
+    start(&threads, "serial");
+    let _ = line.join();
+    detach(authority, serial, threads, "serial");
+    let (hint, took) = stopped.unwrap_or_else(|e| panic!("{e}"));
+    std::os::seraph::log!(
+        "logd_flush: pending with a {hint} ms hint, then flushed in {} ms with the serial driver \
+         stopped",
+        took.as_millis()
+    );
+}
+
+/// With the serial driver stopped: start flushes until one is pending, which
+/// must happen before [`STALL_SEEN`] passes, with a hint within the stall
+/// bound, then ask again with its token until it is flushed, within twice the
+/// stall bound. The hint and the time to flushed, or the first failure.
+fn flush_while_stopped(flush: u64) -> Result<(u32, Duration), String>
+{
+    let start_at = Instant::now();
+    let (token, hint) = loop
+    {
+        match flush_answer(flush, None)?
+        {
+            FlushAnswer::Pending { token, retry_ms } => break (token, retry_ms),
+            FlushAnswer::Flushed { .. } if start_at.elapsed() < STALL_SEEN =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            FlushAnswer::Flushed { .. } =>
+            {
+                return Err(format!(
+                    "logd_flush: no flush pending within {} ms of the serial driver's stop",
+                    STALL_SEEN.as_millis()
+                ));
+            }
+        }
+    };
+    if !(1..=SINK_STALL_MS).contains(&hint)
+    {
+        return Err(format!(
+            "logd_flush: retry hint {hint} ms outside 1 to {SINK_STALL_MS} ms"
+        ));
+    }
+    let took = await_flushed(
+        flush,
+        FlushAnswer::Pending {
+            token,
+            retry_ms: hint,
+        },
+        STALL_BOUND.saturating_mul(2),
+    )?;
+    Ok((hint, took))
+}
+
+/// Ask again, after each pending answer's hint, until `flush` answers flushed
+/// for the token of `answer`, within `within`: the time it took, or the
+/// failure.
+fn await_flushed(flush: u64, answer: FlushAnswer, within: Duration) -> Result<Duration, String>
+{
+    let start_at = Instant::now();
+    let mut answer = answer;
+    loop
+    {
+        let FlushAnswer::Pending { token, retry_ms } = answer
+        else
+        {
+            return Ok(start_at.elapsed());
+        };
+        if start_at.elapsed() > within
+        {
+            return Err(format!(
+                "logd_flush: not flushed within {} ms",
+                within.as_millis()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(u64::from(retry_ms)));
+        answer = flush_answer(flush, Some(token))?;
+    }
+}
+
+/// One `LOG_FLUSH` call on `flush`, a new flush (`None`) or one asked again
+/// for `token`: logd's answer, or the failure.
+fn flush_answer(flush: u64, token: Option<u64>) -> Result<FlushAnswer, String>
+{
+    let reply = flush_call(flush, &ipc::log_flush::request(token))?;
+    FlushAnswer::decode(&reply)
+        .map_err(|status| format!("logd_flush: LOG_FLUSH refused ({status:#x})"))
+}
+
+/// Call `cap` with `msg`, bounded by the log client's bound, which logd,
+/// answering a flush at once, keeps well within: its reply, or the failure.
+fn flush_call(cap: u64, msg: &IpcMessage) -> Result<IpcMessage, String>
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let bound = u32::try_from(LOG_CALL_BOUND.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+    unsafe { ipc::ipc_call_timeout(cap, msg, ipc_buf, bound) }
+        .map_err(|e| format!("logd_flush: call to logd not answered within {bound} ms ({e})"))
 }
 
 /// Wait until devmgr serves the framebuffer class's ordinal 1, the restart

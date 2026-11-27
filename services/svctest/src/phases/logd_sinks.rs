@@ -40,7 +40,15 @@
 //!   that it skipped). The framebuffer sink is `skip` and holds nobody, and
 //!   shows critical and more
 //!   severe by default, so the framebuffer cases send their lines at
-//!   critical. While its driver is stopped the phase sends more lines than
+//!   critical. The serial sink shows them too, so first the phase waits on
+//!   logd's flush barrier, as the flush phase's running case does, until that
+//!   sink holds senders again and has written svctest's lines: it stays
+//!   stalled, holding no sender, until the write in flight when the serial
+//!   case stopped its driver returns (`services/logd/docs/sinks.md` § Pace),
+//!   and earlier phases' floods can leave it behind, so the case's lines would
+//!   otherwise evict svctest's lines it has not written from the console the
+//!   boot is judged on. A sink that never resumed fails the barrier. While
+//!   its driver is stopped the phase sends more lines than
 //!   svctest's share of the history holds at its largest ([`FLOOD_LINES`]),
 //!   so the history drops svctest's oldest before the sink writes them. A
 //!   line logd refuses for the running serial sink's window is sent again
@@ -185,6 +193,7 @@ pub fn logd_sinks_phase(caps: &Caps)
     let authority = caps.debug_authority;
     assert_ne!(authority, 0, "logd_sinks: no debug authority");
     assert_ne!(caps.logd_query, 0, "logd_sinks: no logd.query seed");
+    assert_ne!(caps.logd_flush, 0, "logd_sinks: no logd.flush seed");
 
     let serial = super::crash::badge_named(authority, SERIAL_NAME)
         .expect("logd_sinks: LIST_PROCESSES lists no serial driver");
@@ -212,6 +221,10 @@ pub fn logd_sinks_phase(caps: &Caps)
         std::os::seraph::log!("logd_sinks: framebuffer case skipped: no framebuffer driver");
         return;
     };
+    // The framebuffer cases' lines are shown on serial too, so the serial
+    // sink must hold none of svctest's lines and must hold svctest to its
+    // window when they are sent, as only a sink that is not stalled does.
+    flush_while_running(caps.logd_flush, "logd_sinks").unwrap_or_else(|e| panic!("{e}"));
     let threads = attach(authority, fb, "framebuffer");
     let notices = fb_notices(caps.logd_query);
     stop(&threads, "framebuffer");
@@ -506,7 +519,7 @@ pub fn logd_flush_phase(caps: &Caps)
         "logd_flush: a stale version not refused"
     );
 
-    let took = flush_while_running(flush).unwrap_or_else(|e| panic!("{e}"));
+    let took = flush_while_running(flush, "logd_flush").unwrap_or_else(|e| panic!("{e}"));
     std::os::seraph::log!(
         "logd_flush: flushed in {} ms with the serial driver running",
         took.as_millis()
@@ -537,8 +550,9 @@ pub fn logd_flush_phase(caps: &Caps)
 /// is one the sink did not hold, since it is still stalled from the first
 /// phase or wrote the burst before the call (`services/logd/docs/ipc-interface.md`
 /// § Flush barrier); the burst is repeated after 10 ms for twice the stall
-/// bound. The time from the pending answer to flushed, or the first failure.
-fn flush_while_running(flush: u64) -> Result<Duration, String>
+/// bound. `phase` names the phase in the burst's lines and the failure. The
+/// time from the pending answer to flushed, or the first failure.
+fn flush_while_running(flush: u64, phase: &str) -> Result<Duration, String>
 {
     let start_at = Instant::now();
     loop
@@ -546,7 +560,7 @@ fn flush_while_running(flush: u64) -> Result<Duration, String>
         for i in 0..RUNNING_BURST
         {
             std::os::seraph::log!(
-                "logd_flush: line {i} before a flush with the serial driver running"
+                "{phase}: line {i} before a flush with the serial driver running"
             );
         }
         let answer = flush_answer(flush, None)?;
@@ -557,7 +571,7 @@ fn flush_while_running(flush: u64) -> Result<Duration, String>
         if start_at.elapsed() > STALL_BOUND.saturating_mul(2)
         {
             return Err(format!(
-                "logd_flush: no flush pending with the serial driver running within {} ms",
+                "{phase}: no flush pending with the serial driver running within {} ms",
                 STALL_BOUND.saturating_mul(2).as_millis()
             ));
         }

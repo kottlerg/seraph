@@ -518,9 +518,11 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<FatCaps>
 /// Validate the BPB by reading sector 0 through the block cap. Updates
 /// `state` in place; returns the IPC reply label to use.
 ///
-/// The device's logical block size comes first, from `BLK_GET_GEOMETRY`:
-/// the cache addresses one device block per sector, and the BPB's
-/// `BytsPerSec` must equal it ([`fat_parse::parse_bpb_geometry`]).
+/// The device's logical block size and the partition's length come first,
+/// from `BLK_GET_GEOMETRY`: the cache addresses one device block per sector,
+/// so the BPB's `BytsPerSec` must equal the block size, and the volume may
+/// declare no more sectors than the partition holds
+/// ([`fat_parse::parse_bpb_geometry`]).
 ///
 /// On a successful FAT32 parse, also loads the `FSInfo` sector (advisory
 /// next-free / free-count hints) so the cluster allocator can seed its
@@ -528,7 +530,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<FatCaps>
 /// `u32::MAX` sentinel and the allocator scans from cluster 2.
 fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf: *mut u64) -> u64
 {
-    let Some(block_size) = query_block_size(caps.block_dev, ipc_buf)
+    let Some((block_size, partition_sectors)) = query_geometry(caps.block_dev, ipc_buf)
     else
     {
         return ipc::fs_errors::IO_ERROR;
@@ -540,7 +542,7 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
         return ipc::fs_errors::IO_ERROR;
     }
     // The BPB lies in the sector's first 512 bytes, whatever its size.
-    if !bpb::parse_bpb(&sector_buf, block_size, state)
+    if !bpb::parse_bpb(&sector_buf, block_size, partition_sectors, state)
     {
         return ipc::fs_errors::NOT_FOUND;
     }
@@ -548,10 +550,11 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
     ipc::fs_errors::SUCCESS
 }
 
-/// The block device's logical block size, from `BLK_GET_GEOMETRY` on the
-/// partition cap, or `None` when the driver refuses or reports a size that
-/// is no FAT sector size ([`fat_parse::is_sector_size`]).
-fn query_block_size(block_dev: u64, ipc_buf: *mut u64) -> Option<u32>
+/// The block device's logical block size and the partition's length in
+/// those blocks, from `BLK_GET_GEOMETRY` on the partition cap, or `None`
+/// when the driver refuses or reports a size that is no FAT sector size
+/// ([`fat_parse::is_sector_size`]).
+fn query_geometry(block_dev: u64, ipc_buf: *mut u64) -> Option<(u32, u64)>
 {
     let msg = IpcMessage::builder(ipc::blk_labels::BLK_GET_GEOMETRY)
         .word(0, u64::from(ipc::BLK_LABELS_VERSION))
@@ -570,7 +573,7 @@ fn query_block_size(block_dev: u64, ipc_buf: *mut u64) -> Option<u32>
         std::os::seraph::log!(warn: "unsupported device block size {size}");
         return None;
     }
-    Some(size)
+    Some((size, reply.word(1)))
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────

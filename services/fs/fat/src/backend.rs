@@ -345,7 +345,9 @@ impl NamespaceBackend for FatfsBackend<'_>
             return Ok(None);
         };
         let mut name_buf = [0u8; MAX_LFN_UTF8];
-        let len = entry.write_display_name(&mut name_buf);
+        // A long name past the protocol's name limit is listed under its
+        // short name.
+        let len = entry.write_display_name(&mut name_buf, namespace_protocol::MAX_NAME_LEN);
         let kind = Self::entry_kind(&entry);
         // No FAT entry is hidden: `lookup` reports `visible_requires`
         // NONE for every entry, and readdir MUST agree with it.

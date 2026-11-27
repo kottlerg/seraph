@@ -1025,7 +1025,7 @@ Every entry here is `correct as is`; none is tracked.
 | FS_READ reply size | `services/fs/fat/src/main.rs` | 504 B | ABI width | 512 B stack | correct as is | None |
 | memory verbs | `services/fs/fat/src/main.rs` | one page per call | encoding artefact | none | correct as is | None |
 | cluster-chain walk | `services/fs/fat/src/main.rs`, `fat.rs` | at most file size over cluster size, from the chain's head or, for an `FS_READ_MEMORY`, from the open's chain cursor when it serves | encoding artefact (`u32` file size) | none | correct as is | Add a cycle guard |
-| `next_dir_cluster` step guard | `services/fs/fat/src/dir.rs` | `total_clusters` | provably unreachable (longer chains must cycle) | none | correct as is | None |
+| `next_dir_cluster` step guard | `services/fs/fat/src/dir.rs` | `fat_parse::dir_chain_limit`: the clusters `DIR_ENTRIES_MAX` 32-byte entries (2 MiB) fill, at most `total_clusters` | hardware spec (the FAT specification's 65536-entry directory); past it a walk is `Corrupt` and an insert is refused `NoSpace` | none | correct as is | None |
 | allocator scans | `services/fs/fat/src/alloc.rs` | `total_clusters`, one wrap | encoding artefact | none | correct as is | None |
 | `MAX_NUMERIC_TAIL` | `services/fs/fat/fat-parse/src/lib.rs` | 999 999, the lowest free tail taken | hardware spec (FAT numeric tail; a directory's 65536 entries always leave one) | 8 KiB heap per insert | correct as is | None |
 | on-disk `u32` fields | `services/fs/fat/src/dir.rs` | `u32` | hardware spec (FAT32) | none | correct as is | None |

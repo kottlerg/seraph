@@ -3,8 +3,8 @@
 # crashd reports each process that dies on a fault to the system log, as one
 # marked block (services/crashd/docs/block-format.md). `debug_authority =
 # yes` makes svcmgr mint a DEBUG_AUTHORITY SEND|GRANT on procmgr and deliver
-# it in the bootstrap slot after the seeds (cap[1] here, after the RECV
-# `provides` delivers, with no seeds): crashd registers with it as the
+# it in the bootstrap slot after the seeds (cap[2] here, after the RECV
+# `provides` delivers and the one seed): crashd registers with it as the
 # receiver of procmgr's crash endpoint, attaches to each faulting process,
 # and asks procmgr for the snapshot a live core is written from. Removing this recipe from the image
 # removes the reports: procmgr then declines every fault on that endpoint,
@@ -39,11 +39,19 @@
 # grace and cooldown together (services/oomd.svc), so a fault held from the
 # level's rise outlasts oomd's first two stops, and resumes when either frees
 # memory; a later stop finds it reported and declined.
+# `seed = logd.flush` delivers cap[1]: the LOG_FLUSH_AUTHORITY-badged SEND
+# on logd's master log endpoint, which carries logd's flush barrier and no
+# other authority (services/logd/docs/ipc-interface.md § Flush barrier).
+# crashd waits on it after a report and before it declines the fault, within
+# the report's bound, since the decline can kill logd itself and the lines
+# logd has taken but not written die with it. Without it, crashd declines
+# without the wait.
 binary          = /services/crashd
 priority        = 20
 restart         = on_failure
 critical        = no
 provides        = crashd.core:grant
+seed            = logd.flush
 env             = CORE_DUMP=no CRASHD_OOM_STALL_MS=10000
 namespace       = subtree:/crash:LOOKUP+READDIR+STAT+WRITE+MUTATE_DIR
 debug_authority = yes

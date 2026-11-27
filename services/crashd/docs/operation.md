@@ -10,12 +10,17 @@ request, bounds that handling, and what it cannot report.
 
 1. crashd declares itself undebuggable to procmgr (`DECLARE_NO_DEBUG`), so no debug-authority
    holder stops it and its own threads are not bound to the endpoint it receives on.
-2. Its bootstrap round delivers two caps: the `RECV` on its live-core endpoint, which its recipe's
-   `provides = crashd.core:grant` has svcmgr create ([Live Core](#live-core)), and a
-   `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which its recipe's `debug_authority = yes`
-   has svcmgr mint ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)
-   § `provides`, § `debug_authority`). Without the authority it reports nothing and exits; without
-   the endpoint it logs a warning and writes no live core.
+2. Its bootstrap round delivers three caps: the `RECV` on its live-core endpoint, which its
+   recipe's `provides = crashd.core:grant` has svcmgr create ([Live Core](#live-core)); the
+   `logd.flush` seed of its recipe's `seed = logd.flush`, a `LOG_FLUSH_AUTHORITY`-badged `SEND`
+   on logd's master log endpoint that carries logd's flush barrier and no other authority
+   ([logd IPC interface](../../logd/docs/ipc-interface.md#flush-barrier) § Flush barrier), which
+   step 6 of [Per Fault](#per-fault) waits on; and a `DEBUG_AUTHORITY`-badged `SEND|GRANT` on
+   procmgr, which its recipe's `debug_authority = yes` has svcmgr mint
+   ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `provides`, § `seed`,
+   § `debug_authority`). Without the authority it reports nothing and exits; without the endpoint
+   it logs a warning and writes no live core; without the seed it declines each fault without
+   waiting for the log.
 3. It reads its core-dump policy from the `CORE_DUMP` entry of its environment and logs it
    ([Core Dump](#core-dump)), and its stall from `CRASHD_OOM_STALL_MS` ([Hold](#hold)).
 4. It sends `REGISTER_CRASH_SERVICE` with a Thread cap of its main thread, and receives a `RECV` cap
@@ -58,11 +63,19 @@ Authority). crashd:
 4. logs the block ([block-format.md](block-format.md));
 5. writes a core of the process when its policy names it ([Core Dump](#core-dump)), and logs the
    dump's line;
-6. declines the fault with the block's id as the decline reason, which the kernel prints on its
-   `fault unhandled` line.
+6. waits on logd's flush barrier until logd has written the lines it took before the wait to the
+   sinks that hold the log, within what is left of the report's 2 s bound ([Bounds](#bounds)),
+   asking again after each retry hint (`ipc::log_flush::wait`); logd answers at once when no sink
+   holds the log or the one that does is stalled
+   ([logd IPC interface](../../logd/docs/ipc-interface.md#flush-barrier) § Flush barrier);
+7. declines the fault with the block's id as the decline reason, which the kernel prints on its
+   `fault unhandled` line. It declines whatever step 6 ended on: flushed, refused, not answered,
+   or out of time.
 
 The block and the dump's line are logged before the decline, so the kernel's diagnostic of the
-kill does not land among them on the serial console.
+kill does not land among them on the serial console. logd answers a log call once it holds the
+line and writes it later, and the lines it holds unwritten die with it; the wait of step 6 is
+what lets the block of a fault of logd's own, which the decline ends, reach the serial console.
 
 A fault of a restartable syscall's user copy never reaches crashd: its pager's forward is a decline
 ([docs/fault-handling.md](../../../docs/fault-handling.md) § Reply), so the syscall fails and the
@@ -339,11 +352,17 @@ in its address space, which count against its budget node's max while attached
 
 Handling one fault, its reading and its block's logging, runs under a call deadline 2 s ahead
 (`FAULT_BOUND`; `std::os::seraph::with_call_deadline`,
-[runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Call deadline). The attach request
-can wait on procmgr, and procmgr can be waiting on the faulting process (an fs driver serving a
-`CREATE_FROM_FILE` read); a log write can wait on a driver logd writes through, for up to logd's
-`SINK_STALL_MS` per sink ([logd IPC interface](../../logd/docs/ipc-interface.md#output-sinks)
-§ Output sinks). Every call of the step carries the time left as its `SYS_IPC_CALL` timeout, so
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Call deadline), and so does the
+wait for the log before the decline (step 6 of [Per Fault](#per-fault)), with what is left of the
+same deadline, after a dump when one ran: one deadline over the block and the wait. The attach
+request can wait on procmgr, and procmgr can be waiting on the faulting process (an fs driver
+serving a `CREATE_FROM_FILE` read); a log write is refused while a sink that holds the log has not
+written enough of crashd's earlier lines, and is sent again after logd's retry hint
+([logd IPC interface](../../logd/docs/ipc-interface.md#hold-window) § Hold window); the wait for
+the log lasts until the sink holding the log has written the block, or that sink stalls
+(`SINK_STALL_MS`). A fault in a thread of logd that holds logd's state lock leaves logd unable
+to answer the wait: it ends at the deadline, the fault is declined, and the block's lines logd had
+not written are lost with logd. Every call of the step carries the time left as its `SYS_IPC_CALL` timeout, so
 the kernel ends the one waiting at the deadline (`WouldBlock`): crashd's own requests, the attach
 and the stack walk's resident requests (`ipc::ipc_call_within`, `ipc::ResidentBound`), and the
 runtime's, the log writes among them. None is sent once the deadline has passed. The deadline

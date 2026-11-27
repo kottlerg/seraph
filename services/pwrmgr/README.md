@@ -87,7 +87,7 @@ log have written the lines it had taken, for at most 5 s (`log::LOG_CALL_TIMEOUT
 logged before the request, a harness's pass marker and crash reports among them, reach the serial
 console before the platform stops. logd answers at once when no sink holds the log or the one that
 does is stalled; without the seed, on a refusal, or with no answer, pwrmgr acts without the wait
-(`pwrmgr::log_flush` holds the steps).
+(`ipc::log_flush::wait` holds the steps).
 
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.

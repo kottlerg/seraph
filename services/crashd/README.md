@@ -11,8 +11,10 @@ have. On request it also writes an ELF core of a process that keeps running.
 A thread killed by a fault leaves only its exit reason; its registers are gone by then. crashd
 receives the fault while the thread is still stopped, reads it, and logs one marked block with the
 fault, the registers, the bytes at the instruction pointer, the image placement, and a stack walk,
-in the format [docs/block-format.md](docs/block-format.md) defines. It then declines the fault
-(`FAULT_REPLY_KILL`), so the thread dies with the exit reason and the death flow it would have had
+in the format [docs/block-format.md](docs/block-format.md) defines. It then waits, within the
+fault's bound, for logd to write the block (logd's flush barrier, through the `logd.flush` seed,
+whose only authority is that barrier), since the decline can end logd itself and the lines logd
+holds unwritten end with it, and declines the fault (`FAULT_REPLY_KILL`), so the thread dies with the exit reason and the death flow it would have had
 with no handler ([docs/fault-handling.md](../../docs/fault-handling.md) § Crash Reports).
 
 A page fault memmgr declined for want of memory crashd may hold instead, when its recipe sets a
@@ -38,7 +40,8 @@ the core from the snapshot to `/crash` as it writes a crash core. A process that
 on the core path gets none.
 
 svcmgr starts crashd from `rootfs/config/svcmgr/services/crashd.svc`, which sets
-`debug_authority = yes`, `provides = crashd.core:grant`, which no shipped recipe seeds, and
+`debug_authority = yes`, `provides = crashd.core:grant`, which no shipped recipe seeds,
+`seed = logd.flush`, and
 `reserve = yes`, which creates it inside memmgr's system reserve
 ([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)).
 Whether a system reports crashes is a staging decision: an image without the recipe has no crash

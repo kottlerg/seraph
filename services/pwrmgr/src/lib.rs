@@ -7,8 +7,7 @@
 //! (docs/supervision.md § Core Set and System Death): the allocation guard
 //! the power-off runs under ([`guard`]), the reading of the core-death
 //! queue's entries ([`core_death`]), and the reading of the register the
-//! x86-64 power-off writes ([`power_off`]); and the steps of the wait for
-//! logd's flush barrier before every power-off and reset ([`log_flush`]).
+//! x86-64 power-off writes ([`power_off`]).
 //!
 //! The binary (`main.rs`) installs the guard as its global allocator and
 //! drains the queue svcmgr serves it into a [`core_death::Deaths`].
@@ -17,5 +16,4 @@
 
 pub mod core_death;
 pub mod guard;
-pub mod log_flush;
 pub mod power_off;

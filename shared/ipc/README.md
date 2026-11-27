@@ -72,13 +72,19 @@ syscall), and a loop with work before its next receive, set the reply and send i
 reply alone with `Reply::send_last`, so that no receive binds a call the exit would fail, and
 answers a call an earlier `flush` bound with the refusal its argument picks for that call, deleting
 that call's caps. `flush` sends it with a receive that does not wait (`SYS_IPC_REPLY_RECV` at
-`WAIT_TRY_ONCE`), not alone: a server that outranks its caller and last received through
-`SYS_IPC_REPLY_RECV` may run on the caller's CPU, where a plain reply leaves the caller's wake
-queued behind it until it parks, while the wake of a reply whose receive does not park goes to
-another CPU ([scheduler.md](../../core/kernel/docs/scheduler.md) § Thread Assignment). A call that
-receive binds is held in the `Reply`, and the next `next_request` or `next_request_timeout` returns
-it with no syscall, so it is served once the loop's work is done, as it would have been from the
-endpoint's queue. A loop that uses the reply's outcome reads `Reply::undelivered` after the send
+`WAIT_TRY_ONCE`), not alone, from the slot of a loop that is its endpoint's one receiving thread
+(`Reply::new`): a server that outranks its caller and last received through `SYS_IPC_REPLY_RECV`
+may run on the caller's CPU, where a plain reply leaves the caller's wake queued behind it until it
+parks, while the wake of a reply whose receive does not park goes to another CPU
+([scheduler.md](../../core/kernel/docs/scheduler.md) § Thread Assignment). A call that receive binds
+is held in the `Reply`, and the next `next_request` or `next_request_timeout` returns it with no
+syscall, so it is served once the loop's work is done, as the loop's one thread would have served
+it from the endpoint's queue. A thread that shares its endpoint with other receiving threads (a
+receive pool, [shared/recv-pool](../recv-pool/README.md)) builds its slot with `Reply::pooled`,
+whose `flush` sends the reply alone: there a receive that does not wait finds a call only when
+every other thread is busy, and would tie that waiting call to this thread's work, for as long as
+that work lasts, instead of leaving it to the next free thread; the caller's wake may wait behind
+the work instead. A loop that uses the reply's outcome reads `Reply::undelivered` after the send
 that carried it, `flush` or the next receive: it is true when the reply did not reach its caller
 (the caller is gone, or its `CSpace` could not take the reply's caps), until the next send, so the
 loop can undo what the reply reported.

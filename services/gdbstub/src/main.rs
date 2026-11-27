@@ -307,7 +307,8 @@ fn start_receiver(id: usize, endpoint: u64, events: Sender<Stop>) -> Option<Send
     std::thread::Builder::new()
         .spawn(move || {
             let ipc_buf = std::os::seraph::current_ipc_buf();
-            let mut slot = Reply::new();
+            // The other receivers receive on `endpoint` too.
+            let mut slot = Reply::pooled();
             loop
             {
                 // SAFETY: ipc_buf is this thread's registered IPC buffer.

@@ -86,8 +86,9 @@ under its sender's name, the first after the restart included
   rfc5424), pace, backlog, `relayed` and colour come from the `LOGD_SINK_SERIAL` and
   `LOGD_SINK_FRAMEBUFFER` `env` entries of logd's recipe over built-in defaults, serial at info
   and the framebuffer at critical; an entry that does not parse keeps the defaults and is logged at
-  warning. The history keeps every entry whatever the sinks show (see
-  [`docs/sinks.md`](docs/sinks.md) § Settings).
+  warning. A `SINK_SET` on `logd.control` changes them while logd runs
+  ([`docs/ipc-interface.md`](docs/ipc-interface.md) § Sink control). The history keeps every entry
+  whatever the sinks show (see [`docs/sinks.md`](docs/sinks.md) § Settings).
   See [docs/console-model.md](../../docs/console-model.md).
 
 * **Log records.** Beside the text stream, a sender can send a log record,

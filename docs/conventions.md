@@ -723,9 +723,15 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    step 1. One release PR bumps `[workspace.package] version` in the root
    `Cargo.toml` to `<X>.<Y>.<Z>` and adds the notes file from the draft,
    every section filled and the Known Issues as the maintainer decided
-   them, through the normal PR workflow, and merges once the maintainer
-   approves its merge (§ Pre-merge review). The tag MUST point at a commit
-   that contains both.
+   them. It also regenerates both hot-path accounts, every configuration
+   of each
+   ([core/kernel/docs/hot-path-account.md](../core/kernel/docs/hot-path-account.md#regenerating-it)
+   § Regenerating It), at a head of the PR from which the change to its
+   merge is documentation or comments only, so that each block names a
+   head whose code is the merge's. It goes through the normal PR
+   workflow, and merges once the maintainer approves its merge
+   (§ Pre-merge review). The tag MUST point at a commit that contains the
+   bump and the notes file.
 4. Run the release host runs ([testing.md](testing.md#coverage-tiers)
    § Coverage tiers) on the commit to be tagged, a `master` commit that
    contains the bump and the notes file and whose own CI run is green (a

@@ -44,7 +44,9 @@ call passes `scriptPath`, below.
   decide to ship gets an open Issue that names it, filed with their approval, and each audit
   failure its fix.
 - Once the fix PR has merged, a worker opens the release PR from the draft (step 3), its Known
-  Issues as the maintainer decided them. At its gate, ask the maintainer to approve its merge,
+  Issues as the maintainer decided them, and regenerates both hot-path accounts in it
+  (core/kernel/docs/hot-path-account.md § Regenerating It; each trace is a one-vCPU boot and
+  needs no grant). At its gate, ask the maintainer to approve its merge,
   and merge it once they do. Then run the release host runs (step 4) yourself under an
   exclusive grant to yourself and write their report to
   `target/xtask/review/release-v<X.Y.Z>/host-runs.md`.

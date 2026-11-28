@@ -60,6 +60,7 @@ use ipc::IpcMessage;
 use ipc::log_control::{SINK_SERVED, decode_list_reply, list_request};
 use ipc::log_flush::FlushAnswer;
 use ipc::stream_labels::{LEVEL_INFO, STREAM_BYTES, WINDOW_FULL, level_bits};
+use logd_codec::settings::text_holds;
 use logd_slot_table::HOLD_WINDOW;
 
 use crate::bootstrap::Caps;
@@ -301,9 +302,7 @@ impl Window
             {
                 break;
             };
-            let settings = String::from_utf8_lossy(sink.settings);
-            let mut words = settings.split_ascii_whitespace();
-            let holds = words.clone().any(|w| w == "pace=hold") && !words.any(|w| w == "level=off");
+            let holds = core::str::from_utf8(sink.settings).is_ok_and(text_holds);
             served &= !holds || sink.state == SINK_SERVED;
             if !more
             {

@@ -513,8 +513,9 @@ never a worker's own (`.claude/agents/worker.md` § Review).
   a worker prepares the change as a patch file and reports its path after its first push. Send
   the supervisor the path and the PR's branch: it shows the maintainer the diff and, once they
   approve it, applies the patch and commits it onto that branch, so the PR's review and gate
-  cover it (`.claude/skills/orchestrate/SKILL.md`, step 6). When it answers with the commit,
-  send the commit to the worker, which commits nothing further on the branch until then.
+  cover it (`.claude/skills/orchestrate/SKILL.md`, step 6). Send its answer to the worker: the
+  commit, or the maintainer's refusal or requested change. A revised patch from the worker
+  goes to the supervisor the same way and replaces the earlier one.
 - **A finding the workers cannot place** goes to the maintainer with your recommendation, in
   one line.
 

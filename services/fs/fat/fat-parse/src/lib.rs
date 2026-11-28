@@ -1648,6 +1648,17 @@ pub fn encode_lfn(name: &[u8], out: &mut [u16; MAX_LFN_CHARS]) -> Option<usize>
     Some(len)
 }
 
+/// Whether `name` can be stored as a FAT long name: [`encode_lfn`] encodes
+/// it into at least one code unit. A name this refuses (empty, not UTF-8,
+/// holding U+0000 or U+FFFF, or longer than [`MAX_LFN_CHARS`] code units)
+/// is no name a directory entry can hold.
+#[must_use]
+pub fn is_storable_name(name: &[u8]) -> bool
+{
+    let mut units = [0u16; MAX_LFN_CHARS];
+    encode_lfn(name, &mut units).is_some_and(|len| len > 0)
+}
+
 /// The UTF-8 character `bytes` starts with and its width in bytes, by the
 /// table of well-formed byte sequences (Unicode § 3.9, Table 3-7; RFC 3629
 /// § 4); `None` when `bytes` starts with none, an empty `bytes` included.
@@ -3800,5 +3811,18 @@ mod tests
         assert_eq!(encode_lfn("a\u{FFFF}b".as_bytes(), &mut units), None);
         assert_eq!(encode_lfn(b"a\0b", &mut units), None);
         assert_eq!(encode_lfn("a\u{FFFE}b".as_bytes(), &mut units), Some(3));
+    }
+
+    // Defect caught: a create or rename of a name no long name can hold
+    // reached the directory write, which refused it as a corrupt volume.
+    #[test]
+    fn is_storable_name_refuses_what_encode_lfn_refuses_or_an_empty_name()
+    {
+        assert!(is_storable_name(b"a.txt"));
+        assert!(is_storable_name(&[b'a'; MAX_LFN_CHARS]));
+        assert!(!is_storable_name(b""));
+        assert!(!is_storable_name("a\u{FFFF}".as_bytes()));
+        assert!(!is_storable_name(&[0xFF]));
+        assert!(!is_storable_name(&[b'a'; MAX_LFN_CHARS + 1]));
     }
 }

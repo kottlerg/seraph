@@ -448,8 +448,9 @@ impl Hold
                 std::os::seraph::log!(warn: "hold slot {slot} not watched (err={e})");
             });
         }
-        // The repeat of a re-asked fault is held again in its own slot to the
-        // same deadline: its re-ask's line stands for it.
+        // The repeat of a re-asked fault is held again, wherever a slot is
+        // free, to the re-asked hold's deadline: its re-ask's line stands for
+        // it.
         if self.holds.held(slot).is_some_and(|h| h.reasked)
         {
             return;

@@ -1148,9 +1148,11 @@ pub unsafe fn route_device_irq(
 /// did not raise. A CPU's vectors are assigned in turn and the cursor
 /// moves past a released one (`ioapic::assign_vector`), so the next route to that CPU does
 /// not take it while other vectors are free. On a level-triggered line such a latched
-/// delivery also leaves the entry's Remote IRR set, which stays set when the line is routed
-/// again before that delivery's EOI; `ioapic::route` clears it before the line is
-/// programmed again.
+/// delivery also leaves the entry's Remote IRR set until its EOI. The mask here writes the
+/// entry from its kept low dword, whose Remote IRR bit is zero, which clears the bit on an
+/// I/O APIC that lists it read/write (the ICH9); on one that makes it read-only (the
+/// 82093AA) it stays set when the line is routed again before that delivery's EOI, and
+/// `ioapic::route` clears it before the line is programmed again.
 ///
 /// # Safety
 /// Must be called after Phase 5 init, under `irq`'s routing lock.

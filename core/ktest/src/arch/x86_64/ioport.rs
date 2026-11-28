@@ -15,8 +15,12 @@
 //! carved cap it was made through: deleting that cap, consuming it with a
 //! split, or revoking an ancestor of it withdraws it
 //! ([capability-model.md](../../../../../docs/capability-model.md) § `IoPort` (x86-64 only)).
-//! The carved caps a consumer binds therefore stay in ktest's `CSpace`; the
-//! prefix caps left beside them are the ones other tests may consume.
+//! The carved caps a consumer binds therefore stay in ktest's `CSpace`. A carve
+//! moves upward through the wide cap, and the prefix it splits off below the
+//! carved range is deleted: no later carve can reach those ports. A test that
+//! needs an `IoPort` cap takes its handle from here ([`wide_cap`], [`wide`],
+//! [`carve_port_range`]), never from a scan of slot indices, which name only
+//! slots never recycled.
 
 use init_protocol::{CapType, InitInfo};
 
@@ -67,6 +71,15 @@ pub fn wide_cap() -> Option<u64>
     (slot != 0).then_some(slot)
 }
 
+/// The wide cap's handle and the ports `[base, end)` it covers, or `None` when
+/// it is uninitialised or exhausted.
+pub fn wide() -> Option<(u64, u32, u32)>
+{
+    // SAFETY: ktest is single-threaded.
+    let WideCap { slot, base, end } = unsafe { WIDE };
+    (slot != 0).then_some((slot, base, end))
+}
+
 /// Bind `[port, port + count)` to `thread_cap`. Returns `true` on
 /// success.
 ///
@@ -85,7 +98,7 @@ pub fn bind_port_range(thread_cap: u64, port: u16, count: u16) -> bool
 /// wide cap, or when an `ioport_split` fails. When `port` is above the wide
 /// cap's base, a failure at the second split (the one at `port + count`) comes
 /// after the first has consumed the old wide cap: the prefix cap for
-/// `[base, port)` stays in the `CSpace` and the wide cap is left narrowed to
+/// `[base, port)` is already deleted and the wide cap is left narrowed to
 /// `[port, end)`.
 pub fn carve_port_range(port: u16, count: u16) -> Option<u64>
 {
@@ -114,14 +127,9 @@ pub fn carve_port_range(port: u16, count: u16) -> Option<u64>
             reason = "port_start <= 0xFFFF because the caller supplied a u16; safe cast"
         )]
         let (prefix, rest) = syscall::ioport_split(slot, port_start as u16).ok()?;
-        // ktest itself never drives the prefix range [base, port_start),
-        // but the carved-off prefix cap is left alive in the cspace so
-        // that any consumer (test harness, future module, debug probe)
-        // that wants to claim those ports can find an IoPort
-        // covering them. See `ioport_syscalls::split` (this directory)
-        // for the test that relies on this for coverage of the
-        // `ioport_split` syscall.
-        let _ = prefix;
+        // No carve reaches the prefix range [base, port_start) again, since
+        // carves move upward, so its cap goes.
+        syscall::cap_delete(prefix).ok();
         slot = rest;
         // The split consumed the old wide cap: record `rest` now, so a failed
         // second split below leaves a wide cap that still resolves.

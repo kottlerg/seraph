@@ -1474,8 +1474,8 @@ fn create_and_open_in(
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { deadline_call(split.parent_cap, &msg, ipc_buf) };
     // A cap the kernel did not move (a refused call) is still ours and is
-    // deleted here; a moved one's handle is stale, and the kernel's
-    // generation check refuses the delete.
+    // deleted here; a moved one left its slot empty, and the delete of an
+    // empty slot succeeds without effect. The result is ignored.
     let _ = syscall::cap_delete(session);
     let reply = reply
         .map_err(|e| call_error(split.parent_cap, e, "seraph fs: FS_CREATE ipc_call failed"))?;
@@ -1674,7 +1674,8 @@ impl File
         {
             open_existing(path, ipc_buf, release_send)
         };
-        // A moved SEND's handle is stale, and the delete is refused.
+        // A moved SEND left its slot empty, so the delete succeeds without
+        // effect; the result is ignored.
         let _ = syscall::cap_delete(release_send);
         let (file_cap, mut size) = opened?;
 

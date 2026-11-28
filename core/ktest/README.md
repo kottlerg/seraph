@@ -164,10 +164,10 @@ Architecture-only Tier 1 tests live under `src/arch/<arch>/` and run through
 `src/arch/x86_64/user_half_top.rs` that `mem_map` refuses the top user page
 (`0x7FFF_FFFF_F000` at 4-level paging, `0xFF_FFFF_FFFF_F000` at 5-level) with
 `InvalidAddress` and maps the page below it. Each architecture's
-`ioport_syscalls.rs` holds its `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT` tests (a bind and a split
-of the initial `IoPort` caps on x86-64, and a bind whose thread's `CSpace` is deleted first, which
-returns the binding table with the `CSpace`'s pages and leaves the thread refusing a bind;
-`NotSupported` on RISC-V), and its `sbi_call.rs` its
+`ioport_syscalls.rs` holds its `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT` tests (a bind of ktest's
+wide `IoPort` cap and a split of a derived copy of it on x86-64, and a bind whose thread's `CSpace`
+is deleted first, which returns the binding table with the `CSpace`'s pages and leaves the thread
+refusing a bind; `NotSupported` on RISC-V), and its `sbi_call.rs` its
 `SYS_SBI_CALL` test: the call reaches the SBI firmware on RISC-V and returns `NotSupported` on
 x86-64. `src/arch/riscv64/fp_refusal.rs` checks that an F/D instruction the hart refuses while the
 thread's F/D and V units are on (`fadd.d` with a reserved rounding mode) kills the thread with the
@@ -337,7 +337,7 @@ width implies (CPUs / 16), by which each cross-CPU handoff slows, so the bound s
 slow step from a stuck or wrong one. They are the report bound of `tally::await_report` and
 `tally::await_all`; the round bounds of `configure_start_race`, `stop_target_vanishes`,
 `thread_cap_delete_under_use`, `copy_source_delete` and `affinity_swap_handoff`, and the exit
-polls of `thread_cap_delete_under_use` and `copy_source_delete`; the phase bound of
+polls of `thread_cap_delete_under_use` and `copy_source_delete`; the progress bound of
 `affinity_park_handoff`; the pinned-CPU report wait of `priority_dealloc_race`; the
 acknowledgement, result, approach, sync and entry bounds of `stop_claimed_delete`,
 `stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the held-round delivery and
@@ -467,7 +467,7 @@ is not a stall to the all-idle detector.
 | `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout; for each source the late rounds must end in both deliveries and timeouts, which needs the controller's delay to start as the waiter enters its timed wait: after the fixed rounds, while either source lacks either, held rounds run on, up to `MAX_EXTRA_ROUNDS`, late rounds whose delay is measured from the waiter's own clock stamp of its entry rather than from when the controller saw it; the log counts the held rounds run (≥ 2 CPUs) | `CYCLES=400` fixed rounds, `WAIT_MS=1`, `MAX_EXTRA_ROUNDS=1000` |
 | `double_enqueue_storm.rs` | Run-queue double-link guard regression (#244): wake + priority + affinity churn, then wake racing `cap_delete(Thread)` | `NUM_WORKERS=32`, `CYCLES=600` |
 | `affinity_swap_handoff.rs` | Swap the affinities of pairs of workers that each own one CPU of their pair and report their CPU and yield in a loop, so both CPUs of a pair hand their outgoing thread to the other in `schedule()`'s cross-affinity requeue at once; every round must see every worker on its new CPU (#529, the dispatch wait for an unpublished `next` closing into a cycle) (≥ 2 CPUs) | `MAX_PAIRS=8`, `ROUNDS=400` |
-| `affinity_park_handoff.rs` | A worker moves its own hard affinity between two CPUs and parks at once in a notification wait, while a waker on a third CPU sends it after a delay the rounds sweep, so the wake, routed by the new affinity, links the worker on the CPU it names while it is still `current` on the CPU it parks on; in the first phase that CPU idles, in the second a spinner below the worker yields in a loop on each of the two CPUs, so the claiming CPU dequeues the worker while the parking CPU's `schedule()` decides. Every affinity change and wait returns `Ok`, both children finish each phase within its bound, and in each phase some wait returns on the CPU its round named (#1221, `schedule()` requeueing a `current` another CPU's dispatch has claimed; the kernel's debug assertions, `commit_blocked`'s "parking while linked" and the run queue's double-link guard, are the tripwires) (≥ 3 CPUs) | `CYCLES=16_000` per phase (two phases) |
+| `affinity_park_handoff.rs` | A worker moves its own hard affinity between two CPUs and parks at once in a notification wait, while a waker on a third CPU sends it after a delay the rounds sweep, so the wake, routed by the new affinity, links the worker on the CPU it names while it is still `current` on the CPU it parks on; in the first phase that CPU idles, in the second a spinner below the worker yields in a loop on each of the two CPUs, so the claiming CPU dequeues the worker while the parking CPU's `schedule()` decides. Every affinity change and wait returns `Ok`, both children finish each phase, neither going its progress bound (`STALL_SLICES`) without a round, and in each phase some wait returns on the CPU its round named (#1221, `schedule()` requeueing a `current` another CPU's dispatch has claimed; the kernel's debug assertions, `commit_blocked`'s "parking while linked" and the run queue's double-link guard, are the tripwires) (≥ 3 CPUs) | `CYCLES=16_000` per phase (two phases) |
 | `event_try_recv_post_race.rs` | A non-blocking `SYS_EVENT_RECV` try-once racing a concurrent `event_post` must never leave the poller wakeable (#352) (≥ 2 CPUs) | `CYCLES=1024` |
 | `load_balance_handoff_steal.rs` | Arm the load-balancer mid-handoff steal (#314/#293): unpinned IPC clients vs round-robin-pinned servers expose `pull_unpinned_ready` stealing a `context_saved == 0` thread (≥ 2 CPUs) | `NUM_PAIRS=16`, `ITERS=16000` |
 | `concurrent_notification.rs` | Multiple threads sending distinct bits to one notification simultaneously | `NUM_SENDERS=64`, `SEND_ITERATIONS=5000` |
@@ -545,10 +545,10 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   `memory_base` (first RAM Memory cap), `sbi_control_cap` (zero on
   x86-64), `sched_control_cap` (the root `SchedControl`), `entropy_control_cap` (the
   root `EntropyControl`), `pmu_control_cap` (the root `PmuControl`), and `init_info_va` (the
-  `InitInfo` page's VA). Passed by reference to every test function. `cspace_cap` is queried via
-  `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` by hardware tests whose
-  scans must cover slots populated after `aspace_cap` (e.g. narrow
-  `IoPort` caps carved by `ioport::bind_port_range` on `x86_64`).
+  `InitInfo` page's VA). Passed by reference to every test function. A test reaches a cap
+  through the handle its mint returned, or a boot cap through its `InitInfo` descriptor
+  (`unit::hw::boot_caps`), never through a scan of slot indices: an index carries generation 0,
+  so it names only a slot never recycled.
 - `PASS_COUNT` / `FAIL_COUNT` — atomic counters updated by `run_test!`.
 - `log(msg)` / `log_u64(prefix, value)` / `log_args(format_args!(…))` —
   heap-free logging utilities; `log_args` composes a line with `core::fmt` in

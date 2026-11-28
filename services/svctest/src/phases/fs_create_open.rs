@@ -14,7 +14,8 @@
 //! asks to open it (`CREATE_OPEN_EXISTING`), and then opens it unless the
 //! directory's cap lacks `LOOKUP` (`PERMISSION_DENIED`), a directory of that
 //! name is `IS_A_DIRECTORY`, a request with no session cap or with
-//! the second flag alone is `INVALID_ARGUMENT`, and in a session whose node is
+//! the second flag alone is `INVALID_ARGUMENT`, a name no FAT long name can
+//! hold (U+FFFF) is `IO_ERROR` with no entry made, and in a session whose node is
 //! at its max a create, and an open of an existing file, are `LIMIT` and make
 //! no entry. Three children drive std's create: a `fs-create-open-full` child
 //! ([`full_session_main`]) fills its node to its max and its session with the
@@ -81,6 +82,9 @@ const LIMITED: &str = "co-limit.bin";
 const NO_SESSION: &str = "co-none.bin";
 /// The name a create with `CREATE_OPEN_EXISTING` alone tries.
 const EXISTING_ALONE: &str = "co-alone.bin";
+/// A valid name no FAT long name can hold: its U+FFFF is the code unit a
+/// long name's slots take as its end.
+const UNSTORABLE: &str = "co-\u{FFFF}.bin";
 /// A directory a create that opens an existing file meets.
 const DIR: &str = "co-dir";
 /// The bytes the phase writes through a new file's open cap.
@@ -376,6 +380,24 @@ fn raw_creates(svctest: u64, session: u64, ipc_buf: *mut u64)
         entry_size(svctest, EXISTING_ALONE, ipc_buf),
         None,
         "{EXISTING_ALONE} was created"
+    );
+
+    // A name no long name can hold is refused as an invalid name, by a
+    // create that opens and by a mkdir, and makes no entry.
+    assert_eq!(
+        create_in(svctest, UNSTORABLE, OPEN, session, ipc_buf).err(),
+        Some(fs_errors::IO_ERROR),
+        "a create that opens a name holding U+FFFF"
+    );
+    assert_eq!(
+        fs_mkdir(svctest, UNSTORABLE.as_bytes(), ipc_buf).err(),
+        Some(fs_errors::IO_ERROR),
+        "a mkdir of a name holding U+FFFF"
+    );
+    assert_eq!(
+        entry_size(svctest, UNSTORABLE, ipc_buf),
+        None,
+        "a name holding U+FFFF was created"
     );
 }
 

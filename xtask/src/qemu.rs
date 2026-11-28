@@ -842,8 +842,13 @@ pub enum Execution
     /// Deterministic instruction counting: single-threaded TCG with
     /// `-icount shift=0,sleep=on,align=off`. While a vCPU runs, the guest's
     /// clock, and the cycle counters read from it, advance one tick per
-    /// retired instruction, so a window that does not idle counts the same
-    /// from run to run. While every vCPU idles, the clock follows the host's
+    /// retired instruction. At one CPU the count of a window that does not
+    /// idle, and that no interrupt or other thread enters, is the same in
+    /// every run of one build, unless the path's cost depends on the order in
+    /// which earlier host-timed events (a device completion, the end of an
+    /// idle) left the system's state; at more than one CPU the vCPUs share the
+    /// clock, so a window also counts the other vCPUs' instructions
+    /// (docs/testing.md § Benchmarks). While every vCPU idles, the clock follows the host's
     /// time up to the next timer deadline (`sleep=on`), and a device
     /// completion, which lands on the host's clock, ends the idle as it would
     /// on hardware. Under `sleep=off` the clock would jump to the next

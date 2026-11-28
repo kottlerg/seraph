@@ -3589,10 +3589,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// raises the free pages outside `promised` ([`Self::evicting_frees`]),
     /// and while it evicts for frames ([`Self::frames_short`] with the growth
     /// floor and `band`) one whose eviction raises those above the growth
-    /// floor ([`Self::evicting_opens`]). At `CRITICAL` an uncommitted chunk's
-    /// eviction short of a full restore headroom opens no draw room and leaves
-    /// the free pages its own restore needs short, so it waits for a direct
-    /// reclaim.
+    /// floor ([`Self::evicting_opens`]), or any while a committed draw is short
+    /// ([`Self::draw_short`]). An uncommitted chunk's eviction short of a full
+    /// restore headroom opens no draw room, but it raises the headroom by its
+    /// pages, and once the headroom reaches the reserve every eviction opens
+    /// the room: with no idle committed chunk left, that is the only way a
+    /// short draw's room opens before the out-of-memory path acts. Without a
+    /// short draw, at `CRITICAL` such a chunk waits for a direct reclaim.
     #[must_use]
     pub fn evicts_in_background(
         &self,
@@ -3604,7 +3607,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     {
         (level == PressureLevel::Low && self.evicting_frees())
             || (self.frames_short(self.growth_floor(pool_total), band)
-                && self.evicting_opens(reg, pool_total))
+                && (self.short_draw || self.evicting_opens(reg, pool_total)))
     }
 
     /// The region node `reg` of `rec` and the chunk holding `page_base` in it:
@@ -8997,6 +9000,78 @@ mod tests
         l.remove_region(rec, plain, pool_all).unwrap();
         l.remove_region(rec, reg, pool_all).unwrap();
         assert!(!l.frames_short(990, 10));
+    }
+
+    #[test]
+    fn a_short_draw_with_no_committed_victim_opens_its_room_by_evicting_uncommitted_chunks()
+    {
+        const CHUNKS: u64 = 12;
+        const STORE: u32 = 4;
+        let chunk_pages = u64::from(DEMAND_CHUNK_PAGES);
+        let mut l = roomy_ledger(4096);
+        let total = pool_pages(&l);
+        let reserve = reserve_pages(total);
+        let band = crate::pressure::band(total).max(chunk_pages);
+        let crit = PressureLevel::Critical;
+        let floor = |l: &Ledger<VecStore, VecWords>| l.growth_floor(total);
+        register_slots(&mut l, 625);
+        // Idle uncommitted chunks, backed whole.
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let plain = l
+            .add_region(rec, region(BASE, CHUNKS * CHUNK), Commit::Uncommitted)
+            .unwrap();
+        for c in 0..CHUNKS
+        {
+            back_whole(&mut l, rec, plain, c);
+        }
+        // The writer's committed region, no chunk of it backed yet: no
+        // committed chunk is a victim.
+        let writer = l.insert_process(2, NodeSpec::TOP).unwrap();
+        l.add_region(writer, region(BASE, CHUNK), Commit::Committed)
+            .unwrap();
+        // One uncommitted chunk compressed: a restore headroom of its pages,
+        // short of the reserve.
+        swap_out(&mut l, rec, plain, 0, 1, STORE);
+        assert!(l.uncommitted_swapped() < reserve);
+        // The free pool taken down to half a chunk above the growth floor, as
+        // svctest's grants take it: the draw room is short of a chunk, and the
+        // pool covers `promised`.
+        while l.pool.free_pages() > floor(&l) + chunk_pages / 2
+        {
+            let want = l.pool.free_pages() - floor(&l) - chunk_pages / 2;
+            take(&mut l, u32::try_from(want).unwrap(), crate::Fit::UpTo);
+        }
+        assert!(l.draw_room(floor(&l)) < chunk_pages);
+        assert!(l.promised() <= l.pool.free_pages());
+        // With no committed draw short, the selection is as it was: at
+        // `CRITICAL` no uncommitted chunk is a victim short of a full headroom.
+        assert!(!l.evicting_opens(plain, total));
+        assert!(!l.evicts_in_background(plain, total, crit, band));
+        // A committed draw found too few pages. Each uncommitted chunk
+        // background eviction takes raises the headroom by its pages until it
+        // reaches the reserve, and every one after that frees its pages less
+        // its store above the floor, so the room opens after the evictions
+        // that fill the headroom and two more, which win back what the stores
+        // took and the half chunk the room lacked.
+        l.note_short_draw();
+        let fill = (reserve - l.uncommitted_swapped()).div_ceil(chunk_pages);
+        let mut evicted = 0;
+        while l.draw_room(floor(&l)) < chunk_pages
+        {
+            assert!(
+                evicted < fill + 2,
+                "the draw room still short after {evicted} evictions"
+            );
+            assert!(l.frames_short(floor(&l), band));
+            assert!(l.evicts_in_background(plain, total, crit, band));
+            swap_out(&mut l, rec, plain, 1 + evicted, 1, STORE);
+            evicted += 1;
+        }
+        assert!(evicted > fill, "the room opened before the headroom filled");
+        // memmgr clears the latch at the opening, which ends the wider
+        // selection.
+        l.clear_short_draw();
+        assert!(!l.evicts_in_background(plain, total, crit, band));
     }
 
     #[test]

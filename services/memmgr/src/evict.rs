@@ -378,7 +378,10 @@ fn reclaiming(l: &MemLedger) -> bool
 /// to the committed draws, which `promised` keeps them for or which wait for
 /// them, and to the restores, so eviction runs at `CRITICAL` too, and any
 /// evictable idle chunk whose eviction frees a page above the growth floor is
-/// a victim ([`free_pool::Ledger::evicting_opens`]).
+/// a victim ([`free_pool::Ledger::evicting_opens`]), and while a committed draw
+/// is short any evictable idle chunk, so the restore headroom fills and the
+/// draw room opens when no committed chunk is idle
+/// ([`free_pool::Ledger::evicts_in_background`]).
 fn frames_short(l: &MemLedger) -> bool
 {
     let total = pool_total_pages();
@@ -435,7 +438,8 @@ fn slice_due() -> Option<u64>
 /// § Receive loop). While memmgr reclaims, the slice finds the cold chunks and
 /// posts a job for each whose eviction raises the free pages outside
 /// `promised`, or, while it evicts for frames, those above the growth floor,
-/// as many as there are free slots;
+/// and any while a committed draw is short, the ones that free pages above
+/// the floor first, as many as there are free slots;
 /// otherwise it finds the chunks idle for [`RECLAIM_IDLE_SWEEPS`]. The rest
 /// it finds are kept for direct reclaim ([`keep_victims`]).
 pub(crate) fn turn(l: &mut MemLedger, answer: &mut Answer)
@@ -481,20 +485,37 @@ pub(crate) fn turn(l: &mut MemLedger, answer: &mut Answer)
         opens,
     );
     // While memmgr reclaims, each victim background eviction takes
-    // ([`free_pool::Ledger::evicts_in_background`]) takes a free job slot; the
-    // rest are kept.
+    // ([`free_pool::Ledger::evicts_in_background`]) takes a free job slot,
+    // those whose eviction opens the draw room first, so a victim taken for a
+    // short draw only to raise the restore headroom takes no slot one of them
+    // needs; the rest are kept.
     let level = current_pressure();
     let short_band = short_band(total);
+    let found = victims.get(..found).unwrap_or(&[]);
+    let mut posted = [false; JOB_SLOTS + VICTIM_CACHE];
+    for opening in [true, false]
+    {
+        for (v, done) in found.iter().zip(posted.iter_mut())
+        {
+            if *done
+                || opens(l, v.reg) != opening
+                || !l.evicts_in_background(v.reg, total, level, short_band)
+            {
+                continue;
+            }
+            let Some(slot) = STATE.iter().position(|s| s.load(Ordering::Relaxed) == FREE)
+            else
+            {
+                break;
+            };
+            post(l, v, slot);
+            *done = true;
+        }
+    }
     let mut kept = [Victim::default(); JOB_SLOTS + VICTIM_CACHE];
     let mut n: usize = 0;
-    for v in victims.get(..found).unwrap_or(&[])
+    for (v, _) in found.iter().zip(posted).filter(|(_, done)| !done)
     {
-        if l.evicts_in_background(v.reg, total, level, short_band)
-            && let Some(slot) = STATE.iter().position(|s| s.load(Ordering::Relaxed) == FREE)
-        {
-            post(l, v, slot);
-            continue;
-        }
         if let Some(k) = kept.get_mut(n)
         {
             *k = *v;

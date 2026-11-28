@@ -34,6 +34,10 @@
 //!   it checks that the code at the stopped program counter is the
 //!   function's, since another process can map the same address, moves that
 //!   CPU's program counter, removes the breakpoint, and resumes the VM.
+//!   memmgr's kill takes a stop on a CPU other than CPU 0 only, so it kills a
+//!   receive thread other than the main one, which is pinned to CPU 0
+//!   (services/memmgr/docs/memory-pool.md § Receive threads): its boot has at
+//!   least 2 CPUs, and the shell runs the program again until such a stop.
 //!
 //! A boot passes when, after the kill, QEMU's `SHUTDOWN` event gives reason
 //! `guest-shutdown` and QEMU exits on its own. One boot per target; the
@@ -199,7 +203,17 @@ struct Breakpoint
     bias_line: &'static str,
     /// The function's demangled path, without its hash.
     function: &'static str,
+    /// The CPUs on which a stop in the function is the kill's.
+    cpus: breakpoint_kill::Cpus,
 }
+
+/// Times the shell is asked to run the program when the kill passes over the
+/// stops on CPU 0 ([`breakpoint_kill::Cpus::NotBoot`]), each spawn's
+/// requests reaching any of memmgr's receive threads.
+const RETYPES: u32 = 8;
+
+/// The pause between two of those.
+const RETYPE_PAUSE: Duration = Duration::from_secs(2);
 
 /// The route to `target`'s thread.
 fn route(target: Target) -> Route
@@ -208,25 +222,29 @@ fn route(target: Target) -> Route
     const PROCMGR_BIAS: &str = "init: procmgr image bias=";
     match target
     {
-        // memmgr's receive loop, in the admission of an allocation the spawn
-        // charges. A function the release build keeps out of line, as it
-        // does not `memmgr::select`.
+        // A receive thread other than the main one, in the admission of an
+        // allocation the spawn charges, which only receive threads run. A
+        // function the release build keeps out of line, as it does not
+        // `memmgr::select`.
         Target::Memmgr => Route::Hardware(Breakpoint {
             binary: "services/memmgr",
             bias_line: MEMMGR_BIAS,
             function: "memmgr::admit",
+            cpus: breakpoint_kill::Cpus::NotBoot,
         }),
         // A request worker (the main thread is one), in the spawn's create.
         Target::Procmgr => Route::Hardware(Breakpoint {
             binary: "services/procmgr",
             bias_line: PROCMGR_BIAS,
             function: "procmgr::handle_create",
+            cpus: breakpoint_kill::Cpus::Any,
         }),
         // The reaper thread, never the main thread, in the program's reap.
         Target::ProcmgrReaper => Route::Hardware(Breakpoint {
             binary: "services/procmgr",
             bias_line: PROCMGR_BIAS,
             function: "procmgr::process::reap_dead",
+            cpus: breakpoint_kill::Cpus::Any,
         }),
         Target::Svcmgr => Route::Stub("svcmgr", KillPoint::Attach, Contact::Attached),
         Target::Devmgr => Route::Stub("devmgr", KillPoint::SystemUp, Contact::Attached),
@@ -239,6 +257,12 @@ fn route(target: Target) -> Route
 /// sysroot and admitted the boot.
 pub(super) fn run(ctx: &Context, args: &CaseArgs, target: Target) -> Result<()>
 {
+    if let Route::Hardware(bp) = route(target)
+        && bp.cpus == breakpoint_kill::Cpus::NotBoot
+        && args.cpus < 2
+    {
+        bail!("the {target:?} kill takes a CPU other than CPU 0: boot at least 2 (--cpus)");
+    }
     match route(target)
     {
         route @ Route::Stub(name, ..) =>
@@ -333,16 +357,22 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout, route: Route) -> Res
                     .with_context(|| {
                         format!("no `{}` line before the READY marker", bp.bias_line)
                     })?;
+                let times = match bp.cpus
+                {
+                    breakpoint_kill::Cpus::Any => 1,
+                    breakpoint_kill::Cpus::NotBoot => RETYPES,
+                };
                 let killed = breakpoint_kill::kill_at_breakpoint(
                     args.arch,
                     &gdb_sock,
                     bias,
                     &function,
-                    move || type_input(stdin),
+                    bp.cpus,
+                    move || type_input(stdin, times),
                 )?;
                 step(&format!(
-                    "core-death test: moved the CPU at {:#x} to 0",
-                    killed.pc
+                    "core-death test: moved CPU {} at {:#x} to 0",
+                    killed.cpu, killed.pc
                 ));
                 // QEMU's stdin closes here, ending the serial line's input:
                 // the typed bytes are already in the pipe, and nothing is
@@ -560,22 +590,27 @@ fn kill_through_stub(
     Ok(Instant::now())
 }
 
-/// Type [`SERIAL_INPUT`] once the VM has had time to resume; returns the
-/// handle, kept open. Another request can reach the function first, and the
-/// kill's power-off can end QEMU before the input is typed, closing its
-/// stdin: the input is then not needed, and the failure is only noted.
-fn type_input(mut stdin: ChildStdin) -> Option<ChildStdin>
+/// Type [`SERIAL_INPUT`] `times` times, the first once the VM has had time
+/// to resume and each next [`RETYPE_PAUSE`] later; returns the handle, kept
+/// open. Another request can reach the function first, and the kill's
+/// power-off can end QEMU before the input is typed, closing its stdin: the
+/// input is then not needed, and the failure is only noted.
+fn type_input(mut stdin: ChildStdin, times: u32) -> Option<ChildStdin>
 {
     thread::sleep(Duration::from_secs(1));
-    match stdin.write_all(SERIAL_INPUT).and_then(|()| stdin.flush())
+    for typed in 0..times
     {
-        Ok(()) => Some(stdin),
-        Err(e) =>
+        if typed > 0
+        {
+            thread::sleep(RETYPE_PAUSE);
+        }
+        if let Err(e) = stdin.write_all(SERIAL_INPUT).and_then(|()| stdin.flush())
         {
             step(&format!("core-death test: the input was not typed ({e})"));
-            None
+            return None;
         }
     }
+    Some(stdin)
 }
 
 #[cfg(test)]
@@ -641,5 +676,13 @@ mod tests
             unreachable!()
         };
         assert_eq!(reaper.function, "procmgr::process::reap_dead");
+        // Defect caught: memmgr's kill landing on its main thread, which
+        // the death of any receive thread must not need.
+        let Route::Hardware(memmgr) = route(Target::Memmgr)
+        else
+        {
+            unreachable!()
+        };
+        assert_eq!(memmgr.cpus, breakpoint_kill::Cpus::NotBoot);
     }
 }

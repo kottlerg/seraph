@@ -1135,24 +1135,25 @@ event's reason is `guest-shutdown`, and QEMU exits on its own within 30 seconds;
 press runs through. The QMP socket is `power-button.qmp` in the case's socket directory
 ([§ Cases](#cases)).
 
-**Core death** (`memmgr`, `procmgr`, `procmgr-reaper`, `svcmgr`, `devmgr`, `vfsd`, `logd`: the
-death of a core or critical service powers the system off). Each boot kills its cause's service by
-moving one of its threads to program counter 0. svcmgr, devmgr, vfsd and logd are reached through
-the GDB stub service, which the case stages naming the target and boots with the debug port, as
-`run --debug-target` does, removing it again and repacking the disk images in the layout they had,
-whatever the outcome; logd is killed four times, once more than svcmgr's restart budget allows,
-and when init-logd's last line, `handover complete; init-logd thread exiting`, has not appeared
-before the first kill (the first instance died before its bootstrap request or after it, before its
-release), the restart must produce it.
-memmgr and procmgr are reached through QEMU's own gdbstub, on a unix socket, with a hardware
-breakpoint on a function of the target's binary, read from the symbols store's file of its build id,
-hit by a `hello` the case types at the shell once the terminal's READY line and pwrmgr's
+**Core death** (`memmgr`, `procmgr`, `procmgr-reaper`, `svcmgr`, `devmgr`, `vfsd`, `logd`: the death
+of a core or critical service powers the system off). Each boot kills its cause's service by moving
+one of its threads to program counter 0. svcmgr, devmgr, vfsd and logd are reached through the GDB
+stub service, which the case stages naming the target and boots with the debug port, as `run
+--debug-target` does, removing it again and repacking the disk images in the layout they had,
+whatever the outcome; logd is killed four times, once more than svcmgr's restart budget allows, and
+when init-logd's last line, `handover complete; init-logd thread exiting`, has not appeared before
+the first kill (the first instance died before its bootstrap request or after it, before its
+release), the restart must produce it. memmgr and procmgr are reached through QEMU's own gdbstub, on
+a unix socket, with a hardware breakpoint on a function of the target's binary, read from the
+symbols store's file of its build id, hit (for memmgr, on a receive thread other than the main one,
+which stops only on a CPU other than CPU 0, so the boot has at least 2 CPUs) by a `hello` the case
+types at the shell, up to 8 times until such a stop, once the terminal's READY line and pwrmgr's
 `core-death power-off armed` line have appeared. It passes for a cause when QMP's `SHUTDOWN` event,
 after the kill, gives reason `guest-shutdown`, and QEMU exits on its own within two minutes of the
 kill; [docs/testing.md](../docs/testing.md#core-death-shutdown-case) § Core death says when each
-target is killed and which path powers the system off. A main thread whose program-counter write
-the stub refuses as held in a call (`E06`) has its program counter read and written again every
-100 ms until the call returns, for up to 60 s. The QMP and gdbstub sockets are `core-death.qmp` and
+target is killed and which path powers the system off. A main thread whose program-counter write the
+stub refuses as held in a call (`E06`) has its program counter read and written again every 100 ms
+until the call returns, for up to 60 s. The QMP and gdbstub sockets are `core-death.qmp` and
 `core-death.gdb` in the case's socket directory ([§ Cases](#cases)).
 
 #### The `debug-port` case

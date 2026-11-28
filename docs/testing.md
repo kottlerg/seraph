@@ -937,14 +937,16 @@ the fault is terminal. Two routes reach the thread:
   debugger can attach to them. Once the terminal's READY line and pwrmgr's `core-death power-off
   armed` line have appeared, the host sets a hardware breakpoint on a function of the target's
   binary, at the image bias init logs for it plus the function's address in the binary's symbol
-  table, read from the symbols store's file of its build
-  id ([docs/build-system.md](build-system.md#symbols-store) § Symbols Store), and types `hello` at
-  the shell over the serial line, whose spawn and reap run it: `memmgr::admit` (memmgr's receive
-  loop, in an allocation's admission), `procmgr::handle_create` (a procmgr request worker, in the
-  create), and `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main
-  thread, in the reap). On each stop it checks that the program counter is the function's and the
-  code there is the binary's, since another process can run code at the same address, moves that
-  CPU's program counter, removes the breakpoint, and resumes the VM.
+  table, read from the symbols store's file of its build id
+  ([docs/build-system.md](build-system.md#symbols-store) § Symbols Store), and types `hello` at the
+  shell over the serial line, whose spawn and reap run it: `memmgr::admit` (a memmgr receive thread
+  other than the main one, in an allocation's admission; it stops only on a CPU other than CPU 0, so
+  the boot has at least 2 CPUs, and the shell runs `/programs/hello` up to 8 times until such a
+  stop), `procmgr::handle_create` (a procmgr request worker, in the create), and
+  `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main thread, in the
+  reap). On each stop it checks that the program counter is the function's and the code there is the
+  binary's, since another process can run code at the same address, moves that CPU's program
+  counter, removes the breakpoint, and resumes the VM.
 
 A boot passes when, after the kill, QMP's `SHUTDOWN` event gives reason `guest-shutdown` and QEMU
 exits on its own within two minutes. The paths it covers are pwrmgr's core-death power-off for

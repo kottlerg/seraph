@@ -459,11 +459,12 @@ memmgr serves frame requests over IPC. The contract:
   chosen VA via `mem_map` (which already accepts a multi-page
   `page_count` argument).
 - **Zeroed frames.** Every page of a returned Memory cap, and every page a
-  demand fault backs, reads zero: memmgr zeroes each run when it hands the
-  run out, whatever path returned it to the pool, so no process receives
-  what an earlier owner or the kernel left in a frame
+  demand fault backs, reads zero: memmgr has the kernel zero each run
+  (`SYS_MEMORY_ZERO`) when it hands the run out, whatever path returned it
+  to the pool, so no process receives what an earlier owner or the kernel
+  left in a frame
   ([`services/memmgr/docs/memory-pool.md`](../services/memmgr/docs/memory-pool.md#frame-contents)
-  § Frame contents). The kernel zeroes RAM only once, at boot.
+  § Frame contents).
 - **Caller releases.** `RELEASE_MEMORY_CAPS` returns a granted region to the
   pool mid-life, named by the opaque region id memmgr reported at grant (the caller
   need not still hold the cap — it may have retyped the region, deleted the

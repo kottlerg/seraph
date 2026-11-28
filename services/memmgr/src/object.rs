@@ -22,14 +22,14 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, PAGE_SIZE};
 
 use crate::capture::Dest;
 use crate::{
-    Answer, FaultDecline, MemLedger, SCRUB_VA, SCRUB_WINDOW_PAGES, back_span_with, cap_badge,
+    Answer, COPY_VA, COPY_WINDOW_PAGES, FaultDecline, MemLedger, back_span_with, cap_badge,
     delete_caps, ensure_committed_slots, fault_target, ledger_mut, map_self,
     release_unmapped_chunk, self_aspace,
 };
 
 const _: () = assert!(FILL_CHUNKS as u64 == memmgr_labels::FILL_CHUNKS);
-// An `OBJECT_READ` maps its destination pages at the scrub window at once.
-const _: () = assert!(memmgr_labels::OBJECT_READ_PAGES <= SCRUB_WINDOW_PAGES);
+// An `OBJECT_READ` maps its destination pages at the copy window at once.
+const _: () = assert!(memmgr_labels::OBJECT_READ_PAGES <= COPY_WINDOW_PAGES);
 
 /// Bytes of a page, as a `usize`.
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
@@ -351,24 +351,24 @@ fn fill_run(
 }
 
 /// Copy the `pages` pages of `obj` from its page `first` into the run of the
-/// Memory cap `cap`, mapped read-write at [`SCRUB_VA`] and unmapped again
+/// Memory cap `cap`, mapped read-write at [`COPY_VA`] and unmapped again
 /// after the copy, as every pass through the window leaves it.
 fn copy_run(l: &mut MemLedger, obj: NodeIdx, first: u64, cap: u64, pages: u32) -> Result<(), i64>
 {
     let pages = u64::from(pages);
-    // SAFETY: the scrub window is memmgr's own zone, which every pass leaves
+    // SAFETY: the copy window is memmgr's own zone, which every pass leaves
     // unmapped, a failed map included, and a run of at most a chunk's pages
     // lies in it.
-    unsafe { map_self(l, cap, SCRUB_VA, 0, pages) }?;
+    unsafe { map_self(l, cap, COPY_VA, 0, pages) }?;
     let len = usize::try_from(pages.saturating_mul(PAGE_SIZE)).unwrap_or(0);
     // SAFETY: the window's `pages` pages are mapped read-write above to the
     // run, which nothing else maps yet, and the slice is not used past the
     // unmap below.
-    let dst = unsafe { core::slice::from_raw_parts_mut(SCRUB_VA as *mut u8, len) };
+    let dst = unsafe { core::slice::from_raw_parts_mut(COPY_VA as *mut u8, len) };
     copy_pages(l, obj, first, dst);
     // SAFETY: the span is the window's pages mapped above. The unmap is inline
     // assembly without `nomem`, so the stores are made before it.
-    unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, pages) }
+    unsafe { syscall::mem_unmap(self_aspace(), COPY_VA, pages) }
 }
 
 /// The error label of a `FILL_REGION` whose fault would be declined for

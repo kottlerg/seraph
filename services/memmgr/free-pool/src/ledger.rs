@@ -631,6 +631,15 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         (free < self.promised || self.short_draw) && free <= floor.saturating_add(band)
     }
 
+    /// Whether a committed draw found too few free pages since the draw room
+    /// last opened ([`Self::note_short_draw`]): memmgr evicts for frames
+    /// until it opens (`ipc::memmgr_labels::QUERY_POOL_STATUS` `data[22]`).
+    #[must_use]
+    pub const fn draw_short(&self) -> bool
+    {
+        self.short_draw
+    }
+
     /// Record that a committed draw found too few free pages, so memmgr
     /// evicts for frames until the draw room opens ([`Self::frames_short`]).
     pub fn note_short_draw(&mut self)

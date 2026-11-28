@@ -1488,17 +1488,34 @@ pub fn memory_pressure() -> Option<MemoryPressure> {
     }
 }
 
-/// memmgr's draw room in bytes: what a fault on a committed page of a process
-/// outside the system reserve may take from the free pool now
-/// (`QUERY_POOL_STATUS` `data[16]`; `services/memmgr/docs/memory-pool.md`
-/// § Commit, Overcommit). A fault memmgr declined as a commit overrun can be
-/// backed once it is open, at a demand chunk's bytes or more, which write-out
-/// to swap brings about while the level stays `Critical`; memmgr signals its
-/// opening ([`COMMIT_DRAW_ROOM_BIT`]) and not its closing. `None` if memmgr
-/// is unreachable.
+/// memmgr's draw room, read in one `QUERY_POOL_STATUS` reply
+/// ([`commit_draw_room`]; `services/memmgr/docs/memory-pool.md` § Commit,
+/// Overcommit).
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn commit_draw_room_bytes() -> Option<u64> {
-    pal_alloc::memmgr_query_draw_room()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitDrawRoom {
+    /// What a fault on a committed page of a process outside the system
+    /// reserve may take from the free pool now, in bytes (`data[16]`). A
+    /// fault memmgr declined as a commit overrun can be backed once it is
+    /// open, at a demand chunk's bytes or more, which write-out to swap
+    /// brings about while the level stays `Critical`; memmgr signals its
+    /// opening ([`COMMIT_DRAW_ROOM_BIT`]) and not its closing.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub bytes: u64,
+    /// Whether memmgr evicts for a committed draw it found short since the
+    /// draw room last opened (`data[22]`), which opens the room again; it
+    /// stops at the opening, so a room another draw closed after it reads
+    /// short with this false.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub evicting: bool,
+}
+
+/// memmgr's draw room and whether it evicts for a short committed draw
+/// ([`CommitDrawRoom`]), one snapshot. `None` if memmgr is unreachable.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn commit_draw_room() -> Option<CommitDrawRoom> {
+    let (bytes, evicting) = pal_alloc::memmgr_query_draw_room()?;
+    Some(CommitDrawRoom { bytes, evicting })
 }
 
 /// The bit memmgr sends on [`memory_pressure_notification`] when the
@@ -1507,7 +1524,7 @@ pub fn commit_draw_room_bytes() -> Option<u64> {
 pub const MEMORY_PRESSURE_BIT: u64 = pal_alloc::PRESSURE_BIT;
 
 /// The bit memmgr sends on [`memory_pressure_notification`] when its draw
-/// room opens ([`commit_draw_room_bytes`]).
+/// room opens ([`commit_draw_room`]).
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub const COMMIT_DRAW_ROOM_BIT: u64 = pal_alloc::DRAW_ROOM_BIT;
 
@@ -1521,7 +1538,7 @@ pub const COMMIT_DRAW_ROOM_BIT: u64 = pal_alloc::DRAW_ROOM_BIT;
 /// coalesces with one not yet taken, so each bit a wake carries says that
 /// its event happened at least once since the last wake: the level changed
 /// at least once, perhaps back to where it was, or the draw room opened;
-/// [`memory_pressure`] and [`commit_draw_room_bytes`] then read them.
+/// [`memory_pressure`] and [`commit_draw_room`] then read them.
 /// A process that registers another Notification with memmgr itself
 /// (`memmgr_labels::REGISTER_PRESSURE`) replaces this one, which is then
 /// signalled no more.

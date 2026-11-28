@@ -23,7 +23,9 @@ stall (`CRASHD_OOM_STALL_MS`; the shipped recipe sets 10 000 ms): the fault wait
 of 16 endpoints crashd made at start, no thread of crashd waiting on it, until the memory it waits
 for is there, memmgr's pressure level below `CRITICAL` or, for a commit overrun, memmgr's draw room
 open, or for a fault no free page could back either of them, when crashd resumes it, or the stall
-passes, when crashd reports and declines it.
+passes, when crashd reports and declines it. A held commit overrun whose draw room reads short while
+memmgr is not evicting for it is re-asked: resumed into memmgr again, which backs it or declines it
+again and evicts, and its repeat is held again to the same deadline.
 
 Before the decline, when the `CORE_DUMP` entry of its recipe's environment names the process,
 crashd writes an ELF core of it to `/crash` on the root filesystem, which host `gdb` reads, under

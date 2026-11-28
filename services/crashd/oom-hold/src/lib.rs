@@ -20,8 +20,21 @@
 //! give it; one of a commit overrun is resumed again, remembered until that
 //! deadline, since one opening of the draw room backs one committed draw and
 //! another draw may have taken it first. The holds of one fault total at most
-//! the stall (`services/crashd/docs/operation.md` § Hold). A
-//! redirected fault reaches its slot's endpoint only when its thread next
+//! the stall (`services/crashd/docs/operation.md` § Hold).
+//!
+//! memmgr evicts for a commit overrun from its decline until the draw room
+//! next opens, and signals only the opening, which another draw can close
+//! again before crashd reads it. A held commit overrun whose room reads short
+//! while memmgr reads as not evicting for it ([`Rooms::evicting`]) is
+//! therefore re-asked ([`Holds::reasks`]): resumed, so its thread faults into
+//! memmgr again, which backs it or declines it again and evicts. Its repeat
+//! is held to its first hold's deadline, quietly, so a re-ask does not
+//! lengthen its stall. Its slot is kept for the repeat only while another is
+//! free, and not once its thread faults at another page, since crashd cannot
+//! tell a re-asked fault memmgr backed, whose repeat never comes, from one on
+//! its way: no fault is turned away while a slot stands idle.
+//!
+//! A redirected fault reaches its slot's endpoint only when its thread next
 //! runs, so a hold ends when its memory is there only once its fault has
 //! arrived ([`Holds::arrived`]). A
 //! held fault the kernel withdraws from its slot after it arrived (a stop, a
@@ -164,6 +177,10 @@ pub struct Rooms
     pub level: Room,
     /// For a fault that waits on the draw room.
     pub draw: Room,
+    /// Whether memmgr evicts for a committed draw it found short since the
+    /// draw room last opened (`QUERY_POOL_STATUS` `data[22]`), so the room
+    /// opens again and memmgr signals it; true when it cannot be read.
+    pub evicting: bool,
 }
 
 impl Rooms
@@ -236,6 +253,9 @@ pub struct Held
     pub deadline: u64,
     /// Whether the fault has been seen queued on the slot's endpoint.
     pub arrived: bool,
+    /// Whether it is the repeat of a re-asked fault ([`Holds::reasks`]), held
+    /// again quietly.
+    pub reasked: bool,
 }
 
 /// Why crashd ends a hold ([`Holds::end`]).
@@ -246,6 +266,9 @@ pub enum Why
     RoomOpened,
     /// The hold's deadline passed ([`Holds::due`]).
     Due,
+    /// Its room reads short and memmgr not evicting for it
+    /// ([`Holds::reasks`]).
+    Reask,
 }
 
 /// What crashd's receive on a held fault's slot endpoint found.
@@ -265,6 +288,9 @@ pub enum Ended
 {
     /// Resume the fault, which crashd remembers for the repeat rule.
     Resume(Held),
+    /// Resume the fault as a re-ask, which crashd remembers for the repeat
+    /// rule and keeps its slot for, as [`Holds::admit`] lends it.
+    Reasked(Held),
     /// Report and decline the fault: its stall passed.
     Decline(Held),
     /// The fault arrived and was no longer queued on the slot's endpoint;
@@ -282,6 +308,8 @@ struct Resumed
 {
     key: Key,
     deadline: u64,
+    /// Whether it was resumed as a re-ask, so its repeat is held quietly.
+    reasked: bool,
 }
 
 /// The held faults and the resumed ones the repeat rule reads. Times are in
@@ -294,6 +322,10 @@ pub struct Holds
     /// Slots crashd took out of use, their endpoints gone ([`Holds::retire`]).
     retired: [bool; SLOTS],
     resumed: [Option<Resumed>; SLOTS],
+    /// The slots kept for the repeat of a re-asked fault, each until its
+    /// first hold's deadline, its thread's fault at another page, or a new
+    /// fault that finds no other slot free.
+    kept: [Option<Resumed>; SLOTS],
 }
 
 impl Holds
@@ -307,6 +339,7 @@ impl Holds
             held: [None; SLOTS],
             retired: [false; SLOTS],
             resumed: [None; SLOTS],
+            kept: [None; SLOTS],
         }
     }
 
@@ -330,7 +363,10 @@ impl Holds
             return Admit::Decline(Refusal::NoStall);
         }
         self.forget_expired(now);
+        self.forget_moved_on(key);
         let repeat = self.take_resumed(key);
+        let reasked = repeat.is_some_and(|r| r.reasked);
+        let repeat = repeat.map(|r| r.deadline);
         let waits = match (repeat, waits)
         {
             (Some(_), Waits::LevelOrDrawRoom) => Waits::Level,
@@ -340,41 +376,102 @@ impl Holds
         {
             (Some(deadline), Room::Open) if waits == Waits::DrawRoom =>
             {
-                self.remember(key, deadline);
+                self.remember(Resumed {
+                    key,
+                    deadline,
+                    reasked: false,
+                });
                 Admit::Resume
             }
             (Some(_), Room::Open) => Admit::Decline(Refusal::Repeat),
-            (Some(deadline), Room::Short) => self.hold(key, waits, now, deadline),
+            (Some(deadline), Room::Short) => self.hold(
+                waits,
+                now,
+                Resumed {
+                    key,
+                    deadline,
+                    reasked,
+                },
+            ),
             (None, Room::Open) =>
             {
-                self.remember(key, now.saturating_add(self.stall_ms));
+                self.remember(Resumed {
+                    key,
+                    deadline: now.saturating_add(self.stall_ms),
+                    reasked: false,
+                });
                 Admit::Resume
             }
-            (None, Room::Short) => self.hold(key, waits, now, now.saturating_add(self.stall_ms)),
+            (None, Room::Short) => self.hold(
+                waits,
+                now,
+                Resumed {
+                    key,
+                    deadline: now.saturating_add(self.stall_ms),
+                    reasked: false,
+                },
+            ),
         }
     }
 
-    /// Hold `key`, which waits for `waits`, in a free slot until `deadline`.
-    fn hold(&mut self, key: Key, waits: Waits, now: u64, deadline: u64) -> Admit
+    /// Hold the fault `of` names, which waits for `waits`, until its deadline,
+    /// as the repeat of a re-asked fault when it says so: in the slot kept for
+    /// it at `now`, when it repeats a re-asked fault, else in a
+    /// free slot kept for no other fault's repeat, else in the free kept slot
+    /// whose keeping ends first. crashd cannot tell a re-asked fault memmgr
+    /// backed, whose repeat never comes, from one still on its way, so a kept
+    /// slot is only preferred: a fault is never turned away while a slot is
+    /// free.
+    fn hold(&mut self, waits: Waits, now: u64, of: Resumed) -> Admit
     {
-        let Some((slot, free)) = self
-            .held
-            .iter_mut()
-            .zip(self.retired)
-            .enumerate()
-            .find(|(_, (held, retired))| held.is_none() && !retired)
-            .map(|(slot, (free, _))| (slot, free))
+        let Resumed {
+            key,
+            deadline,
+            reasked,
+        } = of;
+        let kept_for = |slot: usize| {
+            self.kept
+                .get(slot)
+                .copied()
+                .flatten()
+                .filter(|k| k.deadline > now)
+                .map(|k| k.key)
+        };
+        let free = |slot: usize| {
+            self.held.get(slot).is_some_and(Option::is_none)
+                && !self.retired.get(slot).copied().unwrap_or(true)
+        };
+        let own = (0..SLOTS).find(|&slot| free(slot) && kept_for(slot) == Some(key));
+        let unkept = || (0..SLOTS).find(|&slot| free(slot) && kept_for(slot).is_none());
+        let lent = || {
+            (0..SLOTS).filter(|&slot| free(slot)).min_by_key(|&slot| {
+                self.kept
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .map_or(0, |k| k.deadline)
+            })
+        };
+        let Some(slot) = own.or_else(unkept).or_else(lent)
         else
         {
             return Admit::Decline(Refusal::SlotsFull);
         };
-        *free = Some(Held {
-            key,
-            waits,
-            since: now,
-            deadline,
-            arrived: false,
-        });
+        if let Some(kept) = self.kept.get_mut(slot)
+        {
+            *kept = None;
+        }
+        if let Some(cell) = self.held.get_mut(slot)
+        {
+            *cell = Some(Held {
+                key,
+                waits,
+                since: now,
+                deadline,
+                arrived: false,
+                reasked,
+            });
+        }
         Admit::Hold { slot, deadline }
     }
 
@@ -412,6 +509,8 @@ impl Holds
     ///
     /// A fault found is resumed when its memory came back, and remembered for the
     /// repeat rule until its deadline, or declined when its deadline passed.
+    /// One re-asked is resumed and remembered as well, and its slot kept for
+    /// its repeat as [`Holds::admit`] says.
     /// Nothing found after the fault arrived means it was withdrawn: its
     /// thread was stopped (a debugger's attach), destroyed with its process,
     /// or its exception class rebound, and the kernel ended or redelivered
@@ -421,7 +520,7 @@ impl Holds
     {
         let cell = self.held.get_mut(slot)?;
         let held = (*cell)?;
-        if let (Found::Nothing, false, Why::RoomOpened) = (found, held.arrived, why)
+        if let (Found::Nothing, false, Why::RoomOpened | Why::Reask) = (found, held.arrived, why)
         {
             return None;
         }
@@ -432,11 +531,58 @@ impl Holds
             (Found::Nothing, _) => Ended::Undelivered(held),
             (Found::Fault, Why::RoomOpened) =>
             {
-                self.remember(held.key, held.deadline);
+                self.remember(Resumed {
+                    key: held.key,
+                    deadline: held.deadline,
+                    reasked: false,
+                });
                 Ended::Resume(held)
+            }
+            (Found::Fault, Why::Reask) =>
+            {
+                let resumed = Resumed {
+                    key: held.key,
+                    deadline: held.deadline,
+                    reasked: true,
+                };
+                self.remember(resumed);
+                if let Some(kept) = self.kept.get_mut(slot)
+                {
+                    *kept = Some(resumed);
+                }
+                Ended::Reasked(held)
             }
             (Found::Fault, Why::Due) => Ended::Decline(held),
         })
+    }
+
+    /// The fault held in `slot`, if any.
+    #[must_use]
+    pub fn held(&self, slot: usize) -> Option<Held>
+    {
+        self.held.get(slot).copied().flatten()
+    }
+
+    /// The slots that hold a commit overrun that has arrived, to re-ask at
+    /// `rooms`: each, when the draw room reads short and memmgr not evicting
+    /// for a short draw. memmgr's latch clears only on a turn that ends with
+    /// the draw room open, so a draw that closes the room after that leaves
+    /// memmgr evicting for nothing while these wait for the room; each
+    /// re-ask is backed, or declined again, which sets the latch and comes
+    /// back to crashd as a repeat. Every such fault is re-asked at once: one
+    /// that memmgr backs sets nothing, so a fault left held would wait with
+    /// nothing to read the room again for it. A fault of code 7 is not
+    /// re-asked: its decline does not set the latch.
+    pub fn reasks(&self, rooms: Rooms) -> impl Iterator<Item = usize> + '_
+    {
+        let ask = rooms.draw == Room::Short && !rooms.evicting;
+        self.held
+            .iter()
+            .enumerate()
+            .filter_map(move |(slot, held)| {
+                held.filter(|h| ask && h.arrived && h.waits == Waits::DrawRoom)
+                    .map(|_| slot)
+            })
     }
 
     /// The slots that hold a fault.
@@ -481,11 +627,12 @@ impl Holds
         self.held.iter().flatten().map(|h| h.deadline).min()
     }
 
-    /// Remember a resumed fault of `key` until `deadline`, in place of an
+    /// Remember `resumed`, a resumed fault, until its deadline, in place of an
     /// earlier entry of the same key, else in a free entry, else in place of
     /// the entry that expires first.
-    fn remember(&mut self, key: Key, deadline: u64)
+    fn remember(&mut self, resumed: Resumed)
     {
+        let key = resumed.key;
         let same = self
             .resumed
             .iter()
@@ -502,18 +649,31 @@ impl Holds
             .or(soonest)
             .and_then(|at| self.resumed.get_mut(at))
         {
-            *cell = Some(Resumed { key, deadline });
+            *cell = Some(resumed);
         }
     }
 
-    /// The deadline of a remembered resume of `key`, which this forgets.
-    fn take_resumed(&mut self, key: Key) -> Option<u64>
+    /// The remembered resume of `key`, which this forgets.
+    fn take_resumed(&mut self, key: Key) -> Option<Resumed>
     {
         self.resumed
             .iter_mut()
             .find(|r| r.is_some_and(|r| r.key == key))?
             .take()
-            .map(|r| r.deadline)
+    }
+
+    /// Stop keeping a slot for a re-asked fault of `key`'s thread at another
+    /// page: the thread faulted on past it, so memmgr backed it, and its
+    /// repeat never comes.
+    fn forget_moved_on(&mut self, key: Key)
+    {
+        for cell in &mut self.kept
+        {
+            if cell.is_some_and(|k| k.key.badge == key.badge && k.key.page != key.page)
+            {
+                *cell = None;
+            }
+        }
     }
 
     /// Forget each remembered resume whose deadline has passed at `now`: a
@@ -541,12 +701,14 @@ mod tests
     const SHORT: Rooms = Rooms {
         level: Room::Short,
         draw: Room::Short,
+        evicting: true,
     };
 
     /// Memory there for every fault.
     const OPEN: Rooms = Rooms {
         level: Room::Open,
         draw: Room::Open,
+        evicting: true,
     };
 
     fn key(badge: u64) -> Key
@@ -928,6 +1090,7 @@ mod tests
         let level_only = Rooms {
             level: Room::Open,
             draw: Room::Short,
+            evicting: true,
         };
         let mut holds = Holds::new(STALL);
         let Admit::Hold { slot: commit, .. } = holds.admit(0, key(1), waits_on(11), level_only)
@@ -952,6 +1115,7 @@ mod tests
         let draw_only = Rooms {
             level: Room::Short,
             draw: Room::Open,
+            evicting: true,
         };
         assert_eq!(holds.opened(draw_only).collect::<Vec<_>>(), [commit]);
         assert_eq!(holds.opened(level_only).collect::<Vec<_>>(), [level]);
@@ -1011,10 +1175,12 @@ mod tests
         let draw_only = Rooms {
             level: Room::Short,
             draw: Room::Open,
+            evicting: true,
         };
         let level_only = Rooms {
             level: Room::Open,
             draw: Room::Short,
+            evicting: true,
         };
         assert_eq!(draw_only.of(Waits::LevelOrDrawRoom), Room::Open);
         assert_eq!(level_only.of(Waits::LevelOrDrawRoom), Room::Open);
@@ -1055,5 +1221,169 @@ mod tests
             holds.admit(20, key(2), waits_on(7), draw_only),
             Admit::Resume
         );
+    }
+    /// The slot `admit` holds its fault in.
+    fn slot_of(admit: Admit) -> usize
+    {
+        match admit
+        {
+            Admit::Hold { slot, .. } => slot,
+            other @ (Admit::Resume | Admit::Decline(_)) => panic!("not held: {other:?}"),
+        }
+    }
+
+    /// A commit overrun's room short, memmgr evicting for nothing.
+    const IDLE: Rooms = Rooms {
+        level: Room::Short,
+        draw: Room::Short,
+        evicting: false,
+    };
+
+    // The defect caught: memmgr's latch, which keeps it evicting for a commit
+    // overrun, clears when the draw room opens; a draw that closes the room
+    // before crashd reads it left the held fault waiting on a room nothing
+    // would open, until its stall passed. Each arrived commit overrun is
+    // re-asked then, and no other fault.
+    #[test]
+    fn a_short_room_memmgr_does_not_evict_for_reasks_each_arrived_commit_overrun()
+    {
+        let mut holds = Holds::new(STALL);
+        let a = slot_of(holds.admit(0, key(1), waits_on(11), SHORT));
+        let b = slot_of(holds.admit(0, key(2), waits_on(11), SHORT));
+        let level = slot_of(holds.admit(0, key(3), waits_on(8), SHORT));
+        let either = slot_of(holds.admit(0, key(4), waits_on(7), SHORT));
+        let late = slot_of(holds.admit(0, key(5), waits_on(11), SHORT));
+        for slot in [a, b, level, either]
+        {
+            holds.arrived(slot);
+        }
+        // memmgr evicting, or the room open: nothing to re-ask.
+        assert_eq!(holds.reasks(SHORT).count(), 0);
+        let open_idle = Rooms {
+            draw: Room::Open,
+            ..IDLE
+        };
+        assert_eq!(holds.reasks(open_idle).count(), 0);
+        // Short and idle: both arrived commit overruns, not the fault still on
+        // its way, nor those of codes 8 and 7.
+        assert_eq!(holds.reasks(IDLE).collect::<Vec<_>>(), [a, b]);
+        assert!(matches!(
+            holds.end(a, Why::Reask, Found::Fault),
+            Some(Ended::Reasked(Held { reasked: false, .. }))
+        ));
+        assert!(matches!(
+            holds.end(b, Why::Reask, Found::Fault),
+            Some(Ended::Reasked(_))
+        ));
+        assert_eq!(holds.end(late, Why::Reask, Found::Nothing), None);
+        // memmgr backs A's retry: nothing comes back for it. It declines B's,
+        // which comes back as a repeat with memmgr evicting: held again in
+        // its own slot, to its first hold's deadline.
+        assert_eq!(
+            holds.admit(10, key(2), waits_on(11), SHORT),
+            Admit::Hold {
+                slot: b,
+                deadline: STALL
+            }
+        );
+        assert!(holds.held(b).is_some_and(|h| h.reasked));
+        holds.arrived(b);
+        assert_eq!(holds.reasks(SHORT).count(), 0);
+    }
+
+    // The defect caught: a re-asked fault memmgr backs never comes back, so a
+    // slot kept for its repeat turned away new faults until its deadline,
+    // and the backed thread's next commit overrun was declined while the
+    // slot stood idle. A fault of that thread at another page ends the
+    // keeping, and a kept slot is lent to a new fault when no other is free.
+    #[test]
+    fn a_reasked_faults_slot_is_kept_only_while_another_is_free()
+    {
+        let mut holds = Holds::new(STALL);
+        // Thread 2's slot is kept to an earlier deadline than thread 1's, so a
+        // slot lent would be thread 2's.
+        let b = slot_of(holds.admit(0, key(2), waits_on(11), SHORT));
+        let a = slot_of(holds.admit(1, key(1), waits_on(11), SHORT));
+        for badge in 3..=u64::try_from(SLOTS).unwrap_or(0)
+        {
+            slot_of(holds.admit(0, key(badge), waits_on(8), SHORT));
+        }
+        holds.arrived(a);
+        holds.arrived(b);
+        assert_eq!(holds.reasks(IDLE).collect::<Vec<_>>(), [b, a]);
+        for slot in [a, b]
+        {
+            assert!(matches!(
+                holds.end(slot, Why::Reask, Found::Fault),
+                Some(Ended::Reasked(_))
+            ));
+        }
+        // memmgr backs thread 1's retry, and it faults on at another page with
+        // every other slot taken: held, in the slot kept for its backed fault.
+        let moved_on = Key {
+            badge: 1,
+            page: 0x4000_1000,
+        };
+        assert_eq!(
+            holds.admit(2, moved_on, waits_on(11), SHORT),
+            Admit::Hold {
+                slot: a,
+                deadline: 2 + STALL
+            }
+        );
+        assert!(holds.held(a).is_some_and(|h| !h.reasked));
+        // Thread 2's repeat takes the slot kept for it, to its first deadline.
+        assert_eq!(
+            holds.admit(3, key(2), waits_on(11), SHORT),
+            Admit::Hold {
+                slot: b,
+                deadline: STALL
+            }
+        );
+        assert!(holds.held(b).is_some_and(|h| h.reasked));
+    }
+
+    // A kept slot is passed over while another is free, and lent to a new
+    // fault, rather than that fault declined, once none is; the repeat is
+    // held where it finds a slot, as the repeat of a re-ask.
+    #[test]
+    fn a_kept_slot_is_lent_to_a_new_fault_only_when_no_other_is_free()
+    {
+        let mut holds = Holds::new(STALL);
+        let first = slot_of(holds.admit(0, key(1), waits_on(11), SHORT));
+        holds.arrived(first);
+        assert!(matches!(
+            holds.end(first, Why::Reask, Found::Fault),
+            Some(Ended::Reasked(_))
+        ));
+        let mut last = first;
+        for badge in 2..=u64::try_from(SLOTS).unwrap_or(0)
+        {
+            last = slot_of(holds.admit(1, key(badge), waits_on(8), SHORT));
+            assert_ne!(last, first);
+        }
+        assert_eq!(
+            holds.admit(2, key(100), waits_on(8), SHORT),
+            Admit::Hold {
+                slot: first,
+                deadline: 2 + STALL
+            }
+        );
+        assert!(holds.held(first).is_some_and(|h| !h.reasked));
+        // The repeat is held in a slot another fault freed, quietly and to its
+        // first hold's deadline.
+        holds.arrived(last);
+        assert!(matches!(
+            holds.end(last, Why::Due, Found::Fault),
+            Some(Ended::Decline(_))
+        ));
+        assert_eq!(
+            holds.admit(4, key(1), waits_on(11), SHORT),
+            Admit::Hold {
+                slot: last,
+                deadline: STALL
+            }
+        );
+        assert!(holds.held(last).is_some_and(|h| h.reasked));
     }
 }

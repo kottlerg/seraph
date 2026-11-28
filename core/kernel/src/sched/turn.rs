@@ -193,36 +193,40 @@ unsafe fn give_ticks(tcb: *mut ThreadControlBlock, more: u64)
 /// tick of this CPU, the slice's only other writer, runs meanwhile.
 pub unsafe fn lend_turn_out(caller: *mut ThreadControlBlock)
 {
-    // SAFETY: caller is the running thread (contract), whose fields this CPU
-    // alone writes while interrupts are masked.
-    let tcb = unsafe { &mut *caller };
-    // The level is read as a hint, without the sched_lock its writer holds, as
-    // the placement reads it: a level changed meanwhile is the tick's to cut
-    // to (cut_to_level), as it cuts the slice.
-    let level = tcb.priority;
+    // The level is read as a hint through the pointer, without the sched_lock
+    // its writer on another CPU holds, as take_turn and the placement read it:
+    // a level changed meanwhile is the tick's to cut the turn to
+    // (cut_to_level), as it cuts the slice. No reference to the whole TCB is
+    // made, since other CPUs write its fields meanwhile.
+    // SAFETY: caller is a valid TCB (contract).
+    let level = unsafe { (*caller).priority };
     if !super::is_fair_level(level)
     {
         return;
     }
-    let held = tcb.lent_turn.load(Ordering::Relaxed);
+    // SAFETY: as above; lent_turn is atomic, so a shared reference to it is
+    // sound beside the claimants' compare-and-swaps.
+    let lent = unsafe { &(*caller).lent_turn };
+    let held = lent.load(Ordering::Relaxed);
     // A turn of its own started at a level the caller has left since is cut
     // to its level's quantum before the bind moves it, as the tick cuts it.
     let word = cut_to_level(held, level);
     if word != held
     {
-        let _ = tcb
-            .lent_turn
-            .compare_exchange(held, word, Ordering::Relaxed, Ordering::Relaxed);
+        let _ = lent.compare_exchange(held, word, Ordering::Relaxed, Ordering::Relaxed);
     }
     if word != 0 && word != ORPHANED
     {
         return;
     }
-    let own = tcb.slice_remaining;
+    // SAFETY: caller is the running thread (contract): its slice's only other
+    // writer is this CPU's tick, which cannot run while interrupts are masked.
+    let own = unsafe { (*caller).slice_remaining };
     if own > 0
     {
-        tcb.lent_turn.store(u64::from(own), Ordering::Relaxed);
-        tcb.slice_remaining = 1;
+        lent.store(u64::from(own), Ordering::Relaxed);
+        // SAFETY: as for the read above.
+        unsafe { (*caller).slice_remaining = 1 };
     }
 }
 

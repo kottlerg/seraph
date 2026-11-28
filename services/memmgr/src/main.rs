@@ -143,7 +143,7 @@ const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 // reservation-arena zones) are free in its address space. memmgr's private
 // windows, in address order, all below `MAIN_TLS_WINDOW.base`:
 //
-//   scrub window        [SCRUB_VA, + 2 MiB)                 a run being cleared
+//   copy window         [COPY_VA, + 2 MiB)                  a run being written
 //   eviction windows    [evict::EVICT_ZONE_VA, + 256 KiB)   a job's input, a
 //                                                            restore's victim,
 //                                                            a chunk's stream
@@ -164,18 +164,22 @@ const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 // kernel refuses the map and the arena ends at the low zone, which outlasts
 // the RAM such a machine can hold.
 
-/// Base of the scrub window, where memmgr maps a run to zero it before it
-/// hands the run out ([`scrub_run`]; services/memmgr/docs/memory-pool.md
-/// § Frame contents). Deterministic: the window holds a run only while memmgr
-/// clears it, and nothing but memmgr can read memmgr's address space.
-const SCRUB_VA: u64 = 0x0000_0001_0000_0000;
+/// Base of the copy window, where memmgr maps a run whose every byte it
+/// writes with content before it hands the run out: a copy of an object page
+/// ([`copy_page`], `object::copy_run`), an `OBJECT_READ` destination
+/// (`capture::Dest::fill`), a restored chunk (`evict::decode_runs`)
+/// (services/memmgr/docs/memory-pool.md § Frame contents). A run handed out
+/// zeroed is zeroed by the kernel and never mapped here ([`zero_run`]).
+/// Deterministic: the window holds a run only while memmgr writes it, and
+/// nothing but memmgr can read memmgr's address space.
+const COPY_VA: u64 = 0x0000_0001_0000_0000;
 
-/// Pages of the scrub window: the span of one leaf page table on every
-/// paging mode (2 MiB), at a base aligned to it, so the window needs one leaf
-/// table, which the kernel funds once and keeps, since a plain `mem_unmap`
-/// leaves page tables in place. A run larger than the window is cleared one
-/// window at a time.
-const SCRUB_WINDOW_PAGES: u64 = LEAF_TABLE_PAGES;
+/// Pages of the copy window: the span of one leaf page table on every paging
+/// mode (2 MiB), at a base aligned to it, so the window needs one leaf table,
+/// which memmgr funds at startup ([`fund_copy_window`]) and the kernel
+/// keeps, since a plain `mem_unmap` leaves page tables in place. Every copy
+/// maps at most a chunk's run or `OBJECT_READ_PAGES`, which the window holds.
+const COPY_WINDOW_PAGES: u64 = LEAF_TABLE_PAGES;
 
 /// Degraded-fallback scratch VA in memmgr's address space for mapping the
 /// bootstrap phys-table memory cap, and the base of its per-boot draw
@@ -233,8 +237,8 @@ const META_ARENA_HIGH_END: u64 = 1 << 56;
 // Zone-map invariants: each window ends before the next begins, and the
 // arena's worst-case base draw leaves its low zone non-empty.
 const _: () = {
-    assert!(SCRUB_VA.is_multiple_of(SCRUB_WINDOW_PAGES * PAGE_SIZE));
-    assert!(SCRUB_VA + SCRUB_WINDOW_PAGES * PAGE_SIZE <= evict::EVICT_ZONE_VA);
+    assert!(COPY_VA.is_multiple_of(COPY_WINDOW_PAGES * PAGE_SIZE));
+    assert!(COPY_VA + COPY_WINDOW_PAGES * PAGE_SIZE <= evict::EVICT_ZONE_VA);
     assert!(evict::EVICT_ZONE_END <= disk::SWAP_WINDOW_VA);
     assert!(disk::SWAP_WINDOW_END <= disk::SWAP_SLOTS_VA);
     assert!(disk::SWAP_SLOTS_END <= PHYS_TABLE_TEMP_VA);
@@ -925,39 +929,56 @@ unsafe fn map_self_page(l: &mut MemLedger, cap: u64, va: u64) -> bool
 }
 
 /// Zero the `pages` pages of the run `cap` names before it leaves memmgr, a
-/// grant entry or a demand run (services/memmgr/docs/memory-pool.md § Frame
-/// contents): map it window by window at [`SCRUB_VA`] ([`map_self`]), clear
-/// the window, and unmap it again, leaving its page table in place. Every
-/// hand-out passes through here, so no frame reaches a process with what an
-/// earlier owner, or the kernel, left in it, whatever path returned it to the
-/// pool. Returns the error of a map or unmap that failed; the run is then not
-/// all clear, and the caller keeps it from the requester.
-fn scrub_run(l: &mut MemLedger, cap: u64, pages: u64) -> Result<(), i64>
+/// grant entry, a demand run or a zero frame (services/memmgr/docs/
+/// memory-pool.md § Frame contents): the kernel zeroes them through its direct
+/// map (`SYS_MEMORY_ZERO`), so memmgr maps nothing. Every hand-out that does
+/// not write the run whole passes through here, so no frame reaches a process
+/// with what an earlier owner, or the kernel, left in it, whatever path
+/// returned it to the pool. Returns the error of the call that failed; the run
+/// is then not all clear, and the caller keeps it from the requester.
+fn zero_run(cap: u64, pages: u64) -> Result<(), i64>
 {
-    let mut first = 0;
-    while first < pages
+    // SAFETY: `cap` names a run taken from the free pool, whose frames
+    // memmgr maps nowhere in its own address space: no pooled run is an arena
+    // page, an object frame of the own view, or mapped at a window, which every
+    // use leaves unmapped. The zero changes no memory memmgr reads.
+    unsafe { syscall::memory_zero_all(cap, 0, pages) }
+}
+
+/// Fund the copy window's leaf page table at startup, while the pool is full:
+/// map one free page at [`COPY_VA`] and unmap it again, leaving the table in
+/// place, so no copy needs page-table funding later, a restore under memory
+/// pressure among them (services/memmgr/docs/memory-pool.md § Frame
+/// contents). The page goes back to the pool, or, should its unmap fail,
+/// stays memmgr's own. Returns whether the window's table is in place; when
+/// it is not, the first copy funds it as any map into memmgr's own address
+/// space does.
+fn fund_copy_window(l: &mut MemLedger) -> bool
+{
+    let Ok(grant) = select(l, 1, Fit::Contiguous)
+    else
     {
-        // The loop condition keeps `first` below `pages`.
-        let window = pages.saturating_sub(first).min(SCRUB_WINDOW_PAGES);
-        // SAFETY: the scrub window is memmgr's own zone (the zone map above),
-        // which every pass leaves unmapped, a failed map included, so the map
-        // changes nothing memmgr runs on.
-        unsafe { map_self(l, cap, SCRUB_VA, first, window) }?;
-        // `window` is at most `SCRUB_WINDOW_PAGES`, so the byte count is 2 MiB
-        // at most.
-        let bytes = window.saturating_mul(PAGE_SIZE) as usize;
-        // SAFETY: `[SCRUB_VA, SCRUB_VA + bytes)` was mapped read-write just
-        // above and nothing refers to it. The unmap below is inline assembly
-        // without `nomem`, which the compiler must assume reads memory, so the
-        // stores are made before it.
-        unsafe { core::ptr::write_bytes(SCRUB_VA as *mut u8, 0, bytes) };
-        // SAFETY: the span is the scrub window mapped above; nothing memmgr
-        // runs on lies in it.
-        unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, window) }?;
-        // `window` is at most `pages - first`.
-        first = first.saturating_add(window);
+        return false;
+    };
+    let (outer, taken, phys) = grant.entries[0];
+    // SAFETY: the copy window is memmgr's own zone (the zone map above),
+    // which nothing has mapped yet at startup, so the map changes nothing
+    // memmgr runs on.
+    if unsafe { map_self(l, outer, COPY_VA, 0, 1) }.is_err()
+    {
+        return_taken(l, outer, taken, phys);
+        return false;
     }
-    Ok(())
+    // SAFETY: the span is the window page mapped above; nothing refers to it.
+    if unsafe { syscall::mem_unmap(self_aspace(), COPY_VA, 1) }.is_ok()
+    {
+        return_taken(l, outer, taken, phys);
+    }
+    else
+    {
+        l.add_own_pages(u64::from(taken));
+    }
+    true
 }
 
 /// Map one pool frame as the next arena page and carve it into free slots.
@@ -1567,7 +1588,7 @@ fn handle_request_memory_caps(req: &IpcMessage, caps: &[u64], answer: &mut Answe
     // with memmgr: the grant goes back whole, before anything is accounted.
     for &(outer, pages, _) in grant.entries()
     {
-        if scrub_run(l, outer, u64::from(pages)).is_err()
+        if zero_run(outer, u64::from(pages)).is_err()
         {
             rollback_grant(l, &grant, &[]);
             answer.set_status(memmgr_errors::QUOTA);
@@ -2911,8 +2932,9 @@ enum FaultDecline
     /// The run could not be recorded on its chunk in the region's chunk
     /// table.
     FrameRecord = 8,
-    /// A map of the run failed: into memmgr's scrub window to zero it
-    /// ([`scrub_run`]), or into the process, after memmgr funded the
+    /// The kernel's zero of the run failed ([`zero_run`]), or a map of the
+    /// run failed: into memmgr's copy window to write it, or into the
+    /// process, after memmgr funded the
     /// address space's page-table pool as often as [`PT_FUND_ROUNDS`] allows
     /// when the failure was an exhausted pool; the high 32 bits of the reason
     /// word carry the magnitude of its `SyscallError`.
@@ -3037,7 +3059,7 @@ fn select_fault_run(
 /// region of a process with a delegated address space, memmgr backs the part
 /// of the [`chunk_for`] chunk containing the faulting page that no earlier run
 /// backs, with one contiguous Memory cap of up to `DEMAND_CHUNK_PAGES` pages,
-/// zeroed ([`scrub_run`]), and replies [`syscall_abi::FAULT_REPLY_RESUME`]; a
+/// zeroed ([`zero_run`]), and replies [`syscall_abi::FAULT_REPLY_RESUME`]; a
 /// fault on a page an earlier run backed is resumed without backing. When no
 /// free run covers that part, the largest free run backs the pages around the
 /// faulting one ([`fault_window`]), and the process's budget node bounds the
@@ -3304,8 +3326,8 @@ fn back_span(
 {
     // Zero the run before the process can read it (services/memmgr/docs/
     // memory-pool.md § Frame contents).
-    back_span_with(l, target, span_pages, |l, cap, _, pages| {
-        scrub_run(l, cap, u64::from(pages))
+    back_span_with(l, target, span_pages, |_, cap, _, pages| {
+        zero_run(cap, u64::from(pages))
     })
 }
 
@@ -3829,7 +3851,7 @@ fn copy_object_page(
         page_count: u64::from(pages),
         phys_base: phys,
     };
-    // The copy writes the whole page, so it needs no scrub.
+    // The copy writes the whole page, so it needs no zero.
     let src_va = source.va.saturating_add(off.saturating_mul(PAGE_SIZE));
     // SAFETY: `source` is a frame of the object the attachment holds, whose
     // `va` is its first page in memmgr's own view and `off` is below its page
@@ -3865,7 +3887,7 @@ fn copy_object_page(
 }
 
 /// Copy the object page memmgr's own view maps at `src_va` into the first
-/// page of `dst`, mapped read-write at [`SCRUB_VA`] and unmapped again after
+/// page of `dst`, mapped read-write at [`COPY_VA`] and unmapped again after
 /// the copy, as every pass through the window leaves it.
 ///
 /// # Safety
@@ -3875,24 +3897,20 @@ fn copy_object_page(
 /// object retires only between turns ([`retire_objects`]).
 unsafe fn copy_page(l: &mut MemLedger, src_va: u64, dst: u64) -> Result<(), i64>
 {
-    // SAFETY: the scrub window is memmgr's own zone (the zone map above),
+    // SAFETY: the copy window is memmgr's own zone (the zone map above),
     // which every pass leaves unmapped, so the map changes nothing memmgr runs
     // on.
-    unsafe { map_self(l, dst, SCRUB_VA, 0, 1) }?;
+    unsafe { map_self(l, dst, COPY_VA, 0, 1) }?;
     // SAFETY: the window page was mapped just above and nothing else refers
     // to it; the caller's contract maps `src_va` readable, in the object zone,
     // apart from the window. The unmap below is inline assembly without
     // `nomem`, which the compiler must assume reads memory, so the stores are
     // made before it.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            src_va as *const u8,
-            SCRUB_VA as *mut u8,
-            PAGE_SIZE as usize,
-        );
+        core::ptr::copy_nonoverlapping(src_va as *const u8, COPY_VA as *mut u8, PAGE_SIZE as usize);
     }
     // SAFETY: the span is the window page mapped above.
-    unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, 1) }
+    unsafe { syscall::mem_unmap(self_aspace(), COPY_VA, 1) }
 }
 
 /// Total pages of RAM memmgr owns: every page it has taken ownership of since
@@ -4859,7 +4877,7 @@ fn attach_region(
 /// # Errors
 /// The label of the error reply: `LIMIT` for more pages than one zero frame
 /// backs, `OUT_OF_MEMORY_BEST_EFFORT` when the pool cannot spare the page or
-/// its scrub fails, `QUOTA` when the arena cannot grow for its record.
+/// its zero fails, `QUOTA` when the arena cannot grow for its record.
 fn attach_zero_frame(l: &mut MemLedger, pages: u64) -> Result<(NodeIdx, bool), u64>
 {
     if let Some(zero) = l.zero_frame_for(pages)
@@ -4873,7 +4891,7 @@ fn attach_zero_frame(l: &mut MemLedger, pages: u64) -> Result<(NodeIdx, bool), u
     let grant =
         select(l, 1, Fit::Contiguous).map_err(|_| memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT)?;
     let (outer, taken, phys) = grant.entries[0];
-    if scrub_run(l, outer, u64::from(taken)).is_err()
+    if zero_run(outer, u64::from(taken)).is_err()
     {
         return_taken(l, outer, taken, phys);
         return Err(memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
@@ -5653,6 +5671,10 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
             OBJECT_ZONE_VA,
             OBJECT_ZONE_END.saturating_sub(OBJECT_ZONE_VA) / PAGE_SIZE,
         );
+
+    // The copy window's page table, funded while the pool is full; without
+    // it the first copy funds the table.
+    let _ = fund_copy_window(l);
 
     // The compression worker, at the fair class's top under memmgr's own
     // `SchedControl` cap. Without it memmgr evicts nothing and serves as

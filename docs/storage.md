@@ -202,7 +202,9 @@ label, or a filesystem UUID. The model is:
   serves with the PCI location devmgr reports for its device
   (`QUERY_DEVICE_LOCATION`), and parses each disk's GPT: the primary, or, when the primary's
   header or entry array fails its CRC32 or `MyLBA` check or cannot be read, the backup at the
-  disk's last LBA, as UEFI 2.10 § 5.3.2 directs; vfsd writes neither copy. Before a runtime
+  disk's last LBA, as UEFI 2.10 § 5.3.2 directs, and the backup too when the primary's array
+  holds more used entries than vfsd keeps of one disk (`MAX_PARTITIONS`, 256, in
+  `services/vfsd/gpt`); vfsd writes neither copy. Before a runtime
   `MOUNT` and the first `GET_SWAP_PARTITION` resolve their role, vfsd queries again from
   the first ordinal not yet queried and holds each disk devmgr served
   since, a disk added or inserted again after startup among them, so a

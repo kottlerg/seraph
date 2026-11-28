@@ -540,7 +540,7 @@ Options:
           Possible values:
           - reboot:         pwrmgr's `REBOOT`, which the `reboot` fixture sends: QMP's reason `guest-reset`
           - power-button:   The ACPI power button, pressed over QMP (`x86_64` only)
-          - memmgr:         The death of memmgr's thread, in an allocation
+          - memmgr:         The death of a memmgr receive thread other than the main one, in an allocation
           - procmgr:        The death of a procmgr request worker, in a create
           - procmgr-reaper: The death of procmgr's reaper thread, in a reap
           - svcmgr:         The death of svcmgr's main thread

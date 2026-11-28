@@ -60,16 +60,18 @@ Production requires before its tag, not code quality: the reviewers own that.
    issues; FAIL only when the Issues cannot be read.
 
 7. Host runs: before the bump, nothing is owed; say so. At a bumped head,
-   read the report the parent names and FAIL when it is missing, when a run
-   Release host runs requires is absent or below its count, when an outcome
-   is anything but `PASS`, or when a run's head is neither the candidate
-   head, the commit to be tagged, nor an earlier commit that contains the
-   bump from which the change to the candidate head is documentation or
-   comments only (`git diff --name-only <run head> <head>` names only
-   Markdown, and `git diff <run head> <head>` alters only comment lines of
-   any other file, text a build embeds such as an `include_str!`,
-   `include_bytes!`, or `global_asm!` input counting as build input, as
-   `docs/testing.md` § Coverage tiers says; § Release Production step 4).
+   read the report the parent names and FAIL when it is missing, when a
+   run Release host runs requires is absent or below its count, when an
+   outcome is anything but `PASS`, when the host-mode boots' `bench-check
+   --mode host` report is absent (its verdicts block nothing), or when a
+   run's head is neither the candidate head, the commit to be tagged, nor
+   an earlier commit that contains the bump from which the change to the
+   candidate head is documentation or comments only (`git diff --name-only
+   <run head> <head>` names only Markdown, and `git diff <run head>
+   <head>` alters only comment lines of any other file, text a build
+   embeds such as an `include_str!`, `include_bytes!`, or `global_asm!`
+   input counting as build input, as `docs/testing.md` § Coverage tiers
+   says; § Release Production step 4).
 
 ## Output
 

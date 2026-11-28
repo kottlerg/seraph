@@ -48,7 +48,7 @@ call passes `scriptPath`, below.
   (core/kernel/docs/hot-path-account.md § Regenerating It; each trace is a one-vCPU boot and
   needs no grant). At its gate, ask the maintainer to approve its merge,
   and merge it once they do. Then run the release host runs (step 4) yourself under an
-  exclusive grant to yourself and write their report to
+  exclusive timing grant to yourself (its host-mode boots measure time) and write their report to
   `target/xtask/review/release-v<X.Y.Z>/host-runs.md`.
 - Run `mode: "audit"` at the commit to tag with `host_runs` that path. When it passes and the
   commit's CI is green, ask the maintainer to approve the tag (step 5), and create and push it

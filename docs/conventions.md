@@ -586,6 +586,11 @@ gives the PR-level linear view.
   `cargo xtask compare-images` and gives the head it ran at and the path of
   the report the command wrote; the pre-merge audit reads that report and
   checks its base, its head, its four cells, and its verdict.
+- Every PR body whose PR states a performance purpose, as
+  [testing.md](testing.md#benchmarks-bench-cell) § Benchmarks defines it, MUST carry in its
+  `## Validation` section the `cargo xtask bench-check --mode host` report of the host-mode
+  runs that section owes, with their `--runs` count and the head they ran at, and the account
+  that section requires of each measurement whose verdict is not `ok`.
 - Every PR body whose diff adds a proof harness or changes one's body, bounds or `kani::any`
   sizes MUST report, in its `## Validation` section, the local sizing run of each such harness
   that [testing.md](testing.md#bounded-verification) § Bounded verification owes: its
@@ -746,7 +751,10 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    debug-port cell (`test debug-port`, on both architectures),
    the hotplug cell (`test hotplug`, on both architectures),
    the CET cell (`test cet`, on x86_64), and the TPM cell (`test tpm`,
-   on x86_64) once each, every bounded proof (`cargo xtask kani`
+   on x86_64) once each, the host-mode boots (the release build's
+   bench-only ktest image and its ubench boot, 5 runs each on x86_64 with
+   `--timing`, [testing.md](testing.md#benchmarks-bench-cell)
+   § Benchmarks), every bounded proof (`cargo xtask kani`
    with no option, which reads no stored pass), and the fuzz campaign: a
    manual dispatch of `fuzz.yml` on `master` while the commit to be
    tagged is its head (`gh workflow run fuzz.yml --ref master`), at the
@@ -755,8 +763,9 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    contains the bump stands for the commit to be tagged when the change between the two is
    documentation or comments only, as [testing.md](testing.md#coverage-tiers)
    § Coverage tiers defines it.
-   Their report, each run's command, `--runs` count, outcome, and head, is
-   written to `target/xtask/review/release-v<X>.<Y>.<Z>/host-runs.md`, the
+   Their report, each run's command, `--runs` count, outcome, and head,
+   with the host-mode boots' `bench-check --mode host` report, which
+   blocks nothing, is written to `target/xtask/review/release-v<X>.<Y>.<Z>/host-runs.md`, the
    file the release audit reads; the release PR's body states its own local
    host runs as § PR-body checklist discipline requires.
 5. Run the release review in `audit` mode at that commit, with that report:

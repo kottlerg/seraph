@@ -1671,9 +1671,15 @@ args! {
         pub host: bool,
 
         /// Rewrite every baseline file and the ENV file, not only those whose
-        /// measurements moved.
+        /// measurements moved; with `--bands`, every band of a measurement
+        /// the logs made.
         #[arg(long)]
         pub all: bool,
+
+        /// Calibrate the host mode's bands from the same logs too: a band for
+        /// each measurement with none, or with `--all` for each the logs made.
+        #[arg(long, requires = "host")]
+        pub bands: bool,
 
         /// The baselines root, which holds `<mode>/<arch>/`.
         #[arg(long, value_name = "DIR", default_value = "xtask/baselines/bench")]

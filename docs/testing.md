@@ -720,10 +720,32 @@ region's instructions only for a window on one CPU that does not idle and that n
 other thread enters.
 
 Icount counts instructions, not time: a change that costs cycles without instructions (a cache
-miss, a TLB flush, a contended line) does not move them. Time is measured on the reference host
-(`--mode host`, x86_64 under KVM, on the release build the cell measures, per-measurement bands
-in `xtask/baselines/bench/host/x86_64/BANDS`), and is report-only: no host-mode baseline is
-checked in yet, so no PR owes a host-mode run.
+miss, a TLB flush, a contended line) does not move them. Time is measured in host mode, on the
+reference host: the release build's bench-only ktest image and its ubench boot, each booted
+under KVM at 4 CPUs with `--timing` under the exclusive grant (`cargo xtask run --arch x86_64
+--cpus 4 --runs 5 --timing`, the ubench boot with `--display framebuffer`), and
+`cargo xtask bench-check --mode host` over their logs, which reports each measurement's lowest
+p50 against its baseline under `xtask/baselines/bench/host/x86_64/` and its band in `BANDS`
+there. Host mode gates nothing: no CI runner is the reference host, and the time one session
+reads bounds no other host's, so its report is evidence that a PR's body accounts for, not a
+check its CI run makes. riscv64 has no host mode: the reference host has no riscv64 KVM and no
+riscv64 hardware.
+
+A PR states a performance purpose when its body states that its purpose is to make a
+benchmarked path faster, or rests a claim on the time a benchmark measures. Such a PR, unless
+its changes outside Markdown are all inert, owes the host-mode runs above, 5 of each boot, at a
+head that covers the merge head (Coverage tiers, When the runs are owed), and its body carries
+their `bench-check --mode host` report with that head. Each measurement whose verdict is not
+`ok` is accounted for in the body: one with no baseline or no band (`NEW`, `NO-BAND`), or one
+the PR moved on purpose, has its baseline, and its band if it had none, written from those logs
+(`cargo xtask bench-baseline --host --bands`), with the reason; for one the PR did not mean to
+move, the PR boots its merge base the same way under the same grant and reports both sets, so
+that a drift of the stored baseline since it was taken is told apart from the PR's own change.
+Any other PR owes no host-mode run. The release host runs take the same report once per release
+candidate (Coverage tiers, Release host runs), so a time that PRs with no performance purpose
+moved is seen before the tag. The bands and the baselines are calibrated together, from 10 runs
+of each boot (`cargo xtask bench-baseline --host --all --bands`), and again when the reference
+host, its kernel or its QEMU changes, as `bench-check`'s `WARNING:` lines show.
 
 ### Crash reports
 
@@ -1533,7 +1555,7 @@ to the tiers below.
 | Canonical | `build-test.yml` | every push / PR: the cells its change owes ([conventions.md § CI Gating](conventions.md#ci-gating)) | full arch × profile × harness at the fixed defaults, and the `bench` cell (Cells below) |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog`, `reserve-creator` and `stopsrc` co-staged in the svctest cell, the svctest boots headless in both profiles, no `cargo xtask test` case or cell boots), and every bounded proof whose pass no run of the repository stored at the same inputs (the `kani` jobs, [Bounded verification](#bounded-verification)) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation, the large-memory cell, and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation, the large-memory cell, and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, the host-mode boots of Benchmarks on x86_64, 5 runs each, and every bounded proof, whatever the release's PRs touched, and the fuzz campaign, a manual dispatch of `fuzz.yml` (see Release host runs below) |
 
 **Cells.** A cell is one launch configuration and the boots made on it; each differs from every
 other cell in that configuration, which is why it stands alone. The table states every cell, its
@@ -2121,7 +2143,8 @@ head (after `git fetch origin`, `git diff $(git merge-base <head> origin/master)
 excludes what a merge or rebase from `master` brings in. A run's surface is the surface that owes
 it: the CPU-count surface for the boundary set, the memory surface for the memory variation, the
 device surfaces that owe a device cell for that cell, and, for the runs a concurrency-fix purpose
-owes, every non-inert line of the PR's own diff. A run at head H covers a later head M when the
+or a performance purpose ([Benchmarks](#benchmarks-bench-cell)) owes, every non-inert line of the
+PR's own diff. A run at head H covers a later head M when the
 PR's own diff makes the same non-inert changes to that run's surface at H and at M. An update from
 `master` that leaves those changes as they were therefore owes no run; one whose conflict
 resolution alters them does. A fix round that alters them breaks the
@@ -2288,7 +2311,9 @@ x86_64 16 and 128 vCPUs) once each (`--runs 1`) in the debug profile and once ea
 profile (`cargo xtask build --release`, then the same `run` command, per the boundary commands
 above), and the memory variation, the large-memory cell, and every device cell (the disk
 variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the
-CET cell, and the TPM cell) once each, and every bounded proof (`cargo xtask kani` with no
+CET cell, and the TPM cell) once each, the host-mode boots of [Benchmarks](#benchmarks-bench-cell)
+(the release build's bench-only ktest image and its ubench boot, 5 runs each on x86_64 with
+`--timing`), and every bounded proof (`cargo xtask kani` with no
 option, which reads no stored pass, [Bounded
 verification](#bounded-verification)), and the fuzz campaign (§ Fuzzing): a manual dispatch of
 `fuzz.yml` on `master` while the commit to be tagged is its head (`gh workflow run fuzz.yml --ref
@@ -2299,7 +2324,8 @@ profiles (CI boots release builds only at 4 CPUs), from a 4Kn disk, from two dis
 with a framebuffer, with a debug port, with a hot-added device, on CET shadow stacks, with a TPM,
 and with 8 GiB of RAM under svctest, carries every proof a pull request's selection or a stored
 pass may have left unverified and a campaign of every fuzz target, and runs the timing report on
-the boundary logs, which is reported and blocks nothing.
+the boundary logs and `bench-check --mode host` on the host-mode logs, each of which is reported
+and blocks nothing.
 A tag's repeated-run check is the burn-in tier, which the tag push starts. The no-IOMMU variant, the
 no-iommu device cell, boots svctest once on each architecture with the machine's IOMMU detached, so
 devmgr's unconfined path still serves every driver (svctest staged as `build-test.yml` stages it, on
@@ -2847,7 +2873,8 @@ note in full.
 [README.md](../README.md), [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [core/ktest/README.md](../core/ktest/README.md), [Build System](build-system.md),
 [Console Model](console-model.md), [Project Conventions](conventions.md),
-[Threat Model](threat-model.md), [programs/hello/README.md](../programs/hello/README.md),
+[Performance](performance.md), [Threat Model](threat-model.md),
+[programs/hello/README.md](../programs/hello/README.md),
 [programs/shell/README.md](../programs/shell/README.md),
 [programs/terminal/README.md](../programs/terminal/README.md),
 [programs/usertest/README.md](../programs/usertest/README.md),

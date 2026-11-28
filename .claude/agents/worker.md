@@ -367,8 +367,9 @@ The validation set is `cargo xtask test`, `cargo xtask lint-docs`, then on both 
 and usertest for services and runtimes (recipes: docs/testing.md § Gating, `xtask/README.md`).
 Run the three coverage screens of § Coverage tiers on your own diff and state which local host
 runs they owe, each at `--runs 1`. An owed run that fails or hangs blocks: report it with the
-log before any re-run, apart from the one re-run alone above. A documentation-only or
-comment-only PR owes `cargo xtask lint-docs` only.
+log before any re-run, apart from the one re-run alone above. A PR that states a performance
+purpose (docs/testing.md § Benchmarks) owes that section's host-mode runs too, under a timing
+grant. A documentation-only or comment-only PR owes `cargo xtask lint-docs` only.
 
 ## Review
 

@@ -27148,7 +27148,7 @@ error: the following required arguments were not provided:
   --from-run <ID>
 
 ["bench-baseline","--from-run","123"]
-ok-all bench-baseline from_run=["123"] host=default all=default baselines=default["xtask/baselines/bench"]
+ok-all bench-baseline from_run=["123"] host=default all=default bands=default baselines=default["xtask/baselines/bench"]
 
 ["bench-baseline","--from-run","1","--host","a"]
 ArgumentConflict

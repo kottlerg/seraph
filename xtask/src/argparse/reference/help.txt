@@ -809,7 +809,8 @@ Arguments:
 Options:
       --from-run <ID>    The CI run whose bench cell artifacts (`bench-x86_64`, `bench-riscv64`) give the icount baselines of both architectures
       --host             Give the host-mode baselines from LOG..., saved run logs of this host's `x86_64` boots under a native accelerator
-      --all              Rewrite every baseline file and the ENV file, not only those whose measurements moved
+      --all              Rewrite every baseline file and the ENV file, not only those whose measurements moved; with `--bands`, every band of a measurement the logs made
+      --bands            Calibrate the host mode's bands from the same logs too: a band for each measurement with none, or with `--all` for each the logs made
       --baselines <DIR>  The baselines root, which holds `<mode>/<arch>/` [default: xtask/baselines/bench]
   -h, --help             Print help
 === xtask bench-baseline --help
@@ -823,7 +824,8 @@ Arguments:
 Options:
       --from-run <ID>    The CI run whose bench cell artifacts (`bench-x86_64`, `bench-riscv64`) give the icount baselines of both architectures
       --host             Give the host-mode baselines from LOG..., saved run logs of this host's `x86_64` boots under a native accelerator
-      --all              Rewrite every baseline file and the ENV file, not only those whose measurements moved
+      --all              Rewrite every baseline file and the ENV file, not only those whose measurements moved; with `--bands`, every band of a measurement the logs made
+      --bands            Calibrate the host mode's bands from the same logs too: a band for each measurement with none, or with `--all` for each the logs made
       --baselines <DIR>  The baselines root, which holds `<mode>/<arch>/` [default: xtask/baselines/bench]
   -h, --help             Print help
 === xtask path-account -h

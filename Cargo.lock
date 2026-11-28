@@ -25,6 +25,10 @@ version = "0.1.5"
 [[package]]
 name = "bench"
 version = "0.1.5"
+dependencies = [
+ "pmu",
+ "syscall-abi",
+]
 
 [[package]]
 name = "boot"
@@ -898,6 +902,7 @@ dependencies = [
 name = "svctest"
 version = "0.1.5"
 dependencies = [
+ "bench",
  "driver-binding",
  "elf",
  "fatfs-parse",
@@ -910,6 +915,7 @@ dependencies = [
  "memmgr-free-pool",
  "namespace-protocol",
  "oomd-policy",
+ "pmu",
  "process-abi",
  "process-layout",
  "procmgr-process-table",

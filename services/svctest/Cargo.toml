@@ -10,6 +10,9 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# `EventCounters`: the pmu_authority phase counts a loop through the event
+# columns a benchmark reports, with the copy svcmgr delivers.
+bench = { path = "../../shared/bench", features = ["pmu"] }
 # `InterruptKind`: the devmgr MSI delivery phase matches the interrupt kind
 # the test-dma fixture reports holding.
 driver-binding = { path = "../../shared/driver-binding" }
@@ -43,6 +46,9 @@ logd-slot-table = { path = "../logd/slot-table" }
 # std's copy and svctest's real log stream are untouched.
 log = { path = "../../shared/log" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
+# `Pmu`, `PmuEvent` and `PmuMode`: the pmu_authority phase describes the CPU's
+# counters through the copy svcmgr delivers and names the events it opens.
+pmu = { path = "../../shared/pmu", features = ["client"] }
 # `Config` and its parsers: the oom phase reads oomd's recipe as oomd does.
 oomd-policy = { path = "../oomd/policy" }
 process-abi = { workspace = true }
@@ -78,6 +84,8 @@ syscall = { path = "../../shared/syscall" }
 # expects RESUME or FORWARD.
 # `PAGE_SIZE`: the argv/env refusal cell declares a header one byte past its
 # one-page cap, and the verified-read phase counts the copy's pages.
+# `SyscallError` also: the pmu_authority phase matches the codes the open of
+# the event counters is refused with.
 syscall-abi = { path = "../../abi/syscall" }
 shmem = { path = "../../shared/shmem" }
 

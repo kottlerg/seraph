@@ -284,6 +284,13 @@ pub fn reconcile_and_launch(
             def.name
         );
     });
+    // One PMU-authority holder, chosen the same way.
+    svcmgr_defs::keep_one_pmu_holder(&mut defs, |def| {
+        log!(
+            warn: "svcmgr: {} also declares pmu_authority; not given",
+            def.name
+        );
+    });
 
     // One actuator, the first declaration in launch order; any later one is
     // a configuration error, launched as an ordinary service.
@@ -650,8 +657,8 @@ fn release_registration(pending: &PendingRegistration)
 
 /// Clone the launch surfaces the restart path replays from a parsed
 /// definition: argv/env/cwd/seed byte-for-byte, the log-sink,
-/// debug-authority, `oom_stop`, stop-authority, entropy-authority, reserve
-/// and `private_image` flags, the `stop_source` class, and the scheduling
+/// debug-authority, `oom_stop`, stop-authority, entropy-authority,
+/// PMU-authority, reserve and `private_image` flags, the `stop_source` class, and the scheduling
 /// fields. `shutdown_actuator` starts clear; the caller sets it for the
 /// recognised shutdown actuator, and the restart reads it for the pinned
 /// create and the core-death RECV. The name, binary, policy and namespace
@@ -674,6 +681,7 @@ fn recipe_from(def: &Definition) -> Option<RestartRecipe>
         oom_stop: def.oom_stop,
         stop_authority: def.stop_authority,
         entropy_authority: def.entropy_authority,
+        pmu_authority: def.pmu_authority,
         reserve: def.reserve,
         private_image: def.private_image,
         stop_source: def.stop_source,

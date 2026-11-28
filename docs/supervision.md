@@ -249,7 +249,9 @@ svcmgr holds:
 - the original of each provider's service endpoint, which it creates on the provider's first launch;
 - the master log endpoint source and a source on procmgr's endpoint, from which it mints each logd
   instance's caps and each `debug_authority` service's debug authority, and the `EntropyControl`
-  source, from which it derives the `entropy_authority` service's copy
+  source, from which it derives the `entropy_authority` service's copy, and, while a recipe it keeps
+  sets `pmu_authority`, the `PmuControl` source, from which it derives that service's copy (it
+  deletes the source once the recipes are read when none sets the key)
   ([svcmgr IPC Interface](../services/svcmgr/docs/ipc-interface.md) § Handover endowment);
 - the devmgr registry source and the published names, from which it re-resolves a restarted
   service's seeds;

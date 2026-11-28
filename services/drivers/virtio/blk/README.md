@@ -88,6 +88,10 @@ which its host tests drive:
 
 - A partition badge is **registered** from the `REGISTER_PARTITION` that
   mints it until the `BLK_RETIRE_PARTITION` sent on it, then **retired**.
+  A registration whose reply does not reach its caller (the caller is gone,
+  or its `CSpace` cannot take the cap, which the driver then deletes) is
+  retired before the driver serves its next request, since no cap carries
+  its badge and no `BLK_RETIRE_PARTITION` can name it.
   Each registration mints a fresh badge from a counter that only grows, a
   range already registered included, so a retired badge is never minted
   again on this endpoint. A new driver serves a new endpoint, which no cap
@@ -129,9 +133,10 @@ Register a partition LBA range and receive a partition-badged `SEND_GRANT`
 cap scoped to it. Callable only with a `MOUNT_AUTHORITY`-badged cap (the
 whole-disk cap); callers whose badge lacks it receive `REGISTER_REJECTED`.
 Each registration is a new grant under a fresh badge, a range already
-registered included, until `BLK_RETIRE_PARTITION` retires it (§ Grants and
-regions). The driver's table holds one entry per live grant, grows with them,
-and has no fixed size.
+registered included, until `BLK_RETIRE_PARTITION` retires it, or until the
+reply carrying its cap fails to reach the caller (§ Grants and regions). The
+driver's table holds one entry per live grant, grows with them, and has no
+fixed size.
 
 **Request:**
 

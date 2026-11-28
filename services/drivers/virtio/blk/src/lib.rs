@@ -136,7 +136,8 @@ pub struct PartitionBound
 ///
 /// Each registration is one grant and takes a fresh badge, one no earlier
 /// registration had, whether or not its range is already registered; a
-/// retire ([`Grants::retire`]) removes the entry, and its badge
+/// retire ([`Grants::retire`], or [`Grants::settle_delivery`] for a grant
+/// whose reply never reached its caller) removes the entry, and its badge
 /// names nothing from then on. The table holds one entry per live grant. It
 /// grows on the heap with them; nothing in it is fixed-size.
 #[derive(Default)]
@@ -675,6 +676,18 @@ pub enum RegionRefusal
     Limit,
 }
 
+/// How the send of a reply went (`ipc::serve::Reply::undelivered`), for
+/// [`Grants::settle_delivery`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery
+{
+    /// The reply reached its caller, with every cap it carried.
+    Delivered,
+    /// The reply did not reach its caller: it is gone, or its `CSpace` could
+    /// not take the caps, which the send deleted.
+    Lost,
+}
+
 /// The driver's grants: the partition badges it minted
 /// ([`PartitionTable`]) and the regions registered through them and through
 /// whole-disk badges ([`RegionTable`]), with the decisions the service loop
@@ -694,11 +707,17 @@ pub enum RegionRefusal
 ///   caller to unmap and release, and its slot retires until the
 ///   sole-reference post its release owes, naming no badge meanwhile;
 /// - no badge is minted twice: a retired badge never names a grant again,
-///   and a range registered again takes a new badge.
+///   and a range registered again takes a new badge;
+/// - the table holds only grants a delivered cap carries: a grant whose
+///   `REGISTER_PARTITION` reply did not reach its caller is retired once the
+///   send's outcome is known ([`Grants::settle_delivery`]).
 pub struct Grants<K>
 {
     partitions: PartitionTable,
     regions: RegionTable<K>,
+    /// The grant whose cap the reply in flight carries
+    /// ([`Grants::await_delivery`]), until the send's outcome settles it.
+    unsettled: Option<u64>,
 }
 
 impl<K> Default for Grants<K>
@@ -718,6 +737,7 @@ impl<K> Grants<K>
         Self {
             partitions: PartitionTable::new(),
             regions: RegionTable::new(),
+            unsettled: None,
         }
     }
 
@@ -726,6 +746,42 @@ impl<K> Grants<K>
     pub fn register_partition(&mut self, base_lba: u64, length_lba: u64) -> Option<u64>
     {
         self.partitions.register(base_lba, length_lba)
+    }
+
+    /// The reply just set carries the only cap of the grant `badge`, so the
+    /// grant stands only if that reply is delivered: the next
+    /// [`Grants::settle_delivery`] keeps or retires it. One reply is in flight
+    /// at a time, so one grant waits at most.
+    pub fn await_delivery(&mut self, badge: u64)
+    {
+        debug_assert!(
+            self.unsettled.is_none(),
+            "a reply's outcome is settled before the next turn's reply is set"
+        );
+        self.unsettled = Some(badge);
+    }
+
+    /// After a send of the service loop's reply: keep the grant
+    /// [`Grants::await_delivery`] marked when the reply was delivered, and
+    /// retire it when it was [`Delivery::Lost`], since no cap carries its badge and no
+    /// `BLK_RETIRE_PARTITION` can name it. Returns the badge retired; `None`
+    /// when the grant was kept or none waited. Nothing waits afterwards.
+    ///
+    /// No region was registered through the retired badge: a registration is
+    /// a request sent on a cap carrying it, and none was delivered.
+    pub fn settle_delivery(&mut self, outcome: Delivery) -> Option<u64>
+    {
+        let badge = self.unsettled.take()?;
+        if outcome == Delivery::Delivered
+        {
+            return None;
+        }
+        debug_assert_eq!(
+            self.regions.live_of(badge),
+            0,
+            "an undelivered grant has no region"
+        );
+        self.retire(badge, |_, _| {}).then_some(badge)
     }
 
     /// What a request carrying `badge` reaches; `None` for every badge
@@ -1630,6 +1686,46 @@ mod tests
             grant_region(&mut g, again, 3);
             assert_eq!(g.scope(badge), None, "{order:?}");
         }
+    }
+
+    // Defect caught: a REGISTER_PARTITION reply that never reached its caller
+    // (it died, or its CSpace could not take the cap) leaving its grant in the
+    // table for the driver's life, one more entry for each retry.
+    #[test]
+    fn a_grant_whose_reply_is_lost_is_retired_and_a_delivered_one_kept()
+    {
+        let mut g: Grants<u8> = Grants::new();
+        // Nothing waits: a settle changes nothing, delivered or not.
+        assert_eq!(g.settle_delivery(Delivery::Lost), None);
+
+        let lost: Vec<u64> = (0..4)
+            .map(|_| {
+                let badge = g.register_partition(0, 64).unwrap();
+                g.await_delivery(badge);
+                assert_eq!(g.settle_delivery(Delivery::Lost), Some(badge));
+                badge
+            })
+            .collect();
+        let kept = g.register_partition(0, 64).unwrap();
+        g.await_delivery(kept);
+        assert_eq!(g.settle_delivery(Delivery::Delivered), None);
+        // A later turn's settle, with nothing waiting, keeps the grant.
+        assert_eq!(g.settle_delivery(Delivery::Lost), None);
+
+        for &badge in &lost
+        {
+            assert_eq!(g.scope(badge), None);
+            assert_eq!(g.admit_region(badge), Err(RegionRefusal::NoScope));
+            assert_eq!(
+                retire(&mut g, badge),
+                None,
+                "a lost grant is already retired"
+            );
+        }
+        assert!(matches!(g.scope(kept), Some(Scope::Partition(_))));
+        // Only the delivered grant is left: its retire empties the table.
+        assert_eq!(retire(&mut g, kept), Some(vec![]));
+        assert_eq!(g.partitions.entries, []);
     }
 
     #[test]

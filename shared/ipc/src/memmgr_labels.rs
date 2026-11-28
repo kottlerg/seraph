@@ -264,11 +264,11 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   and memory objects hold, each charged to a budget node; a run on the
 ///   deferred list or in the store is not counted.
 /// * `data[22]` — `draw_short`: 1 while a committed draw has found too few
-///   free pages since the draw room (`data[16]`) last opened, so memmgr
-///   evicts for frames until it opens again; 0 from the turn that ends with
-///   it open. Read with `data[16]` in one reply: a room short with this 0
-///   has no eviction under way for a committed draw, which crashd's hold
-///   reads to re-ask a held commit overrun.
+///   free pages since the draw room (`data[16]`) last opened, which keeps
+///   memmgr evicting for frames until it opens again; 0 from the turn that
+///   ends with it open. It is that latch alone: with it 0, memmgr may still
+///   evict while `data[3]` is below `data[8]`. Read with `data[16]` in one
+///   reply, which crashd's hold reads to re-ask a held commit overrun.
 ///
 /// The pages in no account are `data[2]` less `data[3]`, `data[4]`,
 /// `data[9]`, `data[20]` and `data[21]`. memmgr keeps each page it owns

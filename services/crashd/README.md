@@ -25,7 +25,7 @@ for is there, memmgr's pressure level below `CRITICAL` or, for a commit overrun,
 open, or for a fault no free page could back either of them, when crashd resumes it, or the stall
 passes, when crashd reports and declines it. A held commit overrun whose draw room reads short while
 memmgr is not evicting for it is re-asked: resumed into memmgr again, which backs it or declines it
-again and evicts, and its repeat is held again in its slot to the same deadline.
+again and evicts, and its repeat is held again to the same deadline.
 
 Before the decline, when the `CORE_DUMP` entry of its recipe's environment names the process,
 crashd writes an ELF core of it to `/crash` on the root filesystem, which host `gdb` reads, under

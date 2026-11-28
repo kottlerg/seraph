@@ -174,8 +174,10 @@ evicting is re-asked: crashd resumes it, logging `re-asked after <ms> ms: no com
 memmgr not evicting`, and its thread faults into memmgr again, which backs it or declines it again
 and evicts. Each is re-asked at once, since one memmgr backs leaves nothing to read the room again
 for the others. A fault of code 7 is not re-asked: memmgr's decline of it starts no such eviction.
-crashd keeps a re-asked fault's slot for its repeat until its hold's deadline, and the repeat is
-held there again, with no line of its own, to that deadline. When a hold's
+The repeat is held again, with no line of its own, to the re-asked hold's deadline. crashd keeps
+the re-asked fault's slot for it until then, but lends the slot to a new fault that finds no other
+free, and stops keeping it when the thread faults at another page: a re-asked fault memmgr backed
+sends no repeat, and crashd cannot tell it from one on its way. When a hold's
 deadline passes first, crashd receives that fault, logs `hold timed out after <ms> ms` as a warning,
 and reports and declines it as [Per Fault](#per-fault) does, from the message it kept. A receive
 that finds nothing after the fault arrived frees the slot with no answer, logged `withdrawn after

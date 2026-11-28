@@ -1748,7 +1748,9 @@ lost, its slot freed: the reply carries the decline word of code 12 with detail 
 service forwards the held fault with, so the faulting thread is killed, as every later fault on the
 chunk is. A fault on a chunk on disk with no swap service registered is declined with code 12 and
 detail 0. Detail 2 is the swap service's own: it could not read the chunk's slot, and it forwards
-the held fault with it; the chunk stays on disk. memmgr produces details 0 and 1 only.
+the held fault with it; the chunk stays on disk. A redirect for which memmgr's `CSpace` has no slot
+for the copy of the swap service's endpoint it names (§ Receive loop) is declined with code 12 and
+detail 3, and the chunk stays on disk. memmgr produces details 0, 1 and 3.
 `SWAP_RESTORE` names a slot word, which `SWAP_TAKE`'s reply also carries, not a fault, so the swap
 service may also restore ahead of one, as it does for a debugger's `MAKE_RESIDENT` or procmgr's
 `CAPTURE_CHUNKS` of a chunk on disk: memmgr posts the chunk's slot word to a list of at most

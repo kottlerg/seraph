@@ -3036,7 +3036,9 @@ enum FaultDecline
     /// (services/memmgr/docs/memory-pool.md § Disk tier): detail
     /// [`disk::DETAIL_UNREGISTERED`] when no swap service is registered to
     /// restore it, [`disk::DETAIL_LOST`] when its slot's bytes failed
-    /// authentication and the chunk is lost.
+    /// authentication and the chunk is lost, and 3 when memmgr's `CSpace` had
+    /// no slot for the copy of the swap service's endpoint that a redirect
+    /// names, the chunk still on disk.
     OnDiskChunk = 12,
 }
 

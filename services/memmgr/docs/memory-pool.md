@@ -589,10 +589,12 @@ worker's run does. A CPU whose thread cannot be created, mapped or placed (an of
 the affinity) gets none: memmgr serves on the threads it has, since every thread receives on the
 one endpoint.
 
-No receive thread has a fault handler, and any receive thread's exit ends memmgr: the kernel
-records its address space's end at the first terminal end of any of its threads, so a fault of any
-receive thread is memmgr's death, a core death that powers the system off
-([docs/supervision.md](../../../docs/supervision.md) § Core Set and System Death).
+No receive thread has a fault handler. A fault of any receive thread ends memmgr's address space,
+which the kernel ends at the first terminal end of any of its threads, and so does a panic of any,
+since memmgr's panic handler exits the address space (`SYS_ASPACE_EXIT`) and not the thread alone:
+either is memmgr's death, a core death that powers the system off
+([docs/supervision.md](../../../docs/supervision.md) § Core Set and System Death). A receive thread
+that ended alone would leave G held for good, with every other receive thread spinning on it.
 
 Every receive thread runs at `MEMMGR_PRIORITY`, above every client, with no priority inheritance
 ([core/kernel/docs/scheduler.md](../../../core/kernel/docs/scheduler.md) § Priority Inversion
@@ -618,7 +620,8 @@ one receive's return to the next receive, in this order:
 4. **`CSpace` top-up** (§ CSpace headroom).
 5. **Pressure signal.** The level and the draw room are recomputed, and every registrant signalled
    on a change (§ Memory pressure).
-6. **The receive.** A reply with an undo is sent alone and settled first; the limit events of the
+6. **The receive.** A reply with an undo, or one that names a cap it does not move (below), is
+   sent alone and settled first; the limit events of the
    section are sent (below), G and then the stripe are released, and the receive sends the reply
    still set. The main thread's receive waits a bounded time while the clock runs or a job is in
    flight (§ Eviction), so completions drain and the clock runs with no message arriving; every
@@ -666,13 +669,24 @@ use for, a charge-only handle (`NODE_CHARGE_HANDLE`) or the buffer a disk-tier r
 (`SWAP_TAKE`, `SWAP_RESTORE`), deletes them when it is not delivered. Nothing faults in, maps or
 names what the undo takes back first: the thread holds the stripe of the process the request acted
 for from before the effect until the undo, so none of that process's requests runs in between; a
-registration, a node handle and a sealed object are named only by the reply that carries them; and
-the other threads' sections that run while G is released for the send (eviction, retirement, other
-processes' requests, the disk tier's labels) reach no frame of a grant before it is delivered and no
-VA of a region its process cannot fault on. They can count the effect: a limit event sent in that
-span can count a charge that the undo then takes back, at worst one signal more than the ledger then
-shows. The pressure step, whose broadcast reaches every registrant, reads the level and the draw
-room again after a send it made, so it signals the ledger past the undo.
+registration and a sealed object are named only by the reply that carries them; a node handle is
+named also by its owner's list, and `NODE_CREATE` on a handle another process owns holds the
+caller's stripe and not the owner's, so the owner's teardown can drop the handle's state first and
+its slot can hold another by then: the undo drops the state only while it still carries the key the
+request minted; and the other threads' sections that run while G is released for the send (eviction,
+retirement, other processes' requests, the disk tier's labels) reach no frame of a grant before it
+is delivered and no VA of a region its process cannot fault on. They can count the effect: a limit
+event sent in that span can count a charge that the undo then takes back, at worst one signal more
+than the ledger then shows. The pressure step, whose broadcast reaches every registrant, reads the
+level and the draw room again after a send it made, so it signals the ledger past the undo.
+
+**A reply that names a kept cap.** A fault redirect to the swap service (§ Disk tier) names the
+swap service's endpoint, which the kernel resolves without moving it. Another thread's
+`SWAP_REGISTER` can replace the registered endpoint and delete its slot while G is released for the
+send, so the redirect names a copy memmgr derives for that reply alone, and the reply, sent alone,
+deletes the copy once it is settled. A redirect for which memmgr's `CSpace` has no slot is declined
+with code 12, detail 3 ([ipc-interface.md](ipc-interface.md#kernel-origin-fault-message-fault_label)
+§ Kernel-origin fault message).
 
 ---
 

@@ -34,9 +34,10 @@
 //!   it checks that the code at the stopped program counter is the
 //!   function's, since another process can map the same address, moves that
 //!   CPU's program counter, removes the breakpoint, and resumes the VM.
-//!   memmgr's kill takes a stop on a CPU other than CPU 0 only, so it kills a
-//!   receive thread other than the main one, which is pinned to CPU 0
-//!   (services/memmgr/docs/memory-pool.md § Receive threads): its boot has at
+//!   memmgr's kill takes only a stop whose stack pointer lies in memmgr's
+//!   receive-thread zone, which holds the stack of every receive thread but
+//!   the main one's (services/memmgr/docs/memory-pool.md § Receive threads),
+//!   so it kills a receive thread other than the main one: its boot has at
 //!   least 2 CPUs, and the shell runs the program again until such a stop.
 //!
 //! A boot passes when, after the kill, QEMU's `SHUTDOWN` event gives reason
@@ -203,13 +204,21 @@ struct Breakpoint
     bias_line: &'static str,
     /// The function's demangled path, without its hash.
     function: &'static str,
-    /// The CPUs on which a stop in the function is the kill's.
-    cpus: breakpoint_kill::Cpus,
+    /// The stops in the function that are the kill's.
+    take: breakpoint_kill::Take,
 }
 
-/// Times the shell is asked to run the program when the kill passes over the
-/// stops on CPU 0 ([`breakpoint_kill::Cpus::NotBoot`]), each spawn's
-/// requests reaching any of memmgr's receive threads.
+/// memmgr's receive-thread zone, `[THREAD_ZONE_VA, THREAD_ZONE_END)` in
+/// memmgr's address space, which holds the stacks of its receive threads
+/// but the main one's. Kept in sync with `services/memmgr/src/main.rs`.
+const MEMMGR_RECEIVE_STACKS: breakpoint_kill::Take = breakpoint_kill::Take::StackIn {
+    start: 0x0000_0001_4000_0000,
+    end: 0x0000_0001_6000_0000,
+};
+
+/// Times the shell is asked to run the program when the kill passes over
+/// some stops ([`breakpoint_kill::Take::StackIn`]), each spawn's requests
+/// reaching any of memmgr's receive threads.
 const RETYPES: u32 = 8;
 
 /// The pause between two of those.
@@ -230,21 +239,21 @@ fn route(target: Target) -> Route
             binary: "services/memmgr",
             bias_line: MEMMGR_BIAS,
             function: "memmgr::admit",
-            cpus: breakpoint_kill::Cpus::NotBoot,
+            take: MEMMGR_RECEIVE_STACKS,
         }),
         // A request worker (the main thread is one), in the spawn's create.
         Target::Procmgr => Route::Hardware(Breakpoint {
             binary: "services/procmgr",
             bias_line: PROCMGR_BIAS,
             function: "procmgr::handle_create",
-            cpus: breakpoint_kill::Cpus::Any,
+            take: breakpoint_kill::Take::Any,
         }),
         // The reaper thread, never the main thread, in the program's reap.
         Target::ProcmgrReaper => Route::Hardware(Breakpoint {
             binary: "services/procmgr",
             bias_line: PROCMGR_BIAS,
             function: "procmgr::process::reap_dead",
-            cpus: breakpoint_kill::Cpus::Any,
+            take: breakpoint_kill::Take::Any,
         }),
         Target::Svcmgr => Route::Stub("svcmgr", KillPoint::Attach, Contact::Attached),
         Target::Devmgr => Route::Stub("devmgr", KillPoint::SystemUp, Contact::Attached),
@@ -258,10 +267,12 @@ fn route(target: Target) -> Route
 pub(super) fn run(ctx: &Context, args: &CaseArgs, target: Target) -> Result<()>
 {
     if let Route::Hardware(bp) = route(target)
-        && bp.cpus == breakpoint_kill::Cpus::NotBoot
+        && bp.take != breakpoint_kill::Take::Any
         && args.cpus < 2
     {
-        bail!("the {target:?} kill takes a CPU other than CPU 0: boot at least 2 (--cpus)");
+        bail!(
+            "the {target:?} kill takes a receive thread other than the main one: boot at least 2 CPUs (--cpus)"
+        );
     }
     match route(target)
     {
@@ -357,17 +368,17 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout, route: Route) -> Res
                     .with_context(|| {
                         format!("no `{}` line before the READY marker", bp.bias_line)
                     })?;
-                let times = match bp.cpus
+                let times = match bp.take
                 {
-                    breakpoint_kill::Cpus::Any => 1,
-                    breakpoint_kill::Cpus::NotBoot => RETYPES,
+                    breakpoint_kill::Take::Any => 1,
+                    breakpoint_kill::Take::StackIn { .. } => RETYPES,
                 };
                 let killed = breakpoint_kill::kill_at_breakpoint(
                     args.arch,
                     &gdb_sock,
                     bias,
                     &function,
-                    bp.cpus,
+                    bp.take,
                     move || type_input(stdin, times),
                 )?;
                 step(&format!(
@@ -683,6 +694,6 @@ mod tests
         {
             unreachable!()
         };
-        assert_eq!(memmgr.cpus, breakpoint_kill::Cpus::NotBoot);
+        assert_eq!(memmgr.take, MEMMGR_RECEIVE_STACKS);
     }
 }

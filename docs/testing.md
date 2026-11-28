@@ -940,9 +940,10 @@ the fault is terminal. Two routes reach the thread:
   table, read from the symbols store's file of its build id
   ([docs/build-system.md](build-system.md#symbols-store) § Symbols Store), and types `hello` at the
   shell over the serial line, whose spawn and reap run it: `memmgr::admit` (a memmgr receive thread
-  other than the main one, in an allocation's admission; it stops only on a CPU other than CPU 0, so
-  the boot has at least 2 CPUs, and the shell runs `/programs/hello` up to 8 times until such a
-  stop), `procmgr::handle_create` (a procmgr request worker, in the create), and
+  other than the main one, in an allocation's admission; the kill takes only a stop whose stack
+  pointer lies in memmgr's receive-thread zone, which holds every receive thread's stack but the
+  main one's, so the boot has at least 2 CPUs, and the shell runs `/programs/hello` up to 8 times
+  until such a stop), `procmgr::handle_create` (a procmgr request worker, in the create), and
   `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main thread, in the
   reap). On each stop it checks that the program counter is the function's and the code there is the
   binary's, since another process can run code at the same address, moves that CPU's program

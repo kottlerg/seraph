@@ -423,11 +423,13 @@ fn slice_due() -> Option<u64>
 
 /// One turn's eviction work, after the turn's message, if any: drain the done
 /// jobs, then, while the clock runs and the interval since the last slice has
-/// passed, run a slice of it. A turn with either sends its reply first, with
-/// a receive that does not wait ([`Answer::flush`]), so no caller waits for
-/// this work; it drains only the
-/// jobs done when it looked, and leaves one done since to the next turn,
-/// which the receive's bounded wait brings (services/memmgr/docs/memory-pool.md
+/// passed, run a slice of it. A turn with either sends its reply alone first
+/// ([`Answer::flush`]), so no caller waits for this work, and looks again
+/// once G is taken back: another receive thread can drain a job or run a
+/// slice while G is released for the send, and a slot it drained may hold a
+/// new job by then. It drains only the jobs done when it looked last, and
+/// leaves one done since to the next turn of this thread or another, which
+/// the main thread's bounded wait brings (services/memmgr/docs/memory-pool.md
 /// § Receive loop). While memmgr reclaims, the slice finds the cold chunks and
 /// posts a job for each whose eviction raises the free pages outside
 /// `promised`, or, while it evicts for frames, those above the growth floor,
@@ -436,15 +438,14 @@ fn slice_due() -> Option<u64>
 /// it finds are kept for direct reclaim ([`keep_victims`]).
 pub(crate) fn turn(held: &mut Held, answer: &mut Answer)
 {
-    let done = done_jobs();
-    let any_done = done.contains(&true);
-    let slice = slice_due();
-    if any_done || slice.is_some()
+    let (mut done, mut slice) = (done_jobs(), slice_due());
+    if done.contains(&true) || slice.is_some()
     {
         answer.flush(held);
+        (done, slice) = (done_jobs(), slice_due());
     }
     let l: &mut MemLedger = held;
-    if any_done
+    if done.contains(&true)
     {
         drain(l, done);
     }

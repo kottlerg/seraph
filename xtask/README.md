@@ -1145,8 +1145,9 @@ when init-logd's last line, `handover complete; init-logd thread exiting`, has n
 the first kill (the first instance died before its bootstrap request or after it, before its
 release), the restart must produce it. memmgr and procmgr are reached through QEMU's own gdbstub, on
 a unix socket, with a hardware breakpoint on a function of the target's binary, read from the
-symbols store's file of its build id, hit (for memmgr, on a receive thread other than the main one,
-which stops only on a CPU other than CPU 0, so the boot has at least 2 CPUs) by a `hello` the case
+symbols store's file of its build id, hit (for memmgr, on a receive thread other than the main one:
+the kill takes only a stop whose stack pointer lies in memmgr's receive-thread zone, so the boot has
+at least 2 CPUs) by a `hello` the case
 types at the shell, up to 8 times until such a stop, once the terminal's READY line and pwrmgr's
 `core-death power-off armed` line have appeared. It passes for a cause when QMP's `SHUTDOWN` event,
 after the kill, gives reason `guest-shutdown`, and QEMU exits on its own within two minutes of the

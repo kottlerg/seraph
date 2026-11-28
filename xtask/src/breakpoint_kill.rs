@@ -32,38 +32,57 @@ const HIT_TIMEOUT: Duration = Duration::from_mins(1);
 /// process running at the same address) before the kill gives up.
 const FOREIGN_HITS_MAX: u32 = 8;
 
-/// Stops in the target's code on a CPU the kill does not take ([`Cpus`])
+/// Stops in the target's code by a thread the kill does not take ([`Take`])
 /// before the kill gives up.
 const PASSED_HITS_MAX: u32 = 256;
 
-/// The gdbstub thread of the boot CPU: QEMU numbers its threads by CPU index
-/// from 1.
-const BOOT_CPU_THREAD: u64 = 1;
+/// The gdbstub thread of the CPU of index 0: QEMU numbers its threads by CPU
+/// index from 1.
+const FIRST_CPU_THREAD: u64 = 1;
 
-/// The CPUs on which a stop in the target's code is the kill's.
+/// The stops in the target's code that are the kill's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cpus
+pub enum Take
 {
-    /// Any CPU.
+    /// Every stop.
     Any,
-    /// Any CPU but the boot CPU, CPU 0: the kill of a thread hard-affine to
-    /// another CPU (memmgr's receive threads but its main one). A stop on
-    /// CPU 0 is passed over, the breakpoint kept for the next.
-    NotBoot,
+    /// A stop whose stack pointer lies in `[start, end)`: one of the threads
+    /// whose stacks the target keeps there (memmgr's receive threads but its
+    /// main one). Any other stop is passed over, the breakpoint kept for the
+    /// next.
+    StackIn
+    {
+        start: u64, end: u64
+    },
 }
 
-impl Cpus
+impl Take
 {
-    /// Whether a stop on the CPU of gdbstub thread `thread` is the kill's.
+    /// Whether a stop with stack pointer `sp` is the kill's.
     #[must_use]
-    pub fn take(self, thread: u64) -> bool
+    pub fn take(self, sp: u64) -> bool
     {
         match self
         {
             Self::Any => true,
-            Self::NotBoot => thread != BOOT_CPU_THREAD,
+            Self::StackIn { start, end } => (start..end).contains(&sp),
         }
     }
+}
+
+/// The register number of the stack pointer in `arch`'s register block.
+fn sp_regnum(arch: Arch) -> Result<usize>
+{
+    let name = match arch
+    {
+        Arch::X86_64 => "rsp",
+        Arch::Riscv64 => "sp",
+    };
+    debug_stub::rsp_arch(arch)
+        .registers()
+        .iter()
+        .position(|r| r.name == name)
+        .with_context(|| format!("no {name} register in the {arch:?} register block"))
 }
 
 /// Bytes of code compared at the stop.
@@ -85,7 +104,7 @@ pub struct Function
 }
 
 /// What [`kill_at_breakpoint`] did: the program counter it moved, the CPU
-/// whose it was (its index, from 0), the moment the VM resumed, and the
+/// whose it was (QEMU's index, from 0), the moment the VM resumed, and the
 /// trigger's result.
 pub struct Killed<T>
 {
@@ -120,7 +139,8 @@ pub fn spawn_bias<S: AsRef<str>>(lines: &[S], name: &str) -> Option<u64>
 
 /// Over QEMU's gdbstub at `sock`, break on `function` at `bias`, run
 /// `trigger` on a thread of its own once the VM runs again, and move the
-/// CPU stopped in the function's code, among `cpus`, to program counter 0.
+/// CPU stopped in the function's code, by a stop `take` takes, to program
+/// counter 0.
 /// The trigger is joined after the detach that resumes the VM; a function the
 /// target runs unasked needs none.
 pub fn kill_at_breakpoint<T: Send + 'static>(
@@ -128,11 +148,12 @@ pub fn kill_at_breakpoint<T: Send + 'static>(
     sock: &Path,
     bias: u64,
     function: &Function,
-    cpus: Cpus,
+    take: Take,
     trigger: impl FnOnce() -> T + Send + 'static,
 ) -> Result<Killed<T>>
 {
     let pc_reg = debug_stub::rsp_arch(arch).pc_regnum();
+    let sp_reg = sp_regnum(arch)?;
     let at = bias.wrapping_add(function.address);
     let kind = breakpoint_kind(arch);
     // Connecting stops the VM.
@@ -162,16 +183,16 @@ pub fn kill_at_breakpoint<T: Send + 'static>(
         let code = stub.read_memory(pc, CODE_CHECK_BYTES)?;
         if pc == at && code == function.code
         {
-            if cpus.take(thread)
+            if take.take(stub.read_register(sp_reg)?)
             {
                 stub.expect_ok(format!("P{pc_reg:x}={}", le_hex(0)).as_bytes())?;
-                break (pc, thread.saturating_sub(BOOT_CPU_THREAD));
+                break (pc, thread.saturating_sub(FIRST_CPU_THREAD));
             }
             passed = passed.saturating_add(1);
             if passed >= PASSED_HITS_MAX
             {
                 bail!(
-                    "{PASSED_HITS_MAX} stops in the target's code were on CPUs the kill passes over"
+                    "{PASSED_HITS_MAX} stops in the target's code were by threads the kill passes over"
                 );
             }
         }
@@ -275,14 +296,30 @@ mod tests
 {
     use super::*;
 
-    // Defect caught: a kill that must miss memmgr's main thread taken on
-    // the boot CPU, which only the main thread serves on.
+    // Defect caught: a kill that must miss memmgr's main thread taking a
+    // stop whose stack lies outside the receive threads' zone, or missing
+    // one inside it.
     #[test]
-    fn only_a_stop_off_the_boot_cpu_is_taken_when_it_must_be()
+    fn only_a_stop_on_a_stack_in_the_range_is_taken_when_it_must_be()
     {
-        assert!(Cpus::Any.take(BOOT_CPU_THREAD));
-        assert!(!Cpus::NotBoot.take(BOOT_CPU_THREAD));
-        assert!(Cpus::NotBoot.take(BOOT_CPU_THREAD + 1));
+        let take = Take::StackIn {
+            start: 0x1000,
+            end: 0x2000,
+        };
+        assert!(Take::Any.take(0));
+        assert!(!take.take(0xfff));
+        assert!(take.take(0x1000));
+        assert!(take.take(0x1fff));
+        assert!(!take.take(0x2000));
+    }
+
+    // Defect caught: the stack pointer read from another register than
+    // `rsp` or `sp`, so the kill judges a stop by an unrelated value.
+    #[test]
+    fn the_stack_pointer_is_found_in_each_register_block()
+    {
+        assert_eq!(sp_regnum(Arch::X86_64).unwrap(), 7);
+        assert_eq!(sp_regnum(Arch::Riscv64).unwrap(), 2);
     }
 
     // Defect caught: a breakpoint set on another function than the one

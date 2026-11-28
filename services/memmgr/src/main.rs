@@ -108,10 +108,18 @@ pub extern "C" fn _start(info_ptr: u64) -> !
     main(&startup, info.sched_control_cap)
 }
 
+/// memmgr's exit code on a panic. Any end of its address space is its death,
+/// which powers the system off (docs/supervision.md § Core Set and System
+/// Death); the code only tells a panic from a fault in the end's reason.
+const PANIC_EXIT_CODE: u32 = 1;
+
+/// End memmgr's address space, whichever thread panicked: a receive thread's
+/// exit alone would end nothing its observers see, and one that panicked
+/// under G would leave every other receive thread spinning on it.
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> !
 {
-    syscall::thread_exit();
+    syscall::process_exit(PANIC_EXIT_CODE);
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -193,7 +201,9 @@ const COPY_WINDOW_PAGES: u64 = LEAF_TABLE_PAGES;
 /// thread, whose stack and IPC page init placed. A slot holds, from its base,
 /// an unmapped guard page, the thread's stack, a guard page, its IPC buffer
 /// page, and a guard page. Deterministic: nothing but memmgr can read
-/// memmgr's address space.
+/// memmgr's address space. The shutdown case's core-death kill names the
+/// zone to tell a receive thread's stop from the main thread's
+/// (`xtask/src/commands/test/shutdown/core_death.rs`, kept in sync).
 const THREAD_ZONE_VA: u64 = 0x0000_0001_4000_0000;
 
 /// Pages of one receive thread's slot of the zone.
@@ -4309,9 +4319,16 @@ fn handle_create_sub_node(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answ
         .word(0, max)
         .cap(cap)
         .build();
-    // A reply that does not reach the caller leaves nothing that can name the
-    // node: the undo drops it.
-    answer.set_undoable(reply, Undo::SubNode { cap, handle: h });
+    // A reply that does not reach the caller leaves nothing but its owner's
+    // list that can name the node: the undo drops it.
+    answer.set_undoable(
+        reply,
+        Undo::SubNode {
+            cap,
+            handle: h,
+            key,
+        },
+    );
 }
 
 /// `NODE_QUERY_USAGE`: reply the own pages, max and subtree pages of the
@@ -5079,11 +5096,11 @@ enum Undo
         len: u64,
         high: u64,
     },
-    /// `NODE_CREATE` and `CREATE_SUB_NODE`: the handle state and the cap
-    /// the reply moves.
+    /// `NODE_CREATE` and `CREATE_SUB_NODE`: the handle state, the key it
+    /// was minted with, and the cap the reply moves.
     SubNode
     {
-        cap: u64, handle: NodeIdx
+        cap: u64, handle: NodeIdx, key: u64
     },
     /// `SEAL_OBJECT`: the object made of `rec`'s grants, and the handle cap
     /// the reply moves.
@@ -5097,8 +5114,12 @@ enum Undo
 
 impl Undo
 {
-    /// Take back the request's effect. Nothing has been served since the
-    /// request, so nothing has faulted in, mapped or named what it made.
+    /// Take back the request's effect. No request for the process the request
+    /// acted for has run since, as its stripe is still held, so nothing has
+    /// faulted in, mapped or named what it made; a node handle's state, which
+    /// its owner's teardown can drop meanwhile, is checked first
+    /// (services/memmgr/docs/memory-pool.md § Receive loop, A reply not
+    /// delivered).
     fn run(self, l: &mut MemLedger)
     {
         match self
@@ -5138,10 +5159,17 @@ impl Undo
             {
                 let _ = l.undo_extend(rec, reg, len, high, quiescent);
             }
-            Self::SubNode { cap, handle } =>
+            Self::SubNode { cap, handle, key } =>
             {
                 delete_cap(cap);
-                let _ = l.drop_handle(handle);
+                // The state's owner can be another process than the one whose
+                // stripe the request held (`NODE_CREATE` on a handle another
+                // process owns), so its teardown may have dropped the state
+                // already, and its slot may hold another state by now.
+                if l.handle(handle).is_some_and(|s| s.key == key)
+                {
+                    let _ = l.drop_handle(handle);
+                }
             }
             Self::Seal { cap, rec, obj } =>
             {
@@ -5165,6 +5193,9 @@ struct Answer
 {
     reply: ipc::serve::Reply,
     undo: Option<Undo>,
+    /// A cap the reply names without moving it, a fault redirect's copy of
+    /// the swap service's endpoint, deleted once the reply is sent.
+    named: Option<u64>,
     /// The stripe the turn's request took before G ([`STRIPES`]), released
     /// once its reply is settled.
     stripe: Option<StripeGuard<'static>>,
@@ -5188,6 +5219,7 @@ impl Answer
         Self {
             reply: ipc::serve::Reply::pooled(),
             undo: None,
+            named: None,
             stripe: None,
             ep,
             ipc_buf,
@@ -5233,6 +5265,18 @@ impl Answer
         self.undo = Some(undo);
     }
 
+    /// Answer the caller with `msg`, which names `cap` without moving it:
+    /// the answer deletes `cap` once the reply is sent.
+    #[expect(
+        clippy::large_types_passed_by_value,
+        reason = "`ipc::serve::Reply` takes the message by value; a reference here would add a copy"
+    )]
+    fn set_naming(&mut self, msg: IpcMessage, cap: u64)
+    {
+        self.reply.set(msg);
+        self.named = Some(cap);
+    }
+
     /// Send the reply now, when one is set, before a step of the turn's tail
     /// that has work to do: alone (`SYS_IPC_REPLY`, [`ipc::serve::Reply::pooled`]),
     /// so a call waiting on the endpoint stays queued for a free receive
@@ -5254,9 +5298,10 @@ impl Answer
 
     /// End the turn and take the next request, into `req`: the next call on
     /// memmgr's endpoint, waiting up to `timeout_ms` milliseconds (`0`:
-    /// without bound). A reply with an undo is sent and settled first, under
-    /// G ([`Self::flush`]); G and then the stripe are released; a reply still
-    /// set, which has no undo, goes with the receive.
+    /// without bound). A reply with an undo, or one naming a cap the answer
+    /// deletes, is sent and settled first ([`Self::flush`]); G and then the
+    /// stripe are released; a reply still set, which has neither, goes with
+    /// the receive.
     ///
     /// # Errors
     /// [`ipc::serve::next_request_timeout`]'s.
@@ -5267,7 +5312,7 @@ impl Answer
         req: &mut IpcMessage,
     ) -> Result<(), i64>
     {
-        if self.undo.is_some()
+        if self.undo.is_some() || self.named.is_some()
         {
             self.flush(&mut held);
         }
@@ -5288,13 +5333,18 @@ impl Answer
     }
 
     /// After a send: run the undo of a reply that was not delivered, and drop
-    /// it otherwise; then release the request's stripe.
+    /// it otherwise, and delete the cap the reply named; then release the
+    /// request's stripe.
     fn settle(&mut self, l: &mut MemLedger)
     {
         if let Some(undo) = self.undo.take()
             && self.reply.undelivered()
         {
             undo.run(l);
+        }
+        if let Some(cap) = self.named.take()
+        {
+            delete_cap(cap);
         }
         self.stripe = None;
     }

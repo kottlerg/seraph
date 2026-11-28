@@ -57,7 +57,9 @@ impl TicketLock
     #[must_use]
     pub fn try_lock(&self) -> bool
     {
-        let serving = self.serving.load(Ordering::Relaxed);
+        // Acquire pairs with the last holder's release in `unlock`: the
+        // exchange below reads `next`, which that holder never wrote.
+        let serving = self.serving.load(Ordering::Acquire);
         self.next
             .compare_exchange(
                 serving,
@@ -142,16 +144,27 @@ pub struct SpinGuard<'a, T>
 
 impl<T> SpinGuard<'_, T>
 {
-    /// Release the lock for the span of `f`, then take it again. The guard is
-    /// borrowed mutably for the call, so no reference to the value lives
+    /// Release the lock for the span of `f`, then take it again, also when
+    /// `f` unwinds, so the guard holds the lock whenever it drops. The guard
+    /// is borrowed mutably for the call, so no reference to the value lives
     /// across it, and `f` reaches the value only by taking the lock itself.
     pub fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R
     {
+        /// Takes the lock again when it drops.
+        struct Relock<'a>(&'a TicketLock);
+
+        impl Drop for Relock<'_>
+        {
+            fn drop(&mut self)
+            {
+                self.0.lock();
+            }
+        }
+
         // SAFETY: the guard exists, so this thread holds the lock.
         unsafe { self.mutex.lock.unlock() };
-        let r = f();
-        self.mutex.lock.lock();
-        r
+        let _relock = Relock(&self.mutex.lock);
+        f()
     }
 }
 
@@ -517,6 +530,24 @@ mod tests
         assert!(m.is_locked());
         drop(g);
         assert!(!m.is_locked());
+    }
+
+    // Defect caught: a guard whose lock is not taken back after an unlocked
+    // span that unwinds, whose drop then releases a lock it does not hold and
+    // lets two holders in.
+    #[test]
+    fn unlocked_takes_the_lock_back_when_its_span_unwinds()
+    {
+        let m = SpinMutex::new(0u32);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut g = m.lock();
+            g.unlocked(|| panic!("the span unwinds"));
+        }));
+        assert!(r.is_err());
+        assert!(!m.is_locked());
+        assert!(m.lock.try_lock());
+        // SAFETY: try_lock just took the lock.
+        unsafe { m.lock.unlock() };
     }
 
     #[test]

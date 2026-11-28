@@ -349,7 +349,7 @@ fn restart_round(
         gdb_sock,
         bias,
         driver,
-        breakpoint_kill::Cpus::Any,
+        breakpoint_kill::Take::Any,
         || (),
     )?;
     step(&format!(

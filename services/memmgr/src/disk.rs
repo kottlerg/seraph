@@ -72,6 +72,11 @@ pub(crate) const DETAIL_UNREGISTERED: u64 = 0;
 /// The decline detail of a chunk whose slot failed authentication: lost.
 pub(crate) const DETAIL_LOST: u64 = 1;
 
+/// The decline detail of a chunk on disk whose redirect memmgr could not make:
+/// its own `CSpace` had no slot for the reply's copy of the swap service's
+/// endpoint ([`reply_fault`]). The chunk stays on disk.
+const DETAIL_NO_SLOT: u64 = 3;
+
 /// memmgr's buffer for a slot's bytes: the chunk's stream, or a raw chunk's
 /// pages, sealed in place before it is copied out, or a slot's bytes copied in before they are opened
 /// in place. Reached only by G's holder.
@@ -259,12 +264,22 @@ pub(crate) fn reply_fault(
                 crate::decline_fault(answer, FaultDecline::OnDiskChunk, DETAIL_UNREGISTERED);
                 return true;
             };
+            // A copy for this reply alone: the reply is sent with G released,
+            // when another receive thread's `SWAP_REGISTER` can replace the
+            // registered endpoint and delete its slot.
+            let Ok(ep) = syscall::cap_derive(state().endpoint, syscall::RIGHTS_ALL)
+            else
+            {
+                crate::decline_fault(answer, FaultDecline::OnDiskChunk, DETAIL_NO_SLOT);
+                return true;
+            };
             let reply = IpcMessage::builder(syscall_abi::FAULT_REPLY_REDIRECT)
                 .word(0, disk::slot_word(n.slot, n.len, n.nonce))
-                .cap(state().endpoint)
+                .cap(ep)
                 .build();
-            // The kernel resolves the cap without moving it, so memmgr keeps it.
-            answer.set(reply);
+            // The kernel resolves the cap without moving it; the answer deletes
+            // the copy once the reply is sent.
+            answer.set_naming(reply, ep);
             true
         }
         FaultPath::DeclineUnregistered =>

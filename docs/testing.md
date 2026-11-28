@@ -743,15 +743,16 @@ the merge head (Coverage tiers, When the runs are owed), and its body carries th
 --mode host` report with that head. Each measurement whose verdict is not `ok` is accounted for in
 the body: one with no baseline or no band (`NEW`, `NO-BAND`), or one the PR moved on purpose, has
 its baseline, and its band if it had none, written from those logs (`cargo xtask bench-baseline
---host --bands`), with the reason, and a file the command rewrote only for a measurement the PR did
-not mean to move is restored before the commit; for such a measurement, the PR boots its merge base
-the same way under the same grant and reports both sets, so that a drift of the stored baseline
-since it was taken is told apart from the PR's own change. Any other PR owes no host-mode run. The
-release host runs take the same report once per release candidate (Coverage tiers, Release host
-runs), so a time that PRs with no performance purpose moved is seen before the tag. The bands and
-the baselines are calibrated together, from 10 runs of each boot (`cargo xtask bench-baseline --host
---all --bands`), and again when the reference host, its kernel or its QEMU changes, as
-`bench-check`'s `WARNING:` lines show.
+--host --bands`), with the reason. For a measurement the PR did not mean to move, the PR boots its
+merge base the same way under the same grant and reports both sets, so that a drift of the stored
+baseline since it was taken is told apart from the PR's own change. The command rewrites a baseline
+file whole, so every file it rewrites stands as written, and the body names each measurement in it
+that the PR did not mean to move, with both sets. Any other PR owes no host-mode run. The release
+host runs take the same report once per release candidate (Coverage tiers, Release host runs), so a
+time that PRs with no performance purpose moved is seen before the tag. The bands and the baselines
+are calibrated together, from 10 runs of each boot (`cargo xtask bench-baseline --host --all
+--bands`), and again when the reference host, its kernel or its QEMU changes, as `bench-check`'s
+`WARNING:` lines show.
 
 ### Crash reports
 

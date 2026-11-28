@@ -1492,8 +1492,9 @@ queued caller, a try-once found none, its park was refused, or it failed), and t
 load reads. A reply whose caller's turn ran out during the request passes `WakeHint::None` instead
 (`turn::Returned::RanOut`), so the caller goes to the tail with a fresh turn
 ([scheduler.md](scheduler.md) § Time Slice Policy). A fair caller that the server does not outrank
-is passed on k (rule P) and runs when the server blocks: it waits in the front segment, where no
-pull takes it, while the server serves its backlog on the turns of the callers that queued it.
+is passed on k (rule P) and runs when the server blocks: it waits in the front segment, which only
+an idle CPU's pull reads while k runs a fair thread, while the server serves its backlog on the
+turns of the callers that queued it.
 When the server outranks the caller, `wake_replied` places the wake with k excluded
 (`reply_wake_exclusion`, `select_target_cpu_excluding`): every rule after rule 1 leaves k out,
 since the server keeps k past any slice the caller could wait for, and only a caller pinned to k
@@ -1508,7 +1509,8 @@ the tail of its level) before it returns to user mode, after
 delivering a bound message or before returning an error; a refused park yields through its own
 `schedule()` ([ipc-internals.md](ipc-internals.md) § Reply-and-Receive Path). A caller placed
 there would otherwise wait behind the server until the server parks or its slice ends. A passed
-caller has no yield: the server runs on, and the caller runs next. Every other wake passes
+caller has no yield: the server runs on, and the caller runs when it blocks, ahead of the fair
+threads linked at the tail, unless an idle CPU pulls it first. Every other wake passes
 `WakeHint::None`.
 
 When the guard holds, the woken thread is the thread k's `schedule()` dispatches when the waker

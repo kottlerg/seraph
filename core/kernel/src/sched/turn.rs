@@ -20,7 +20,9 @@
 //! of ticks out of a server's word is a compare-and-swap that holds only while
 //! the word carries the caller's tag, so a claimant on another CPU that wins
 //! the binding and a late one that lost it to a later bind never move a turn
-//! twice.
+//! twice. A turn begins at a wake that links the thread at the tail of its
+//! queue ([`start_turn`]), as one does at a slice expiry: a call or a pass
+//! never makes one.
 
 use core::sync::atomic::Ordering;
 
@@ -33,6 +35,13 @@ pub const TURN_TICKS: u64 = 0x7FFF_FFFF;
 /// The bit of a tag that marks a caller's turn, set in every
 /// [`lender_tag`]; a word without it holds the thread's own turn.
 const LENT: u64 = 1 << 31;
+
+/// The word a claimant leaves in a server whose caller's turn it took back
+/// spent, its ticks lent on to a call the server made in turn or run out: the
+/// nested call's reply gives ticks back into it, which are the ended caller's
+/// and are dropped ([`give_ticks`]), not credited to the server. No thread id
+/// makes it, since it lacks [`LENT`], and it holds no tick.
+const ORPHANED: u64 = !TURN_TICKS & !LENT;
 
 /// The tag a turn taken from the caller of thread id `tid` carries in its
 /// server's word: the id in the high half and [`LENT`].
@@ -122,7 +131,8 @@ unsafe fn caller_tag(caller: *mut ThreadControlBlock) -> u64
     lender_tag(unsafe { (*caller).thread_id })
 }
 
-/// Add `more` ticks to `tcb`'s word, keeping its tag.
+/// Add `more` ticks to `tcb`'s word, keeping its tag; an [`ORPHANED`]
+/// word drops them and holds no turn after.
 ///
 /// # Safety
 /// `tcb` is a valid TCB.
@@ -136,7 +146,16 @@ unsafe fn give_ticks(tcb: *mut ThreadControlBlock, more: u64)
     let word = unsafe { &(*tcb).lent_turn };
     // The closure never refuses, so the update cannot fail.
     let _ = word.try_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
-        Some(with_more_ticks(w, more))
+        Some(
+            if w == ORPHANED
+            {
+                0
+            }
+            else
+            {
+                with_more_ticks(w, more)
+            },
+        )
     });
 }
 
@@ -144,8 +163,8 @@ unsafe fn give_ticks(tcb: *mut ThreadControlBlock, more: u64)
 /// calls, leaving its slice one tick, which the word's ticks stand in for: the
 /// tick charges the word first and expires the slice when the word's last
 /// tick goes ([`TickCharge::OwnTurnEnds`]). A caller whose word already holds
-/// a turn (one it serves on, or its own, given back by an earlier reply) keeps
-/// it, and the bind moves that.
+/// a turn (one it serves on, its own given back by an earlier reply, or one a
+/// tail wake started) keeps it, and the bind moves that.
 ///
 /// # Safety
 /// `caller` is the thread running on this CPU, with interrupts masked, so no
@@ -155,7 +174,8 @@ pub unsafe fn lend_turn_out(caller: *mut ThreadControlBlock)
     // SAFETY: caller is the running thread (contract), whose fields this CPU
     // alone writes while interrupts are masked.
     let tcb = unsafe { &mut *caller };
-    if !super::is_fair_level(tcb.priority) || tcb.lent_turn.load(Ordering::Relaxed) != 0
+    let word = tcb.lent_turn.load(Ordering::Relaxed);
+    if !super::is_fair_level(tcb.priority) || (word != 0 && word != ORPHANED)
     {
         return;
     }
@@ -263,16 +283,15 @@ pub unsafe fn give_displaced_turn(displaced: *mut ThreadControlBlock, prior: Opt
     unsafe { give_ticks(displaced, ticks(prior)) };
 }
 
-/// The reply of `server` to `caller` gives the caller back what is left of
-/// the turn the server took from it, and a fresh turn of its own when that
-/// turn ran out during the request, for the tail link the reply then makes.
+/// Take `caller`'s turn back from `server`'s word, leaving `spent` there
+/// when the turn holds no tick, and give the caller what is left.
 ///
 /// # Safety
-/// Both are valid TCBs; `caller` is pinned by the won reply claim, or by the
-/// claimant's won claim for [`reclaim_turn`].
-pub unsafe fn return_turn(
+/// As for [`return_turn`].
+unsafe fn take_back(
     server: *mut ThreadControlBlock,
     caller: *mut ThreadControlBlock,
+    spent: u64,
 ) -> Returned
 {
     // SAFETY: caller valid (contract).
@@ -282,7 +301,7 @@ pub unsafe fn return_turn(
         (*server)
             .lent_turn
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
-                (tag(w) == held).then_some(0)
+                (tag(w) == held).then_some(if ticks(w) == 0 { spent } else { 0 })
             })
     };
     let Ok(word) = took
@@ -291,39 +310,76 @@ pub unsafe fn return_turn(
         return Returned::NotHeld;
     };
     let left = ticks(word);
-    if left > 0
+    if left == 0
     {
-        // SAFETY: caller valid and pinned (contract).
-        unsafe { give_ticks(caller, left) };
-        return Returned::InTime;
+        // The caller goes on on what its word holds: nothing for one on its
+        // own turn, whose tail link starts the next (start_turn), and its own
+        // caller's turn, now spent, for one that serves a call.
+        return Returned::RanOut;
     }
-    // A caller on its own turn starts its next one; one that serves a call
-    // on its own caller's turn keeps that word, now spent, and goes on on its
-    // own slice.
-    // SAFETY: caller valid and pinned (contract); the level is read as a hint.
-    let quantum = u64::from(super::quantum_ticks(unsafe { (*caller).priority }));
-    // SAFETY: caller valid (contract); lent_turn is atomic.
-    let _ = unsafe {
-        (*caller)
-            .lent_turn
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
-                (w == 0).then_some(quantum)
-            })
-    };
-    Returned::RanOut
+    // SAFETY: caller valid and pinned (contract).
+    unsafe { give_ticks(caller, left) };
+    Returned::InTime
+}
+
+/// The reply of `server` to `caller` gives the caller back what is left of
+/// the turn the server took from it. A turn that ran out during the request
+/// gives nothing back ([`Returned::RanOut`]): the reply links the caller at
+/// the tail, where [`start_turn`] starts its next turn.
+///
+/// # Safety
+/// Both are valid TCBs; `caller` is pinned by the won reply claim.
+pub unsafe fn return_turn(
+    server: *mut ThreadControlBlock,
+    caller: *mut ThreadControlBlock,
+) -> Returned
+{
+    // SAFETY: the contract, which is take_back's.
+    unsafe { take_back(server, caller, 0) }
 }
 
 /// A claimant that ends `caller`'s call to `server` unanswered (the server's
 /// next receive, a cancel, a timed call's expiry, a dealloc, a fault
-/// redelivery) gives the caller back what is left of its turn.
+/// redelivery) gives the caller back what is left of its turn. A turn that
+/// holds no tick may be lent on to a call the server made in turn, whose reply
+/// would give its rest back to the server: the claimant leaves the server's
+/// word [`ORPHANED`], so those ticks are dropped and the server gains no turn
+/// by the ended call.
 ///
 /// # Safety
 /// Both are valid TCBs; the claimant won `server`'s binding of `caller`,
 /// which pins `caller`.
 pub unsafe fn reclaim_turn(server: *mut ThreadControlBlock, caller: *mut ThreadControlBlock)
 {
-    // SAFETY: the contract, which is return_turn's.
-    let _ = unsafe { return_turn(server, caller) };
+    // SAFETY: the contract, which is take_back's.
+    let _ = unsafe { take_back(server, caller, ORPHANED) };
+}
+
+/// A wake links the fair `tcb`, at level `priority` read under its
+/// `sched_lock`, at the tail of its queue: it starts a fresh turn of its own,
+/// a full quantum in its word, which the tick charges before the slice and
+/// whose last tick expires the slice ([`TickCharge::OwnTurnEnds`]). A word that
+/// holds a caller's turn, which a server woken while it serves a call runs on,
+/// is kept.
+///
+/// # Safety
+/// `tcb` is a valid TCB whose `sched_lock` the caller holds, and the wake
+/// links it.
+pub unsafe fn start_turn(tcb: *mut ThreadControlBlock, priority: u8)
+{
+    if !super::is_fair_level(priority)
+    {
+        return;
+    }
+    let quantum = u64::from(super::quantum_ticks(priority));
+    // SAFETY: tcb valid (contract); lent_turn is atomic.
+    let _ = unsafe {
+        (*tcb)
+            .lent_turn
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
+                (w & LENT == 0).then_some(quantum)
+            })
+    };
 }
 
 /// Charge this CPU's tick to the turn `current`, the thread running here,
@@ -470,6 +526,19 @@ mod tests
         unsafe { charge_tick(t) }
     }
 
+    fn start(t: *mut ThreadControlBlock)
+    {
+        // SAFETY: as above.
+        let level = unsafe { (*t).priority };
+        // SAFETY: as above.
+        unsafe { start_turn(t, level) }
+    }
+
+    fn quantum() -> u64
+    {
+        u64::from(super::super::quantum_ticks(LEVEL))
+    }
+
     const LEVEL: u8 = 10;
 
     // Defect caught (#1732): a turn copied rather than moved (the caller keeps
@@ -514,8 +583,86 @@ mod tests
         assert_eq!(tick(server), TickCharge::Lent);
         assert_eq!(tick(server), TickCharge::Slice);
         assert_eq!(back(server, caller), Returned::RanOut);
-        assert_eq!(word(caller), u64::from(super::super::quantum_ticks(LEVEL)));
-        assert_eq!(word(server), 0);
+        assert_eq!((word(caller), word(server)), (0, 0));
+        // The reply's tail link starts the caller's next turn.
+        start(caller);
+        assert_eq!(word(caller), quantum());
+    }
+
+    // Defect caught (#1732): a thread woken at the tail of its queue that
+    // carries the rest of an old turn, so a call it makes soon after runs
+    // out mid-request and waits a round of the queue; a tail wake of a server
+    // that serves a call dropping the caller's turn it runs on; or an RT
+    // thread given a turn.
+    #[test]
+    fn a_tail_wake_starts_a_fresh_turn_and_keeps_a_callers()
+    {
+        let thread = tcb(CALLER, LEVEL, 3);
+        lend(thread);
+        assert_eq!((word(thread), slice(thread)), (3, 1));
+        start(thread);
+        assert_eq!(word(thread), quantum());
+        for _ in 1..quantum()
+        {
+            assert_eq!(tick(thread), TickCharge::Lent);
+        }
+        assert_eq!(tick(thread), TickCharge::OwnTurnEnds);
+
+        let caller = tcb(CALLER + 1, LEVEL, 5);
+        let server = tcb(SERVER, LEVEL, 4);
+        lend(caller);
+        assert_eq!(take(server, caller), Some(0));
+        start(server);
+        assert_eq!(word(server), lender_tag(CALLER + 1) | 5);
+
+        let rt = tcb(CALLER + 2, super::super::RT_PRIORITY_MIN, 10);
+        start(rt);
+        assert_eq!(word(rt), 0);
+    }
+
+    // Defect caught (#1732): a claimant that ends a call while its server has
+    // lent the caller's turn on to a call of its own, after which the nested
+    // reply credits the rest of that turn to the server as its own, so the
+    // server runs it and a full slice besides ahead of the queue.
+    #[test]
+    fn a_turn_lent_on_is_dropped_when_its_callers_call_ends_unanswered()
+    {
+        let caller = tcb(CALLER, LEVEL, 6);
+        let first = tcb(SERVER, LEVEL, 4);
+        let second = tcb(SERVER + 1, LEVEL, 4);
+        lend(caller);
+        assert_eq!(take(first, caller), Some(0));
+        lend(first);
+        assert_eq!(take(second, first), Some(0));
+        reclaim(first, caller);
+        assert_eq!(word(first), ORPHANED);
+        assert_eq!(word(caller), 0);
+        assert_eq!(tick(second), TickCharge::Lent);
+        assert_eq!(back(second, first), Returned::InTime);
+        assert_eq!((word(first), slice(first)), (0, 4));
+        assert_eq!(tick(first), TickCharge::Slice);
+
+        // An orphaned word is no turn: the server's next call lends its own
+        // slice, and a tail wake starts a fresh turn over it.
+        let other = tcb(SERVER + 2, LEVEL, 4);
+        lend(other);
+        assert_eq!(take(first, other), Some(0));
+        reclaim(first, other);
+        assert_eq!(word(other), 4);
+        assert_eq!(tick(first), TickCharge::Slice);
+        let spent = tcb(CALLER + 3, LEVEL, 1);
+        lend(spent);
+        assert_eq!(take(first, spent), Some(0));
+        assert_eq!(tick(first), TickCharge::Lent);
+        reclaim(first, spent);
+        assert_eq!(word(first), ORPHANED);
+        lend(first);
+        assert_eq!((word(first), slice(first)), (4, 1));
+        let orphan = tcb(SERVER + 3, LEVEL, 2);
+        // SAFETY: orphan is a live TCB of this test.
+        unsafe { (*orphan).lent_turn.store(ORPHANED, Ordering::Relaxed) };
+        start(orphan);
+        assert_eq!(word(orphan), quantum());
     }
 
     // Defect caught (#1732): a server that calls on while it serves lending

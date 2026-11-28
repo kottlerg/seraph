@@ -273,13 +273,31 @@ enum QueueEnd
     Front,
 }
 
+/// The CPU a scan for a thread to move away ([`PerCpuScheduler::find_runnable`])
+/// takes one for, as the scan's reading of the front segment needs it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Puller
+{
+    /// A CPU with work of its own, behind which a moved thread waits; and the
+    /// RT push, whose scan reads only RT queues.
+    Busy,
+    /// A CPU with no work (`has_no_work` under its lock), where a moved
+    /// thread runs at once.
+    Idle,
+}
+
 /// Whether a scan for a thread to move away ([`PerCpuScheduler::find_runnable`])
 /// reads the fair queue's front segment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FrontSegment
 {
-    /// The segment's threads run on this CPU next: the scan skips them.
+    /// The segment's threads run on this CPU when its running fair thread
+    /// blocks, yields or expires, and the puller has work of its own: the scan
+    /// skips them.
     Skip,
+    /// The puller has no work, so a thread it takes runs at once: the scan
+    /// reads the segment after every other thread of the queue.
+    Last,
     /// RT work runs or waits ahead of them: the scan reads them, as it reads
     /// any fair thread queued behind RT work.
     Include,
@@ -499,14 +517,34 @@ impl RunQueue
     where
         F: FnMut(*mut ThreadControlBlock) -> bool,
     {
-        let mut cur = self.head;
-        if front == FrontSegment::Skip
-            && let Some(front) = self.front
+        let Some(end) = self.front.filter(|_| front != FrontSegment::Include)
+        else
         {
-            // SAFETY: front is a valid TCB linked on this queue.
-            cur = unsafe { (*front).run_queue_next };
+            return Self::first_from(self.head, None, &mut pred);
+        };
+        // SAFETY: end is a valid TCB linked on this queue.
+        let behind = unsafe { (*end).run_queue_next };
+        let found = Self::first_from(behind, None, &mut pred);
+        if found.is_some() || front == FrontSegment::Skip
+        {
+            return found;
         }
+        Self::first_from(self.head, behind, &mut pred)
+    }
+
+    /// The first TCB satisfying `pred` from `from` up to, not including,
+    /// `stop` (`None`: the end of the queue).
+    fn first_from<F>(
+        from: Option<*mut ThreadControlBlock>,
+        stop: Option<*mut ThreadControlBlock>,
+        pred: &mut F,
+    ) -> Option<*mut ThreadControlBlock>
+    where
+        F: FnMut(*mut ThreadControlBlock) -> bool,
+    {
+        let mut cur = from;
         while let Some(c) = cur
+            && cur != stop
         {
             if pred(c)
             {
@@ -1544,21 +1582,29 @@ impl PerCpuScheduler
     }
 
     /// Whether a scan for a thread to move away reads the fair queue's front
-    /// segment: the segment's threads run on this CPU next while it runs a
-    /// fair thread or its idle thread and queues no RT thread, and a scan then
-    /// skips them. While an RT thread runs or waits here they wait behind it
-    /// as any queued fair thread does, and a pull may take them.
-    fn front_segment(&self) -> FrontSegment
+    /// segment. While this CPU runs a fair thread or its idle thread and
+    /// queues no RT thread, the segment's threads run here when the running
+    /// thread blocks, yields or expires: a scan for a [`Puller::Busy`] skips
+    /// them, since a thread moved there would wait behind its work, and a scan
+    /// for a [`Puller::Idle`] reads them after every other thread of the
+    /// queue, since one moved there runs at once. While an RT thread runs or
+    /// waits here they wait behind it as any queued fair thread does, and a
+    /// pull may take them.
+    fn front_segment(&self, puller: Puller) -> FrontSegment
     {
         let fair_rank = level_rank(syscall::PRIORITY_MIN);
         let ranks = self.ranks();
-        if ranks.effective() <= fair_rank
+        if ranks.effective() > fair_rank
         {
-            FrontSegment::Skip
+            FrontSegment::Include
+        }
+        else if puller == Puller::Idle
+        {
+            FrontSegment::Last
         }
         else
         {
-            FrontSegment::Include
+            FrontSegment::Skip
         }
     }
 
@@ -1571,14 +1617,15 @@ impl PerCpuScheduler
     /// Used by the cross-CPU load balancer to pick a migratable (unpinned)
     /// thread from a busier CPU's queue, over every queue, and by the RT push
     /// over its window ([`push_window`]). The fair queue's front segment is
-    /// read only while RT work runs or waits ahead of it
-    /// ([`front_segment`](Self::front_segment)).
+    /// read while RT work runs or waits ahead of it, and, last, for a
+    /// [`Puller::Idle`] ([`front_segment`](Self::front_segment)).
     ///
     /// # Safety
     /// The caller holds `self.lock`.
     pub unsafe fn find_runnable<F>(
         &self,
         within: u32,
+        puller: Puller,
         mut pred: F,
     ) -> Option<(*mut ThreadControlBlock, u8)>
     where
@@ -1587,7 +1634,7 @@ impl PerCpuScheduler
         // SAFETY: the caller holds `self.lock` (contract), so no `&mut` to the
         // queues is live.
         let queues = unsafe { self.queues.as_ref_unchecked() };
-        let front = self.front_segment();
+        let front = self.front_segment(puller);
         let mut ne = self.non_empty.load(Ordering::Relaxed) & within;
         while ne != 0
         {
@@ -1927,7 +1974,8 @@ mod tests
         assert!(enq(&sched, pf, 12));
         assert!(enq(&sched, pr, 23));
         // SAFETY: single-threaded test.
-        let found = unsafe { sched.find_runnable(u32::MAX, |t| core::ptr::eq(t, pf)) };
+        let found =
+            unsafe { sched.find_runnable(u32::MAX, Puller::Busy, |t| core::ptr::eq(t, pf)) };
         let Some((tcb, level)) = found
         else
         {
@@ -1936,7 +1984,8 @@ mod tests
         assert_eq!(tcb, pf);
         assert!(rm(&sched, pf, level));
         // SAFETY: single-threaded test.
-        let found = unsafe { sched.find_runnable(u32::MAX, |t| core::ptr::eq(t, pr)) };
+        let found =
+            unsafe { sched.find_runnable(u32::MAX, Puller::Busy, |t| core::ptr::eq(t, pr)) };
         assert_eq!(found, Some((pr, 23)));
         assert!(rm(&sched, pr, 23));
         assert_eq!(sched.non_empty_mask(), 0);
@@ -1957,10 +2006,11 @@ mod tests
         assert!(enq(&sched, &raw mut *fair, syscall::PRIORITY_MIN));
         let below_high = bit(RT_PRIORITY_MIN + 3) | bit(syscall::PRIORITY_MIN);
         // SAFETY: single-threaded test.
-        let found = unsafe { sched.find_runnable(below_high & RT_QUEUES, |_| true) };
+        let found = unsafe { sched.find_runnable(below_high & RT_QUEUES, Puller::Busy, |_| true) };
         assert_eq!(found, Some((&raw mut *low, RT_PRIORITY_MIN + 3)));
         // SAFETY: single-threaded test.
-        let found = unsafe { sched.find_runnable(bit(RT_PRIORITY_MIN + 5), |_| true) };
+        let found =
+            unsafe { sched.find_runnable(bit(RT_PRIORITY_MIN + 5), Puller::Busy, |_| true) };
         assert_eq!(found, None);
     }
 
@@ -2058,7 +2108,7 @@ mod tests
         let window = push_window(src.waiting_rt(), dst.ranks());
         assert_eq!(window, bit(waiting_level));
         // SAFETY: single-threaded test.
-        let pick = unsafe { src.find_runnable(window, |_| true) };
+        let pick = unsafe { src.find_runnable(window, Puller::Busy, |_| true) };
         assert_eq!(pick, Some((pl, waiting_level)));
         assert!(rm(&src, pl, waiting_level));
         assert!(enq(&dst, pl, waiting_level));
@@ -3050,11 +3100,19 @@ mod tests
         unsafe { s.enqueue_woken(tcb, prio, WakeLink::Front) }
     }
 
-    /// The first queued TCB a scan for a thread to move away finds.
+    /// The first queued TCB a scan for a thread to move away finds, for a
+    /// puller with work of its own.
     fn first_movable(s: &PerCpuScheduler) -> Option<*mut ThreadControlBlock>
     {
         // SAFETY: single-threaded test.
-        unsafe { s.find_runnable(u32::MAX, |_| true) }.map(|(tcb, _)| tcb)
+        unsafe { s.find_runnable(u32::MAX, Puller::Busy, |_| true) }.map(|(tcb, _)| tcb)
+    }
+
+    /// As [`first_movable`], for a puller with no work.
+    fn first_movable_to_idle(s: &PerCpuScheduler) -> Option<*mut ThreadControlBlock>
+    {
+        // SAFETY: single-threaded test.
+        unsafe { s.find_runnable(u32::MAX, Puller::Idle, |_| true) }.map(|(tcb, _)| tcb)
     }
 
     // Defect caught (#1732): a passed thread linked at the head ahead of the
@@ -3095,11 +3153,14 @@ mod tests
         assert_eq!(deq(&sched), tail);
     }
 
-    // Defect caught (#1732): a pull that takes a passed thread from the CPU it
-    // runs on next, so its call or reply waits on the puller's dispatch; or a
-    // passed thread stranded behind an RT thread that holds its CPU, which no
-    // pull may then take (a thread looping on yield at an RT level holds it
-    // for good).
+    // Defect caught (#1732): a busy CPU's pull that takes a passed thread from
+    // the CPU it runs on next, so its call or reply waits behind the puller's
+    // work; an idle CPU that cannot pull a caller passed behind a server that
+    // runs on, so the caller waits out the server's run-on while that CPU
+    // idles; an idle CPU's pull that takes a passed thread ahead of a thread
+    // linked at the tail, splitting a pair it need not; or a passed thread
+    // stranded behind an RT thread that holds its CPU, which no pull may then
+    // take (a thread looping on yield at an RT level holds it for good).
     #[test]
     fn a_scan_skips_the_front_segment_unless_rt_work_holds_the_cpu()
     {
@@ -3111,8 +3172,12 @@ mod tests
         assert!(enq_front(&sched, passed, fair));
         sched.set_current_level(fair);
         assert_eq!(first_movable(&sched), None);
+        assert_eq!(first_movable_to_idle(&sched), Some(passed));
         assert!(enq(&sched, queued, fair));
         assert_eq!(first_movable(&sched), Some(queued));
+        assert_eq!(first_movable_to_idle(&sched), Some(queued));
+        assert!(rm(&sched, queued, fair));
+        assert!(enq(&sched, queued, fair));
         sched.set_current_level(RT_PRIORITY_MIN);
         assert_eq!(first_movable(&sched), Some(passed));
         sched.set_current_level(fair);

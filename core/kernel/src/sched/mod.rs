@@ -7004,8 +7004,19 @@ unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -
         // predicate sees is linked on src.
         unsafe { pullable(tcb) }
     };
+    // A destination with no work runs the thread it takes at once, so it may
+    // take a passed thread, after every other (run_queue::FrontSegment::Last);
+    // read under the destination's lock, held.
+    let puller = if dst.has_no_work()
+    {
+        run_queue::Puller::Idle
+    }
+    else
+    {
+        run_queue::Puller::Busy
+    };
     // SAFETY: src's lock held (caller's contract); the predicate is read-only.
-    let pick = unsafe { src.find_runnable(queues, movable) };
+    let pick = unsafe { src.find_runnable(queues, puller, movable) };
     let Some((tcb, priority)) = pick
     else
     {
@@ -7215,6 +7226,23 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
     unsafe { enqueue_and_wake_at(tcb, WakeTarget::tail(target_cpu)) };
 }
 
+/// Release the wake-in-flight pin on `tcb`, which lets a waiting
+/// `dealloc_object(Thread)` proceed.
+///
+/// # Safety
+/// `tcb` is a valid TCB, pinned by the wake that calls this, whose last use
+/// of the pin this is.
+#[cfg(not(test))]
+unsafe fn release_wake_pin(tcb: *mut ThreadControlBlock)
+{
+    // SAFETY: tcb valid (contract); wake_in_flight is atomic.
+    unsafe {
+        (*tcb)
+            .wake_in_flight
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
 /// [`enqueue_and_wake`] at the placement `target` of [`select_wake_target`]:
 /// a [`WakeLink::Front`] link, a pass, goes into the front segment of the
 /// fair queue of `target.cpu` when the link is made there and the level read
@@ -7270,11 +7298,7 @@ pub unsafe fn enqueue_and_wake_at(tcb: *mut ThreadControlBlock, target: WakeTarg
             // SAFETY: tcb valid; wake_pending is written under sched_lock, held.
             unsafe { (*tcb).wake_pending = true };
             // SAFETY: tcb valid; wake_in_flight is atomic.
-            unsafe {
-                (*tcb)
-                    .wake_in_flight
-                    .store(0, core::sync::atomic::Ordering::Release);
-            }
+            unsafe { release_wake_pin(tcb) };
             // SAFETY: paired with the lock_raw above.
             unsafe { tcb_lock.unlock_raw(sched_saved) };
             return;
@@ -7299,11 +7323,7 @@ pub unsafe fn enqueue_and_wake_at(tcb: *mut ThreadControlBlock, target: WakeTarg
             unsafe { (*tcb).blocked_on_object = core::ptr::null_mut() };
             // SAFETY: tcb valid; wake_in_flight is atomic, released under
             // sched_lock.
-            unsafe {
-                (*tcb)
-                    .wake_in_flight
-                    .store(0, core::sync::atomic::Ordering::Release);
-            }
+            unsafe { release_wake_pin(tcb) };
             // SAFETY: paired with the lock_raw above.
             unsafe { tcb_lock.unlock_raw(sched_saved) };
             return;
@@ -7324,11 +7344,7 @@ pub unsafe fn enqueue_and_wake_at(tcb: *mut ThreadControlBlock, target: WakeTarg
             unsafe { tcb_lock.unlock_raw(sched_saved) };
             // SAFETY: the pin keeps the TCB valid until this release, its last
             // touch.
-            unsafe {
-                (*tcb)
-                    .wake_in_flight
-                    .store(0, core::sync::atomic::Ordering::Release);
-            }
+            unsafe { release_wake_pin(tcb) };
             return;
         }
     }
@@ -7358,11 +7374,7 @@ pub unsafe fn enqueue_and_wake_at(tcb: *mut ThreadControlBlock, target: WakeTarg
             (*tcb).wake_pending = false;
         }
         // SAFETY: tcb valid; wake_in_flight is atomic, released under sched_lock.
-        unsafe {
-            (*tcb)
-                .wake_in_flight
-                .store(0, core::sync::atomic::Ordering::Release);
-        }
+        unsafe { release_wake_pin(tcb) };
         // SAFETY: paired with the lock_raw above.
         unsafe { tcb_lock.unlock_raw(sched_saved) };
         return;
@@ -7403,6 +7415,14 @@ pub unsafe fn enqueue_and_wake_at(tcb: *mut ThreadControlBlock, target: WakeTarg
     // SAFETY: both locks held; tcb is valid.
     if unsafe { sched.enqueue_woken(tcb, priority, link) }
     {
+        // A fair thread linked at the tail starts a fresh turn; a pass runs on
+        // the turn it has. Written before the CPU lock's release publishes the
+        // link to the dispatcher.
+        if link == WakeLink::Tail
+        {
+            // SAFETY: tcb valid; its sched_lock is held and this wake linked it.
+            unsafe { turn::start_turn(tcb, priority) };
+        }
         // Count the wake's placement against the CPU the thread was last on,
         // before the retarget below overwrites it.
         // SAFETY: both locks held; tcb valid; sched is target_cpu's scheduler.
@@ -7419,11 +7439,7 @@ pub unsafe fn enqueue_and_wake_at(tcb: *mut ThreadControlBlock, target: WakeTarg
     // waiting dealloc_object(Thread) may proceed (it then observes the thread
     // via the run queue / current and applies its removal + context_saved gate).
     // SAFETY: tcb valid; locks held.
-    unsafe {
-        (*tcb)
-            .wake_in_flight
-            .store(0, core::sync::atomic::Ordering::Release);
-    }
+    unsafe { release_wake_pin(tcb) };
 
     // Release inner (run-queue) then outer (sched_lock). Never IPI under
     // sched_lock.
@@ -10034,7 +10050,8 @@ pub unsafe fn timer_tick()
         };
         // SAFETY: this CPU's scheduler lock is held; the predicate is
         // read-only.
-        unsafe { sched.find_runnable(waiting, movable) }.map(|(_, level)| level)
+        unsafe { sched.find_runnable(waiting, run_queue::Puller::Busy, movable) }
+            .map(|(_, level)| level)
     };
 
     // SAFETY: Unlock before calling schedule(), which will re-acquire.

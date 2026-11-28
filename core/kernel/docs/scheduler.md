@@ -215,10 +215,14 @@ The fair queue has a front segment: the run of threads at its head that passes l
 of the segment (`PerCpuScheduler::enqueue_woken` with `WakeLink::Front`), behind the threads
 passed before it and ahead of every thread linked at the tail; a dequeue takes the head as before,
 and a dequeue or removal of the segment's last thread moves `front` to the thread ahead of it, or
-empties the segment. A scan for a thread to move away (`find_runnable`, for the load balancer's
-pulls and the RT push) skips the segment, whose threads run on this CPU next, unless RT work runs
-or waits on the CPU (its effective rank is above the fair level's): a passed thread behind RT work
-is pulled as any queued fair thread is (§ Load Balancing).
+empties the segment. While the CPU runs a fair thread or its idle thread and queues no RT thread,
+the segment's threads run there when the running thread blocks, yields or its slice ends, so a
+scan for a thread to move away (`find_runnable`, for the load balancer's pulls and the RT push)
+skips the segment for a puller with work of its own, behind which a moved thread would wait, and
+reads it after every other queued thread for a puller with none (`has_no_work` under its lock),
+where a moved thread runs at once. While RT work runs or waits on the CPU (its effective rank is
+above the fair level's), a passed thread waits behind it and is pulled as any queued fair thread
+is (§ Load Balancing).
 
 ### Time Slice Policy
 
@@ -251,12 +255,17 @@ moves what is left back to the caller, as does every path that ends a call unans
 receive, a cancel, a timed call's expiry, a dealloc, a fault redelivery), each a compare-and-swap
 on the tag, so only the holder of the caller's tag moves its turn. A turn that runs out while the
 server works on the request leaves the server on its own slice, and the reply then sends the
-caller to the tail of its queue with a fresh turn, as a slice expiry does. A slice is refilled
-only at its own expiry, so between two tail links a fair thread runs one turn of its own, plus
-the marker tick, however calls and passes carry it. A call between threads that are not both fair
-moves no turn. What a reply gave back to a server for a call it made on its own turn is dropped
-when the server next binds a call, whose caller's turn replaces it: a thread never gains a turn by
-lending.
+caller to the tail of its queue. A wake that links a fair thread at the tail of its queue starts a
+fresh turn there, a full quantum in its word, as a slice expiry does (`turn::start_turn`); a word
+that holds a caller's turn, which a server woken mid-request runs on, is kept. A call, a reply and
+a pass start no turn, so between two tail links a fair thread runs one turn of its own, plus the
+marker tick, however calls and passes carry it, and a thread that blocks outside IPC, as one that
+sleeps or waits for a notification does, makes its next calls on a whole turn. A call between
+threads that are not both fair moves no turn. What a reply gave back to a server for a call it
+made on its own turn is dropped when the server next binds a call, whose caller's turn replaces
+it; a claimant that ends a call whose turn its server has lent on to a call of its own leaves the
+server's word orphaned, so the nested reply's rest of that turn is dropped rather than credited
+to the server: a thread never gains a turn by lending.
 
 Slice expiry never hands the CPU to a lower RT level, nor from an RT thread to a fair one: the
 expiring thread is requeued at its run queue's tail and the highest non-empty queue runs next.
@@ -685,10 +694,13 @@ than the threads queued behind its running one.
 
 The balancer counts queued threads without weighing them by class or level (§ Scheduling
 Classes): it evens out the number of queued threads per CPU, and `find_runnable` scans the
-victim's queues from the highest, so an RT thread is pulled before a fair one. The scan skips the
-fair queue's front segment, whose passed threads run on the victim next, unless RT work runs or
-waits there (§ Run Queue Structure): a passed thread behind RT work is pulled as any fair thread
-is, so a thread that loops at an RT level cannot strand it.
+victim's queues from the highest, so an RT thread is pulled before a fair one. A busy CPU's pull
+skips the fair queue's front segment, whose passed threads run on the victim when its running
+thread blocks, yields or its slice ends, and an idle CPU's pull reads it after every other queued
+thread, since a thread it takes runs at once: a caller passed behind a server that runs on is
+pulled by an idle CPU as any queued fair thread is, within the bound below. While RT work runs or
+waits on the victim, every pull reads the segment (§ Run Queue Structure), so a thread that loops
+at an RT level cannot strand a passed thread.
 
 **Scan windows.** Each scan of the CPUs on a wake or a tick path reads at most `CPU_SCAN_WINDOW`
 (128) of them (`sched::ScanWindow`): consecutive CPUs in index order from a cursor of the
@@ -1356,15 +1368,17 @@ the rule of § Thread Assignment and the turn of § Time Slice Policy:
   bounded by one turn of each other caller of S and one slice of S. No term depends on the number
   of fair threads queued on either CPU, nor on the length of their slices. A call with a receive
   thread parked and no backlog, as a probe of a service that answers one caller at a time makes,
-  has Q = E = 0.
+  has Q = E = 0. T's turn begins when a wake links it at the tail of its queue (§ Time Slice
+  Policy), so every call that a caller makes within one turn of running since such a wake is
+  within the bound: a probe that sleeps between its calls makes each on a whole turn.
 - **The precondition.** The bound holds for a service whose request path blocks only in IPC. A
   server thread that waits mid-request on a lock or a condition variable of its own process is
   woken by a notification wake, which links at the tail of its CPU's queue behind the fair threads
   there, and the lock's holder runs on no caller's turn. Such a service is outside the bound:
   logd's receive workers wait on its state lock mid-request (#1772).
 - **A turn that runs out.** A caller whose turn runs out during the request is sent to the tail
-  with a fresh turn by the reply (§ Time Slice Policy), so a thread that calls in a loop runs
-  ahead of its CPU's queue for at most one turn between two tail links.
+  by the reply, where it starts a fresh turn (§ Time Slice Policy), so a thread that calls in a
+  loop runs ahead of its CPU's queue for at most one turn between two tail links.
 
 The reverse direction is bounded as the fair class bounds any thread. A pass is made only on the
 waker's CPU, which the waker holds while it makes it, so a pair converges on one CPU and does not

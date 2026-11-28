@@ -1497,7 +1497,8 @@ value_enum! {
         Reboot,
         /// The ACPI power button, pressed over QMP (`x86_64` only).
         PowerButton,
-        /// The death of memmgr's thread, in an allocation.
+        /// The death of a memmgr receive thread other than the main one, in an
+        /// allocation.
         Memmgr,
         /// The death of a procmgr request worker, in a create.
         Procmgr,

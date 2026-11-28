@@ -23,17 +23,16 @@
 //! a revoke of the cap does not withdraw (core/kernel/docs/syscalls.md
 //! § `SYS_CAP_REVOKE`), so a copy into or out of it neither faults nor blocks.
 
-use core::ptr::addr_of_mut;
-
 use free_pool::disk::{self, KEY_BYTES, Registered, SLOT_WORDS_PER_PAGE, SlotError};
+use free_pool::lock::{Claim, Claimed};
 use free_pool::{CHUNK_BYTES, ClockHand, FaultPath, Fit, NodeIdx, SwapError};
 use free_pool::{WANT_WORDS, WantList};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::{MAP_READ, PAGE_SIZE};
 
 use crate::{
-    Answer, FaultDecline, MemLedger, coalesce, ensure_slots, evict, ledger_mut, map_self,
-    map_self_with, return_taken, select, self_aspace,
+    Answer, FaultDecline, MemLedger, coalesce, ensure_slots, evict, map_self, map_self_with,
+    return_taken, select, self_aspace,
 };
 
 /// The window where memmgr maps a buffer of the swap service's for one
@@ -73,20 +72,25 @@ pub(crate) const DETAIL_UNREGISTERED: u64 = 0;
 /// The decline detail of a chunk whose slot failed authentication: lost.
 pub(crate) const DETAIL_LOST: u64 = 1;
 
+/// The decline detail of a chunk on disk whose redirect memmgr could not make:
+/// its own `CSpace` had no slot for the reply's copy of the swap service's
+/// endpoint ([`reply_fault`]). The chunk stays on disk.
+const DETAIL_NO_SLOT: u64 = 3;
+
 /// memmgr's buffer for a slot's bytes: the chunk's stream, or a raw chunk's
 /// pages, sealed in place before it is copied out, or a slot's bytes copied in before they are opened
-/// in place. The receive loop's alone.
+/// in place. Reached only by G's holder.
 #[repr(C, align(16))]
 struct Buf([u8; BUF_BYTES]);
 
-static mut BUF: Buf = Buf([0; BUF_BYTES]);
+static BUF: Claim<Buf> = Claim::new(Buf([0; BUF_BYTES]));
 
 /// The disk tier's state: the per-boot key (`None` when its draw failed, and
 /// the disk tier then stays off), the next nonce, the swap service's endpoint
 /// (`0` while none is registered), its want Notification and the bits to
 /// send on it (`0` while it registered none), the slot words
 /// `MAKE_RESIDENT` posted for it to restore, and the hand of the walk
-/// `SWAP_TAKE` makes. The receive loop's alone.
+/// `SWAP_TAKE` makes. Reached only by G's holder.
 struct Disk
 {
     key: Option<[u8; KEY_BYTES]>,
@@ -98,7 +102,7 @@ struct Disk
     hand: ClockHand,
 }
 
-static mut DISK: Disk = Disk {
+static DISK: Claim<Disk> = Claim::new(Disk {
     key: None,
     nonce: 0,
     endpoint: 0,
@@ -106,29 +110,21 @@ static mut DISK: Disk = Disk {
     want_bits: 0,
     wants: WantList::new(),
     hand: ClockHand::START,
-};
+});
 
 const _: () = assert!(WANT_WORDS as u64 == memmgr_labels::SWAP_WANTED_WORDS);
 
-#[expect(
-    static_mut_refs,
-    reason = "`DISK` is reached only through this accessor, by the receive loop, the one \
-              thread that touches it, and each caller holds one `&mut` at a time"
-)]
-fn state() -> &'static mut Disk
+/// The disk tier's state, claimed until the guard drops; G's holder alone
+/// calls it, and no caller holds the guard across another call.
+fn state() -> Claimed<'static, Disk>
 {
-    // SAFETY: the receive loop is the only thread that reaches `DISK`, and no
-    // caller holds the reference across another call of this accessor.
-    unsafe { &mut DISK }
+    DISK.claim()
 }
 
-/// memmgr's swap buffer, reached alone.
-fn buf() -> &'static mut [u8; BUF_BYTES]
+/// memmgr's swap buffer, claimed until the guard drops, as [`state`].
+fn buf() -> Claimed<'static, Buf>
 {
-    // SAFETY: only the receive loop reaches `BUF`, through this accessor, and
-    // no caller holds the reference across another call of it. The pointer is
-    // made with no intermediate reference to the static.
-    unsafe { &mut (*addr_of_mut!(BUF)).0 }
+    BUF.claim()
 }
 
 /// Draw the per-boot key from the kernel's entropy pool (`SYS_GETRANDOM`).
@@ -150,6 +146,7 @@ pub(crate) fn init()
 /// Hand a swap label's request to its handler, with the caps its contract
 /// keeps (`crate::dispatch`).
 pub(crate) fn route(
+    l: &mut MemLedger,
     opcode: u64,
     req: &IpcMessage,
     kept: &[u64],
@@ -159,10 +156,10 @@ pub(crate) fn route(
 {
     match opcode
     {
-        memmgr_labels::SWAP_REGISTER => handle_register(req, kept, answer, service_ep),
-        memmgr_labels::SWAP_TAKE => handle_take(kept, answer),
-        memmgr_labels::SWAP_DONE => handle_done(req, answer),
-        memmgr_labels::SWAP_RESTORE => handle_restore(req, kept, answer),
+        memmgr_labels::SWAP_REGISTER => handle_register(l, req, kept, answer, service_ep),
+        memmgr_labels::SWAP_TAKE => handle_take(l, kept, answer),
+        memmgr_labels::SWAP_DONE => handle_done(l, req, answer),
+        memmgr_labels::SWAP_RESTORE => handle_restore(l, req, kept, answer),
         memmgr_labels::SWAP_WANTED => handle_wanted(answer),
         _ => answer.set_status(memmgr_errors::INVALID_ARGUMENT),
     }
@@ -208,7 +205,7 @@ pub(crate) fn post_want(l: &MemLedger, disk: Option<NodeIdx>) -> bool
     {
         return false;
     };
-    let s = state();
+    let mut s = state();
     if s.wants.post(disk::slot_word(n.slot, n.len, n.nonce)) == free_pool::Posted::Added
     {
         let _ = syscall::notification_send(s.want, s.want_bits);
@@ -267,12 +264,22 @@ pub(crate) fn reply_fault(
                 crate::decline_fault(answer, FaultDecline::OnDiskChunk, DETAIL_UNREGISTERED);
                 return true;
             };
+            // A copy for this reply alone: the reply is sent with G released,
+            // when another receive thread's `SWAP_REGISTER` can replace the
+            // registered endpoint and delete its slot.
+            let Ok(ep) = syscall::cap_derive(state().endpoint, syscall::RIGHTS_ALL)
+            else
+            {
+                crate::decline_fault(answer, FaultDecline::OnDiskChunk, DETAIL_NO_SLOT);
+                return true;
+            };
             let reply = IpcMessage::builder(syscall_abi::FAULT_REPLY_REDIRECT)
                 .word(0, disk::slot_word(n.slot, n.len, n.nonce))
-                .cap(state().endpoint)
+                .cap(ep)
                 .build();
-            // The kernel resolves the cap without moving it, so memmgr keeps it.
-            answer.set(reply);
+            // The kernel resolves the cap without moving it; the answer deletes
+            // the copy once the reply is sent.
+            answer.set_naming(reply, ep);
             true
         }
         FaultPath::DeclineUnregistered =>
@@ -332,7 +339,13 @@ fn unmap_window(pages: u64)
 /// every write in flight ([`free_pool::Ledger::end_writes`]): a new swap
 /// service knows nothing of its predecessor's. The reply's `data[0]` is the
 /// slots memmgr uses, the count clamped to [`MAX_SLOTS`].
-fn handle_register(req: &IpcMessage, caps: &[u64], answer: &mut Answer, service_ep: u64)
+fn handle_register(
+    l: &mut MemLedger,
+    req: &IpcMessage,
+    caps: &[u64],
+    answer: &mut Answer,
+    service_ep: u64,
+)
 {
     let Some(&cap) = caps.first()
     else
@@ -343,7 +356,6 @@ fn handle_register(req: &IpcMessage, caps: &[u64], answer: &mut Answer, service_
     let want = caps.get(1).copied().unwrap_or(0);
     let want_bits = req.word(1);
     let total = req.word(0).min(MAX_SLOTS);
-    let l = ledger_mut();
     let ours = syscall::endpoint_badge(service_ep, cap).is_ok();
     let want_ok = want == 0 || (want_bits != 0 && crate::is_notify_cap(want));
     if state().key.is_none()
@@ -360,7 +372,7 @@ fn handle_register(req: &IpcMessage, caps: &[u64], answer: &mut Answer, service_
         answer.set_status(memmgr_errors::INVALID_ARGUMENT);
         return;
     }
-    let s = state();
+    let mut s = state();
     for prior in [
         core::mem::replace(&mut s.endpoint, cap),
         core::mem::replace(&mut s.want, want),
@@ -440,7 +452,7 @@ fn grow_slots(l: &mut MemLedger) -> bool
 /// Its time in memmgr's loop is bounded: a walk of at most [`TAKE_STEPS`]
 /// steps, one copy of the stream or the pages (at most a chunk's bytes), one
 /// seal of it, and one copy of the sealed bytes out.
-fn handle_take(caps: &[u64], answer: &mut Answer)
+fn handle_take(l: &mut MemLedger, caps: &[u64], answer: &mut Answer)
 {
     let Some(&cap) = caps.first()
     else
@@ -448,7 +460,6 @@ fn handle_take(caps: &[u64], answer: &mut Answer)
         answer.set_status(memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    let l = ledger_mut();
     let (label, words) = take(l, cap);
     reply_with_cap(answer, label, &words, cap);
 }
@@ -456,8 +467,11 @@ fn handle_take(caps: &[u64], answer: &mut Answer)
 /// [`handle_take`]'s work: its reply label and words.
 fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
 {
-    let s = state();
-    let Some(key) = s.key.filter(|_| s.endpoint != 0)
+    let key = {
+        let s = state();
+        s.key.filter(|_| s.endpoint != 0)
+    };
+    let Some(key) = key
     else
     {
         return (memmgr_errors::INVALID_ARGUMENT, [0; 3]);
@@ -481,7 +495,8 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
     };
     let entry = l.chunk_at(v.reg, v.page_base);
     let raw = entry.is_raw();
-    let buf = buf();
+    let mut buf = buf();
+    let buf = &mut buf.0;
     let read = if raw
     {
         evict::read_raw(l, v.rec, v.reg, v.page_base, buf)
@@ -495,11 +510,14 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
     {
         return (memmgr_errors::QUOTA, [0; 3]);
     };
-    let s = state();
-    let nonce = s.nonce;
-    // A nonce is used once under the key, whatever follows: 2^64 seals never
-    // run out within a boot.
-    s.nonce = s.nonce.wrapping_add(1);
+    let nonce = {
+        let mut s = state();
+        let nonce = s.nonce;
+        // A nonce is used once under the key, whatever follows: 2^64 seals
+        // never run out within a boot.
+        s.nonce = s.nonce.wrapping_add(1);
+        nonce
+    };
     let sealed = if raw
     {
         disk::seal_detached(&key, nonce, buf, len).map(|tag| (len, Some(tag)))
@@ -564,9 +582,8 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
 /// raw, again on them ([`free_pool::Ledger::abandon_write`]); a write a restore or a
 /// teardown cancelled meanwhile frees its slot either way. Reply: `SUCCESS`,
 /// or `INVALID_ARGUMENT` for a slot that holds no write in flight.
-fn handle_done(req: &IpcMessage, answer: &mut Answer)
+fn handle_done(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
-    let l = ledger_mut();
     let done = u32::try_from(req.word(0)).is_ok_and(|slot| {
         if req.word(1) == 0
         {
@@ -632,7 +649,7 @@ fn handle_wanted(answer: &mut Answer)
 /// the chunk staying on disk. Reply: `SUCCESS`; `RESTORE_DECLINED`;
 /// `RESTORE_STALE`; or `INVALID_ARGUMENT` for a missing or small cap, or
 /// one memmgr cannot map.
-fn handle_restore(req: &IpcMessage, caps: &[u64], answer: &mut Answer)
+fn handle_restore(l: &mut MemLedger, req: &IpcMessage, caps: &[u64], answer: &mut Answer)
 {
     let Some(&cap) = caps.first()
     else
@@ -640,7 +657,6 @@ fn handle_restore(req: &IpcMessage, caps: &[u64], answer: &mut Answer)
         answer.set_status(memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    let l = ledger_mut();
     let (label, word) = restore(l, req.word(0), cap);
     reply_with_cap(answer, label, &[word], cap);
 }
@@ -678,7 +694,8 @@ fn restore(l: &mut MemLedger, word: u64, cap: u64) -> (u64, u64)
     {
         return (memmgr_errors::INVALID_ARGUMENT, 0);
     }
-    let buf = buf();
+    let mut buf = buf();
+    let buf = &mut buf.0;
     if let Some(dst) = buf.get_mut(..total)
     {
         // SAFETY: `pages` pages of the swap service's buffer are mapped

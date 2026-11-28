@@ -555,7 +555,8 @@ pub struct CreateResult
 /// Resolved placement for a child, produced by `crate::resolve_create_sched`
 /// from the create-label fields and the creator: its scheduling and its
 /// memmgr registration. Invariant: `1 <= priority <= band_max <=`
-/// [`ipc::sched_policy::BASELINE_PRIORITY_MAX`].
+/// [`ipc::sched_policy::PROCMGR_PRIORITY`], below the baseline's top,
+/// `MEMMGR_PRIORITY` (`process_table::Creator::UNBADGED`).
 #[derive(Clone, Copy)]
 pub struct ChildSched
 {
@@ -1567,35 +1568,26 @@ unsafe fn populate_child_info(
     // see all-zero stdio memory-cap/notification slots, which std maps to silent
     // println! / EOF on stdin.
 
-    // Baseline SchedControl: the child's band `[1, sched.band_max]`.
-    // Full-width bands are a plain copy of procmgr's baseline. Narrower
-    // bands are minted copy-then-split: derive a private copy, split it at
+    // Baseline SchedControl: the child's band `[1, sched.band_max]`, below
+    // the baseline's top (`ChildSched`), so every band is minted
+    // copy-then-split: derive a private copy, split it at
     // `band_max + 1` (the split consumes only the invoked copy — procmgr's
     // baseline slot is untouched), hand the low child across, and drop
     // both procmgr-side pieces (the child's `cap_copy` holds its own
     // reference; the discarded high child never leaves procmgr).
     let sched_in_child = if universals.sched_baseline != 0
     {
-        if sched.band_max >= ipc::sched_policy::BASELINE_PRIORITY_MAX
-        {
-            syscall::cap_copy(universals.sched_baseline, child_cspace, syscall::RIGHTS_ALL)
-                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
-        }
-        else
-        {
-            let own_copy = CapGuard::new(
-                syscall::cap_derive(universals.sched_baseline, syscall::RIGHTS_ALL)
-                    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
-            );
-            let (low, high) =
-                syscall::sched_split(own_copy.cap(), sched.band_max.saturating_add(1))
-                    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-            // The split consumed `own_copy`; its two halves replace it.
-            let _ = own_copy.disarm();
-            let (low, _high) = (CapGuard::new(low), CapGuard::new(high));
-            syscall::cap_copy(low.cap(), child_cspace, syscall::RIGHTS_ALL)
-                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
-        }
+        let own_copy = CapGuard::new(
+            syscall::cap_derive(universals.sched_baseline, syscall::RIGHTS_ALL)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?,
+        );
+        let (low, high) = syscall::sched_split(own_copy.cap(), sched.band_max.saturating_add(1))
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        // The split consumed `own_copy`; its two halves replace it.
+        let _ = own_copy.disarm();
+        let (low, _high) = (CapGuard::new(low), CapGuard::new(high));
+        syscall::cap_copy(low.cap(), child_cspace, syscall::RIGHTS_ALL)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?
     }
     else
     {

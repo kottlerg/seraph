@@ -615,7 +615,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[17] | `uncommitted_free_bytes` — the free pages outside `promised`, which every admission but a commitment's reads and the pressure level is computed from: the lesser of `data[3]` plus `data[15]` less `data[8]`, and `data[3]`; `data[3]` less `data[8]` while `data[15]` is `0` ([`memory-pool.md`](memory-pool.md#commit) § Commit, Promised) |
 | data[18] | `committed_swapped_bytes` — the part of `data[8]` the evicted chunks of committed regions hold for their restores: the subset of `data[10]` in committed regions, which `promised` holds again once a chunk holds no frame of its own ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit); the rest of `data[8]` is the commitments' pages never backed or discarded and their page-table and metadata bounds |
 | data[19] | `cspace_used_slots` — the used slots of memmgr's own `CSpace` (`CAP_INFO_CSPACE_USED`), a count, not bytes: the caps memmgr holds, its free runs' and grants' among them, so a cap it kept by mistake raises it for good ([`memory-pool.md`](memory-pool.md#cspace-headroom) § CSpace headroom; § Capability Transfer) |
-| data[20] | `metadata_bytes` — subset of `pool_total_bytes` memmgr holds as its own metadata, charged to no node: its arena's pages, its process index's and its swap slot map's, the zero frames it keeps, and the pages it retyped into its own page tables, `CSpace` growth and eviction worker ([`memory-pool.md`](memory-pool.md#metadata-arena) § Metadata Arena); none goes back to the free runs but a zero frame a refused request took |
+| data[20] | `metadata_bytes` — subset of `pool_total_bytes` memmgr holds as its own metadata, charged to no node: its arena's pages, its process index's and its swap slot map's, the zero frames it keeps, its receive threads' runs, and the pages it retyped into its own page tables, `CSpace` growth and eviction worker ([`memory-pool.md`](memory-pool.md#metadata-arena) § Metadata Arena); none goes back to the free runs but a zero frame a refused request took |
 | data[21] | `held_bytes` — subset of `pool_total_bytes` the frame records of processes and memory objects hold, each charged to a budget node: grants and page-table donations, the runs backing regions, a copy a make-private drew, and an object's frames; a run on the deferred list or in the store is not counted ([`memory-pool.md`](memory-pool.md#per-process-tracking) § Per-Process Tracking) |
 | data[22] | `draw_short` — 1 while a committed draw has found too few free pages since the draw room (`data[16]`) last opened, which keeps memmgr evicting for frames until it opens again, and 0 from the turn that ends with it open; read with `data[16]` in the one reply. It is that latch alone: with it 0, memmgr may still evict while `data[3]` is below `data[8]` ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 
@@ -2003,7 +2003,7 @@ not executable, is declined with code 4.
 | 9 | The kernel's zero of the run failed ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or a map of the run failed: into memmgr's copy window, to copy an attachment's object page into it, or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
 | 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Committed fault declines); for a fault on a chunk memmgr is evicting, holds raw or evicted, in either kind of region, the page-table funding the map of the chunk's runs needs would, past what a committed region's page-table reservation still holds; a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
 | 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the growth floor, for a process outside the system reserve, while a swap service has registered swap slots) even after memmgr evicted victims in its turn; only registered swap slots, or memmgr's own metadata taking free pages without admission, make it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it until the draw room opens (`QUERY_POOL_STATUS` `data[16]`), and re-asks it while the room reads short and `data[22]` 0 |
-| 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost, detail 2 when the swap service could not read the chunk's slot (swapd forwards a held fault with it) and the chunk stays on disk; memmgr itself produces details 0 and 1 only |
+| 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost, detail 2 when the swap service could not read the chunk's slot (swapd forwards a held fault with it) and the chunk stays on disk, detail 3 when memmgr's own `CSpace` had no slot for the copy of the swap service's endpoint a redirect names ([`memory-pool.md`](memory-pool.md#receive-loop) § Receive loop) and the chunk stays on disk; memmgr itself produces details 0, 1 and 3 |
 
 Each demand run is recorded on its chunk in the region's chunk table, so
 `PROCESS_DIED` / `UNREGISTER_REGION` reclaim it and the all-RAM-accounted
@@ -2110,15 +2110,16 @@ of its caps. An attached cap therefore never outlives the call that carried it u
 ownership of it, so no client can grow memmgr's `CSpace` by attaching caps. memmgr funds that growth
 from its own pool before every receive ([`memory-pool.md`](memory-pool.md#cspace-headroom) § CSpace
 headroom), so caps it kept would cost the pool a slot page per `CSPACE_SLOTS_PER_PAGE` of them
-rather than wedge its receive loop; `QUERY_POOL_STATUS` `data[19]` counts its used slots, which
+rather than wedge its receive threads; `QUERY_POOL_STATUS` `data[19]` counts its used slots, which
 svctest's stray-cap flood reads around each case.
 
 ---
 
 ## Out-of-Order and Reordered Calls
 
-memmgr serialises all incoming calls on a single thread; there is no
-ordering hazard between concurrent callers. Within a single caller,
+memmgr serves on one receive thread per CPU, under one ledger lock and a per-process stripe lock
+([`memory-pool.md`](memory-pool.md#concurrency) § Concurrency); calls for one process do not run
+at once, so there is no ordering hazard between concurrent callers of it. Within a single caller,
 the kernel guarantees that `REQUEST_MEMORY_CAPS` and `RELEASE_MEMORY_CAPS`
 execute in the order the caller issued them.
 

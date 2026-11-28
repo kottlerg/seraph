@@ -419,7 +419,14 @@ fn restart_round(
 {
     let mut stub = Stub::connect_tcp(&format!("127.0.0.1:{port}"), RESTART_ANSWER_TIMEOUT)?;
     stub.request(b"qSupported")?;
-    let killed = breakpoint_kill::kill_at_breakpoint(arch, gdb_sock, bias, driver, || ())?;
+    let killed = breakpoint_kill::kill_at_breakpoint(
+        arch,
+        gdb_sock,
+        bias,
+        driver,
+        breakpoint_kill::Take::Any,
+        || (),
+    )?;
     step(&format!(
         "gdb stub test: moved the port's driver at {:#x} to 0",
         killed.pc

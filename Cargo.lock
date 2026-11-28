@@ -552,6 +552,7 @@ dependencies = [
 name = "memmgr"
 version = "0.1.5"
 dependencies = [
+ "boot-protocol",
  "ipc",
  "memmgr-free-pool",
  "process-abi",

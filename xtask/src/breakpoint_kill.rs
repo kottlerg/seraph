@@ -32,6 +32,59 @@ const HIT_TIMEOUT: Duration = Duration::from_mins(1);
 /// process running at the same address) before the kill gives up.
 const FOREIGN_HITS_MAX: u32 = 8;
 
+/// Stops in the target's code by a thread the kill does not take ([`Take`])
+/// before the kill gives up.
+const PASSED_HITS_MAX: u32 = 256;
+
+/// The gdbstub thread of the CPU of index 0: QEMU numbers its threads by CPU
+/// index from 1.
+const FIRST_CPU_THREAD: u64 = 1;
+
+/// The stops in the target's code that are the kill's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Take
+{
+    /// Every stop.
+    Any,
+    /// A stop whose stack pointer lies in `[start, end)`: one of the threads
+    /// whose stacks the target keeps there (memmgr's receive threads but its
+    /// main one). Any other stop is passed over, the breakpoint kept for the
+    /// next.
+    StackIn
+    {
+        start: u64, end: u64
+    },
+}
+
+impl Take
+{
+    /// Whether a stop with stack pointer `sp` is the kill's.
+    #[must_use]
+    pub fn take(self, sp: u64) -> bool
+    {
+        match self
+        {
+            Self::Any => true,
+            Self::StackIn { start, end } => (start..end).contains(&sp),
+        }
+    }
+}
+
+/// The register number of the stack pointer in `arch`'s register block.
+fn sp_regnum(arch: Arch) -> Result<usize>
+{
+    let name = match arch
+    {
+        Arch::X86_64 => "rsp",
+        Arch::Riscv64 => "sp",
+    };
+    debug_stub::rsp_arch(arch)
+        .registers()
+        .iter()
+        .position(|r| r.name == name)
+        .with_context(|| format!("no {name} register in the {arch:?} register block"))
+}
+
 /// Bytes of code compared at the stop.
 pub const CODE_CHECK_BYTES: usize = 16;
 
@@ -50,11 +103,13 @@ pub struct Function
     pub code: Vec<u8>,
 }
 
-/// What [`kill_at_breakpoint`] did: the program counter it moved, the moment
-/// the VM resumed, and the trigger's result.
+/// What [`kill_at_breakpoint`] did: the program counter it moved, the CPU
+/// whose it was (QEMU's index, from 0), the moment the VM resumed, and the
+/// trigger's result.
 pub struct Killed<T>
 {
     pub pc: u64,
+    pub cpu: u64,
     pub resumed: Instant,
     pub triggered: T,
 }
@@ -84,18 +139,21 @@ pub fn spawn_bias<S: AsRef<str>>(lines: &[S], name: &str) -> Option<u64>
 
 /// Over QEMU's gdbstub at `sock`, break on `function` at `bias`, run
 /// `trigger` on a thread of its own once the VM runs again, and move the
-/// CPU stopped in the function's code to program counter 0. The trigger is
-/// joined after the detach that resumes the VM; a function the target runs
-/// unasked needs none.
+/// CPU stopped in the function's code, by a stop `take` takes, to program
+/// counter 0.
+/// The trigger is joined after the detach that resumes the VM; a function the
+/// target runs unasked needs none.
 pub fn kill_at_breakpoint<T: Send + 'static>(
     arch: Arch,
     sock: &Path,
     bias: u64,
     function: &Function,
+    take: Take,
     trigger: impl FnOnce() -> T + Send + 'static,
 ) -> Result<Killed<T>>
 {
     let pc_reg = debug_stub::rsp_arch(arch).pc_regnum();
+    let sp_reg = sp_regnum(arch)?;
     let at = bias.wrapping_add(function.address);
     let kind = breakpoint_kind(arch);
     // Connecting stops the VM.
@@ -105,7 +163,8 @@ pub fn kill_at_breakpoint<T: Send + 'static>(
     // Run once the VM runs again, while the continue below waits.
     let trigger = thread::spawn(trigger);
     let mut foreign: u32 = 0;
-    let moved = loop
+    let mut passed: u32 = 0;
+    let (moved, cpu) = loop
     {
         stub.set_answer_timeout(HIT_TIMEOUT)?;
         let reply = stub.request(b"c")?;
@@ -124,14 +183,28 @@ pub fn kill_at_breakpoint<T: Send + 'static>(
         let code = stub.read_memory(pc, CODE_CHECK_BYTES)?;
         if pc == at && code == function.code
         {
-            stub.expect_ok(format!("P{pc_reg:x}={}", le_hex(0)).as_bytes())?;
-            break pc;
+            if take.take(stub.read_register(sp_reg)?)
+            {
+                stub.expect_ok(format!("P{pc_reg:x}={}", le_hex(0)).as_bytes())?;
+                break (pc, thread.saturating_sub(FIRST_CPU_THREAD));
+            }
+            passed = passed.saturating_add(1);
+            if passed >= PASSED_HITS_MAX
+            {
+                bail!(
+                    "{PASSED_HITS_MAX} stops in the target's code were by threads the kill passes over"
+                );
+            }
         }
-        foreign = foreign.saturating_add(1);
-        if foreign >= FOREIGN_HITS_MAX
+        else
         {
-            bail!("{FOREIGN_HITS_MAX} stops at {at:#x} ran other code than the target's");
+            foreign = foreign.saturating_add(1);
+            if foreign >= FOREIGN_HITS_MAX
+            {
+                bail!("{FOREIGN_HITS_MAX} stops at {at:#x} ran other code than the target's");
+            }
         }
+        step_over(&mut stub, thread, at, kind)?;
     };
     stub.expect_ok(format!("z1,{at:x},{kind:x}").as_bytes())?;
     stub.expect_ok(b"D")?;
@@ -141,9 +214,29 @@ pub fn kill_at_breakpoint<T: Send + 'static>(
         .map_err(|_| crate::error::Error::msg("the trigger's thread panicked"))?;
     Ok(Killed {
         pc: moved,
+        cpu,
         resumed,
         triggered,
     })
+}
+
+/// Resume the CPU of gdbstub thread `thread`, stopped at the breakpoint at
+/// `at`, past it: remove the breakpoint, step that CPU one instruction, and
+/// set the breakpoint again, so the next continue does not stop at once on
+/// the same instruction.
+fn step_over(stub: &mut Stub, thread: u64, at: u64, kind: u32) -> Result<()>
+{
+    stub.expect_ok(format!("z1,{at:x},{kind:x}").as_bytes())?;
+    stub.expect_ok(format!("Hc{thread:x}").as_bytes())?;
+    let reply = stub.request(b"s")?;
+    if stop_thread(&reply).is_none()
+    {
+        bail!(
+            "a step answered with no stop: {}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    stub.expect_ok(format!("Z1,{at:x},{kind:x}").as_bytes())
 }
 
 /// The `kind` of a hardware breakpoint: the instruction's length, which
@@ -202,6 +295,32 @@ pub fn resolve(data: &[u8], path: &str) -> Result<Function>
 mod tests
 {
     use super::*;
+
+    // Defect caught: a kill that must miss memmgr's main thread taking a
+    // stop whose stack lies outside the receive threads' zone, or missing
+    // one inside it.
+    #[test]
+    fn only_a_stop_on_a_stack_in_the_range_is_taken_when_it_must_be()
+    {
+        let take = Take::StackIn {
+            start: 0x1000,
+            end: 0x2000,
+        };
+        assert!(Take::Any.take(0));
+        assert!(!take.take(0xfff));
+        assert!(take.take(0x1000));
+        assert!(take.take(0x1fff));
+        assert!(!take.take(0x2000));
+    }
+
+    // Defect caught: the stack pointer read from another register than
+    // `rsp` or `sp`, so the kill judges a stop by an unrelated value.
+    #[test]
+    fn the_stack_pointer_is_found_in_each_register_block()
+    {
+        assert_eq!(sp_regnum(Arch::X86_64).unwrap(), 7);
+        assert_eq!(sp_regnum(Arch::Riscv64).unwrap(), 2);
+    }
 
     // Defect caught: a breakpoint set on another function than the one
     // named, or on a symbol the host's own binary resolves.

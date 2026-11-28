@@ -33,6 +33,7 @@ pub mod disk;
 pub mod fill;
 pub mod index;
 pub mod ledger;
+pub mod lock;
 pub mod object_va;
 pub mod pool;
 pub mod pressure;

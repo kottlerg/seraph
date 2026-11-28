@@ -408,8 +408,9 @@ carries at most two of the creator endpoint, the argv/env cap and the relay.
 `CREATE_FROM_FILE` — carry the child's scheduling placement; bits `[38..64]`
 remain reserved and MUST be zero (`INVALID_ARGUMENT` otherwise, which keeps a
 future field addition provably additive). Resolution, against the **creator's
-band ceiling** (badge 0 = init, ceiling `sched_policy::BASELINE_PRIORITY_MAX`;
-a badged caller's ceiling is its own minted `band_max`; a badge that names no
+band ceiling** (badge 0 = init, ceiling `sched_policy::PROCMGR_PRIORITY` (27), so no band
+procmgr mints reaches `MEMMGR_PRIORITY` (28), which only memmgr's receive threads run at after
+init's reap; a badged caller's ceiling is its own minted `band_max`; a badge that names no
 live process is refused, as **Memory max and reserve** above says):
 
 | Field | 0 (unspecified) | Nonzero |
@@ -417,15 +418,13 @@ live process is refused, as **Memory max and reserve** above says):
 | `CREATE_BAND_MAX` | copy of the creator's band | `[1, band_max]`; must be ≤ the creator's ceiling |
 | `CREATE_PRIORITY` | `DEFAULT_SPAWN_PRIORITY` clamped to the band | must be ≤ the resolved `band_max` (so the child's own band always covers its starting level) |
 
-Violations reply `INVALID_ARGUMENT` before any resource is acquired. On
-success procmgr creates the child's initial thread at the resolved priority
-(via its own baseline `SchedControl`), mints the child's band — a plain
-`cap_copy` of the baseline for a full-width band, copy-then-`SYS_SCHED_SPLIT`
-for a narrowed one — into `ProcessInfo.sched_control_cap`, and records the
-resolved priority in `ProcessInfo.initial_priority` so the runtime spawns
-further threads at the same level by default, unless
-`std::os::seraph::thread::BuilderExt::spawn_at_priority` places one
-elsewhere in the band.
+Violations reply `INVALID_ARGUMENT` before any resource is acquired. On success procmgr creates the
+child's initial thread at the resolved priority (via its own baseline `SchedControl`), mints the
+child's band — copy-then-`SYS_SCHED_SPLIT` of the baseline at `band_max + 1`, which no ceiling lets
+reach the baseline's top — into `ProcessInfo.sched_control_cap`, and records the resolved priority
+in `ProcessInfo.initial_priority` so the runtime spawns further threads at the same level by
+default, unless `std::os::seraph::thread::BuilderExt::spawn_at_priority` places one elsewhere in the
+band.
 
 ### Label 2: `START_PROCESS`
 

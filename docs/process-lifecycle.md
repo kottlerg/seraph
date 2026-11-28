@@ -350,8 +350,8 @@ at creation time. Examples:
 - `ProcessInfo.sched_control_cap` — baseline `SchedControl` cap covering the
   band the spawner assigned (`[1, band_max]`, from the create label's
   `CREATE_BAND_MAX` field; default is a copy of the creator's own band).
-  procmgr mints it from its baseline (delivered by init) — a plain `cap_copy`
-  for a full-width band, copy-then-`SYS_SCHED_SPLIT` for a narrowed one. A
+  procmgr mints it from its baseline (delivered by init) by copy-then-`SYS_SCHED_SPLIT` at
+  `band_max + 1`: no child's band reaches the baseline's top, `MEMMGR_PRIORITY`. A
   child with a zero slot holds no scheduling authority and cannot set any
   priority.
 - `ProcessInfo.initial_priority` — the level the creator placed the child's

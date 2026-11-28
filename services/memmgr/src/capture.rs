@@ -38,8 +38,7 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::{MSG_CAP_SLOTS_MAX, PAGE_SIZE};
 
 use crate::{
-    Answer, COPY_VA, MemLedger, cap_badge, delete_caps, disk, evict, ledger_mut, map_self,
-    self_aspace,
+    Answer, COPY_VA, MemLedger, cap_badge, delete_caps, disk, evict, map_self, self_aspace,
 };
 
 /// Chunks one request supplies at most: a tuning value that bounds the
@@ -59,6 +58,7 @@ const PAGE_BYTES: usize = PAGE_SIZE as usize;
 /// last cap is the image's handle, a SEND on `service_ep`, read and deleted
 /// first.
 pub(crate) fn handle_capture_chunks(
+    l: &mut MemLedger,
     req: &IpcMessage,
     caps: &[u64],
     answer: &mut Answer,
@@ -83,7 +83,7 @@ pub(crate) fn handle_capture_chunks(
             None => (caps, Err(memmgr_errors::INVALID_ARGUMENT)),
         }
     };
-    let served = serve(req, dest, image, procmgr_badge);
+    let served = serve(l, req, dest, image, procmgr_badge);
     delete_caps(dest);
     match served
     {
@@ -99,6 +99,7 @@ pub(crate) fn handle_capture_chunks(
 /// handle's badge, with `CAPTURE_IMAGE`, is `image` (an error label for a
 /// handle that is missing or no SEND on memmgr), or the error label.
 fn serve(
+    l: &mut MemLedger,
     req: &IpcMessage,
     caps: &[u64],
     image: Result<Option<u64>, u64>,
@@ -109,7 +110,6 @@ fn serve(
     {
         return Err(memmgr_errors::UNAUTHORIZED);
     }
-    let l = ledger_mut();
     let (cursor, end, flags) = (req.word(1), req.word(2), req.word(3));
     let rec = l.find(req.word(0)).ok_or(memmgr_errors::INVALID_ARGUMENT)?;
     let known = memmgr_labels::CAPTURE_COUNT | memmgr_labels::CAPTURE_IMAGE;

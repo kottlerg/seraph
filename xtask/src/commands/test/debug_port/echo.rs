@@ -344,7 +344,14 @@ fn restart_round(
     let bias = breakpoint_kill::spawn_bias(booted, PORT_DRIVER_NAME).with_context(|| {
         format!("no procmgr bias line for {PORT_DRIVER_NAME} before the fixture's READY")
     })?;
-    let killed = breakpoint_kill::kill_at_breakpoint(arch, gdb_sock, bias, driver, || ())?;
+    let killed = breakpoint_kill::kill_at_breakpoint(
+        arch,
+        gdb_sock,
+        bias,
+        driver,
+        breakpoint_kill::Take::Any,
+        || (),
+    )?;
     step(&format!(
         "debug port test: moved the port's driver at {:#x} to 0",
         killed.pc

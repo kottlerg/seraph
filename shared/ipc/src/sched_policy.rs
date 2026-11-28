@@ -16,7 +16,7 @@
 //! | Level | Occupant |
 //! |---|---|
 //! | 30 | init (kernel-assigned `INIT_PRIORITY`) |
-//! | 28 | memmgr |
+//! | 28 | memmgr's receive threads, one per CPU, alone |
 //! | 27 | procmgr |
 //! | 26 | init-logd, virtio-blk, the IOMMU driver, devmgr's DMA thread |
 //! | 25 | serial, framebuffer, rtc, virtio-input, virtio-console, virtio-rng |
@@ -36,9 +36,9 @@
 /// (`[29, 30]`, released when init's reap frees its `CSpace`, per
 /// `docs/process-lifecycle.md` § Init reap), and hands the baseline
 /// `[1, 28]` to memmgr and procmgr.
-/// Every band procmgr mints for a child is a (possibly narrowed)
-/// descendant of this baseline, so no spawned process can ever reach
-/// `[29, 30]`.
+/// Every band procmgr mints for a child is a narrowed descendant of this
+/// baseline, `[1, PROCMGR_PRIORITY]` at most, so no spawned process can
+/// ever reach `[29, 30]`, nor [`MEMMGR_PRIORITY`].
 pub const BASELINE_PRIORITY_MAX: u8 = 28;
 
 /// Priority procmgr assigns when a `CREATE_PROCESS` /
@@ -46,8 +46,10 @@ pub const BASELINE_PRIORITY_MAX: u8 = 28;
 /// clamped to the child's band.
 pub const DEFAULT_SPAWN_PRIORITY: u8 = 10;
 
-/// memmgr — the system pager and frame-pool owner. Everything below
-/// it can fault into it, so it outranks all of them.
+/// memmgr — the system pager and frame-pool owner: each of its receive
+/// threads, one per CPU. Everything below it can fault into it, so it
+/// outranks all of them; no other thread runs at it after init's reap,
+/// since procmgr mints no band above [`PROCMGR_PRIORITY`].
 pub const MEMMGR_PRIORITY: u8 = 28;
 
 /// memmgr's compression worker: the top of the fair class, below every

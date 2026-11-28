@@ -1355,13 +1355,16 @@ impl Creator
 {
     /// The un-badged creator (badge `0`): init, which creates devmgr, vfsd
     /// and svcmgr, or a create svcmgr sends on its un-badged mint source.
-    /// Its ceiling is the full baseline band, its children not charged to a
+    /// Its ceiling is the baseline band narrowed to procmgr's own level
+    /// (`ipc::sched_policy::PROCMGR_PRIORITY`), so no band minted down the
+    /// spawn chain reaches `MEMMGR_PRIORITY`, which memmgr's receive threads
+    /// alone run at. Its children not charged to a
     /// node handle are top-level reserve nodes (init's own record parents no
     /// process), a charged child sits under the handle's node outside the
     /// reserve, it may ask for a phys-class child, and its creates may load
     /// every role a process runs in ([`sign_policy::LOADABLE`]).
     pub const UNBADGED: Creator = Creator {
-        band_max: ipc::sched_policy::BASELINE_PRIORITY_MAX,
+        band_max: ipc::sched_policy::PROCMGR_PRIORITY,
         memmgr_badge: 0,
         reserve: true,
         unbadged: true,
@@ -3681,6 +3684,24 @@ mod tests
         // A reaped process's badge, and a verb-badged cap's.
         assert_eq!(table.creator_of(99), None);
         assert_eq!(table.creator_of(ipc::procmgr_labels::DEBUG_AUTHORITY), None);
+    }
+
+    #[test]
+    fn no_child_band_reaches_memmgr_priority()
+    {
+        let ceiling = Creator::UNBADGED.band_max;
+        assert!(ceiling < ipc::sched_policy::MEMMGR_PRIORITY);
+        // An unspecified band takes the ceiling; one at memmgr's level, or a
+        // priority there, is refused.
+        assert_eq!(resolve_spawn_sched(0, 0, ceiling, 10), Some((10, ceiling)));
+        assert_eq!(
+            resolve_spawn_sched(0, ipc::sched_policy::MEMMGR_PRIORITY, ceiling, 10),
+            None
+        );
+        assert_eq!(
+            resolve_spawn_sched(ipc::sched_policy::MEMMGR_PRIORITY, 0, ceiling, 10),
+            None
+        );
     }
 
     #[test]

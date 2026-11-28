@@ -311,6 +311,9 @@ fn ordered() -> Vec<Phase>
     out.extend_from_slice(logd_restart::phases());
     out.extend_from_slice(swap::phases());
     out.extend_from_slice(node_reclaim::phases());
+    // After the swap phases have emptied memmgr's store and swapped total,
+    // which its baseline needs.
+    out.extend_from_slice(pager::concurrent_faults());
     out.extend_from_slice(swap_client::phases());
     out.extend_from_slice(swap_raw::phases());
     out.extend_from_slice(swapd::phases());

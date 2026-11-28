@@ -3,9 +3,10 @@
 
 // services/fixtures/program-modes/src/main.rs
 
-//! svctest's shared program fixture: the processes svctest's phases spawn
-//! in the program role whose checks need no image of their own, one mode
-//! each, chosen by the first argument (services/fixtures/program-modes/README.md).
+//! svctest's shared program fixture: the processes svctest's phases, and
+//! ubench's `fault_rate`, spawn in the program role whose checks need no image
+//! of their own, one mode each, chosen by the first argument
+//! (services/fixtures/program-modes/README.md).
 //! A mode's further arguments follow its name. Each mode is a module with
 //! its own `main`, which runs from this binary's `main` before anything
 //! else, so it starts in the state a binary of its own would.
@@ -15,6 +16,7 @@ use std::process::ExitCode;
 mod capexhaust;
 mod deadline;
 mod demandpaged;
+mod faultstorm;
 mod narrow;
 mod pipefault;
 mod pipestress;
@@ -42,6 +44,7 @@ fn main() -> ExitCode
             ExitCode::SUCCESS
         }
         Some("demandpaged") => demandpaged::main(),
+        Some("faultstorm") => faultstorm::main(),
         Some("narrow") =>
         {
             narrow::main();

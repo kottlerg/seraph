@@ -123,7 +123,8 @@ services/svctest/
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
         │                      #   refused access; page-table drain; teardown;
         │                      #   faults and a CSpace top-up on a fragmented pool; a
-        │                      #   sparse large region
+        │                      #   sparse large region; concurrent faults of one
+        │                      #   process per CPU
         ├── budget.rs          # Create-time memory max: clamp, grants to it, LIMIT, decline 10,
         │                      #   pages back after the destroy; reserve and max refusals
         ├── node_handle.rs     # memmgr node handles: class refusals, sub-node clamp, a max set
@@ -702,7 +703,7 @@ spawning phases: whatever its arguments it prints `spawn-target ran` and exits 0
 in a mode per phase: `narrow` (procmgr: it tries to start `/tests/fixtures/service-modes` and
 exits 0 only when refused `PermissionDenied`), `pipefault` (pipes), `stackoverflow` and
 `relrofault` (process faults and console whole lines), `capexhaust` (recv guard and console whole
-lines), `demandpaged` (pager), `threadchurn`,
+lines), `demandpaged` and `faultstorm` (pager), `threadchurn`,
 `threadstack`, `deadline` and `pipestress` (their own phases), `fsbench` (FS IPC), and `crashme`
 (`oom-hold <pages>`, run by its path through a session's leader by the `sessiond_operator` and
 `oom_policy` phases: it touches that many heap pages, prints `holding <pages>` and waits to be

@@ -373,6 +373,10 @@ pub struct PlacementCounts
     pub sync_wakes: core::sync::atomic::AtomicU32,
     /// Of those, the wakes the rule placed on the waker's CPU.
     pub sync_local: core::sync::atomic::AtomicU32,
+    /// Of the pulls, those that took the thread out of its source CPU's front
+    /// segment while a scan for that puller skips the segment: none, unless
+    /// the scan breaks the segment's rule.
+    pub front_steals: core::sync::atomic::AtomicU32,
 }
 
 impl PlacementCounts
@@ -387,6 +391,7 @@ impl PlacementCounts
             pulls: core::sync::atomic::AtomicU32::new(0),
             sync_wakes: core::sync::atomic::AtomicU32::new(0),
             sync_local: core::sync::atomic::AtomicU32::new(0),
+            front_steals: core::sync::atomic::AtomicU32::new(0),
         }
     }
 

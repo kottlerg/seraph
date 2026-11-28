@@ -62,9 +62,31 @@ const QUEUED_THREAD_MASK: u32 = !(1 << IDLE_QUEUE);
 /// since every index is below `MAX_CPUS`.
 const NO_IDLE_PULL_CANDIDATE: usize = usize::MAX;
 
+/// The run queue of every `u8` level, as [`queue_of`] computes it, so the
+/// wake and link paths, which ask for several levels' queues on every wake,
+/// read each with one load.
+static QUEUE_OF_LEVEL: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut level = 0usize;
+    while level < table.len()
+    {
+        // queue_of(level) <= 255 - RT_PRIORITY_MIN + FAIR_QUEUE + 1 < 256.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::indexing_slicing,
+            reason = "level < 256 indexes a [u8; 256] table; queue_of of a u8 level is below 256"
+        )]
+        {
+            table[level] = queue_of(level as u8) as u8;
+        }
+        level += 1;
+    }
+    table
+};
+
 /// The run queue threads at `level` link on. Monotone in `level`, so the
 /// highest non-empty queue holds the highest-class ready thread.
-const fn queue_index(level: u8) -> usize
+const fn queue_of(level: u8) -> usize
 {
     if level == IDLE_PRIORITY
     {
@@ -79,12 +101,23 @@ const fn queue_index(level: u8) -> usize
     }
 }
 
+/// [`queue_of`] `level`, read from [`QUEUE_OF_LEVEL`].
+#[inline]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "a u8 level indexes a 256-entry table, so the index is always in bounds"
+)]
+fn queue_index(level: u8) -> usize
+{
+    QUEUE_OF_LEVEL[usize::from(level)] as usize
+}
+
 /// Whether a thread at `level` outranks one running at `other`: its run queue
 /// is above `other`'s. Any RT level outranks a fair level and the idle level,
 /// and a higher RT level a lower one; no fair level outranks another, all of
 /// them sharing the fair queue (core/kernel/docs/scheduler.md § Wake
 /// Preemption).
-pub const fn outranks(level: u8, other: u8) -> bool
+pub fn outranks(level: u8, other: u8) -> bool
 {
     queue_index(level) > queue_index(other)
 }
@@ -191,8 +224,8 @@ impl CpuRanks
 /// ([`CpuRanks`]).
 pub const fn level_rank(level: u8) -> u32
 {
-    // queue_index(level) < NUM_RUN_QUEUES <= 32, so the narrowing is lossless.
-    queue_index(level) as u32
+    // queue_of(level) < NUM_RUN_QUEUES <= 32, so the narrowing is lossless.
+    queue_of(level) as u32
 }
 
 /// The `outranking` value of a stale level ([`PerCpuScheduler::mark_level_stale`]):
@@ -554,6 +587,36 @@ impl RunQueue
             cur = unsafe { (*c).run_queue_next };
         }
         None
+    }
+
+    /// Whether `tcb` is linked in this queue's front segment: at or ahead of
+    /// its last TCB, found by a walk from the head, apart from the scans'
+    /// reading of the segment, which start behind it.
+    ///
+    /// O(n) in the segment's length. Caller MUST hold the owning
+    /// `PerCpuScheduler.lock`.
+    fn in_front_segment(&self, tcb: *mut ThreadControlBlock) -> bool
+    {
+        let Some(end) = self.front
+        else
+        {
+            return false;
+        };
+        let mut cur = self.head;
+        while let Some(c) = cur
+        {
+            if core::ptr::eq(c, tcb)
+            {
+                return true;
+            }
+            if core::ptr::eq(c, end)
+            {
+                return false;
+            }
+            // SAFETY: c is a valid TCB; run_queue_next is always readable.
+            cur = unsafe { (*c).run_queue_next };
+        }
+        false
     }
 
     /// Remove a specific TCB from the queue. Returns `true` if found.
@@ -1617,6 +1680,33 @@ impl PerCpuScheduler
         }
     }
 
+    /// Whether a move of `tcb`, queued here at `priority`, to a CPU that is a
+    /// `puller` takes it out of the fair queue's front segment while a scan for
+    /// that puller skips the segment ([`front_segment`](Self::front_segment)):
+    /// a pull the rule forbids, which the `front_steals` placement counter
+    /// counts (core/kernel/docs/scheduler.md § Placement Counters).
+    ///
+    /// # Safety
+    /// The caller holds `self.lock`; `tcb` is a valid TCB.
+    pub unsafe fn takes_from_skipped_front(
+        &self,
+        tcb: *mut ThreadControlBlock,
+        priority: u8,
+        puller: Puller,
+    ) -> bool
+    {
+        if queue_index(priority) != FAIR_QUEUE || self.front_segment(puller) != FrontSegment::Skip
+        {
+            return false;
+        }
+        // SAFETY: the caller holds `self.lock` (contract), so no `&mut` to the
+        // queues is live.
+        let queues = unsafe { self.queues.as_ref_unchecked() };
+        queues
+            .get(FAIR_QUEUE)
+            .is_some_and(|queue| queue.in_front_segment(tcb))
+    }
+
     /// Scan the run queues whose `non_empty` bits `within` names, from highest
     /// to lowest, and return the first queued TCB whose pointer satisfies
     /// `pred`, along with a level of the queue it is on: its RT level, or the
@@ -1922,6 +2012,19 @@ mod tests
         assert_eq!(queue_index(RT_PRIORITY_MIN - 1), FAIR_QUEUE);
         assert!(queue_index(RT_PRIORITY_MIN) > FAIR_QUEUE);
         assert_eq!(last, NUM_RUN_QUEUES - 1);
+    }
+
+    // The defect caught: a level whose table entry differs from the queue
+    // queue_of computes for it (a narrowing that wraps, or a table built from
+    // another map), so a link and the rank tests read another queue than the
+    // class rules give.
+    #[test]
+    fn the_queue_table_holds_queue_of_for_every_level()
+    {
+        for level in 0..=u8::MAX
+        {
+            assert_eq!(queue_index(level), queue_of(level), "level {level}");
+        }
     }
 
     // ── Classes ───────────────────────────────────────────────────────────────
@@ -3196,5 +3299,38 @@ mod tests
         assert_eq!(first_movable(&sched), Some(rt));
         assert!(rm(&sched, rt, RT_PRIORITY_MIN));
         assert_eq!(first_movable(&sched), Some(queued));
+    }
+
+    // Defect caught (#1732): the front_steals witness counting a pull the rule
+    // allows (a tail thread, an idle puller's take of a passed thread, a take
+    // under RT work), so the steal stress fails a correct scan; or missing a
+    // passed thread behind the segment's first, so it passes a broken one.
+    #[test]
+    fn a_take_from_the_skipped_front_segment_is_told_apart()
+    {
+        let sched = PerCpuScheduler::new();
+        let fair = syscall::PRIORITY_MIN;
+        let mut first = make_tcb();
+        let mut second = make_tcb();
+        let mut queued = make_tcb();
+        let (first, second, queued) = (&raw mut *first, &raw mut *second, &raw mut *queued);
+        let skipped = |tcb, puller| {
+            // SAFETY: single-threaded test; tcb is a live boxed TCB.
+            unsafe { sched.takes_from_skipped_front(tcb, fair, puller) }
+        };
+        assert!(enq_front(&sched, first, fair));
+        assert!(enq_front(&sched, second, fair));
+        assert!(enq(&sched, queued, fair));
+        sched.set_current_level(fair);
+        assert!(skipped(first, Puller::Busy));
+        assert!(skipped(second, Puller::Busy));
+        assert!(!skipped(queued, Puller::Busy));
+        assert!(!skipped(second, Puller::Idle));
+        sched.set_current_level(RT_PRIORITY_MIN);
+        assert!(!skipped(second, Puller::Busy));
+        sched.set_current_level(fair);
+        assert_eq!(deq(&sched), first);
+        assert_eq!(deq(&sched), second);
+        assert!(!skipped(queued, Puller::Busy));
     }
 }

@@ -7049,13 +7049,22 @@ unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -
     // affinity gate inside `relocate_ready_thread` re-reads `cpu_affinity` under
     // the candidate's `sched_lock`, which `sys_thread_set_affinity` holds across
     // its write, so a re-pin between the predicate and here refuses the move.
+    // Whether the move breaks the front segment's rule, read while tcb is
+    // still linked on src, as a diagnostic the steal stress asserts is zero.
+    // SAFETY: src's lock is held (caller's contract); tcb is linked on src.
+    let front_steal = unsafe { src.takes_from_skipped_front(tcb, priority, puller) };
     // SAFETY: sched_lock + both run-queue locks held.
     let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
     if moved
     {
         // SAFETY: tcb valid (linked on dst under its held lock); its sched_lock,
         // held, serialises the counter's writers.
-        thread::PlacementCounts::count(unsafe { &(*tcb).placement.pulls });
+        let counts = unsafe { &(*tcb).placement };
+        thread::PlacementCounts::count(&counts.pulls);
+        if front_steal
+        {
+            thread::PlacementCounts::count(&counts.front_steals);
+        }
     }
 
     // SAFETY: paired with try_lock_raw above; released before the caller
@@ -7219,11 +7228,10 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize, _rule: PullRule)
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer
 /// - `target_cpu` must be < [`CPU_COUNT`] and initialized by `sched::init`
 #[cfg(not(test))]
-#[inline]
 pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 {
-    // SAFETY: the caller's contract is enqueue_and_wake_at's.
-    unsafe { enqueue_and_wake_at(tcb, WakeTarget::tail(target_cpu)) };
+    // SAFETY: the caller's contract is wake_linking's.
+    unsafe { wake_linking::<false>(tcb, target_cpu) };
 }
 
 /// Release the wake-in-flight pin on `tcb`, which lets a waiting
@@ -7253,7 +7261,26 @@ unsafe fn release_wake_pin(tcb: *mut ThreadControlBlock)
 #[cfg(not(test))]
 pub unsafe fn enqueue_and_wake_at(tcb: *mut ThreadControlBlock, target: WakeTarget)
 {
-    let target_cpu = target.cpu;
+    if target.link == WakeLink::Front
+    {
+        // SAFETY: the caller's contract is wake_linking's.
+        unsafe { wake_linking::<true>(tcb, target.cpu) };
+    }
+    else
+    {
+        // SAFETY: as above.
+        unsafe { wake_linking::<false>(tcb, target.cpu) };
+    }
+}
+
+/// The wake of [`enqueue_and_wake_at`], one copy for a pass (`FRONT`) and
+/// one for a tail link, so a tail wake carries none of the pass's tests.
+///
+/// # Safety
+/// As for [`enqueue_and_wake`].
+#[cfg(not(test))]
+unsafe fn wake_linking<const FRONT: bool>(tcb: *mut ThreadControlBlock, target_cpu: usize)
+{
     if target_cpu >= MAX_CPUS
     {
         // SAFETY: tcb may or may not be valid; thread_id is at a known offset.
@@ -7384,7 +7411,18 @@ pub unsafe fn enqueue_and_wake_at(tcb: *mut ThreadControlBlock, target: WakeTarg
     // sched_lock, wins over the caller's target, chosen without it (link_cpu).
     // SAFETY: tcb valid; its sched_lock is held.
     let link_cpu = unsafe { locked_link_cpu(tcb, target_cpu) };
-    let link = target.link_on(link_cpu);
+    let link = if FRONT
+    {
+        WakeTarget {
+            cpu: target_cpu,
+            link: WakeLink::Front,
+        }
+        .link_on(link_cpu)
+    }
+    else
+    {
+        WakeLink::Tail
+    };
     let target_cpu = link_cpu;
     // Acquire the target run-queue lock UNDER sched_lock.
     // SAFETY: caller guarantees target_cpu is initialized; link_cpu returns it
@@ -7533,6 +7571,7 @@ pub unsafe fn placement_view(tcb: *mut ThreadControlBlock, view: u64) -> Option<
         syscall::THREAD_PLACEMENT_PULLS => &counts.pulls,
         syscall::THREAD_PLACEMENT_SYNC_WAKES => &counts.sync_wakes,
         syscall::THREAD_PLACEMENT_SYNC_LOCAL => &counts.sync_local,
+        syscall::THREAD_PLACEMENT_FRONT_STEALS => &counts.front_steals,
         _ => return None,
     };
     Some(u64::from(
@@ -7864,6 +7903,7 @@ pub unsafe fn select_target_cpu_excluding(
 /// to user mode; with [`WakeHint::WakerRuns`], the waker, running on this
 /// CPU.
 #[cfg(not(test))]
+#[inline]
 pub unsafe fn select_wake_target(
     tcb: *mut ThreadControlBlock,
     exclude: Option<usize>,

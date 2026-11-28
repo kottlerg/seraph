@@ -10,8 +10,9 @@
 //! A thread's [`lent_turn`](ThreadControlBlock::lent_turn) word holds the
 //! ticks of a turn the thread runs on before its own slice: the low
 //! [`TURN_TICKS`] bits count the ticks, and the rest is the tag of whose turn
-//! it is. A zero tag is the thread's own turn, moved out of its slice at its
-//! call ([`lend_turn_out`]); a caller's tag ([`lender_tag`]) marks a turn
+//! it is. A zero tag is the thread's own turn, moved out of its slice by its
+//! call, as the call queues for a receive or binds a fair server
+//! ([`lend_turn_out`], [`lend_and_take_turn`]); a caller's tag ([`lender_tag`]) marks a turn
 //! the thread took from that caller with the call it serves ([`take_turn`]).
 //! A turn is moved, never copied: the call moves the caller's remainder out
 //! of its slice, the bind moves it to the server, the reply or a claimant that
@@ -179,8 +180,9 @@ unsafe fn give_ticks(tcb: *mut ThreadControlBlock, more: u64)
     });
 }
 
-/// Move what is left of the running fair `caller`'s slice into its word as it
-/// calls, leaving its slice one tick, which the word's ticks stand in for: the
+/// Move what is left of the running fair `caller`'s slice into its word as its
+/// call queues for a receive, or binds a fair server
+/// ([`lend_and_take_turn`]), leaving its slice one tick, which the word's ticks stand in for: the
 /// tick charges the word first and expires the slice when the word's last
 /// tick goes ([`TickCharge::OwnTurnEnds`]). A caller whose word already holds
 /// a turn (one it serves on, its own given back by an earlier reply, or one a
@@ -194,14 +196,18 @@ pub unsafe fn lend_turn_out(caller: *mut ThreadControlBlock)
     // SAFETY: caller is the running thread (contract), whose fields this CPU
     // alone writes while interrupts are masked.
     let tcb = unsafe { &mut *caller };
-    if !super::is_fair_level(tcb.priority)
+    // The level is read as a hint, without the sched_lock its writer holds, as
+    // the placement reads it: a level changed meanwhile is the tick's to cut
+    // to (cut_to_level), as it cuts the slice.
+    let level = tcb.priority;
+    if !super::is_fair_level(level)
     {
         return;
     }
     let held = tcb.lent_turn.load(Ordering::Relaxed);
     // A turn of its own started at a level the caller has left since is cut
     // to its level's quantum before the bind moves it, as the tick cuts it.
-    let word = cut_to_level(held, tcb.priority);
+    let word = cut_to_level(held, level);
     if word != held
     {
         let _ = tcb
@@ -257,6 +263,33 @@ pub unsafe fn take_turn(
     let tag = unsafe { caller_tag(caller) };
     // SAFETY: server valid (contract); lent_turn is atomic.
     Some(unsafe { (*server).lent_turn.swap(tag | turn, Ordering::Relaxed) })
+}
+
+/// [`lend_turn_out`] and [`take_turn`] at once, for a call that binds a
+/// waiting server: the running fair `caller`'s turn goes straight to the
+/// fair `server`, and a pair that is not both fair moves nothing, the
+/// caller's slice left as it is. Returns what `take_turn` returns.
+///
+/// # Safety
+/// As for both: `caller` is the running thread, with interrupts masked;
+/// `server` is claimed by the bind.
+pub unsafe fn lend_and_take_turn(
+    server: *mut ThreadControlBlock,
+    caller: *mut ThreadControlBlock,
+) -> Option<u64>
+{
+    // SAFETY: both valid (contract); the levels are read as hints, as the
+    // placement reads them.
+    let fair = super::is_fair_level(unsafe { (*server).priority })
+        && super::is_fair_level(unsafe { (*caller).priority });
+    if !fair
+    {
+        return None;
+    }
+    // SAFETY: the contract, which is lend_turn_out's and take_turn's.
+    unsafe { lend_turn_out(caller) };
+    // SAFETY: as above.
+    unsafe { take_turn(server, caller) }
 }
 
 /// Undo [`take_turn`] for a bind that did not commit: `server` gets back the

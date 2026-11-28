@@ -8,7 +8,7 @@
 //! core/kernel/docs/syscalls.md § `SYS_CAP_INFO`).
 //!
 //!   1. **Refusals.** A non-Thread cap, and a Thread cap with a view past
-//!      `THREAD_PLACEMENT_SYNC_LOCAL` (7 and `u64::MAX`), are refused
+//!      `THREAD_PLACEMENT_FRONT_STEALS` (8 and `u64::MAX`), are refused
 //!      `InvalidArgument`.
 //!   2. **CPU view.** `THREAD_PLACEMENT_CPU` of the calling thread is below the
 //!      CPU count.
@@ -98,7 +98,7 @@ fn refusals(ctx: &TestContext) -> TestResult
         return Err("thread_placement: a non-Thread cap was not refused InvalidArgument");
     }
     deleted.map_err(|_| "thread_placement: cap_delete notification failed")?;
-    for view in [syscall_abi::THREAD_PLACEMENT_SYNC_LOCAL + 1, u64::MAX]
+    for view in [syscall_abi::THREAD_PLACEMENT_FRONT_STEALS + 1, u64::MAX]
     {
         if cap_info_thread_placement(ctx.thread_cap, view) != refused
         {

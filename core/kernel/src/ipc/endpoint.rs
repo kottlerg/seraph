@@ -428,11 +428,6 @@ pub unsafe fn endpoint_call(
         unsafe { ep.lock.unlock_raw(saved) };
         return CallRendezvous::NoReceiver;
     }
-    // A fair caller's turn goes with its call (sched::turn).
-    // SAFETY: caller is the running thread; ep.lock is held with interrupts
-    // masked.
-    unsafe { crate::sched::turn::lend_turn_out(caller) };
-
     // Is a server waiting? A call from a CPU that queues no thread but its
     // idle thread takes the receiver its parked-receiver table records for
     // this endpoint, if any; any other call takes the longest-waiting
@@ -510,7 +505,7 @@ pub unsafe fn endpoint_call(
         // binding publishes, so a claimant that wins the binding finds it.
         // SAFETY: server is claimed by this dequeue; caller is the running
         // thread; ep.lock is held with interrupts masked.
-        let prior_turn = unsafe { crate::sched::turn::take_turn(server, caller) };
+        let prior_turn = unsafe { crate::sched::turn::lend_and_take_turn(server, caller) };
         #[expect(
             clippy::multiple_unsafe_ops_per_block,
             reason = "every access is to an atomic field of server, a live TCB dequeued under the \
@@ -585,7 +580,11 @@ pub unsafe fn endpoint_call(
         return CallRendezvous::Bound { server, hint };
     }
 
-    // No server available — block caller on send queue.
+    // No server available — block caller on send queue. A fair caller's turn
+    // goes with its call (sched::turn), for the receive that binds it to take.
+    // SAFETY: caller is the running thread; ep.lock is held with interrupts
+    // masked.
+    unsafe { crate::sched::turn::lend_turn_out(caller) };
     // Clear context_saved before enqueuing on the send queue.
     // See notification.rs notification_wait for the full rationale.
     // SAFETY: caller validated by syscall layer; context_saved is AtomicU32.

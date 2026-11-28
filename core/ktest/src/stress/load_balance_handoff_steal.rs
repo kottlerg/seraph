@@ -24,10 +24,16 @@
 //!     load balancer is *eligible* to steal them. This is the distinction from
 //!     `double_enqueue_storm`, which drives only `migrate_ready_thread` via
 //!     explicit affinity flips, not the autonomous `pull_unpinned_ready` steal.
-//!   * **Servers are pinned round-robin** across CPUs so a reply frequently
-//!     arrives from a *different* CPU than the floating client's — the
-//!     cross-CPU reply is what produces the `Ready`-while-`current` window (a
-//!     same-CPU reply cannot run until the client deschedules, missing it).
+//!   * **Servers are pinned round-robin over the lower half of the CPUs**
+//!     ([`server_cpus`]), so the upper half run no server. A reply passes its
+//!     fair client onto the server's CPU (core/kernel/docs/scheduler.md
+//!     § Service Call Latency), so the clients gather on the server CPUs, and
+//!     the CPUs of the upper half, idle, pull them away; a pulled client's next
+//!     call is answered from a *different* CPU than its own — the cross-CPU
+//!     reply is what produces the `Ready`-while-`current` window (a same-CPU
+//!     reply cannot run until the client deschedules, missing it). Servers
+//!     spread over every CPU would leave the balancer no backlog to pull from,
+//!     each client riding along with its server.
 //!
 //! Synchronous IPC keeps the runnable set bursty, so CPUs idle between
 //! ping-pong rounds and run the balancer against just-woken (mid-handoff)
@@ -42,11 +48,22 @@
 //!     the controller asserts `== NUM_PAIRS` times the round-trips each client
 //!     issued ([`ITERS`]), so every client completed every
 //!     round-trip ⇒ the mid-handoff transients were generated densely.
-//!   * **Cross-CPU migration of unpinned threads** — each client samples
-//!     `system_info(CurrentCpu)` and a client whose samples span ≥ 2 CPUs
-//!     provably migrated; the controller asserts [`MIGRATIONS`] `>= 1` (≥ 1
-//!     unpinned client was relocated across CPUs — the balancer's target
-//!     behavior occurred) and logs the observed-CPU count for diagnostics.
+//!   * **Balancer steals of the clients** — the controller sums each client's
+//!     `THREAD_PLACEMENT_PULLS` placement counter, the kernel's count of the
+//!     load balancer's moves of the thread (the RT push, the counter's other
+//!     writer, moves no fair thread), and asserts the sum `>= 1`: the balancer
+//!     took a client doing IPC handoffs, not a wake that moved one. The clients'
+//!     observed CPUs (`system_info(CurrentCpu)` samples) are logged for
+//!     diagnostics.
+//!
+//! ## Front-segment witness
+//!
+//! A balancer whose destination has work of its own skips the front segment
+//! of a source CPU that runs no RT work, where a passed client waits to run
+//! next (core/kernel/docs/scheduler.md § Load Balancing). The kernel counts a
+//! pull that took a thread out of such a segment (`THREAD_PLACEMENT_FRONT_STEALS`,
+//! from a walk of the segment apart from the scan); the controller asserts
+//! the sum over every client and server is `0`.
 //!
 //! A regression surfaces as a **kernel** guard firing (the
 //! `PerCpuScheduler::enqueue` `queued_on >= 0` single-link tripwire in debug
@@ -63,23 +80,26 @@
 //! reintroduces the steal, surfaced by a kernel guard the harness reports as
 //! FAIL.
 //!
-//! The migration assertion applies only at `cpus <= MIGRATION_GUARD_MAX_CPUS`:
-//! above that the one-hot `u32` CPU witness aliases indices mod 32, and the
-//! oversubscription premise (`2 * NUM_PAIRS ≫ cpus`) is inverted — the threads
-//! spread thin, so a backlog seldom forms or lasts long enough for a pull (the
-//! conditions core/kernel/docs/scheduler.md § Load Balancing sets), the steal
-//! path legitimately may never arm, and the guard becomes a coin flip. The kernel
-//! guards above remain the regression signal at every CPU count; the witness
-//! values are still logged.
+//! The steal assertion applies only at `cpus <= PULL_GUARD_MAX_CPUS`: above
+//! that the oversubscription premise (`2 * NUM_PAIRS ≫ cpus`) is inverted — the
+//! threads spread thin, so a backlog seldom forms or lasts long enough for a
+//! pull (the conditions core/kernel/docs/scheduler.md § Load Balancing sets),
+//! the steal path legitimately may never arm, and the guard becomes a coin flip.
+//! The kernel guards above remain the regression signal at every CPU count, the
+//! front-segment witness is asserted at every CPU count, and the steal count is
+//! still logged.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, system_info, thread_exit,
+    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, cap_info_thread_placement,
+    ipc_buffer_set, notification_send, notification_wait, system_info, thread_exit,
 };
-use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, SystemInfoType};
+use syscall_abi::{
+    RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, SystemInfoType, THREAD_PLACEMENT_FRONT_STEALS,
+    THREAD_PLACEMENT_PULLS,
+};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -89,7 +109,8 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// run, so all `2 * NUM_PAIRS` stacks/buffers are live at once.
 const NUM_PAIRS: usize = 16;
 
-/// Round-trips each client issues. Tuned empirically: with the
+/// Round-trips each client issues. Tuned empirically, with the servers then
+/// spread over every CPU: with the
 /// `pull_unpinned_ready` gate reverted this density trips the double-enqueue
 /// tripwire in ~6% of x86 KVM boots (real-parallelism only — TCG's atomic
 /// translation blocks never expose the still-`current` window), which the
@@ -101,11 +122,10 @@ const ITERS: u32 = 16000;
 /// overhead while still catching migrations across the run).
 const SAMPLE_EVERY: u32 = 64;
 
-/// Widest guest for which the `migrations >= 1` guard is asserted: the bound of
-/// the one-hot `u32` CPU witness (`sample_cpu_bit` masks indices mod 32), and
+/// Widest guest for which the steal guard (client pulls `>= 1`) is asserted:
 /// comfortably inside the oversubscription envelope the guard was tuned for
 /// (see the module doc's Pass criterion).
-const MIGRATION_GUARD_MAX_CPUS: u64 = 32;
+const PULL_GUARD_MAX_CPUS: u64 = 32;
 
 /// Notification NOTIFY right — what a client needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
@@ -132,8 +152,8 @@ static mut IPC_BUFS: [IpcBufPage; 2 * NUM_PAIRS] = [IpcBufPage::ZERO; 2 * NUM_PA
 static ROUNDTRIPS: AtomicU64 = AtomicU64::new(0);
 /// Union of CPU indices any client observed itself running on (diagnostics).
 static OBSERVED_CPUS: AtomicU32 = AtomicU32::new(0);
-/// Count of clients that observed themselves on ≥ 2 distinct CPUs (migration
-/// witness: an unpinned thread the balancer relocated).
+/// Count of clients that observed themselves on ≥ 2 distinct CPUs
+/// (diagnostics: a wake or a pull moved them).
 static MIGRATIONS: AtomicU32 = AtomicU32::new(0);
 
 /// Per-client arguments, handed to `client_entry` by address.
@@ -188,7 +208,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: stress::load_balance_handoff_steal SKIP (need 2+ CPUs)");
         return Ok(());
     }
-    let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
+    let cpu_mod = server_cpus(cpus);
 
     // run() executes once per boot; reset the shared witnesses defensively.
     ROUNDTRIPS.store(0, Ordering::Relaxed);
@@ -204,7 +224,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut clients = [const { spawn::SpawnedChild::EMPTY }; NUM_PAIRS];
     let mut eps = [0u64; NUM_PAIRS];
 
-    // ── Servers first: pinned round-robin, RECEIVE on a private endpoint. ────
+    // ── Servers first: pinned round-robin over the lower half of the CPUs,
+    // RECEIVE on a private endpoint. ──────────────────────────────────────────
     // Started, and reported entering `ipc_recv`, before the clients, so they
     // reply fast.
     for (j, (ep_slot, server_slot)) in eps.iter_mut().zip(servers.iter_mut()).enumerate()
@@ -332,6 +353,21 @@ pub fn run(ctx: &TestContext) -> TestResult
         acc |= bits;
     }
 
+    // ── The kernel's placement counters, read before the caps go. ────────────
+    let mut client_pulls = 0u64;
+    let mut front_steals = 0u64;
+    for client in &clients
+    {
+        client_pulls = client_pulls.saturating_add(placement(client.th, THREAD_PLACEMENT_PULLS)?);
+        front_steals =
+            front_steals.saturating_add(placement(client.th, THREAD_PLACEMENT_FRONT_STEALS)?);
+    }
+    for server in &servers
+    {
+        front_steals =
+            front_steals.saturating_add(placement(server.th, THREAD_PLACEMENT_FRONT_STEALS)?);
+    }
+
     // ── Teardown. Servers are blocked in `ipc_recv`; delete-while-blocked. ───
     // Reap server threads (and so the live receivers) before deleting the
     // endpoints they wait on. Clients have already exited.
@@ -376,6 +412,14 @@ pub fn run(ctx: &TestContext) -> TestResult
         "ktest: stress::load_balance_handoff_steal migrations=",
         u64::from(migrations),
     );
+    crate::log_u64(
+        "ktest: stress::load_balance_handoff_steal client_pulls=",
+        client_pulls,
+    );
+    crate::log_u64(
+        "ktest: stress::load_balance_handoff_steal front_steals=",
+        front_steals,
+    );
 
     let expected = u64::try_from(NUM_PAIRS)
         .unwrap_or(0)
@@ -385,10 +429,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         return Err("stress::load_balance_handoff_steal: not all round-trips completed");
     }
-    if migrations == 0 && cpus <= MIGRATION_GUARD_MAX_CPUS
+    if front_steals != 0
     {
         return Err(
-            "stress::load_balance_handoff_steal: no client observed on 2+ CPUs (steal path unarmed)",
+            "stress::load_balance_handoff_steal: a pull took a thread from a front segment its scan skips",
+        );
+    }
+    if client_pulls == 0 && cpus <= PULL_GUARD_MAX_CPUS
+    {
+        return Err(
+            "stress::load_balance_handoff_steal: the balancer pulled no client (steal path unarmed)",
         );
     }
 
@@ -449,7 +499,8 @@ extern "C" fn client_entry(arg: u64) -> !
 }
 
 /// Server: reply to every call on its private endpoint until torn down. Pinned
-/// round-robin so its reply tends to wake the client from a different CPU.
+/// round-robin over the lower half of the CPUs ([`server_cpus`]), so its reply
+/// tends to wake a pulled client from a different CPU.
 /// Reports on `ready` just before its first receive.
 extern "C" fn server_entry(arg: u64) -> !
 {
@@ -491,9 +542,24 @@ extern "C" fn server_entry(arg: u64) -> !
     }
 }
 
+/// The CPUs the servers are pinned over, round-robin: the lower half of the
+/// `cpus` CPUs, at least one, so the upper half run no server and pull the
+/// clients that gather on the server CPUs.
+fn server_cpus(cpus: u64) -> u32
+{
+    u32::try_from(cpus / 2).unwrap_or(u32::MAX).max(1)
+}
+
+/// One placement counter of a thread ([`cap_info_thread_placement`]).
+fn placement(thread: u64, view: u64) -> Result<u64, &'static str>
+{
+    cap_info_thread_placement(thread, view)
+        .map_err(|_| "stress::load_balance_handoff_steal: cap_info thread placement failed")
+}
+
 /// Sample the CPU the calling thread is on as a one-hot `u32` mask bit, or 0 if
-/// the query fails. The CPU index is masked mod 32, so indices above 31 alias;
-/// `run` asserts the migration guard only at `cpus <= MIGRATION_GUARD_MAX_CPUS`.
+/// the query fails. The CPU index is masked mod 32, so indices above 31 alias:
+/// the observed-CPU count is a diagnostic only.
 fn sample_cpu_bit() -> u32
 {
     match system_info(SystemInfoType::CurrentCpu as u64)

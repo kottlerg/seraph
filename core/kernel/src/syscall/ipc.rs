@@ -1538,6 +1538,7 @@ pub fn sys_ipc_reply_recv(tf: UserFrame) -> Result<u64, SyscallError>
 ///
 /// [`WakeHint::WakerRuns`]: crate::sched::WakeHint::WakerRuns
 #[cfg(not(test))]
+#[inline]
 unsafe fn wake_replied(
     caller: *mut crate::sched::thread::ThreadControlBlock,
     server: *mut crate::sched::thread::ThreadControlBlock,
@@ -1556,10 +1557,12 @@ unsafe fn wake_replied(
     // SAFETY: caller is pinned by the claim; target came from
     // select_wake_target.
     unsafe { crate::sched::enqueue_and_wake_at(caller, target) };
+    // On a WakerRuns wake, no exclusion means the server does not outrank the
+    // caller, so the rank test is made once.
     hint == crate::sched::WakeHint::WakerRuns
+        && exclude.is_none()
         && target.cpu == this_cpu
         && target.link == crate::sched::WakeLink::Tail
-        && !crate::sched::run_queue::outranks(server_level, caller_level)
 }
 
 /// What [`deposit_reply`] leaves owed.

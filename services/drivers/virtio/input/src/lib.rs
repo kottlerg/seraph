@@ -10,7 +10,8 @@
 //! [`input_labels::INPUT_READ_EVENTS`] is gated on
 //! [`input_labels::READ_AUTHORITY`] in the caller's badge (see
 //! `docs/capability-model.md` on verb bits), so a holder of a SEND without
-//! the bit cannot read keystrokes.
+//! the bit cannot read keystrokes; and the judgement of an eventq
+//! completion's length ([`is_whole_event`]).
 
 use ipc::input_labels;
 
@@ -28,6 +29,22 @@ use ipc::input_labels;
 pub fn authorized(label: u64, badge: u64) -> bool
 {
     label != input_labels::INPUT_READ_EVENTS || badge & input_labels::READ_AUTHORITY != 0
+}
+
+/// Bytes of one virtio-input event (`VirtIO` 1.2 §5.8.6.2: `type` and `code`,
+/// 16 bits each, and `value`, 32 bits), the length of each eventq buffer.
+pub const EVENT_SIZE: u32 = 8;
+
+/// Whether an eventq completion whose used element reports `len` bytes
+/// written holds a whole event. The driver reads nothing past the first
+/// `len` bytes of a buffer (`VirtIO` 1.2 §2.7.8.2), so a shorter completion
+/// carries no event: the bytes it did not write are the slot's previous
+/// event, or zeros. A `len` past the buffer is the device's error; the
+/// event's 8 bytes lie inside the buffer, so it is read.
+#[must_use]
+pub fn is_whole_event(len: u32) -> bool
+{
+    len >= EVENT_SIZE
 }
 
 #[cfg(test)]
@@ -49,5 +66,22 @@ mod tests
     fn unknown_label_is_not_gated()
     {
         assert!(authorized(0xFFFF, 0));
+    }
+
+    #[test]
+    fn a_completion_shorter_than_an_event_holds_none()
+    {
+        for len in 0..EVENT_SIZE
+        {
+            assert!(!is_whole_event(len), "a {len}-byte completion was read");
+        }
+    }
+
+    #[test]
+    fn a_completion_of_an_event_or_more_holds_one()
+    {
+        assert!(is_whole_event(EVENT_SIZE));
+        assert!(is_whole_event(9));
+        assert!(is_whole_event(u32::MAX));
     }
 }

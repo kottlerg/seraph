@@ -92,7 +92,9 @@ with the device addresses devmgr returns, never with a physical address
 ([docs/device-management.md](../../../../docs/device-management.md#dma-authorisation)
 § DMA Authorisation). The device fills one event per
 buffer as keys arrive and raises an interrupt; the driver drains the used ring,
-decodes, and re-posts each buffer. A descriptor-head → buffer-slot map locates
+decodes, and re-posts each buffer. A completion whose length is shorter than one event
+carries none: its buffer is re-posted unread, since the bytes the device did not write
+are the slot's previous event (VirtIO 1.2 §2.7.8.2). A descriptor-head → buffer-slot map locates
 the filled buffer on completion. With an interrupt, an interrupt-service
 thread is the only waiter on the notification bound to it: it runs
 virtio-core's `isr::serve_interrupts`, which on the wired line reads the ISR

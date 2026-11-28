@@ -29,9 +29,10 @@
 //!
 //! The parent takes the third thread's bit within `PROGRESS_BUDGET_US` of
 //! starting it (stretched past 16 CPUs by the width's oversubscription
-//! factor, [`crate::scaled_bound`]), and the pair made more round trips
-//! before the bit than when the thread started, so it ran beside a pair
-//! still handing off.
+//! factor, [`crate::scaled_bound`]), and the pair makes more round trips
+//! after the thread ran, so it ran beside a pair still handing off. The pair
+//! need make none between the start and the run: a turn of the pair that
+//! ends just after the start sends the pair behind the thread at once.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -53,8 +54,9 @@ const CPU: u32 = 0;
 /// Round trips the pair makes before the third thread starts.
 const WARM_ROUND_TRIPS: u64 = 1_000;
 
-/// 1 ms waits the parent gives the pair to warm up, and the children to
-/// finish; applied through [`crate::scaled_polls`].
+/// 1 ms waits the parent gives the pair to warm up, and to make a round trip
+/// after the third thread ran, and the children to finish; applied through
+/// [`crate::scaled_polls`].
 const WARM_POLLS: u32 = 2_000;
 const DONE_POLLS: u32 = 4_000;
 
@@ -267,9 +269,19 @@ fn run_children(
             "handoff_pair_progress: a fair thread beside a handoff pair exceeded the budget",
         );
     }
-    if trips_when_ran <= trips_at_start
+    let mut handing_off = false;
+    for _ in 0..crate::scaled_polls(WARM_POLLS)
     {
-        return Err("handoff_pair_progress: the pair stopped handing off before the thread ran");
+        if ROUND_TRIPS.load(Ordering::Acquire) > trips_when_ran
+        {
+            handing_off = true;
+            break;
+        }
+        let _ = thread_sleep(1);
+    }
+    if !handing_off
+    {
+        return Err("handoff_pair_progress: the pair stopped handing off around the thread's run");
     }
     Ok(bits)
 }

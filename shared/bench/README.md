@@ -187,7 +187,11 @@ one that returns halts saw the CPU halt (`Halted`), and one that returns `0` cou
 (`Counted`). Such a row carries the counts of the windows it left out, `moved=` (`MOVED`) and
 `halted=` (`HALTED`), and a row whose counted windows are fewer than half its windows
 (`WindowShape::floor`) does not measure its case, only the windows that happened to stay on the CPU,
-so the benchmark logs no result line for it. fsbench's `affinity=any` rows are such rows
+so the benchmark logs no result line for it. A row with a baseline that no run logs is then
+`MISSING`, which fails the bench cell under icount whether the row gates or not
+([xtask/README.md § `cargo xtask bench-check`](../../xtask/README.md#cargo-xtask-bench-check)):
+its count does not gate, since the other CPUs' work moves it, but a case whose windows mostly
+leave its CPU no longer measures what its row names. fsbench's `affinity=any` rows are such rows
 ([services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md)), as is ubench's
 `fault_fill path=grant affinity=any` ([services/ubench/README.md](../../services/ubench/README.md)).
 

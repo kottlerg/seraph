@@ -43,7 +43,7 @@ use crate::ipc_util::ns::ns_lookup;
 use crate::phases::budget;
 use crate::phases::fs_ipc::{INVALID_NAMES, listing};
 use crate::phases::fs_sessions::{
-    AT_MAX_NO_LIMIT, AT_MAX_PAGES, ESP_PROBE, NO_MAX, SESSION_MAX, at_max_fill, at_max_touch_stack,
+    AT_MAX_NO_LIMIT, AT_MAX_PAGES, AT_MAX_STACK_TOUCH, ESP_PROBE, NO_MAX, SESSION_MAX, at_max_fill,
     charge_handle, sub_node,
 };
 use crate::phases::node_handle::{node_usage, release_refused};
@@ -562,7 +562,7 @@ fn full_session_main() -> !
         }
     }
     files.clear();
-    at_max_touch_stack();
+    std::os::seraph::thread::touch_stack::<AT_MAX_STACK_TOUCH>();
     at_max_fill();
     match crate::phases::memmgr::try_request_contiguous(1)
     {
@@ -648,7 +648,7 @@ fn cwd_at_max_main() -> !
         Ok(file) => drop(file),
         Err(_) => exit(NO_WARMUP),
     }
-    at_max_touch_stack();
+    std::os::seraph::thread::touch_stack::<AT_MAX_STACK_TOUCH>();
     at_max_fill();
     match crate::phases::memmgr::try_request_contiguous(1)
     {

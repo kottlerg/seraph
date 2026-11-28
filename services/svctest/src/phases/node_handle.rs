@@ -679,7 +679,7 @@ fn node_child_main() -> !
 {
     use std::process::exit;
 
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<CHILD_STACK_TOUCH>();
     let max = match budget::memory_usage()
     {
         Some((_, max, _)) if max != NO_MAX => max,
@@ -770,14 +770,4 @@ fn fill_to(max: u64)
         }
     }
     exit(CHILD_FILL_FAILED);
-}
-
-/// Write [`CHILD_STACK_TOUCH`] bytes of the calling thread's stack, so that
-/// memmgr backs them now.
-#[inline(never)]
-fn touch_stack()
-{
-    let mut pad = [0u8; CHILD_STACK_TOUCH];
-    pad.fill(1);
-    std::hint::black_box(&mut pad);
 }

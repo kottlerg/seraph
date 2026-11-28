@@ -21,7 +21,8 @@
 //! which procmgr answers with its `LIMIT`.
 
 use std::os::seraph::startup_info;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::os::seraph::thread::BuilderExt;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::bootstrap::Caps;
@@ -114,9 +115,6 @@ static REGION_VA: AtomicU64 = AtomicU64::new(0);
 /// to memmgr to make room for the touched page.
 static FIRST_GRANT_CAP: AtomicU64 = AtomicU64::new(0);
 static FIRST_GRANT_REGION: AtomicU64 = AtomicU64::new(0);
-/// Set by the handler thread once its stack is touched and it is about to
-/// receive.
-static HANDLER_READY: AtomicBool = AtomicBool::new(false);
 /// The handler's verdict on the first fault it received: `0` while none came,
 /// [`HANDLED`] for the touch's, else the child's exit code naming what was
 /// wrong.
@@ -750,14 +748,10 @@ fn arm_handler() -> u64
         exit(CHILD_SETUP_FAILED)
     };
     if std::thread::Builder::new()
-        .spawn(move || handler_main(endpoint))
+        .spawn_backed::<HANDLER_STACK_TOUCH, _, _>(move || handler_main(endpoint))
         .is_err()
     {
         exit(CHILD_SETUP_FAILED);
-    }
-    while !HANDLER_READY.load(Ordering::Acquire)
-    {
-        std::thread::yield_now();
     }
     if syscall::thread_set_fault_handler(
         std::os::seraph::thread::current_thread_cap(),
@@ -819,16 +813,6 @@ fn fill_to_max()
     exit(CHILD_FILL_FAILED);
 }
 
-/// Write `HANDLER_STACK_TOUCH` bytes of the calling thread's stack, so that
-/// memmgr backs them now.
-#[inline(never)]
-fn touch_stack()
-{
-    let mut pad = [0u8; HANDLER_STACK_TOUCH];
-    pad.fill(1);
-    std::hint::black_box(&mut pad);
-}
-
 /// The handler thread: receive the faults the main thread's exception class
 /// is bound to `endpoint` for. The first, the touch's, must be the region's
 /// page forwarded by memmgr with decline 10; the handler records its verdict,
@@ -842,8 +826,6 @@ fn handler_main(endpoint: u64)
         FAULT_REPLY_RESUME, PAGE_SIZE,
     };
 
-    touch_stack();
-    HANDLER_READY.store(true, Ordering::Release);
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut first = true;
     loop

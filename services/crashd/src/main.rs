@@ -410,20 +410,6 @@ fn stall_ms() -> u64
     stall.ms
 }
 
-/// Touch [`STACK_TOUCH_BYTES`] of the calling thread's stack below this
-/// frame, so its pages are backed before memory can run out.
-#[inline(never)]
-#[expect(
-    clippy::large_stack_arrays,
-    clippy::large_stack_frames,
-    reason = "the probe exists to occupy and touch this much of the stack"
-)]
-fn touch_stack()
-{
-    let mut probe = [0u8; STACK_TOUCH_BYTES];
-    std::hint::black_box(&mut probe);
-}
-
 /// Touch [`HEAP_TOUCH_BYTES`] of heap and free them: the allocator keeps
 /// the pages, and places later requests first fit from the heap's bottom.
 fn touch_heap()

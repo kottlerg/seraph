@@ -162,7 +162,7 @@ pub fn serve(
     {
         return;
     };
-    crate::touch_stack();
+    std::os::seraph::thread::touch_stack::<{ crate::STACK_TOUCH_BYTES }>();
     crate::touch_heap();
     std::os::seraph::log!("holding faults declined for want of memory up to {stall_ms} ms");
     std::os::seraph::log!("reporting crashes");

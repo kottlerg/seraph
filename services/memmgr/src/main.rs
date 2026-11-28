@@ -176,9 +176,9 @@ const COPY_VA: u64 = 0x0000_0001_0000_0000;
 
 /// Pages of the copy window: the span of one leaf page table on every paging
 /// mode (2 MiB), at a base aligned to it, so the window needs one leaf table,
-/// which the kernel funds once and keeps, since a plain `mem_unmap` leaves
-/// page tables in place. Every copy maps at most a chunk's run or
-/// `OBJECT_READ_PAGES`, which the window holds.
+/// which memmgr funds at startup ([`fund_copy_window`]) and the kernel
+/// keeps, since a plain `mem_unmap` leaves page tables in place. Every copy
+/// maps at most a chunk's run or `OBJECT_READ_PAGES`, which the window holds.
 const COPY_WINDOW_PAGES: u64 = LEAF_TABLE_PAGES;
 
 /// Degraded-fallback scratch VA in memmgr's address space for mapping the
@@ -943,6 +943,42 @@ fn zero_run(cap: u64, pages: u64) -> Result<(), i64>
     // page, an object frame of the own view, or mapped at a window, which every
     // use leaves unmapped. The zero changes no memory memmgr reads.
     unsafe { syscall::memory_zero_all(cap, 0, pages) }
+}
+
+/// Fund the copy window's leaf page table at startup, while the pool is full:
+/// map one free page at [`COPY_VA`] and unmap it again, leaving the table in
+/// place, so no copy needs page-table funding later, a restore under memory
+/// pressure among them (services/memmgr/docs/memory-pool.md § Frame
+/// contents). The page goes back to the pool, or, should its unmap fail,
+/// stays memmgr's own. Returns whether the window's table is in place; when
+/// it is not, the first copy funds it as any map into memmgr's own address
+/// space does.
+fn fund_copy_window(l: &mut MemLedger) -> bool
+{
+    let Ok(grant) = select(l, 1, Fit::Contiguous)
+    else
+    {
+        return false;
+    };
+    let (outer, taken, phys) = grant.entries[0];
+    // SAFETY: the copy window is memmgr's own zone (the zone map above),
+    // which nothing has mapped yet at startup, so the map changes nothing
+    // memmgr runs on.
+    if unsafe { map_self(l, outer, COPY_VA, 0, 1) }.is_err()
+    {
+        return_taken(l, outer, taken, phys);
+        return false;
+    }
+    // SAFETY: the span is the window page mapped above; nothing refers to it.
+    if unsafe { syscall::mem_unmap(self_aspace(), COPY_VA, 1) }.is_ok()
+    {
+        return_taken(l, outer, taken, phys);
+    }
+    else
+    {
+        l.add_own_pages(u64::from(taken));
+    }
+    true
 }
 
 /// Map one pool frame as the next arena page and carve it into free slots.
@@ -5635,6 +5671,10 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
             OBJECT_ZONE_VA,
             OBJECT_ZONE_END.saturating_sub(OBJECT_ZONE_VA) / PAGE_SIZE,
         );
+
+    // The copy window's page table, funded while the pool is full; without
+    // it the first copy funds the table.
+    let _ = fund_copy_window(l);
 
     // The compression worker, at the fair class's top under memmgr's own
     // `SchedControl` cap. Without it memmgr evicts nothing and serves as

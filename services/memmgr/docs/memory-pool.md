@@ -224,8 +224,12 @@ Five request paths map the window, and no other does:
   ([`ipc-interface.md`](ipc-interface.md) § Label 31: `CAPTURE_CHUNKS`);
 - a restore of a compressed or on-disk chunk: each new run ([Eviction](#eviction)).
 
-A plain unmap keeps the window's page table, so only the first copy funds page tables, from the
-free pool as every map into memmgr's own address space does ([Metadata Arena](#metadata-arena)). The
+memmgr funds the window's leaf page table at startup, before its first receive, while the pool is
+full: it maps one free page there, unmaps it, and returns the page to the pool. A plain unmap keeps
+the table, so no copy funds page tables, a restore under memory pressure among them, which the
+restore headroom ([Eviction](#eviction)) counts no page-table page for. Should the startup map
+fail, the first copy funds the table from the free pool, as every map into memmgr's own address
+space does ([Metadata Arena](#metadata-arena)). The
 window holds a run only while memmgr writes it, and no other process can read memmgr's address
 space. Each unmap of the window invalidates its leaves on every CPU that runs memmgr's address
 space before it returns.

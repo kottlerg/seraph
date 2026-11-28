@@ -1420,53 +1420,60 @@ eviction then raises the free pages outside `promised` only while a chunk's page
 keep it within the allowance, where the free pool, not `promised`, bounds those pages. A restore of
 an uncommitted chunk and a reserve node's committed draw take any victim, since they need free
 frames alone; eviction for frames and any other committed draw take a victim whose eviction frees a
-page above the growth floor (Selection, below).
+page above the growth floor, and eviction for frames while a committed draw is short any victim
+(Selection, below).
 
 **Selection.** While the pool's pressure level reads `LOW` ([Memory pressure](#memory-pressure)),
 memmgr reclaims in the background until it reads `NORMAL`, and stops there. It also evicts for
 frames: while the free pool does not cover `promised`, or a committed draw has found too few free
 pages since the draw room last opened ([Commit](#commit), Overcommit), and the free frames stand at
 or below the growth floor and the hysteresis band (or a demand chunk's pages, when the band is
-less), it evicts in the background at either level, each evictable idle chunk whose eviction frees
-a page above the growth floor a victim (a committed chunk, or an uncommitted one once the restore
+less), it evicts in the background at either level, each evictable idle chunk whose eviction frees a
+page above the growth floor a victim (a committed chunk, or an uncommitted one once the restore
 headroom has reached the reserve), since the frames go to the committed draws, which `promised`
-keeps them for or which wait for them, and to the restores. While the free pool covers `promised`
-only the growth floor keeps a draw short, and a frame an eviction frees above the floor can go to
-the next admission as well, so memmgr waits for a draw that found too few and stops when the draw
-room opens. Otherwise it
-does not reclaim in the background at `CRITICAL`: the free pages above the growth floor are gone, so
-every frame an eviction frees past the restore headroom goes to the next admission, which a process
-draining the pool makes before any victim faults. Eviction makes room for the processes that run
-while memory is low; at `CRITICAL` only a restore or a committed draw evicts, for itself (Direct
-reclaim, below), and the pool is otherwise left to the out-of-memory path (crashd's hold of a
-declined fault, oomd's stop of a job). While the level reads `LOW` or `CRITICAL`, the receive loop
-waits for a message a bounded time and, at most once per sweep interval, runs a slice of the clock:
-a hand walks the eligible regions of each process in turn, a bounded number of steps a slice
-([docs/limits.md](../../../docs/limits.md) § memmgr gives the interval and the bounds). It takes
-the processes in the order of their badges, which no lookup of the process index changes, so a pass
-sweeps each process once whatever faults and grants land between its slices, and a hand whose
-process is gone goes on at the next badge; `SWAP_TAKE`'s hand (below) takes them in the same order.
-A pass
-sweeps the records of a budget node only as often as the node's reclaim rate allows ([Distribution
-policy](#distribution-policy), Floors and weights): at its first record in a pass the node's credit
-grows by its rate over the greatest rate of a node the previous pass found an idle chunk of, at most
-by a whole sweep, and the pass sweeps the node's records when a whole sweep has built up, spending
-it, and otherwise passes each over in one step, its accessed bits left for its next sweep. A node at
-its floor or below is never swept, and when the previous pass found no idle chunk every other node
-is. For each
-span of up to 256 chunks it reads and clears the accessed bits with one `SYS_ASPACE_HARVEST`, and
-ages each resident chunk of the span with its two-bit age ([Chunk table](#chunk-table)): a chunk
-with no accessed page in two sweeps is cold, and the slice posts one job for each cold chunk whose
-eviction raises the free pages outside `promised` at `LOW` (Committed pages, above), and for each
-whose eviction frees a page above the growth floor while memmgr evicts for frames (Selection,
-above), as many as the compression worker has free job slots. While memmgr evicts for frames, a
-victim of that kind takes the place of one the slice found before it once the slice's list is full,
-so the chunks a committed draw needs are not crowded out by those it does not. The victims a slice
-finds and posts no job for are kept, a bounded number, for direct reclaim; when the list is full,
-one whose eviction frees a page above the growth floor while memmgr evicts for frames takes the
-place of one whose eviction does not; at `CRITICAL` a slice finds the chunks with no accessed page
-in one sweep. A slice ends at the end of a pass, so no slice ages a chunk twice. The granule is the
-chunk: one unmap and one restore fault per chunk, over every run on its run list.
+keeps them for or which wait for them, and to the restores. While a committed draw is short it takes
+any evictable idle chunk, those whose eviction frees a page above the floor first: with no committed
+chunk idle an uncommitted chunk is the only victim, and each one's eviction raises the restore
+headroom by its pages until the headroom reaches the reserve, past which every eviction opens the
+draw room, so the room opens without the out-of-memory path. The wider selection ends when the draw
+room opens, at the turn that clears the short draw (`data[22]`). It does not take a reserve's worth
+again for each short draw: the headroom stays at the reserve while the chunks that filled it stay
+swapped, so a later short draw finds every eviction opening the room, and refills the headroom only
+by the pages restored since, which those restores took from it. While the free pool covers
+`promised` only the growth floor keeps a draw short, and a frame an eviction frees above the floor
+can go to the next admission as well, so memmgr waits for a draw that found too few and stops when
+the draw room opens. Otherwise it does not reclaim in the background at `CRITICAL`: the free pages
+above the growth floor are gone, so every frame an eviction frees past the restore headroom goes to
+the next admission, which a process draining the pool makes before any victim faults. Eviction makes
+room for the processes that run while memory is low; at `CRITICAL` only a restore or a committed
+draw evicts, for itself (Direct reclaim, below), and the pool is otherwise left to the out-of-memory
+path (crashd's hold of a declined fault, oomd's stop of a job). While the level reads `LOW` or
+`CRITICAL`, the receive loop waits for a message a bounded time and, at most once per sweep
+interval, runs a slice of the clock: a hand walks the eligible regions of each process in turn, a
+bounded number of steps a slice ([docs/limits.md](../../../docs/limits.md) § memmgr gives the
+interval and the bounds). It takes the processes in the order of their badges, which no lookup of
+the process index changes, so a pass sweeps each process once whatever faults and grants land
+between its slices, and a hand whose process is gone goes on at the next badge; `SWAP_TAKE`'s hand
+(below) takes them in the same order. A pass sweeps the records of a budget node only as often as
+the node's reclaim rate allows ([Distribution policy](#distribution-policy), Floors and weights): at
+its first record in a pass the node's credit grows by its rate over the greatest rate of a node the
+previous pass found an idle chunk of, at most by a whole sweep, and the pass sweeps the node's
+records when a whole sweep has built up, spending it, and otherwise passes each over in one step,
+its accessed bits left for its next sweep. A node at its floor or below is never swept, and when the
+previous pass found no idle chunk every other node is. For each span of up to 256 chunks it reads
+and clears the accessed bits with one `SYS_ASPACE_HARVEST`, and ages each resident chunk of the span
+with its two-bit age ([Chunk table](#chunk-table)): a chunk with no accessed page in two sweeps is
+cold, and the slice posts one job for each cold chunk whose eviction raises the free pages outside
+`promised` at `LOW` (Committed pages, above), and for each whose eviction frees a page above the
+growth floor while memmgr evicts for frames, or for any while a committed draw is short, those first
+(Selection, above), as many as the compression worker has free job slots. While memmgr evicts for
+frames, a victim of that kind takes the place of one the slice found before it once the slice's list
+is full, so the chunks a committed draw needs are not crowded out by those it does not. The victims
+a slice finds and posts no job for are kept, a bounded number, for direct reclaim; when the list is
+full, one whose eviction frees a page above the growth floor while memmgr evicts for frames takes
+the place of one whose eviction does not; at `CRITICAL` a slice finds the chunks with no accessed
+page in one sweep. A slice ends at the end of a pass, so no slice ages a chunk twice. The granule is
+the chunk: one unmap and one restore fault per chunk, over every run on its run list.
 
 **States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, maps its
 runs into the job slot's input window of its own address space, and the chunk is evicting while the

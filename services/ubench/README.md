@@ -42,14 +42,16 @@ services/ubench/
 ├── README.md
 └── src/
     ├── main.rs            # Seeds, the pin, the benchmark sequence, the marker, power-off
-    ├── harness.rs         # The pin, the CPU count, the result and SKIP lines
+    ├── harness.rs         # The pin, the CPU count, the counter calibration, the result and
+    │                      #   SKIP lines
     ├── ipc_rt.rs          # ipc_rt: call and reply with a server thread on the same CPU
     ├── fault.rs           # fault_fill and fault_scaling: demand faults and grants
     ├── shmem_ring.rs      # shmem_ring: the stdio pipe's byte ring
     ├── pipeline.rs        # pipeline: a producer and a consumer thread, neither pinned
     ├── console.rs         # console_write: FB_WRITE_BYTES to the framebuffer driver
     ├── fsbench.rs         # fsbench: /tests/fixtures/programs/fsbench at its full counts
-    └── empty_window.rs    # empty_window: two counter reads with nothing between them
+    ├── empty_window.rs    # empty_window: two counter reads with nothing between them
+    └── fault_rate.rs      # fault_rate: one faulting process per CPU, timed from CPU 0
 ```
 
 ---
@@ -73,6 +75,7 @@ its timed ones.
 | `console_write` | `bytes=64\|4096` | `bytes` of text, lines of 63 letters and a newline, sent to the framebuffer driver as `FB_WRITE_BYTES` calls of at most 512 bytes each, as the terminal sends its child's output (`programs/terminal/src/output.rs`). Before each size's warm-up, untimed writes of 4096 bytes fill the screen, so every timed write of either size scrolls it, whatever the screen held before | 64 per size, after 16 |
 | `fsbench` | — | [`/tests/fixtures/programs/fsbench`](../fixtures/fsbench/README.md) spawned with no iteration count, its full benchmark, which logs its own `fsbench.read`, `fsbench.write` and `fsbench.open` lines | as fsbench's |
 | `empty_window` | — | Two counter reads with nothing between them: the offset every other line includes ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)) | 1024, after 64 |
+| `fault_rate` | `procs=1\|2\|4\|8 pages=16` | A window in which k processes, process i pinned to CPU i, each take the first store into 16 chunks of a region of its own, `DEMAND_CHUNK_PAGES` pages each, so that memmgr backs `window_ops=` 16·k chunks. Each process is [`program-modes faultstorm`](../fixtures/program-modes/README.md#faultstorm) in `touch`; between two windows each replaces its region with a fresh one, untimed. ubench's thread times the window from CPU 0 (below). A count above the CPUs online logs a SKIP line | 16 per count, after a calibration and 2 |
 
 The `fault` line of `fault_fill` carries two extras, read outside the timed window from ubench's
 own charge, `QUERY_MEMORY_USAGE` before and after each store: `faults=`, the timed stores memmgr
@@ -121,6 +124,22 @@ two threads' placement counters grew over the timed windows, summed, from the co
 Counters](../../core/kernel/docs/scheduler.md#placement-counters) names. They take a line of their
 own so that the result line stays within the bytes the log carries whole (below).
 
+`fault_rate` measures the demand faults the system serves per second when every CPU faults at once,
+which memmgr's one receive loop serves in turn ([memmgr Memory Pool §
+Concurrency](../memmgr/docs/memory-pool.md#concurrency)). No one process can time the window, which
+the faults of all of them make, so ubench's thread, pinned to CPU 0, times it as `pipeline`'s
+observer does: per window it reads its counter, writes each process its start byte, reads each one's
+byte that its chunks are backed, and reads its counter again, a window row ([shared/bench/README.md
+§ Window rows](../../shared/bench/README.md#window-rows)). Process 0 shares CPU 0 with the observer,
+which is blocked in its read for most of the window. Every window is checked against the kernel's
+elapsed microseconds as `pipeline`'s are, the windows left out counted in `clock_stopped=`, and a
+line all of whose windows were left out is the benchmark's FAIL line. Each line's extras:
+`window_ops=`, the chunks a window backs; `clock_stopped=`; `window_us=`, the mean elapsed
+microseconds of a timed window, over every one; and `faults_per_s=`, `window_ops=` per `window_us=`
+in chunks per second, the rate whose ratio between 8 CPUs and 1 judges memmgr's fault path's
+scaling. The line at one CPU gates like every other; the lines at more report. It runs last, so that
+its processes' deaths and the pages memmgr reclaims from them fall in no other benchmark's windows.
+
 ---
 
 ## Output
@@ -137,25 +156,25 @@ logs one of:
       p90=<v> p99=<v> max=<v> [faults=<n> backed_pages=<n>] [window_ops=<n> ...] idle_halts=<n>
   ```
 
-  wrapped above for width only, `idle_halts=` being the halts of the measuring CPU over the
-  measured loop ([shared/bench/README.md § Idle halts](../../shared/bench/README.md#idle-halts)):
-  in `fault_fill path=grant affinity=any`, a window row whose reads the measured thread takes,
-  over every window whose span closed, and in `pipeline`, whose reads its pinned observer takes,
-  over one span around its calibration, warm-up and timed windows; a window row's `n=` is the
+  wrapped above for width only, `idle_halts=` being the halts of the measuring CPU over the measured
+  loop ([shared/bench/README.md § Idle halts](../../shared/bench/README.md#idle-halts)): in
+  `fault_fill path=grant affinity=any`, a window row whose reads the measured thread takes, over
+  every window whose span closed, and in `pipeline` and `fault_rate`, whose reads a pinned observer
+  takes, over one span around the calibration, warm-up and timed windows; a window row's `n=` is the
   windows that counted, and its other extras are those of § Benchmarks; a failed placement read
   leaves `remote_wakes=` out;
 - for a window row whose reads the measured thread takes and whose counted windows fall below half
   its windows, no result line but a WARN line, `fault_fill path=grant affinity=any: counted windows
   below the floor`, with the counts, after which the bench cell fails on the row's baseline, which
   no run measured ([shared/bench/README.md § Window rows](../../shared/bench/README.md#window-rows))
-  (`pipeline` has no floor: it reports the windows that counted, however few, and fails when none
-  did, § Benchmarks);
-- `bench <name> SKIP (<why>)` for a case the boot cannot run (a thread count above the CPUs
-  online, or no framebuffer), beside the lines of the cases it ran;
-- `bench <name> FAIL (<why>)` when the benchmark failed: a failed call, a reply of the wrong
-  size, data that did not round-trip, an unsuccessful exit of fsbench, or a result line longer
-  than `LOG_LINE_BYTES` (256), the longest line logd carries whole (`LINE_BUF_SIZE`,
-  [logd IPC Interface](../logd/docs/ipc-interface.md)), which the log would split.
+  (`pipeline` and `fault_rate` have no floor: each reports the windows that counted, however few,
+  and fails when none did, § Benchmarks);
+- `bench <name> SKIP (<why>)` for a case the boot cannot run (a thread or process count above the
+  CPUs online, or no framebuffer), beside the lines of the cases it ran;
+- `bench <name> FAIL (<why>)` when the benchmark failed: a failed call, a reply of the wrong size,
+  data that did not round-trip, an unsuccessful exit of fsbench or of a `fault_rate` process, or a
+  result line longer than `LOG_LINE_BYTES` (256), the longest line logd carries whole
+  (`LINE_BUF_SIZE`, [logd IPC Interface](../logd/docs/ipc-interface.md)), which the log would split.
 
 The run ends with `ALL TESTS PASSED` when no benchmark failed and `SOME TESTS FAILED` after a
 `failed=<n>` line otherwise

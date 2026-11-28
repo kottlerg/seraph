@@ -250,9 +250,9 @@ and `stdiotest`, each an image of the program role, which the `programs` compone
 program signing role, and none of which installs under `/programs/`; directly under
 `/tests/fixtures/` the ones a harness recipe starts as services, `debug-echo`, `hotplug-check`, and
 `service-modes`. `program-modes` is one image whose first argument names the mode, `capexhaust`,
-`deadline`, `demandpaged`, `narrow`, `pipefault`, `pipestress`, `relrofault`, `stackoverflow`,
-`threadchurn` or `threadstack`; `service-modes` likewise, `crasher`, `memhog` or `stopsrc`. Which
-consumer spawns or drives each one is owned by
+`deadline`, `demandpaged`, `faultstorm`, `narrow`, `pipefault`, `pipestress`, `relrofault`,
+`stackoverflow`, `threadchurn` or `threadstack`; `service-modes` likewise, `crasher`, `memhog` or
+`stopsrc`. Which consumer spawns or drives each one is owned by
 [services/svctest/README.md § Fixtures](../services/svctest/README.md#fixtures) for `svctest` phases
 and by each fixture's README (`services/fixtures/<name>/README.md`, the modes of `program-modes` and
 `service-modes` each a section of theirs). Under `/config/svcmgr/tests/` are the harness recipes,

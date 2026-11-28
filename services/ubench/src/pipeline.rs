@@ -24,14 +24,14 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::Scope;
 
-use bench::{Counters, CycleRate, Value, WINDOW_OPS_KEY};
+use bench::{Counters, Value, WINDOW_OPS_KEY};
 use shmem::{SpscHeader, SpscReader, SpscWriter};
 use syscall_abi::{
-    SyscallError, SystemInfoType, THREAD_PLACEMENT_CPU, THREAD_PLACEMENT_IDLE_WAKES,
-    THREAD_PLACEMENT_PULLS, THREAD_PLACEMENT_REMOTE_WAKES, THREAD_PLACEMENT_WAKE_MOVES,
+    SyscallError, THREAD_PLACEMENT_CPU, THREAD_PLACEMENT_IDLE_WAKES, THREAD_PLACEMENT_PULLS,
+    THREAD_PLACEMENT_REMOTE_WAKES, THREAD_PLACEMENT_WAKE_MOVES,
 };
 
-use crate::harness::{IdleSpan, Outcome, report};
+use crate::harness::{IdleSpan, Outcome, calibrate, elapsed_us, report};
 
 /// The work values measured: iterations of [`spin`] on each side per item,
 /// from none, where a sample is the handoff alone, to work that dwarfs a
@@ -54,10 +54,6 @@ const WARMUP_WINDOWS: u64 = 2;
 
 /// Timed windows per work value.
 const WINDOWS: u64 = 32;
-
-/// The microseconds over which the counter's rate is measured on
-/// [`BENCH_CPU`] before the windows.
-const CALIBRATION_MICROS: u64 = 2000;
 
 /// The sequence number of the item that ends the consumer.
 const STOP_SEQ: u64 = u64::MAX;
@@ -94,24 +90,6 @@ pub fn run(counters: &Counters, cpus: u32) -> Outcome
     Ok(())
 }
 
-/// The counter's rate against the elapsed clock, over
-/// [`CALIBRATION_MICROS`] in which the calling thread keeps its CPU busy, so
-/// that the CPU does not halt.
-fn calibrate(counters: &Counters) -> Result<CycleRate, String>
-{
-    let first = elapsed_us()?;
-    let mut last = first;
-    let cycles = timed(counters, &mut || {
-        while last.saturating_sub(first) < CALIBRATION_MICROS
-        {
-            last = elapsed_us()?;
-        }
-        Ok(())
-    })?;
-    CycleRate::new(cycles, last.saturating_sub(first))
-        .ok_or_else(|| format!("no counter rate: {cycles} cycles in {CALIBRATION_MICROS} us"))
-}
-
 /// The cycles `region` took, between two counter reads. Every window of the
 /// benchmark, the calibration's included, is read here, so that all of them
 /// read the counter at the same two addresses: `cargo xtask path-account`
@@ -124,13 +102,6 @@ fn timed(counters: &Counters, region: &mut dyn FnMut() -> Outcome) -> Result<u64
     let ran = region();
     let cycles = counters.read().since(&start).cycles;
     ran.map(|()| cycles)
-}
-
-/// The kernel's elapsed microseconds (`SystemInfoType::ElapsedUs`).
-fn elapsed_us() -> Result<u64, String>
-{
-    syscall::system_info(SystemInfoType::ElapsedUs as u64)
-        .map_err(|e| format!("elapsed time: error {e}"))
 }
 
 /// Measure one work value with a pair of its own, on a ring and notifications
@@ -556,7 +527,7 @@ fn observe(counters: &Counters, chan: &Channel) -> Result<Measured, String>
     let mut elapsed = 0u64;
     let mut before = [[0u32; COUNT_VIEWS.len()]; 2];
     let idle = IdleSpan::open();
-    let rate = calibrate(counters)?;
+    let rate = calibrate(counters, timed)?;
     for i in 0..WARMUP_WINDOWS + WINDOWS
     {
         if i == WARMUP_WINDOWS

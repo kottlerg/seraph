@@ -37,8 +37,9 @@
 //!   has written every line it took before it, and before each call the probe
 //!   holds at most `HOLD_WINDOW` - 1 lines that logd may not have written,
 //!   which it learns through logd's flush barrier (`logd.flush`,
-//!   `services/logd/docs/ipc-interface.md` § Flush barrier), waiting for its
-//!   oldest one otherwise. A host that slows the serial sink, or a sink left
+//!   `services/logd/docs/ipc-interface.md` § Flush barrier), trusting a
+//!   `FLUSHED` answer only while every `hold` sink is served (`SINK_LIST`
+//!   on `logd.control`), and waits for its oldest one otherwise ([`Window`]). A host that slows the serial sink, or a sink left
 //!   behind by the phases before, makes the probe wait, and logd refuses a
 //!   sender within its window nothing; the waits are logged, not bounded;
 //! - both children still flooding when the probe's last call returns: they
@@ -56,6 +57,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ipc::IpcMessage;
+use ipc::log_control::{SINK_SERVED, decode_list_reply, list_request};
 use ipc::log_flush::FlushAnswer;
 use ipc::stream_labels::{LEVEL_INFO, STREAM_BYTES, WINDOW_FULL, level_bits};
 use logd_slot_table::HOLD_WINDOW;
@@ -107,6 +109,11 @@ const FLOOD_CAP: Duration = Duration::from_secs(30);
 /// flood's windows and the probe's ahead of the line.
 const WRITTEN_WITHIN: Duration = Duration::from_secs(10);
 
+/// The probe's pause before it asks again after a `hold` sink that holds
+/// nobody answered its flush: a stalled sink holds nobody for
+/// `SINK_STALL_MS` or more, so the pause costs little beside it.
+const UNHELD_POLL: Duration = Duration::from_millis(10);
+
 /// How long the phase lets the children start flooding before the probe's
 /// flooded calls.
 const FLOOD_SETTLE: Duration = Duration::from_millis(300);
@@ -146,43 +153,53 @@ struct Probe
     waited: Duration,
 }
 
-/// The probe's lines that logd took and may not have written, as the flush
-/// barrier reports them: before each call the probe holds at most
-/// `HOLD_WINDOW` - 1 of them, so that the call keeps it within its window
-/// (`services/logd/docs/ipc-interface.md` § Hold window).
+/// The probe's lines that logd took and may not have written: before each
+/// call the probe holds at most `HOLD_WINDOW` - 1 of them, so that the call
+/// keeps it within its window (`services/logd/docs/ipc-interface.md`
+/// § Hold window).
+///
+/// A line counts as written once the flush barrier answers `FLUSHED` for a
+/// token taken after it while every `hold` sink not `off` is served, as
+/// `SINK_LIST` reports both before and after the answer. A sink that is
+/// stalled or unserved holds nobody, so logd answers a flush `FLUSHED` with
+/// the sink's cursor where it was, and once it holds again the lines it
+/// has not written count against their senders' windows again (§ Flush
+/// barrier, Flushed). Such an answer says nothing of the window, and the
+/// probe asks again. A stall that begins and ends between the two reads, a
+/// few milliseconds apart, is not seen.
 struct Window
 {
     /// The `logd.flush` SEND.
     flush: u64,
+    /// The `logd.control` SEND, which `SINK_LIST` is served on.
+    control: u64,
     /// The token of a new flush made right after each such line was taken,
-    /// oldest first: past the line, so a flush for it answered flushed
-    /// says the line is written.
+    /// oldest first: past the line.
     unwritten: VecDeque<u64>,
 }
 
 impl Window
 {
-    /// A window on `flush`, once logd has written every line it took
-    /// before: the wait's time, or the failure.
-    fn drained(flush: u64) -> Result<(Self, Duration), String>
+    /// A window on `flush` and `control`, once logd has written every
+    /// line it took before: the wait's time, or the failure.
+    fn drained(flush: u64, control: u64) -> Result<(Self, Duration), String>
     {
         let window = Self {
             flush,
+            control,
             unwritten: VecDeque::with_capacity(HOLD_WINDOW),
         };
         let start_at = Instant::now();
-        let answer = window.ask(None)?;
-        window.until_flushed(answer)?;
+        let token = window.token(None)?.0;
+        window.until_written(token)?;
         Ok((window, start_at.elapsed()))
     }
 
-    /// Note a line logd has just taken, unless logd has written it already.
+    /// Note a line logd has just taken.
     fn took(&mut self) -> Result<(), String>
     {
-        if let FlushAnswer::Pending { token, .. } = self.ask(None)?
-        {
-            self.unwritten.push_back(token);
-        }
+        let token = self.token(None)?.0;
+        self.unwritten.push_back(token);
         Ok(())
     }
 
@@ -200,8 +217,7 @@ impl Window
             {
                 break;
             };
-            let answer = self.ask(Some(token))?;
-            waited |= self.until_flushed(answer)?;
+            waited |= self.until_written(token)?;
         }
         Ok(
             if waited
@@ -215,20 +231,24 @@ impl Window
         )
     }
 
-    /// Sleep each pending answer's hint and ask again with its token until
-    /// logd answers flushed, for at most [`WRITTEN_WITHIN`]: whether it
+    /// Ask for `token` until the lines before it are written, sleeping a
+    /// pending answer's hint, or [`UNHELD_POLL`] after an answer a sink
+    /// that holds nobody gave, for at most [`WRITTEN_WITHIN`]: whether it
     /// slept, or the failure.
-    fn until_flushed(&self, first: FlushAnswer) -> Result<bool, String>
+    fn until_written(&self, token: u64) -> Result<bool, String>
     {
         let start_at = Instant::now();
-        let mut answer = first;
         let mut slept = false;
         loop
         {
-            let FlushAnswer::Pending { token, retry_ms } = answer
-            else
+            let held_before = self.hold_sinks_served()?;
+            let (_, pending_ms) = self.token(Some(token))?;
+            let held_after = self.hold_sinks_served()?;
+            let wait = match pending_ms
             {
-                return Ok(slept);
+                None if held_before && held_after => return Ok(slept),
+                None => UNHELD_POLL,
+                Some(ms) => Duration::from_millis(u64::from(ms.max(1))),
             };
             if start_at.elapsed() > WRITTEN_WITHIN
             {
@@ -237,15 +257,15 @@ impl Window
                     WRITTEN_WITHIN.as_millis()
                 ));
             }
-            std::thread::sleep(Duration::from_millis(u64::from(retry_ms.max(1))));
+            std::thread::sleep(wait);
             slept = true;
-            answer = self.ask(Some(token))?;
         }
     }
 
     /// One `LOG_FLUSH` call, a new flush (`None`) or one asked again for
-    /// `token`: logd's answer, or the failure.
-    fn ask(&self, token: Option<u64>) -> Result<FlushAnswer, String>
+    /// `token`: the answer's token and, when it is pending, its retry hint
+    /// in milliseconds; or the failure.
+    fn token(&self, token: Option<u64>) -> Result<(u64, Option<u32>), String>
     {
         let ipc_buf = std::os::seraph::current_ipc_buf();
         let msg = ipc::log_flush::request(token);
@@ -253,8 +273,44 @@ impl Window
         let reply =
             unsafe { ipc::ipc_call_timeout(self.flush, &msg, ipc_buf, log::LOG_CALL_TIMEOUT_MS) }
                 .map_err(|e| format!("logd_flood: LOG_FLUSH not answered ({e})"))?;
-        FlushAnswer::decode(&reply)
-            .map_err(|status| format!("logd_flood: LOG_FLUSH refused ({status:#x})"))
+        match FlushAnswer::decode(&reply)
+        {
+            Ok(FlushAnswer::Flushed { token }) => Ok((token, None)),
+            Ok(FlushAnswer::Pending { token, retry_ms }) => Ok((token, Some(retry_ms))),
+            Err(status) => Err(format!("logd_flood: LOG_FLUSH refused ({status:#x})")),
+        }
+    }
+
+    /// Whether every `hold` sink not `off` is served, by one `SINK_LIST`
+    /// walk, or the failure.
+    fn hold_sinks_served(&self) -> Result<bool, String>
+    {
+        let ipc_buf = std::os::seraph::current_ipc_buf();
+        let mut served = true;
+        for index in 0u64..
+        {
+            let msg = list_request(index);
+            // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+            let reply = unsafe {
+                ipc::ipc_call_timeout(self.control, &msg, ipc_buf, log::LOG_CALL_TIMEOUT_MS)
+            }
+            .map_err(|e| format!("logd_flood: SINK_LIST not answered ({e})"))?;
+            let Some((sink, more)) = decode_list_reply(&reply)
+                .map_err(|status| format!("logd_flood: SINK_LIST refused ({status:#x})"))?
+            else
+            {
+                break;
+            };
+            let settings = String::from_utf8_lossy(sink.settings);
+            let mut words = settings.split_ascii_whitespace();
+            let holds = words.clone().any(|w| w == "pace=hold") && !words.any(|w| w == "level=off");
+            served &= !holds || sink.state == SINK_SERVED;
+            if !more
+            {
+                break;
+            }
+        }
+        Ok(served)
     }
 }
 
@@ -262,14 +318,15 @@ impl Window
 fn logd_flood_phase(caps: &Caps)
 {
     assert_ne!(caps.logd_flush, 0, "logd_flood: no logd.flush seed");
+    assert_ne!(caps.logd_control, 0, "logd_flood: no logd.control seed");
     std::os::seraph::log!("{TAG} begin");
-    let quiet = probe(caps.logd_flush, 0, QUIET_GAP).unwrap_or_else(|e| panic!("{e}"));
+    let quiet = probe(caps, 0, QUIET_GAP).unwrap_or_else(|e| panic!("{e}"));
 
     let (mut flood_child, flood_stop) = spawn_flooding(FLOODER_ROLE);
     let (mut resend_child, resend_stop) = spawn_flooding(RESENDER_ROLE);
     std::thread::sleep(FLOOD_SETTLE);
     let fb = stop_framebuffer(caps.debug_authority);
-    let flooded = probe(caps.logd_flush, PROBE_CALLS, FLOODED_GAP);
+    let flooded = probe(caps, PROBE_CALLS, FLOODED_GAP);
     let flooding =
         matches!(flood_child.try_wait(), Ok(None)) && matches!(resend_child.try_wait(), Ok(None));
     drop(flood_stop);
@@ -376,17 +433,17 @@ fn spawn_flooding(role: &str) -> (Child, ChildStdin)
 }
 
 /// Make [`PROBE_CALLS`] numbered calls from `first`, one every `gap`,
-/// within the probe's window, which `flush`, the `logd.flush` SEND,
-/// reports ([`Window`]): what the probe saw, or the first failure. A refused
+/// within the probe's window, which logd's `logd.flush` and `logd.control`
+/// SENDs of `caps` report ([`Window`]): what the probe saw, or the first failure. A refused
 /// line is sent again after its hint, so that the console check finds it,
 /// and counted. No assertion panics here, since the framebuffer driver may be
 /// stopped.
-fn probe(flush: u64, first: usize, gap: Duration) -> Result<Probe, String>
+fn probe(caps: &Caps, first: usize, gap: Duration) -> Result<Probe, String>
 {
     let cap = std::os::seraph::log::acquire();
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let bound = log::LOG_CALL_TIMEOUT_MS;
-    let (mut window, drained) = Window::drained(flush)?;
+    let (mut window, drained) = Window::drained(caps.logd_flush, caps.logd_control)?;
     let mut seen = Probe {
         took: Vec::with_capacity(PROBE_CALLS),
         refused: 0,

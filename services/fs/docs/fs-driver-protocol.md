@@ -104,8 +104,9 @@ its block device endpoint and reply success or a typed error.
 `IO_ERROR` (the block device's `BLK_GET_GEOMETRY` or the BPB read failed),
 or `NOT_FOUND` for a malformed BPB, one whose sector size is not the
 device's logical block size (the driver reads one block per sector, 512 to
-4096 bytes), one that declares more sectors than the partition holds, or
-one with fewer than 4085 clusters (FAT12, which the driver does not read).
+4096 bytes), one whose sectors per cluster are not a power of two, one
+that declares more sectors than the partition holds, or one with fewer
+than 4085 clusters (FAT12, which the driver does not read).
 
 The block device endpoint arrives in the driver's bootstrap round;
 see [Bootstrap caps](#bootstrap-caps).
@@ -869,6 +870,9 @@ carried caps:
 - `INVALID_ARGUMENT`: `CREATE_OPEN_EXISTING` without `CREATE_OPEN`; or, with
   `CREATE_OPEN`, no `caps[0]` or one on another endpoint. `INVALID_BADGE`:
   a `caps[0]` on the driver's endpoint that names no live session.
+- `IO_ERROR`: an empty name, one longer than the message, an invalid name
+  (one `namespace_protocol::validate_name` refuses), or one no FAT long
+  name can hold (holding U+FFFF, or longer than 255 UTF-16 code units).
 - With `CREATE_OPEN`, the open's refusals as `FS_OPEN` lists them (`LIMIT`,
   `OUT_OF_MEMORY`, `INVALID_ARGUMENT`, `TOO_MANY_OPEN`, `IO_ERROR`), and
   `IO_ERROR` when the driver cannot mint the open cap.
@@ -1013,7 +1017,8 @@ the source's 8.3 slot, as `FS_REMOVE` does:
   source's node. Both names may remain.
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
-occupied), `NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name, a
+occupied), `NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name or
+a destination no FAT long name can hold, as `FS_CREATE` refuses them, a
 failed block access, or a corrupt directory),
 `PERMISSION_DENIED`, `INVALID_BADGE` (the badge is not a directory node).
 

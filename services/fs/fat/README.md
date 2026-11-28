@@ -14,7 +14,8 @@ fat/
 │                               #   FAT entries, file positions, name encoding, LFN slots
 │                               #   and tails, node slab, cache bounds and victim pick,
 │                               #   page index, session pool (records in client-paid pages),
-│                               #   session sweep schedule, a file write's sector runs
+│                               #   session sweep schedule, a file write's sector runs;
+│                               #   the decoders' property, fuzz seeds and proofs
 ├── docs/
 │   ├── crash-safety.md         # Per-op write ordering and post-crash visible states
 │   └── storage-layout.md       # Allocator, directory mutation, page cache, NodeTable, eviction

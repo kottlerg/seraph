@@ -87,6 +87,26 @@ pub enum TickCharge
     Slice,
 }
 
+/// `word` as the tick of a thread running at `level` finds it: at a fair
+/// level a turn of the thread's own cut to the level's quantum, and at any other
+/// level no tick of any turn, the tag kept. A thread whose level changed thus
+/// runs on a turn no longer than its new level's slice, as its slice is cut
+/// (`PerCpuScheduler::tick_outcome`); a caller's turn that a server raised
+/// out of the fair class held is spent, so the reply sends the caller to the
+/// tail ([`Returned::RanOut`]).
+pub fn cut_to_level(word: u64, level: u8) -> u64
+{
+    if !super::is_fair_level(level)
+    {
+        return tag(word);
+    }
+    if tag(word) != 0
+    {
+        return word;
+    }
+    ticks(word).min(u64::from(super::quantum_ticks(level)))
+}
+
 /// The tick's charge of `word`: the word after it, `None` when the word
 /// holds no tick, and what it means for the slice.
 pub const fn charged(word: u64) -> (Option<u64>, TickCharge)
@@ -174,8 +194,21 @@ pub unsafe fn lend_turn_out(caller: *mut ThreadControlBlock)
     // SAFETY: caller is the running thread (contract), whose fields this CPU
     // alone writes while interrupts are masked.
     let tcb = unsafe { &mut *caller };
-    let word = tcb.lent_turn.load(Ordering::Relaxed);
-    if !super::is_fair_level(tcb.priority) || (word != 0 && word != ORPHANED)
+    if !super::is_fair_level(tcb.priority)
+    {
+        return;
+    }
+    let held = tcb.lent_turn.load(Ordering::Relaxed);
+    // A turn of its own started at a level the caller has left since is cut
+    // to its level's quantum before the bind moves it, as the tick cuts it.
+    let word = cut_to_level(held, tcb.priority);
+    if word != held
+    {
+        let _ = tcb
+            .lent_turn
+            .compare_exchange(held, word, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    if word != 0 && word != ORPHANED
     {
         return;
     }
@@ -382,21 +415,23 @@ pub unsafe fn start_turn(tcb: *mut ThreadControlBlock, priority: u8)
     };
 }
 
-/// Charge this CPU's tick to the turn `current`, the thread running here,
-/// holds in its word, if any ([`charged`]). A claimant on another CPU may
+/// Charge this CPU's tick to the turn `current`, the thread running here at
+/// the recorded `level`, holds in its word, if any, after cutting the word to
+/// that level ([`cut_to_level`], [`charged`]). A claimant on another CPU may
 /// take the turn back at any moment, so the charge is a compare-and-swap.
 ///
 /// # Safety
 /// `current` is the thread running on this CPU, a valid TCB.
-pub unsafe fn charge_tick(current: *mut ThreadControlBlock) -> TickCharge
+pub unsafe fn charge_tick(current: *mut ThreadControlBlock, level: u8) -> TickCharge
 {
     // SAFETY: current valid (contract); lent_turn is atomic.
     let word = unsafe { &(*current).lent_turn };
     let mut charge = TickCharge::Slice;
     let _ = word.try_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
-        let (after, what) = charged(w);
+        let cut = cut_to_level(w, level);
+        let (after, what) = charged(cut);
         charge = what;
-        after
+        after.or_else(|| (cut != w).then_some(cut))
     });
     charge
 }
@@ -523,7 +558,14 @@ mod tests
     fn tick(t: *mut ThreadControlBlock) -> TickCharge
     {
         // SAFETY: as above.
-        unsafe { charge_tick(t) }
+        let level = unsafe { (*t).priority };
+        tick_at(t, level)
+    }
+
+    fn tick_at(t: *mut ThreadControlBlock, level: u8) -> TickCharge
+    {
+        // SAFETY: as above.
+        unsafe { charge_tick(t, level) }
     }
 
     fn start(t: *mut ThreadControlBlock)
@@ -618,6 +660,48 @@ mod tests
         let rt = tcb(CALLER + 2, super::super::RT_PRIORITY_MIN, 10);
         start(rt);
         assert_eq!(word(rt), 0);
+    }
+
+    // Defect caught (#1732): a turn a tail wake started at one level that runs
+    // on in full after the thread's level changed, so a thread lowered to a
+    // shorter quantum, or raised into the RT class, runs past the slice its
+    // new level allows; or a caller's turn cut by its server's level.
+    #[test]
+    fn a_turn_is_cut_to_the_level_the_thread_runs_at()
+    {
+        let low = LEVEL / 2;
+        let rt = super::super::RT_PRIORITY_MIN;
+        let thread = tcb(CALLER, LEVEL, 3);
+        start(thread);
+        for _ in 1..low
+        {
+            assert_eq!(tick_at(thread, low), TickCharge::Lent);
+        }
+        assert_eq!(tick_at(thread, low), TickCharge::OwnTurnEnds);
+
+        start(thread);
+        assert_eq!(tick_at(thread, rt), TickCharge::Slice);
+        assert_eq!(word(thread), 0);
+
+        // A caller's turn is the caller's: a fair level of its server's
+        // leaves it, a level outside the fair class spends it.
+        let caller = tcb(CALLER + 1, LEVEL, 5);
+        let server = tcb(SERVER, low, 4);
+        lend(caller);
+        assert_eq!(take(server, caller), Some(0));
+        assert_eq!(tick_at(server, 1), TickCharge::Lent);
+        assert_eq!(word(server), lender_tag(CALLER + 1) | 4);
+        assert_eq!(tick_at(server, rt), TickCharge::Slice);
+        assert_eq!(back(server, caller), Returned::RanOut);
+
+        // A call made before the first tick at the new level lends the cut
+        // turn.
+        let lowered = tcb(CALLER + 2, LEVEL, 3);
+        start(lowered);
+        // SAFETY: lowered is a live TCB of this test.
+        unsafe { (*lowered).priority = low };
+        lend(lowered);
+        assert_eq!(word(lowered), u64::from(low));
     }
 
     // Defect caught (#1732): a claimant that ends a call while its server has

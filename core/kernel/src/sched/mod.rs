@@ -9870,8 +9870,9 @@ const fn tick_switches(preemption: Preemption) -> bool
 
 /// The slice a tick leaves `current`, and whether its CPU reschedules, as
 /// [`run_queue::TickOutcome::slice_and_reschedule`] gives them; `None` for the idle
-/// thread. A turn lent to the thread is charged before its slice
-/// ([`turn::charge_tick`]): while it lasts the slice is left as it is.
+/// thread. A turn the thread holds is charged before its slice, cut to the
+/// level recorded for it as the slice is ([`turn::charge_tick`]): while it
+/// lasts the slice is left as it is.
 ///
 /// # Safety
 /// `current` is the running thread of `sched`'s CPU, whose scheduler lock
@@ -9885,7 +9886,7 @@ unsafe fn charge_slice(
     // SAFETY: current is valid (contract); slice_remaining is always valid.
     let remaining = unsafe { (*current).slice_remaining };
     // SAFETY: current is this CPU's running thread (contract).
-    match unsafe { turn::charge_tick(current) }
+    match unsafe { turn::charge_tick(current, sched.current_level()) }
     {
         turn::TickCharge::Lent => Some((remaining, false)),
         turn::TickCharge::OwnTurnEnds => sched.tick_outcome(1).slice_and_reschedule(),

@@ -242,15 +242,19 @@ stale, and the CPU records the new one at its first return to user mode with a t
 (§ Wake Preemption) or at the thread's next dispatch, whichever comes first; the thread's class,
 the rank a wake preemption compares, and its slice from the first tick after follow that record:
 until then the thread runs out the slice it holds, and from then on a thread lowered from fair 20
-to 2 runs at most 2 ticks per slice, and one raised from the fair class into the RT class at most
-`TIME_SLICE_TICKS`. A new thread's first slice is its creation level's.
+to 2 runs at most 2 ticks per slice or turn, and one raised from the fair class into the RT class
+at most `TIME_SLICE_TICKS`. A new thread's first slice is its creation level's.
 
 **Lent turns.** A fair thread's call lends its turn to the fair thread that serves it
 (`sched::turn`). The call moves what is left of the caller's slice into the caller's turn word
 (`ThreadControlBlock::lent_turn`), leaving the slice one tick, a marker the word stands in for;
 the receive that binds the call moves the word to the server, tagged with the caller's thread id,
 whether the server was parked or the call queued; a nested call moves it on. While a thread's word
-holds ticks, `timer_tick` charges them before its slice, which is left as it is. Every reply
+holds ticks, `timer_tick` charges them before its slice, which is left as it is. The tick first
+cuts the word to the recorded level, as it cuts the slice (`turn::cut_to_level`): a turn of the
+thread's own to that level's quantum, and every turn to no tick at a level outside the fair class,
+so a level change bounds a turn as it bounds a slice; a call cuts its caller's own turn the same
+way before it lends it. Every reply
 moves what is left back to the caller, as does every path that ends a call unanswered (the next
 receive, a cancel, a timed call's expiry, a dealloc, a fault redelivery), each a compare-and-swap
 on the tag, so only the holder of the caller's tag moves its turn. A turn that runs out while the

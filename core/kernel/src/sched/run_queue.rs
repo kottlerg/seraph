@@ -1218,6 +1218,15 @@ impl PerCpuScheduler
         self.current.store(tcb, Ordering::Relaxed);
     }
 
+    /// The level recorded for the thread this CPU runs
+    /// ([`set_current_level`](Self::set_current_level)), which the tick charges
+    /// the thread's turn at (`turn::charge_tick`). Relaxed, as
+    /// [`tick_outcome`](Self::tick_outcome) reads it.
+    pub fn current_level(&self) -> u8
+    {
+        self.current_level.load(Ordering::Relaxed)
+    }
+
     /// Record `level` as the level of the thread this CPU is dispatching, for
     /// [`tick_outcome`](Self::tick_outcome) and [`outranked`](Self::outranked).
     /// Called only by this CPU, with interrupts masked, at a dispatch or at

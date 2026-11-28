@@ -628,6 +628,18 @@ pub fn gates(mode: BenchMode, key: &Key) -> bool
         && !ICOUNT_IO_BOUND.contains(&key.bench.as_str())
 }
 
+/// Whether a measurement with a baseline fails the gate when no run measured
+/// it: every icount measurement, gated or not. A multi-CPU or
+/// [`ICOUNT_IO_BOUND`] count moves with what its CPUs or the host did, so it
+/// does not gate, but a case logs its line, or does not, whatever its count:
+/// a line gone from every run is a case that failed, ended early, or counted
+/// too few windows to report (shared/bench/README.md § Window rows), which no
+/// count shows. Host mode is report-only.
+pub fn presence_gates(mode: BenchMode) -> bool
+{
+    matches!(mode, BenchMode::Icount)
+}
+
 /// The outcome of one measurement against its baseline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict
@@ -669,6 +681,48 @@ impl Verdict
         }
     }
 
+    /// What a failing row of the verdict did, for its `FAIL:` line.
+    const fn why(self) -> &'static str
+    {
+        match self
+        {
+            Self::Regressed => "regressed past its band",
+            Self::Improved => "improved past its band; the stored count is stale",
+            Self::New => "has no baseline",
+            Self::Missing => "has a baseline no run measured",
+            Self::Partial => "was not measured by every run",
+            Self::Unit => "is measured in another unit than its baseline",
+            Self::Within | Self::NoBand => "",
+        }
+    }
+
+    /// What a failing row of the verdict asks of its reader, for its `FAIL:`
+    /// line.
+    const fn remedy(self) -> &'static str
+    {
+        match self
+        {
+            Self::Partial => "a run skipped it: read that run's log",
+            Self::Missing =>
+            {
+                "read the log for why its case logged no line (a window row under its floor logs a \
+                 WARN, shared/bench/README.md § Window rows), or, when the measurement was \
+                 removed, rewrite its baseline with `cargo xtask bench-baseline` (xtask/README.md) \
+                 and state why in the PR"
+            }
+            Self::Regressed
+            | Self::Improved
+            | Self::New
+            | Self::Unit
+            | Self::Within
+            | Self::NoBand =>
+            {
+                "rewrite its baseline with `cargo xtask bench-baseline` (xtask/README.md) and state \
+                 why in the PR"
+            }
+        }
+    }
+
     /// Whether the verdict leaves the measurement's baseline to rewrite.
     pub const fn moved(self) -> bool
     {
@@ -690,6 +744,9 @@ pub struct Row
     pub verdict: Verdict,
     /// Whether the verdict counts toward the gate (`gates`).
     pub gated: bool,
+    /// Whether a baseline no run measured ([`Verdict::Missing`]) fails the
+    /// gate, whatever `gated` says (`presence_gates`).
+    pub presence_gated: bool,
 }
 
 /// Compare `set` with the stored baselines, measurement by measurement, in key
@@ -728,6 +785,7 @@ pub fn compare(
                 band,
                 verdict,
                 gated: gates(mode, key),
+                presence_gated: presence_gates(mode),
             }
         })
         .collect()
@@ -745,10 +803,19 @@ pub fn idled(row: &Row) -> bool
 }
 
 /// Whether a row fails the gate: a gated row whose verdict is not `Within`,
-/// or whose measured loops idled ([`idled`]).
+/// or whose measured loops idled ([`idled`]), and a row whose presence gates
+/// and that no run measured ([`presence_gates`]).
 pub fn fails(row: &Row) -> bool
 {
-    row.gated && (row.verdict != Verdict::Within || idled(row))
+    verdict_fails(row) || idled(row)
+}
+
+/// Whether a row's verdict fails the gate: any but `Within` of a gated row,
+/// and `Missing` of a row whose presence gates.
+fn verdict_fails(row: &Row) -> bool
+{
+    row.verdict != Verdict::Within
+        && (row.gated || (row.presence_gated && row.verdict == Verdict::Missing))
 }
 
 /// The comparison's table, then a line per failing row with its remedy.
@@ -787,29 +854,15 @@ pub fn report(mode: BenchMode, set: &RunSet, rows: &[Row]) -> String
             row.key
         );
     }
-    for row in rows
-        .iter()
-        .filter(|r| r.gated && r.verdict != Verdict::Within)
+    for row in rows.iter().filter(|r| verdict_fails(r))
     {
-        let why = match row.verdict
-        {
-            Verdict::Regressed => "regressed past its band",
-            Verdict::Improved => "improved past its band; the stored count is stale",
-            Verdict::New => "has no baseline",
-            Verdict::Missing => "has a baseline no run measured",
-            Verdict::Partial => "was not measured by every run",
-            Verdict::Unit => "is measured in another unit than its baseline",
-            Verdict::Within | Verdict::NoBand => "",
-        };
-        let remedy = if row.verdict == Verdict::Partial
-        {
-            "a run skipped it: read that run's log"
-        }
-        else
-        {
-            "rewrite its baseline with `cargo xtask bench-baseline` (xtask/README.md) and state why in the PR"
-        };
-        let _ = writeln!(out, "FAIL: {} {why}: {remedy}", row.key);
+        let _ = writeln!(
+            out,
+            "FAIL: {} {}: {}",
+            row.key,
+            row.verdict.why(),
+            row.verdict.remedy()
+        );
     }
     for row in rows.iter().filter(|r| idled(r))
     {
@@ -1309,6 +1362,55 @@ mod tests
             "{text}"
         );
         assert!(text.contains("cargo xtask bench-baseline"), "{text}");
+    }
+
+    // Defect caught: a report-only measurement whose case stopped logging its
+    // line (fsbench.open depth=3 affinity=any at four CPUs, every window of
+    // which left its CPU) reported MISSING on every run and failed none.
+    #[test]
+    fn an_icount_measurement_no_run_measured_fails_gated_or_not_and_host_mode_reports_it()
+    {
+        let base = stored(&[
+            (key("a", "", 1), 100),
+            (key("gone", "", 4), 100),
+            (key("kept", "", 4), 100),
+        ]);
+        let runs = [
+            log(1, "on", &[line("a", 1, 100)]),
+            log(4, "on", &[line("kept", 4, 500)]),
+        ];
+        let set = gather(BenchMode::Icount, &runs).unwrap();
+        let rows = compare(BenchMode::Icount, &set, &base, &BTreeMap::new());
+        let row = |k: &Key| rows.iter().find(|r| &r.key == k).unwrap();
+        let gone = row(&key("gone", "", 4));
+        assert_eq!(gone.verdict, Verdict::Missing);
+        assert!(!gone.gated && fails(gone));
+        let kept = row(&key("kept", "", 4));
+        assert_eq!(kept.verdict, Verdict::Regressed);
+        assert!(!fails(kept));
+        let text = report(BenchMode::Icount, &set, &rows);
+        assert!(
+            text.contains("FAIL: ktest.gone cpus=4 has a baseline no run measured: read the log"),
+            "{text}"
+        );
+        assert!(!text.contains("FAIL: ktest.kept"), "{text}");
+
+        let mut run = log(4, "off", &[line("b", 4, 300)]);
+        run.arch = "x86_64".to_string();
+        run.accel = "kvm".to_string();
+        run.lines[0].1 = Unit::Cycles;
+        let set = gather(BenchMode::Host, &[run]).unwrap();
+        let cycles = Stored {
+            unit: Unit::Cycles,
+            p50: 300,
+        };
+        let base: BTreeMap<Key, Stored> =
+            [(key("b", "", 4), cycles), (key("c", "", 4), cycles)].into();
+        let rows = compare(BenchMode::Host, &set, &base, &BTreeMap::new());
+        let c = rows.iter().find(|r| r.key == key("c", "", 4)).unwrap();
+        assert_eq!(c.verdict, Verdict::Missing);
+        assert!(!fails(c));
+        assert!(!report(BenchMode::Host, &set, &rows).contains("FAIL"));
     }
 
     #[test]

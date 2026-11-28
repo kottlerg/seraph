@@ -1081,7 +1081,7 @@ const PUBLIC_NAMES: &[&[u8]] = &[
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show twenty-three of the refused names
+/// cap. svctest's own non-zero seeds show twenty-four of the refused names
 /// are published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.acpi`,
 /// which only acpid seeds, are published by the same loop as
 /// `devmgr.registry` and `devmgr.bind`, `acpid.power`,

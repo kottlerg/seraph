@@ -289,7 +289,8 @@ phases (`caps[4]`, `caps[5]`), the `vfsd_namespace_stray_caps` phase (`caps[4]`)
 `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry`,
 `oom_policy`, and `memmgr_swap_commit` phases (`caps[6]`), the `logd_follow` phase (`caps[6]`,
 `caps[23]`, and `caps[24]`), the `logd_control` phase (`caps[6]` and `caps[24]`), the
-`rtc_create_retry` phase (`caps[19]`), the vfsd swap-partition phase (`caps[14]`), the `blk_regions` phase (`caps[25]`), the
+`rtc_create_retry` phase (`caps[19]`), the vfsd swap-partition phase (`caps[14]`), the
+`blk_regions` phase (`caps[25]`), the
 `memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases (`caps[18]`), the `sessiond_operator`
 phase and the `oom_policy` phase's session case (`caps[15]` and `caps[27]`), the `crash_endpoint`,
 `logd_reserve`, `logd_restart`, `logd_sinks`, `logd_flush`, `memmgr_swap`, `memmgr_node_reclaim`,
@@ -314,9 +315,9 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, four slots
 to a round (`caps[0]` to `caps[3]`, `caps[4]` to `caps[7]`, `caps[8]` to `caps[11]`,
 `caps[12]` to `caps[15]`, `caps[16]` to `caps[19]`, `caps[20]` to `caps[23]`, `caps[24]` to
-`caps[27]`, and `caps[28]`), the last three (`caps[26]` to `caps[28]`) being the debug-authority cap the recipe's
-`debug_authority = yes` grants, the stop-authority cap its `stop_authority = yes` grants and the
-`PmuControl` copy its `pmu_authority = yes` grants;
+`caps[27]`, and `caps[28]`), the last three (`caps[26]` to `caps[28]`) being the debug-authority
+cap the recipe's `debug_authority = yes` grants, the stop-authority cap its `stop_authority = yes`
+grants and the `PmuControl` copy its `pmu_authority = yes` grants;
 [service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed) defines each name's
 cap shape and the zero slot an unresolved name leaves. With no creator endpoint, every slot stays
 zero.

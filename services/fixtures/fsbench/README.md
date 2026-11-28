@@ -168,7 +168,9 @@ on another CPU than its waker's (`CAP_INFO_THREAD_PLACEMENT`): a reply from a se
 CPU is one, so `0` with `idle_halts=0` says that every round trip ran on CPU 0. A failed placement
 read leaves `remote_wakes=` out. When fewer than half the windows count, the row does not measure
 the case: `fsbench` logs no result line for it, and logs at WARN
-`<name> affinity=any: counted windows below the floor` with the counts.
+`<name> affinity=any: counted windows below the floor` with the counts, and the bench cell fails
+on the row's baseline, which no run then measured
+([shared/bench/README.md § Window rows](../../../shared/bench/README.md#window-rows)).
 
 Each `read` or `write` sample is one timed iteration, which covers all the `read` or
 `write_all` calls that one size needs, not a single call; each `open` sample is one

@@ -2013,7 +2013,8 @@ none when a line lacks the extra
 ([shared/bench/README.md § Idle halts](../shared/bench/README.md#idle-halts)). The report is a
 table of every measurement, its verdict, whether it gates, its baseline, its lowest p50, the
 change, its band and its halts (`idle`, `-` for none), then one `FAIL:` line per gating
-measurement whose verdict is not `ok`, with its remedy, one per gating measurement whose loops
+measurement whose verdict is not `ok` and per icount measurement that does not gate and is
+`MISSING`, with its remedy, one per gating measurement whose loops
 idled, naming the halts and the runs that saw them (each by its place among the logs given), or
 whose lines lack the count, then a
 `WARNING:` line per key of the stored `ENV` whose value differs here.
@@ -2028,6 +2029,9 @@ whose lines lack the count, then a
   read waits on the disk; a benchmark whose timed samples idle, on a device, a timer or any other
   event, joins the set. The command fails when a gating measurement's verdict is not `ok` (an
   `IMPROVED` count included: its stale baseline would pass a later regression of the same size),
+  when any measurement is `MISSING`, gating or not (a case logs its line, or does not, whatever its
+  count, so a line gone from every log is a case that failed, ended early, or counted too few of its
+  windows to report, [shared/bench/README.md § Window rows](../shared/bench/README.md#window-rows)),
   when a gating measurement's CPU halted in its measured loop in any log, or a line of it lacks
   `idle_halts=`, whatever its verdict, since a window that idled counted host time, or when a
   benchmark logged a `FAIL` line: ktest's `ktest: bench <name> FAIL`, or a userspace suite's

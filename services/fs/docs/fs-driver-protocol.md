@@ -254,7 +254,7 @@ alone does not keep the open alive: its session does (§ Label 23,
 
 An `FS_OPEN` whose reply cannot reach the client (it died mid-call, or its
 `CSpace` cannot take the reply's cap) moves no cap, and the driver releases
-that open at once.
+that open before it serves another request.
 
 The std client opens each file in its process's session with the file's
 driver ([runtime/ruststd/README.md](../../../runtime/ruststd/README.md)

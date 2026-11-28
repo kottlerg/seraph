@@ -2,3 +2,4 @@
 # Format: xtask/README.md (`cargo xtask bench-check`).
 depth=3 cpus=1 unit=cycles p50=64059
 depth=3 cpus=4 unit=cycles p50=66089
+depth=3 affinity=any cpus=4 unit=cycles p50=1060014

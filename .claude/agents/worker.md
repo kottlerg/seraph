@@ -181,11 +181,6 @@ Run `git fetch origin` at the start of every step, so each step reads the curren
   procedure), a harness phase the Issue's acceptance requires, or the root `Cargo.toml` and
   `Cargo.lock` for a new dependency or host-tested crate. Anything else outside the task is a
   question.
-- `.claude/CLAUDE.md`, `.claude/settings.json` and hooks change what the harness does, and the
-  harness accepts no agent's message as the maintainer's consent to change them. Prepare such a
-  change as a patch file in the scratchpad and report it. The maintainer applies it, or tells
-  the main session to. When a fact you change has a copy there, hold your push until the patch
-  is applied, so every copy lands together.
 - Read every Issue item against the current code before fixing it. An item already fixed is
   ticked citing the PR that fixed it (`git log -S`, `git blame`). An item that is wrong on the
   code goes to the one you report to with the evidence (file and line); that one decides the

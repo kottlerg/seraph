@@ -208,16 +208,41 @@ pub fn shutdown_actuator(defs: &[Definition]) -> Option<usize>
 /// definition sets the key.
 pub fn keep_one_entropy_holder(
     defs: &mut [Definition],
+    on_extra: impl FnMut(&Definition),
+) -> Option<usize>
+{
+    keep_first(defs, |d| &mut d.entropy_authority, on_extra)
+}
+
+/// Keep [`Definition::pmu_authority`] on the first definition, in `defs`'
+/// order, that sets it, and clear it on every later one, calling `on_extra`
+/// with each definition it clears before clearing it, as
+/// [`keep_one_entropy_holder`] does for its key. Returns the index of the
+/// holder, `None` when no definition sets the key.
+pub fn keep_one_pmu_holder(
+    defs: &mut [Definition],
+    on_extra: impl FnMut(&Definition),
+) -> Option<usize>
+{
+    keep_first(defs, |d| &mut d.pmu_authority, on_extra)
+}
+
+/// Keep the `yes | no` key `key` selects on the first definition of `defs`
+/// that sets it and clear it on every later one, calling `on_extra` with each
+/// before clearing it. The index of the holder, `None` when none sets it.
+fn keep_first(
+    defs: &mut [Definition],
+    key: fn(&mut Definition) -> &mut bool,
     mut on_extra: impl FnMut(&Definition),
 ) -> Option<usize>
 {
-    let holder = defs.iter().position(|d| d.entropy_authority)?;
+    let holder = defs.iter_mut().position(|d| *key(d))?;
     for def in defs.iter_mut().skip(holder.saturating_add(1))
     {
-        if def.entropy_authority
+        if *key(def)
         {
             on_extra(def);
-            def.entropy_authority = false;
+            *key(def) = false;
         }
     }
     Some(holder)
@@ -340,8 +365,8 @@ pub enum NamespaceShape
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each bool is one independent `yes | no` recipe key: `critical`, `log_sink`, \
-              `debug_authority`, `oom_stop`, `stop_authority`, `entropy_authority` and \
-              `reserve`"
+              `debug_authority`, `oom_stop`, `stop_authority`, `entropy_authority`, \
+              `pmu_authority` and `reserve`"
 )]
 pub struct Definition
 {
@@ -433,6 +458,15 @@ pub struct Definition
     /// clears the key on every later declaration in launch order. Exclusive of
     /// `log_sink`. A core role ([`stop::core_role`]).
     pub entropy_authority: bool,
+    /// `pmu_authority = yes` endows the service with the kernel's
+    /// performance-counter authority: svcmgr derives a copy of its
+    /// `PmuControl` source carrying `Configure` and delivers it in the
+    /// bootstrap slot after the `seed` caps and the debug-, stop- and
+    /// entropy-authority caps. One service holds it: [`keep_one_pmu_holder`]
+    /// clears the key on every later declaration in launch order. When no
+    /// recipe keeps it, svcmgr deletes its source once the recipes are read.
+    /// Exclusive of `log_sink`. A core role ([`stop::core_role`]).
+    pub pmu_authority: bool,
     /// `reserve = yes` creates the service in the system reserve
     /// (`procmgr_labels::CREATE_RESERVE`, [`create_flags`]), on its launch
     /// and on every restart, so it may take the pages memmgr keeps in reserve.
@@ -586,6 +620,52 @@ mod tests
             keep_one_entropy_holder(&mut [], |_| panic!("no extra")),
             None
         );
+    }
+
+    /// A recipe named `name` that sets `pmu_authority` to `holds`.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`holds` is the recipe's pmu_authority key"
+    )]
+    fn pmu(name: &str, holds: bool) -> Definition
+    {
+        let value = if holds { "yes" } else { "no" };
+        let contents = format!(
+            "binary = /services/x\nrestart = on_failure\ncritical = no\nnamespace = none\n\
+             pmu_authority = {value}\n"
+        );
+        parse::parse(name, &contents).expect("valid recipe")
+    }
+
+    // One holder of the counters: every declaration after the first loses the
+    // key and is reported, and the entropy key is left alone.
+    #[test]
+    fn only_the_first_pmu_authority_declaration_keeps_the_key()
+    {
+        let mut defs = [
+            pmu("a", false),
+            entropy("b", true),
+            pmu("c", true),
+            pmu("d", true),
+            pmu("e", false),
+            pmu("f", true),
+        ];
+        let mut extra = Vec::new();
+        let holder = keep_one_pmu_holder(&mut defs, |def| extra.push(def.name.clone()));
+        assert_eq!(holder, Some(2));
+        assert_eq!(extra, ["d", "f"]);
+        let kept: Vec<bool> = defs.iter().map(|d| d.pmu_authority).collect();
+        assert_eq!(kept, [false, false, true, false, false, false]);
+        assert!(defs[1].entropy_authority);
+    }
+
+    // No holder is what makes svcmgr delete its source.
+    #[test]
+    fn no_pmu_authority_declaration_leaves_no_holder()
+    {
+        let mut defs = [pmu("a", false), entropy("b", true)];
+        assert_eq!(keep_one_pmu_holder(&mut defs, |_| panic!("no extra")), None);
+        assert_eq!(keep_one_pmu_holder(&mut [], |_| panic!("no extra")), None);
     }
 
     /// A recipe named `name` providing the names `provides` (a consumer when

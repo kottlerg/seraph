@@ -252,12 +252,31 @@ reclaimed for a new one, but a number in active use is never reassigned.
 ```
 
 **Implementation status.** Every number 0–82 has a handler; every number at or past
-`SYSCALL_NR_BOUND` (83) returns `UnknownSyscall`. The kernel refuses a number at or past the
-bound, then selects the handler with one `match` on the number, clamped as data
-([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and calls
-it directly. The `match` and a build-time check of its numbers come from one list
-(`syscall_handlers!` in `syscall/mod.rs`). A list that leaves a number below the bound without a
-handler, gives one two, or names one at or past the bound fails the kernel's build.
+`SYSCALL_NR_BOUND` (83) returns `UnknownSyscall`.
+
+### Dispatch
+
+The kernel refuses a number at or past `SYSCALL_NR_BOUND`, reads the number clamped as data
+([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and
+matches it against the hot syscalls below, calling a hot syscall's handler directly. Every other
+number goes to one out-of-line `match` of the cold syscalls, which calls its handler directly
+too. The hot `match` holds the hot numbers alone and the cold arms are in another function, so a
+hot syscall's dispatch instructions do not depend on how many syscalls exist or how they are
+numbered. A cold syscall pays the hot `match`'s miss and one more call.
+
+The hot syscalls are `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`,
+`SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_POST`, `SYS_EVENT_RECV`,
+`SYS_WAIT_SET_WAIT`, `SYS_THREAD_YIELD` and `SYS_SYSTEM_INFO`. A syscall is hot when a loop
+makes it once per message, per wakeup or per clock read: a server's or a client's message loop,
+an event or wait-set loop, a yield, and the clock read behind std's `Instant` and the log's
+timestamps (`SYS_SYSTEM_INFO(ElapsedUs)`). Every other syscall is cold. A syscall joins the hot
+set only by a decision this list records, since each hot number adds to the compares of every
+hot syscall's dispatch as the set grows, and to the miss every cold syscall pays.
+
+Both `match`es and a build-time check of their numbers come from one list in two parts, `hot`
+and `cold` (`syscall_handlers!` in `syscall/mod.rs`). A list that leaves a number below the
+bound without a handler, gives one two, or names one at or past the bound fails the kernel's
+build.
 
 ---
 

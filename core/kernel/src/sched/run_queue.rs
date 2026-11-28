@@ -624,20 +624,43 @@ pub struct PerCpuScheduler
     /// Where this CPU's idle pull starts its scan of the other CPUs: the CPU
     /// after the last one whose confirmed backlog its pull found nothing it
     /// could take on (pinned threads only, or none fully saved), so the next
-    /// backlog it records is another CPU's
+    /// backlog it records is another CPU's, and, in a boot with more other CPUs
+    /// than `sched::CPU_SCAN_WINDOW`, the CPU after the window a tick that
+    /// found no backlog read, so successive such ticks read successive windows
     /// (core/kernel/docs/scheduler.md § Load Balancing). Written and read only
     /// by this CPU's `timer_tick`, so Relaxed suffices; atomic only so a shared
     /// reference can reach it.
     idle_pull_cursor: AtomicUsize,
 
     /// Where this CPU's RT push starts its scan of the other CPUs: the CPU
-    /// after the last one the previous scan read when it found no target, so
+    /// after the window the previous scan read when it found no target, so
     /// successive misses read successive windows of at most
-    /// `sched::RT_PUSH_SCAN_CPUS` CPUs (core/kernel/docs/scheduler.md § Load
+    /// `sched::CPU_SCAN_WINDOW` CPUs (core/kernel/docs/scheduler.md § Load
     /// Balancing, "RT push"). Written and read only by this CPU's
     /// `timer_tick`, so Relaxed suffices; atomic only so a shared reference can
     /// reach it.
     rt_push_cursor: AtomicUsize,
+
+    /// Where the balance step of this CPU's busy tick starts its scan of the
+    /// other CPUs when its own load is zero: the CPU after the window the
+    /// previous such scan read when it found no CPU past the imbalance
+    /// threshold, so successive misses read successive windows of at most
+    /// `sched::CPU_SCAN_WINDOW` CPUs (core/kernel/docs/scheduler.md § Load
+    /// Balancing). Set by `sched::init` at boot, then written and read only
+    /// by this CPU's `timer_tick`, so Relaxed suffices; atomic only so a
+    /// shared reference can reach it.
+    balance_cursor: AtomicUsize,
+
+    /// Where the placement of a wake this CPU makes starts its least-load or
+    /// lowest-rank scan: the CPU after the window the previous such scan
+    /// read, so successive wakes from this CPU read successive windows of at
+    /// most `sched::CPU_SCAN_WINDOW` CPUs (core/kernel/docs/scheduler.md
+    /// § Thread Assignment). Set by `sched::init` at boot, then written and
+    /// read only by the placements of wakes this CPU makes. A wake an
+    /// interrupt makes can fall between another placement's load and store,
+    /// and either store leaves a valid cursor, any value being a valid start,
+    /// so Relaxed suffices; atomic only so a shared reference can reach it.
+    wake_cursor: AtomicUsize,
 
     /// Interrupt-flag word saved by [`lock_saving_flags`](Self::lock_saving_flags)
     /// while this CPU's lock is held as part of an all-CPU-locks operation
@@ -703,6 +726,8 @@ impl PerCpuScheduler
             idle_pull_held: AtomicBool::new(false),
             idle_pull_cursor: AtomicUsize::new(0),
             rt_push_cursor: AtomicUsize::new(0),
+            balance_cursor: AtomicUsize::new(0),
+            wake_cursor: AtomicUsize::new(0),
             saved_lock_flags: AtomicU64::new(0),
             deferred_reclaim_head: AtomicPtr::new(core::ptr::null_mut()),
             return_work: AtomicPtr::new(core::ptr::null_mut()),
@@ -1254,9 +1279,9 @@ impl PerCpuScheduler
 
     /// Whether this CPU has no work: it runs its idle thread and no run queue
     /// other than [`IDLE_QUEUE`] links a thread. Lockless and Relaxed, and
-    /// dereferences no TCB: a snapshot for the softlockup watchdog's per-tick
-    /// idle sample (`sched::system_has_no_work`), which re-decides it on every
-    /// BSP tick, and for the SMT core spread, which counts a sibling for which
+    /// dereferences no TCB: a snapshot for the softlockup watchdog's idle
+    /// sample (`sched::cpu_has_no_work`), which re-decides it on every sweep of
+    /// the CPUs, and for the SMT core spread, which counts a sibling for which
     /// it fails as busy (core/kernel/docs/scheduler.md § SMT Awareness). A
     /// thread between two of its loads (mid-dispatch, mid-link, or
     /// mid-migration) can be missed by one sample;
@@ -1538,7 +1563,7 @@ impl PerCpuScheduler
     }
 
     /// Record `cpu` as where this CPU's idle pull starts its next scan. Called
-    /// only by this CPU's `timer_tick`.
+    /// only by `sched::init` and this CPU's `timer_tick`.
     #[cfg(not(test))]
     pub fn set_idle_pull_cursor(&self, cpu: usize)
     {
@@ -1554,11 +1579,44 @@ impl PerCpuScheduler
     }
 
     /// Record `cpu` as where this CPU's RT push starts its next scan. Called
-    /// only by this CPU's `timer_tick`.
+    /// only by `sched::init` and this CPU's `timer_tick`.
     #[cfg(not(test))]
     pub fn set_rt_push_cursor(&self, cpu: usize)
     {
         self.rt_push_cursor.store(cpu, Ordering::Relaxed);
+    }
+
+    /// Where this CPU's busy balance step starts its scan (see the
+    /// `balance_cursor` field).
+    #[cfg(not(test))]
+    pub fn balance_cursor(&self) -> usize
+    {
+        self.balance_cursor.load(Ordering::Relaxed)
+    }
+
+    /// Record `cpu` as where this CPU's busy balance step starts its next
+    /// scan. Called only by `sched::init` and this CPU's `timer_tick`.
+    #[cfg(not(test))]
+    pub fn set_balance_cursor(&self, cpu: usize)
+    {
+        self.balance_cursor.store(cpu, Ordering::Relaxed);
+    }
+
+    /// Where the placement of this CPU's next wake starts its scan (see the
+    /// `wake_cursor` field).
+    #[cfg(not(test))]
+    pub fn wake_cursor(&self) -> usize
+    {
+        self.wake_cursor.load(Ordering::Relaxed)
+    }
+
+    /// Record `cpu` as where the placement of this CPU's next wake starts its
+    /// scan. Called only by `sched::init` and the placements of wakes this
+    /// CPU makes.
+    #[cfg(not(test))]
+    pub fn set_wake_cursor(&self, cpu: usize)
+    {
+        self.wake_cursor.store(cpu, Ordering::Relaxed);
     }
 
     // Test stubs for host-side unit tests

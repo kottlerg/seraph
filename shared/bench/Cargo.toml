@@ -7,17 +7,26 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# `no_std`, no allocation, no dependency: the sample statistics, the counter
-# reads and the one result line every benchmark reports through.
+# `no_std`, no allocation: the sample statistics, the counter reads and the
+# one result line every benchmark reports through.
 [lib]
 doctest = false
+
+[dependencies]
+# The portable events and the width-masked delta of the event columns; with
+# the `pmu` feature, the client through which a thread opens the counters.
+pmu = { path = "../pmu", optional = true }
+syscall-abi = { path = "../../abi/syscall", optional = true }
 
 [features]
 # The counter reads (`Counters`, `Reading`, `ARCH`), which exist only on the
 # architectures Seraph runs on. A host tool that reads result lines alone
 # (xtask's `bench-check`) builds without them, so it builds on any host.
 default = ["counters"]
-counters = []
+counters = ["dep:pmu"]
+# The hardware event counters (`EventCounters`), which make the PMU syscalls.
+# The kernel's `sched-stages` build, which may make none, builds without it.
+pmu = ["counters", "pmu/client", "dep:syscall-abi"]
 
 [lints]
 workspace = true

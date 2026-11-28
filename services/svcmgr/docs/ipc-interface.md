@@ -43,8 +43,8 @@ and svcmgr decodes with.
 
 **First rounds — `CAPS` (`data[0] = 1`, not terminal):** a positional
 slot list, split into windows of `MSG_CAP_SLOTS_MAX` slots, one `CAPS`
-round per window (`ipc::bootstrap::slot_rounds`); the nine slots below
-take three rounds (slots 0-3, 4-7, then 8), and a longer list takes more with
+round per window (`ipc::bootstrap::slot_rounds`); the ten slots below
+take three rounds (slots 0-3, 4-7, then 8-9), and a longer list takes more with
 no change to the encoding.
 
 | Field | Value |
@@ -58,9 +58,10 @@ no change to the encoding.
 | slot 6 | `vfsd_labels::SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.swap`; absent if its derive fails) |
 | slot 7 | `EntropyControl` source carrying `Contribute`, derived from the root capability the kernel mints into init; svcmgr never publishes it, and derives the [`entropy_authority`](service-definitions.md#entropy_authority) service's copy from it on every launch (absent if init holds none or its derive fails) |
 | slot 8 | `memmgr_labels::SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint (published seed-only, its seeds keeping `GRANT`, as `memmgr.swap`; absent if its derive fails) |
+| slot 9 | `PmuControl` source carrying `Configure`, derived from the root capability the kernel mints into init; svcmgr never publishes it, derives the [`pmu_authority`](service-definitions.md#pmu_authority) service's copy from it on every launch, and deletes it once the recipes are read when no recipe holds the key (absent if init holds none or its derive fails) |
 | caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `17`) handshake, in every `CAPS` round |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `18`) handshake, in every `CAPS` round |
 | data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
@@ -172,8 +173,8 @@ to teardown), then runs
      memmgr's and procmgr's observers are already on the core-death
      queue), record the
      recipe's fixed fields on the `ServiceEntry` and its argv/env/cwd/seed,
-     log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`, `reserve` and
-     `private_image` flags, `stop_source` class, and scheduling fields in the parallel
+     log-sink, debug-authority, stop-authority, entropy-authority, PMU-authority, `oom_stop`,
+     `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel
      `RestartRecipe` table.
    * **defined only** — launch via [`definitions::launch`](../src/definitions/launch.rs).
    * **parked without definition** — log `registered without

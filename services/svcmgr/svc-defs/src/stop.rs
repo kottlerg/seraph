@@ -32,8 +32,9 @@ pub struct StopFacts
     /// The recipe's `critical = yes`.
     pub critical: bool,
     /// The recipe gives the service a core role: `log_sink`,
-    /// `debug_authority`, `stop_authority`, `entropy_authority`, `reserve`,
-    /// `shutdown_actuator`, or `stop_source` (see [`core_role`]).
+    /// `debug_authority`, `stop_authority`, `entropy_authority`,
+    /// `pmu_authority`, `reserve`, `shutdown_actuator`, or `stop_source` (see
+    /// [`core_role`]).
     pub core_role: bool,
     /// The recipe's `oom_stop = yes`.
     pub oom_stop: bool,
@@ -71,7 +72,7 @@ impl StopRefusal
             Self::CoreRole =>
             {
                 "holds a core role (log_sink, debug_authority, stop_authority, \
-                 entropy_authority, reserve, shutdown_actuator or stop_source)"
+                 entropy_authority, pmu_authority, reserve, shutdown_actuator or stop_source)"
             }
             Self::NotOptedIn => "oom_stop is not yes",
         }
@@ -80,20 +81,22 @@ impl StopRefusal
 
 /// Whether a recipe's keys give its service a core role, which the
 /// eligibility rule never stops: the system log sink, the holders of
-/// procmgr's debug authority, of the stop authority and of the kernel's
-/// entropy-contribution authority, a service in the
-/// system reserve, the shutdown actuator, and a stop source, which holds kill
-/// authority over processes of its own.
+/// procmgr's debug authority, of the stop authority, of the kernel's
+/// entropy-contribution authority and of its performance counters, a service
+/// in the system reserve, the shutdown actuator, and a stop source, which
+/// holds kill authority over processes of its own.
 #[must_use]
 #[expect(
     clippy::fn_params_excessive_bools,
-    reason = "each argument is one recipe key the rule reads"
+    clippy::too_many_arguments,
+    reason = "each argument is one recipe key the rule reads, one per core role"
 )]
 pub const fn core_role(
     log_sink: bool,
     debug_authority: bool,
     stop_authority: bool,
     entropy_authority: bool,
+    pmu_authority: bool,
     reserve: bool,
     shutdown_actuator: bool,
     stop_source: bool,
@@ -103,6 +106,7 @@ pub const fn core_role(
         || debug_authority
         || stop_authority
         || entropy_authority
+        || pmu_authority
         || reserve
         || shutdown_actuator
         || stop_source
@@ -298,10 +302,10 @@ mod tests
     #[test]
     fn each_core_role_key_alone_is_a_core_role()
     {
-        let none = [false; 7];
-        let role = |k: [bool; 7]| core_role(k[0], k[1], k[2], k[3], k[4], k[5], k[6]);
+        let none = [false; 8];
+        let role = |k: [bool; 8]| core_role(k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]);
         assert!(!role(none));
-        for key in 0..7
+        for key in 0..8
         {
             let mut keys = none;
             keys[key] = true;

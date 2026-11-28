@@ -179,8 +179,8 @@ impl ServiceEntry
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each bool is one independent `yes | no` recipe key: `log_sink`, \
-              `debug_authority`, `oom_stop`, `stop_authority`, `entropy_authority` \
-              and `reserve`"
+              `debug_authority`, `oom_stop`, `stop_authority`, `entropy_authority`, \
+              `pmu_authority` and `reserve`"
 )]
 pub struct RestartRecipe
 {
@@ -207,10 +207,16 @@ pub struct RestartRecipe
     /// `restart::mint_stop_authority`.
     pub stop_authority: bool,
     /// The `entropy_authority = yes` service, the one launch order names
-    /// (`svcmgr_defs::entropy_holder`): a freshly derived `EntropyControl`
-    /// copy rides the slot after its seeds, debug- and stop-authority caps on
-    /// every launch. See `restart::mint_entropy_authority`.
+    /// (`svcmgr_defs::keep_one_entropy_holder`): a freshly derived
+    /// `EntropyControl` copy rides the slot after its seeds, debug- and
+    /// stop-authority caps on every launch. See
+    /// `restart::mint_entropy_authority`.
     pub entropy_authority: bool,
+    /// The `pmu_authority = yes` service, the one launch order names
+    /// (`svcmgr_defs::keep_one_pmu_holder`): a freshly derived `PmuControl`
+    /// copy rides the slot after its seeds, debug-, stop- and entropy-authority
+    /// caps on every launch. See `restart::mint_pmu_authority`.
+    pub pmu_authority: bool,
     /// The `reserve = yes` service: each instance is created in the system
     /// reserve (`svcmgr_defs::create_flags`).
     pub reserve: bool,
@@ -281,6 +287,11 @@ pub struct SvcmgrCaps
     /// from it per launch for the one `entropy_authority = yes` service, and
     /// never publishes it. Zero if absent.
     pub entropy_source: u64,
+    /// `PmuControl` source carrying `Configure`. svcmgr derives a copy from
+    /// it per launch for the one `pmu_authority = yes` service, deletes it
+    /// once the recipes are read when no recipe keeps the key, and never
+    /// publishes it. Zero if absent.
+    pub pmu_source: u64,
     /// `SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's endpoint, published
     /// seed-only, with `GRANT`, as `memmgr.swap`. Zero if absent.
     pub memmgr_swap: u64,
@@ -351,6 +362,7 @@ pub fn bootstrap_caps(
                             vfsd_deny: c.vfsd_deny,
                             vfsd_swap: c.vfsd_swap,
                             entropy_source: c.entropy_source,
+                            pmu_source: c.pmu_source,
                             memmgr_swap: c.memmgr_swap,
                             master_log_source: 0,
                             procmgr_death_auth_source: 0,

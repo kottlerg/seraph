@@ -1,30 +1,30 @@
 # bench baseline, written by `cargo xtask bench-baseline`
 # Format: xtask/README.md (`cargo xtask bench-check`).
-words=0 cpus=1 unit=cycles p50=2463
-words=0 cpus=4 unit=cycles p50=2590
-words=0 aspace=cross cpus=1 unit=cycles p50=2402
-words=0 aspace=cross cpus=4 unit=cycles p50=2402
-words=0 aspace=same cpus=1 unit=cycles p50=2350
-words=0 aspace=same cpus=4 unit=cycles p50=2350
-words=0 fpu=both cpus=1 unit=cycles p50=2468
-words=0 fpu=both cpus=4 unit=cycles p50=2595
-words=0 iopb=none cpus=1 unit=cycles p50=2265
-words=0 iopb=none cpus=4 unit=cycles p50=2265
-words=0 placement=apart cpus=4 unit=cycles p50=3469
-words=0 placement=fan_in cpus=4 unit=cycles p50=2334
-words=0 placement=fan_in server=reply_recv cpus=4 unit=cycles p50=2237
-words=0 placement=same cpus=4 unit=cycles p50=2339
-words=0 placement=unpinned cpus=4 unit=cycles p50=2337
-words=0 placement=unpinned server=reply_recv cpus=4 unit=cycles p50=2341
-words=0 server=reply_recv cpus=1 unit=cycles p50=2366
-words=0 server=reply_recv cpus=4 unit=cycles p50=2366
-words=1 cpus=1 unit=cycles p50=2602
-words=1 cpus=4 unit=cycles p50=2729
-words=16 cpus=1 unit=cycles p50=3265
-words=16 cpus=4 unit=cycles p50=3392
-words=6 cpus=1 unit=cycles p50=2665
-words=6 cpus=4 unit=cycles p50=2792
-words=64 cpus=1 unit=cycles p50=5269
-words=64 cpus=4 unit=cycles p50=5396
-words=7 cpus=1 unit=cycles p50=2946
-words=7 cpus=4 unit=cycles p50=3073
+words=0 cpus=1 unit=cycles p50=2376
+words=0 cpus=4 unit=cycles p50=2503
+words=0 aspace=cross cpus=1 unit=cycles p50=2315
+words=0 aspace=cross cpus=4 unit=cycles p50=2315
+words=0 aspace=same cpus=1 unit=cycles p50=2263
+words=0 aspace=same cpus=4 unit=cycles p50=2263
+words=0 fpu=both cpus=1 unit=cycles p50=2381
+words=0 fpu=both cpus=4 unit=cycles p50=2508
+words=0 iopb=none cpus=1 unit=cycles p50=2178
+words=0 iopb=none cpus=4 unit=cycles p50=2178
+words=0 placement=apart cpus=4 unit=cycles p50=3382
+words=0 placement=fan_in cpus=4 unit=cycles p50=2247
+words=0 placement=fan_in server=reply_recv cpus=4 unit=cycles p50=2180
+words=0 placement=same cpus=4 unit=cycles p50=2238
+words=0 placement=unpinned cpus=4 unit=cycles p50=2236
+words=0 placement=unpinned server=reply_recv cpus=4 unit=cycles p50=2284
+words=0 server=reply_recv cpus=1 unit=cycles p50=2307
+words=0 server=reply_recv cpus=4 unit=cycles p50=2307
+words=1 cpus=1 unit=cycles p50=2514
+words=1 cpus=4 unit=cycles p50=2641
+words=16 cpus=1 unit=cycles p50=3179
+words=16 cpus=4 unit=cycles p50=3306
+words=6 cpus=1 unit=cycles p50=2577
+words=6 cpus=4 unit=cycles p50=2704
+words=64 cpus=1 unit=cycles p50=5183
+words=64 cpus=4 unit=cycles p50=5310
+words=7 cpus=1 unit=cycles p50=2860
+words=7 cpus=4 unit=cycles p50=2987

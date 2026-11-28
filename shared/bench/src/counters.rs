@@ -10,8 +10,10 @@
 //! and no two harts' `cycle` counters are kept in step on riscv64. The handle
 //! is neither `Send` nor `Sync`, so it cannot follow the thread's work to
 //! another thread. A [`Reading`] holds every column the result line can come
-//! to report; the cycle counter is the only one read, and the others read
-//! `None`.
+//! to report; [`Counters`] reads the cycle counter alone, and the others read
+//! `None`. The hardware event columns are filled by
+//! [`crate::EventCounters`] (the `pmu` feature), which reads the cycle
+//! counter too.
 //!
 //! The kernel's `sched-stages` feature calls [`Counters::open`] and
 //! [`Counters::read`] from `schedule()`, in kernel mode with interrupts
@@ -48,7 +50,16 @@ impl Reading
     #[must_use]
     pub fn since(&self, earlier: &Reading) -> Reading
     {
-        let delta = |now: Option<u64>, then: Option<u64>| Some(now?.wrapping_sub(then?));
+        self.since_width(earlier, 64)
+    }
+
+    /// [`Reading::since`] for instruction and event counters `width` bits
+    /// wide, across at most one wrap of each (`pmu::delta`); the cycle
+    /// counter wraps at 64 bits.
+    #[must_use]
+    pub fn since_width(&self, earlier: &Reading, width: u8) -> Reading
+    {
+        let delta = |now: Option<u64>, then: Option<u64>| Some(pmu::delta(then?, now?, width));
         let mut events = [None; EVENT_SLOTS];
         for ((slot, now), then) in events.iter_mut().zip(self.events).zip(earlier.events)
         {
@@ -115,6 +126,33 @@ mod tests
         assert!(second.cycles >= first.cycles);
         assert_eq!(second.instret, None);
         assert_eq!(second.events, [None; EVENT_SLOTS]);
+    }
+
+    // Defect guarded: a counter narrower than 64 bits that wraps between two
+    // readings reported as a count near 2^64.
+    #[test]
+    fn since_width_masks_the_event_columns_to_the_counter_width()
+    {
+        let width = 48;
+        let earlier = Reading {
+            cycles: u64::MAX,
+            instret: Some(0xFFFF_FFFF_FFFB),
+            events: [Some(0xFFFF_FFFF_FFFF), None, Some(2), None],
+        };
+        let later = Reading {
+            cycles: 1,
+            instret: Some(6),
+            events: [Some(0), None, Some(9), Some(1)],
+        };
+        assert_eq!(
+            later.since_width(&earlier, width),
+            Reading {
+                cycles: 2,
+                instret: Some(11),
+                events: [Some(1), None, Some(7), None],
+            }
+        );
+        assert_eq!(later.since(&earlier), later.since_width(&earlier, 64));
     }
 
     #[test]

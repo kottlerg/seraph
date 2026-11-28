@@ -757,6 +757,7 @@ fn event_loop(
         procmgr_death_auth_source: caps.procmgr_death_auth_source,
         kernel_log_source: caps.kernel_log_source,
         entropy_source: caps.entropy_source,
+        pmu_source: core::cell::Cell::new(caps.pmu_source),
         core_death_queue,
         pressure_notification,
         memory_waits: core::cell::Cell::new(MemoryWaits::new(pressure_notification != 0)),
@@ -964,12 +965,16 @@ fn dispatch_ipc(
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             std::os::seraph::log!("handover complete; scanning /config/svcmgr/services/");
-            let reconciled = match definitions::reconcile::reconcile_and_launch(
+            let reconciled = definitions::reconcile::reconcile_and_launch(
                 &mut state.pending,
                 &mut state.table,
                 ctx,
                 &mut state.registry,
-            )
+            );
+            // The recipes are read now, on every outcome: the PMU source
+            // stays only for a recipe svcmgr keeps that holds the key.
+            restart::delete_unheld_pmu_source(ctx, &state.table.recipes);
+            let reconciled = match reconciled
             {
                 Ok(reconciled) => reconciled,
                 Err(exit_reason) =>

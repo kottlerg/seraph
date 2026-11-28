@@ -365,8 +365,8 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 // core/kernel/docs/scheduling-internals.md § Softlockup Watchdog.
 
 /// All-idle softlockup threshold: the detector fires when, for this long, no
-/// CPU has dispatched a non-idle thread and no BSP tick has seen the system
-/// idle ([`all_idle_tick`]). Converted to BSP ticks at `ticks_per_second()`
+/// CPU has dispatched a non-idle thread and no sweep of the CPUs has seen the
+/// system idle ([`all_idle_tick`]). Converted to BSP ticks at `ticks_per_second()`
 /// ([`ticks_for_ms`]), so it holds at any tick rate. A tuning threshold; it
 /// bounds no capacity.
 #[cfg(not(test))]
@@ -402,14 +402,32 @@ fn last_non_idle_tick(cpu: usize) -> Option<&'static core::sync::atomic::AtomicU
 
 static WATCHDOG_TICK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// BSP tick (of [`WATCHDOG_TICK_COUNTER`]) at which the all-idle detector's
-/// per-tick sample last found the system idle ([`system_has_no_work`]); 0
-/// before the first such sample. Written only by the BSP's
+/// BSP tick (of [`WATCHDOG_TICK_COUNTER`]) at which the all-idle detector
+/// last ended a sweep that found every CPU idle ([`all_idle_tick`]); 0
+/// before the first such sweep. Written only by the BSP's
 /// `watchdog_tick_and_check`, and read there and by the dump: Relaxed, since
 /// one CPU writes it and the dump's read is diagnostic.
 #[cfg(not(test))]
 static WATCHDOG_LAST_IDLE_TICK: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// The all-idle detector's sweep between BSP ticks ([`AllIdleSweep`]): its
+/// cursor and its two answers so far. Written and read only by the BSP's
+/// `watchdog_tick_and_check`: Relaxed.
+#[cfg(not(test))]
+static WATCHDOG_SWEEP_CURSOR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(AllIdleSweep::START.cursor);
+#[cfg(not(test))]
+static WATCHDOG_SWEEP_IDLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(AllIdleSweep::START.idle);
+#[cfg(not(test))]
+static WATCHDOG_SWEEP_STALE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(AllIdleSweep::START.stale);
+
+/// The first AP of the next window of [`ap_silence_check`]'s sweep
+/// ([`sweep_window`] over the APs). Written and read only by the BSP: Relaxed.
+#[cfg(not(test))]
+static AP_SILENCE_CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
 
 static WATCHDOG_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -1068,73 +1086,141 @@ pub fn watchdog_mark_non_idle(cpu: usize)
     }
 }
 
-/// One BSP tick of the all-idle softlockup detector, at tick `now`: when this
-/// tick's sample found the system idle (`idle_now`: every CPU on its idle
-/// thread with no other thread queued), record `now` in `last_idle`; then
-/// report a stall when the system has not been seen idle for `threshold`
-/// ticks and every CPU's last non-idle dispatch (`last_dispatch`, one entry
-/// per CPU, `None` for a CPU whose stamp slot does not exist yet) is at least
-/// `threshold` ticks old.
+/// One window of a watchdog sweep over the CPUs `first..cpu_count`, and the
+/// cursor of the next: the CPUs from `cursor` (`first` when `cursor` lies
+/// outside the range), at most [`CPU_SCAN_WINDOW`] of them, in index order.
+/// The window that reaches `cpu_count` ends a sweep, and its next cursor is
+/// `first`, so a sweep reads every CPU of the range once, in
+/// `ceil((cpu_count - first) / CPU_SCAN_WINDOW)` windows, one per call; a
+/// range of up to [`CPU_SCAN_WINDOW`] CPUs is read whole at every call
+/// (core/kernel/docs/scheduling-internals.md § Softlockup Watchdog).
+fn sweep_window(cursor: usize, first: usize, cpu_count: usize) -> (core::ops::Range<usize>, usize)
+{
+    let start = if first <= cursor && cursor < cpu_count
+    {
+        cursor
+    }
+    else
+    {
+        first
+    };
+    let end = cpu_count.min(start.saturating_add(CPU_SCAN_WINDOW));
+    let next = if end >= cpu_count { first } else { end };
+    (start..end, next)
+}
+
+/// The all-idle detector's state across the ticks of one sweep of the CPUs
+/// ([`sweep_window`]), kept by the BSP between its ticks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AllIdleSweep
+{
+    /// The first CPU of the next tick's window.
+    cursor: usize,
+    /// Whether every CPU the sweep has read so far had no work.
+    idle: bool,
+    /// Whether every CPU the sweep has read so far had its last non-idle
+    /// dispatch at least the threshold old, each read while the system had
+    /// not been seen idle for the threshold.
+    stale: bool,
+}
+
+impl AllIdleSweep
+{
+    /// The state before the first tick: a sweep that starts at CPU 0.
+    const START: Self = Self {
+        cursor: 0,
+        idle: true,
+        stale: true,
+    };
+}
+
+/// One BSP tick of the all-idle softlockup detector, at tick `now`: read the
+/// window of `sweep` ([`sweep_window`] over the `cpu_count` CPUs), whether
+/// each CPU has no work (`has_no_work`: it runs its idle thread with no other
+/// thread queued) and, while the system has not been seen idle for
+/// `threshold` ticks, each CPU's last non-idle dispatch (`last_dispatch`,
+/// `None` for a CPU whose stamp slot does not exist yet). At the tick that
+/// ends a sweep, record `now` in `last_idle` when every CPU the sweep read
+/// had no work; then report a stall when the system has not been seen idle
+/// for `threshold` ticks and every CPU's last dispatch, as the sweep read it,
+/// was at least `threshold` ticks old. A window's reads of either kind stop
+/// at the first CPU that settles the sweep's answer, and a later window of the
+/// sweep skips them.
 ///
 /// An idle system waits for a deadline, a device interrupt or a message, and is
 /// not a stall however long it waits. The sample is recorded before the
-/// decision on every tick, so the stall clock restarts at the last idle tick:
-/// work that becomes ready after a long idle span (a sleeper the same BSP tick
-/// woke, before this check) is a stall only once it has waited `threshold`
-/// undispatched. The remaining windows are stated in
-/// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog.
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "`idle_now` is data: this tick's idle sample, on which the function records `now` \
-              in `last_idle`"
-)]
-fn all_idle_tick<I>(
+/// decision, so the stall clock restarts at the last idle sweep: work that
+/// becomes ready after a long idle span (a sleeper the same BSP tick woke,
+/// before this check) is a stall only once it has waited `threshold`
+/// undispatched. With up to [`CPU_SCAN_WINDOW`] CPUs every tick is a whole
+/// sweep. The remaining windows, and the latency a sweep of several ticks
+/// adds, are stated in core/kernel/docs/scheduling-internals.md § Softlockup
+/// Watchdog.
+fn all_idle_tick(
     now: u64,
     threshold: u64,
-    idle_now: bool,
+    sweep: &mut AllIdleSweep,
     last_idle: &mut u64,
-    last_dispatch: I,
+    cpu_count: usize,
+    has_no_work: impl Fn(usize) -> bool,
+    last_dispatch: impl Fn(usize) -> Option<u64>,
 ) -> bool
-where
-    I: IntoIterator<Item = Option<u64>>,
 {
-    if idle_now
+    let (window, next) = sweep_window(sweep.cursor, 0, cpu_count);
+    sweep.cursor = next;
+    if window.start == 0
     {
-        *last_idle = now;
+        *sweep = AllIdleSweep {
+            cursor: next,
+            ..AllIdleSweep::START
+        };
     }
-    if now.saturating_sub(*last_idle) < threshold
+    let ends = window.end >= cpu_count;
+    if sweep.idle
+    {
+        sweep.idle = window.clone().all(&has_no_work);
+    }
+    if sweep.stale
+    {
+        sweep.stale = now.saturating_sub(*last_idle) >= threshold
+            && window.into_iter().all(|cpu| {
+                last_dispatch(cpu).is_some_and(|last| now.saturating_sub(last) >= threshold)
+            });
+    }
+    if !ends
     {
         return false;
     }
-    last_dispatch
-        .into_iter()
-        .all(|last| last.is_some_and(|last| now.saturating_sub(last) >= threshold))
+    if sweep.idle
+    {
+        *last_idle = now;
+    }
+    sweep.stale && now.saturating_sub(*last_idle) >= threshold
 }
 
-/// Whether the system has no work: every CPU runs its idle thread and queues no
-/// other thread ([`run_queue::PerCpuScheduler::has_no_work`]). Lock-free: it
-/// reads each scheduler's atomics with no lock and dereferences no TCB, so a
-/// wedged lock holder cannot stall the BSP tick. Not one snapshot across the
-/// CPUs: a thread moving between CPUs during the walk can be missed, which
-/// the next tick's sample re-decides. Stops at the first CPU with work.
+/// Whether CPU `cpu` has no work: it runs its idle thread and queues no other
+/// thread ([`run_queue::PerCpuScheduler::has_no_work`]). Lock-free: it reads
+/// the scheduler's atomics with no lock and dereferences no TCB, so a wedged
+/// lock holder cannot stall the BSP tick.
+///
+/// # Safety
+/// `cpu` is below `CPU_COUNT`.
 #[cfg(not(test))]
-fn system_has_no_work(cpu_count: usize) -> bool
+unsafe fn cpu_has_no_work(cpu: usize) -> bool
 {
-    (0..cpu_count).all(|cpu| {
-        // SAFETY: cpu < cpu_count, which is CPU_COUNT; the scheduler slab
-        // exists, since the BSP's `timer_tick`, the only caller's caller, has
-        // already reached its own scheduler through `PerCpuData::scheduler`. The
-        // scheduler is reached through a shared reference, as every CPU
-        // reaches it, and only its atomics are read.
-        let sched_ptr = unsafe { scheduler_ptr(cpu) };
-        // SAFETY: as above.
-        unsafe { (*sched_ptr).has_no_work() }
-    })
+    // SAFETY: cpu < CPU_COUNT (the caller's contract); the scheduler slab
+    // exists, since the BSP's `timer_tick`, the only caller's caller, has
+    // already reached its own scheduler through `PerCpuData::scheduler`. The
+    // scheduler is reached through a shared reference, as every CPU reaches
+    // it, and only its atomics are read.
+    let sched_ptr = unsafe { scheduler_ptr(cpu) };
+    // SAFETY: as above.
+    unsafe { (*sched_ptr).has_no_work() }
 }
 
 /// BSP-only: tick the global counter and run the wedge detectors — the
 /// owed-wake registry scan and AP-heartbeat silence check on a coarse
-/// cadence, and the all-idle softlockup check every tick. The first
+/// cadence, and one window of the all-idle softlockup check every tick. The first
 /// detector to trip claims the global dump latch (`watchdog_claim_dump`).
 #[cfg(not(test))]
 fn watchdog_tick_and_check()
@@ -1162,20 +1248,30 @@ fn watchdog_tick_and_check()
         }
     }
 
-    // The all-idle detector: its idle sample runs on every tick, before the
-    // decision (see `all_idle_tick`).
+    // The all-idle detector: each tick reads one window of its sweep, and the
+    // idle sample is recorded before the decision (see `all_idle_tick`).
     let threshold = ticks_for_ms(WATCHDOG_THRESHOLD_SECONDS.saturating_mul(1000));
     let mut last_idle = WATCHDOG_LAST_IDLE_TICK.load(core::sync::atomic::Ordering::Relaxed);
+    let mut sweep = AllIdleSweep {
+        cursor: WATCHDOG_SWEEP_CURSOR.load(core::sync::atomic::Ordering::Relaxed),
+        idle: WATCHDOG_SWEEP_IDLE.load(core::sync::atomic::Ordering::Relaxed),
+        stale: WATCHDOG_SWEEP_STALE.load(core::sync::atomic::Ordering::Relaxed),
+    };
     let stalled = all_idle_tick(
         now,
         threshold,
-        system_has_no_work(cpu_count),
+        &mut sweep,
         &mut last_idle,
-        (0..cpu_count).map(|cpu| {
-            last_non_idle_tick(cpu).map(|slot| slot.load(core::sync::atomic::Ordering::Relaxed))
-        }),
+        cpu_count,
+        // SAFETY: the window holds only CPUs below cpu_count, which is
+        // CPU_COUNT.
+        |cpu| unsafe { cpu_has_no_work(cpu) },
+        |cpu| last_non_idle_tick(cpu).map(|slot| slot.load(core::sync::atomic::Ordering::Relaxed)),
     );
     WATCHDOG_LAST_IDLE_TICK.store(last_idle, core::sync::atomic::Ordering::Relaxed);
+    WATCHDOG_SWEEP_CURSOR.store(sweep.cursor, core::sync::atomic::Ordering::Relaxed);
+    WATCHDOG_SWEEP_IDLE.store(sweep.idle, core::sync::atomic::Ordering::Relaxed);
+    WATCHDOG_SWEEP_STALE.store(sweep.stale, core::sync::atomic::Ordering::Relaxed);
     if !stalled
     {
         return;
@@ -1342,7 +1438,8 @@ fn owed_wake_scan()
 }
 
 /// BSP side of the heartbeat cross-check: report an AP whose `timer_tick`
-/// heartbeat has gone silent past the grace window. An AP wedged with
+/// heartbeat has gone silent past the grace window, reading one window of the
+/// APs per scan ([`sweep_window`] from [`AP_SILENCE_CURSOR`]). An AP wedged with
 /// interrupts off cannot run its own detectors; this names it from the BSP,
 /// after having it print its own frame where the architecture can
 /// (`arch::current::interrupts::dump_remote_frame`).
@@ -1363,7 +1460,13 @@ fn ap_silence_check(cpu_count: usize)
         return;
     }
     let stall = heartbeat_stall_ticks(tps);
-    for cpu in 1..cpu_count
+    let (window, next) = sweep_window(
+        AP_SILENCE_CURSOR.load(core::sync::atomic::Ordering::Relaxed),
+        1,
+        cpu_count,
+    );
+    AP_SILENCE_CURSOR.store(next, core::sync::atomic::Ordering::Relaxed);
+    for cpu in window
     {
         let Some(diag) = cpu_diag(cpu)
         else
@@ -3064,6 +3167,14 @@ pub unsafe fn init(cpu_count: u32) -> u32
         let s = unsafe { &*sched_ptr };
         s.set_idle(tcb);
         s.set_current(tcb);
+        // Each scan cursor starts where this CPU's first window does not
+        // repeat every other CPU's (initial_scan_cursor).
+        let n = cpu_count as usize;
+        let pull_start = initial_scan_cursor(cpu, n, Some(cpu));
+        s.set_idle_pull_cursor(pull_start);
+        s.set_rt_push_cursor(pull_start);
+        s.set_balance_cursor(pull_start);
+        s.set_wake_cursor(initial_scan_cursor(cpu, n, None));
         // SAFETY: cpu < cpu_count, Phase 4 allocated the per-CPU slab, and
         // `tcb` is CPU `cpu`'s idle thread, which it runs until its first
         // dispatch. An AP runs no kernel code yet; the boot CPU's readers before
@@ -5817,6 +5928,204 @@ pub unsafe fn relocate_ready_priority(
     None
 }
 
+// ── CPU scan windows ─────────────────────────────────────────────────────────
+
+/// Most CPUs one scan of the CPUs on a wake or tick path reads: the least-load
+/// and lowest-rank scans of a wake's placement, the busy and idle balance steps'
+/// scans, the RT push's, and each window of the BSP watchdog's sweeps
+/// ([`sweep_window`]). A boot of up to `CPU_SCAN_WINDOW` CPUs, or one more
+/// for a scan that leaves its own CPU out, is read whole by every scan; a larger
+/// one is read a window per scan from a cursor of the scanning CPU, so the cost
+/// a scan adds to a wake or a tick does not grow with the CPU count
+/// (core/kernel/docs/scheduler.md § Load Balancing, "Scan windows").
+const CPU_SCAN_WINDOW: usize = 128;
+
+/// The CPUs one scan reads ([`CPU_SCAN_WINDOW`]): in index order from `start`,
+/// wrapping, every CPU below `cpu_count` but `own`, at most
+/// [`CPU_SCAN_WINDOW`] of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ScanWindow
+{
+    /// The CPU count.
+    cpu_count: usize,
+    /// The first CPU in the window's order, below `cpu_count`.
+    start: usize,
+    /// The scanning CPU, when the scan leaves it out.
+    own: Option<usize>,
+}
+
+impl ScanWindow
+{
+    /// The window from `cursor`, taken modulo `cpu_count` (0 when the count is
+    /// 0), that leaves `own` out.
+    const fn new(cpu_count: usize, cursor: usize, own: Option<usize>) -> Self
+    {
+        // A stored cursor is below the count; only another value needs the
+        // division.
+        let start = if cursor < cpu_count
+        {
+            cursor
+        }
+        else
+        {
+            match cursor.checked_rem(cpu_count)
+            {
+                Some(start) => start,
+                None => 0,
+            }
+        };
+        Self {
+            cpu_count,
+            start,
+            own,
+        }
+    }
+
+    /// The CPUs the window holds, in its order.
+    const fn cpus(self) -> WindowCpus
+    {
+        let held = self.candidates();
+        WindowCpus {
+            next: self.start,
+            cpu_count: self.cpu_count,
+            own: self.own,
+            left: if held < CPU_SCAN_WINDOW
+            {
+                held
+            }
+            else
+            {
+                CPU_SCAN_WINDOW
+            },
+        }
+    }
+
+    /// How many CPUs a window of this count may hold: every CPU below the
+    /// count but `own`.
+    const fn candidates(self) -> usize
+    {
+        match self.own
+        {
+            Some(own) if own < self.cpu_count => self.cpu_count.saturating_sub(1),
+            _ => self.cpu_count,
+        }
+    }
+
+    /// Whether the window holds every CPU below the count but `own`.
+    const fn covers_all(self) -> bool
+    {
+        self.candidates() <= CPU_SCAN_WINDOW
+    }
+
+    /// Where the scanning CPU's cursor goes after a scan of this window that
+    /// moves it on: the CPU after the window's last, so successive scans read
+    /// successive windows and every CPU within `ceil(m / CPU_SCAN_WINDOW)`
+    /// scans, m the CPUs a window may hold; or `start` when the window holds
+    /// every CPU, so a boot no window narrows keeps its cursor where it is.
+    const fn next(self) -> usize
+    {
+        if self.covers_all()
+        {
+            return self.start;
+        }
+        // The window spans CPU_SCAN_WINDOW indices from `start`, one more when
+        // `own` lies among them.
+        let passes_own = match self.own
+        {
+            Some(own) => match own
+                .wrapping_add(self.cpu_count)
+                .wrapping_sub(self.start)
+                .checked_rem(self.cpu_count)
+            {
+                Some(distance) => distance < CPU_SCAN_WINDOW,
+                None => false,
+            },
+            None => false,
+        };
+        let span = if passes_own
+        {
+            CPU_SCAN_WINDOW.wrapping_add(1)
+        }
+        else
+        {
+            CPU_SCAN_WINDOW
+        };
+        let next = match self.start.wrapping_add(span).checked_rem(self.cpu_count)
+        {
+            Some(next) => next,
+            None => 0,
+        };
+        match self.own
+        {
+            Some(own) if own == next => cpu_after(next, self.cpu_count),
+            _ => next,
+        }
+    }
+
+    /// [`next`](Self::next) when it differs from `start`: the cursor value a
+    /// scan that moves its cursor on stores, `None` when it stores none.
+    const fn moved_cursor(self) -> Option<usize>
+    {
+        let next = self.next();
+        if next == self.start { None } else { Some(next) }
+    }
+}
+
+/// The CPUs of a [`ScanWindow`], in its order ([`ScanWindow::cpus`]): from
+/// `next`, wrapping, every CPU but `own` until `left` are yielded.
+struct WindowCpus
+{
+    /// The next CPU index to read, below `cpu_count`.
+    next: usize,
+    /// The CPU count.
+    cpu_count: usize,
+    /// The CPU the window leaves out.
+    own: Option<usize>,
+    /// How many CPUs are still to be yielded, at most the CPUs below the
+    /// count but `own`, so a lap from `next` yields them all.
+    left: usize,
+}
+
+impl Iterator for WindowCpus
+{
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize>
+    {
+        while self.left > 0
+        {
+            let cpu = self.next;
+            // `cpu_after` without its division: `cpu` is below the count.
+            let after = cpu.wrapping_add(1);
+            self.next = if after < self.cpu_count { after } else { 0 };
+            if Some(cpu) != self.own
+            {
+                self.left = self.left.wrapping_sub(1);
+                return Some(cpu);
+            }
+        }
+        None
+    }
+}
+
+/// Where a CPU's scan cursors start at boot: at 0 while the window of `cpu`'s
+/// scan, which leaves `own` out, holds every CPU, so a boot no window narrows
+/// scans in index order; otherwise at the CPU after `cpu`, so the windows of
+/// the CPUs' first scans tile the CPUs rather than every CPU scanning the same
+/// window on the same tick (core/kernel/docs/scheduler.md § Load Balancing,
+/// "Scan windows").
+const fn initial_scan_cursor(cpu: usize, cpu_count: usize, own: Option<usize>) -> usize
+{
+    if ScanWindow::new(cpu_count, 0, own).covers_all()
+    {
+        0
+    }
+    else
+    {
+        cpu_after(cpu, cpu_count)
+    }
+}
+
 // ── Periodic cross-CPU load balancer ─────────────────────────────────────────
 
 /// Tick counter feeding the pseudo-random victim selection. Relaxed
@@ -6079,10 +6388,11 @@ const fn cpu_after(cpu: usize, cpu_count: usize) -> usize
     }
 }
 
-/// Scan every CPU but `this_cpu` and `skip` through [`IdleScan::note`], in index
-/// order starting at `start` and wrapping: one load per CPU, and one run-queue
-/// mask read per CPU whose load is non-zero up to the first with a queued
-/// thread.
+/// Scan the window of `this_cpu` from `start` ([`ScanWindow`], which leaves
+/// `this_cpu` out) but `skip` through [`IdleScan::note`]: one load per CPU,
+/// and one run-queue mask read per CPU whose load is non-zero up to the first
+/// with a queued thread. `skip` stays in the window, so a scan that skips the
+/// victim of a pull reads the same window less that CPU.
 fn idle_scan(
     view: &impl IdlePullView,
     this_cpu: usize,
@@ -6092,14 +6402,10 @@ fn idle_scan(
 ) -> IdleScan
 {
     let mut scan = IdleScan::EMPTY;
-    // Every CPU once, from `start` (taken modulo the count) up, then from 0.
-    let start = start.checked_rem(cpu_count).unwrap_or(0);
-    for cpu in (start..cpu_count).chain(0..start)
+    for cpu in ScanWindow::new(cpu_count, start, Some(this_cpu))
+        .cpus()
+        .filter(|&cpu| Some(cpu) != skip)
     {
-        if cpu == this_cpu || Some(cpu) == skip
-        {
-            continue;
-        }
         scan.note(cpu, view.load(cpu), || view.backlog(cpu));
     }
     scan
@@ -6121,7 +6427,10 @@ fn idle_scan(
 /// than the same pinned one again; so do a candidate whose backlog did not
 /// stand ([`pass_broken_candidate`]) and a backlog pull the re-check refuses.
 /// A confirmed candidate is held one tick, once, when a sibling of `this_cpu`
-/// has work ([`IdlePullStep::Hold`]).
+/// has work ([`IdlePullStep::Hold`]). A tick that finds no backlog in its
+/// window ([`IdlePullStep::Forget`]) moves the cursor past the window
+/// ([`ScanWindow::next`]), which leaves it where it is in a boot whose window
+/// holds every other CPU.
 fn idle_pull_tick(
     view: &mut impl IdlePullView,
     this_cpu: usize,
@@ -6229,7 +6538,7 @@ fn idle_pull_tick(
         IdlePullStep::Forget => IdlePullMemory {
             candidate: None,
             held: false,
-            cursor,
+            cursor: ScanWindow::new(cpu_count, cursor, Some(this_cpu)).next(),
         },
     }
 }
@@ -6256,32 +6565,74 @@ const fn pass_broken_candidate(
     }
 }
 
-/// The most-loaded CPU other than `this_cpu` and its queued load, or `None`
-/// when every other CPU's queue is empty: one Relaxed load per CPU. Ties go
-/// to the lowest index.
-///
-/// # Safety
-/// `cpu_count` is `CPU_COUNT` and the scheduler slab is initialised.
-#[cfg(not(test))]
-unsafe fn heaviest_other_cpu(this_cpu: usize, cpu_count: usize) -> Option<(usize, u32)>
+/// The empty-queue scan of a busy CPU: a CPU of `window` whose load exceeds
+/// the imbalance threshold over an empty queue, or else, as `Err`, where the
+/// CPU's `balance_cursor` moves ([`ScanWindow::moved_cursor`]), so the next
+/// empty-queue tick reads the next window. A window that holds every other CPU
+/// yields the most-loaded one ([`heaviest_in_window`]) and moves no cursor. A
+/// narrower one yields the first such CPU in its order, so that moving the
+/// cursor past a victim the pull found nothing on
+/// ([`balance_cursor_after_pull`]) skips no CPU: a heavier victim later in the
+/// window could otherwise be chosen again in every window that holds a lighter
+/// CPU before it.
+fn empty_queue_victim(
+    window: ScanWindow,
+    load: impl Fn(usize) -> u32,
+) -> Result<usize, Option<usize>>
+{
+    if window.covers_all()
+    {
+        return match heaviest_in_window(window, load)
+        {
+            Some((cpu, load)) if exceeds_imbalance(load, 0) => Ok(cpu),
+            _ => Err(None),
+        };
+    }
+    match window.cpus().find(|&cpu| exceeds_imbalance(load(cpu), 0))
+    {
+        Some(cpu) => Ok(cpu),
+        None => Err(window.moved_cursor()),
+    }
+}
+
+/// Where a busy CPU's `balance_cursor` moves after its empty-queue pull from
+/// `victim`, which `window` chose ([`empty_queue_victim`]), ended in
+/// `outcome`: past `victim` when the pull found nothing it could take there
+/// and the window is narrower than the other CPUs, so a CPU whose load stays
+/// past the threshold with only pinned or mid-handoff threads queued does not
+/// hold the scan on its window; the CPUs before it in the window were below
+/// the threshold ([`empty_queue_victim`]). `None` otherwise: the next tick reads the same
+/// window, which a boot the window does not narrow always does.
+fn balance_cursor_after_pull(
+    window: ScanWindow,
+    victim: usize,
+    outcome: PullOutcome,
+) -> Option<usize>
+{
+    if outcome == PullOutcome::NothingPullable && !window.covers_all()
+    {
+        Some(cpu_after(victim, window.cpu_count))
+    }
+    else
+    {
+        None
+    }
+}
+
+/// The most-loaded CPU of `window` by `load` and its load, or `None` when
+/// every CPU the window holds has a load of zero: one `load` per CPU of the
+/// window. Ties go to the first read.
+fn heaviest_in_window(window: ScanWindow, load: impl Fn(usize) -> u32) -> Option<(usize, u32)>
 {
     let mut heaviest = None;
     let mut max_load = 0u32;
-    for cpu in 0..cpu_count
+    for cpu in window.cpus()
     {
-        if cpu == this_cpu
+        let cpu_load = load(cpu);
+        if cpu_load > max_load
         {
-            continue;
-        }
-        // SAFETY: cpu < cpu_count; slab initialised (caller's contract).
-        let sched = unsafe { scheduler_ptr(cpu) };
-        // SAFETY: the slot holds CPU `cpu`'s initialised scheduler, reached
-        // through shared references only; the load is atomic.
-        let load = unsafe { (*sched).current_load() };
-        if load > max_load
-        {
-            max_load = load;
-            heaviest = Some((cpu, load));
+            max_load = cpu_load;
+            heaviest = Some((cpu, cpu_load));
         }
     }
     heaviest
@@ -6361,9 +6712,12 @@ impl IdlePullView for KernelCpus
 /// thread, run from that CPU's `timer_tick`; an idle CPU balances through
 /// [`try_pull_idle`] instead. It clears this CPU's idle-pull candidate, then
 /// picks a victim by its own load (a pseudo-random one when its load is
-/// non-zero, the most-loaded one otherwise) and pulls from it only past the
-/// imbalance threshold, through the try-lock-only `pull_unpinned_ready`
-/// (#375). The modes, their rationale, and their hot-path cost are
+/// non-zero, otherwise a CPU past the imbalance threshold in the window from
+/// its `balance_cursor`: the most-loaded when the window holds every other
+/// CPU, else the first in the window's order ([`empty_queue_victim`]; a miss
+/// moves the cursor past the window and a pull that finds nothing pullable
+/// past the victim) and pulls from it only past the imbalance threshold,
+/// through the try-lock-only `pull_unpinned_ready` (#375). The modes, their rationale, and their hot-path cost are
 /// core/kernel/docs/scheduler.md § Load Balancing's.
 ///
 /// # Safety
@@ -6389,14 +6743,32 @@ unsafe fn try_pull_balance(this_cpu: usize)
     sched.forget_idle_pull_candidate();
     let my_load = sched.current_load();
 
+    let mut empty_queue_window = None;
     let victim = if my_load == 0
     {
-        // Empty-queue scan: pick the heaviest non-self CPU.
-        // SAFETY: cpu_count is CPU_COUNT; slab initialised.
-        match unsafe { heaviest_other_cpu(this_cpu, cpu_count) }
+        // Empty-queue scan: pick a CPU of this CPU's window past the
+        // threshold (empty_queue_victim).
+        let window = ScanWindow::new(cpu_count, sched.balance_cursor(), Some(this_cpu));
+        empty_queue_window = Some(window);
+        let load = |cpu: usize| {
+            // SAFETY: the window holds only CPUs below cpu_count, which is
+            // CPU_COUNT; slab initialised.
+            let their_sched = unsafe { scheduler_ptr(cpu) };
+            // SAFETY: the slot holds CPU `cpu`'s initialised scheduler, reached
+            // through shared references only; the load is atomic.
+            unsafe { (*their_sched).current_load() }
+        };
+        match empty_queue_victim(window, load)
         {
-            Some((cpu, load)) if exceeds_imbalance(load, my_load) => cpu,
-            _ => return,
+            Ok(cpu) => cpu,
+            Err(moved) =>
+            {
+                if let Some(next) = moved
+                {
+                    sched.set_balance_cursor(next);
+                }
+                return;
+            }
         }
     }
     else
@@ -6424,7 +6796,12 @@ unsafe fn try_pull_balance(this_cpu: usize)
     };
 
     // SAFETY: victim, this_cpu are valid and distinct.
-    unsafe { pull_unpinned_ready(victim, this_cpu, PullRule::Imbalance) };
+    let outcome = unsafe { pull_unpinned_ready(victim, this_cpu, PullRule::Imbalance) };
+    if let Some(next) =
+        empty_queue_window.and_then(|window| balance_cursor_after_pull(window, victim, outcome))
+    {
+        sched.set_balance_cursor(next);
+    }
 }
 
 /// Test stub.
@@ -6705,13 +7082,6 @@ unsafe fn pullable(tcb: *mut ThreadControlBlock) -> bool
         } == 1
 }
 
-/// Most CPUs one RT push scan reads: every other CPU of a boot of up to
-/// `RT_PUSH_SCAN_CPUS + 1` CPUs, so the push's bound is one tick there; a
-/// larger boot is read a window per tick, the cost each tick adds to the
-/// running thread's being capped at two loads per CPU of the window
-/// (core/kernel/docs/scheduler.md § Load Balancing, "RT push").
-const RT_PUSH_SCAN_CPUS: usize = 128;
-
 /// What one RT push scan found ([`rt_push_target`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct PushScan
@@ -6719,14 +7089,16 @@ struct PushScan
     /// The CPU to push to, `None` when no CPU read runs and queues only
     /// threads the waiting one outranks.
     target: Option<usize>,
-    /// The CPU after the last one read: where the next scan starts after a
-    /// miss.
+    /// Where the next scan starts after a miss ([`ScanWindow::next`]): the
+    /// CPU after the window read, or its start when the window holds every
+    /// other CPU.
     next: usize,
 }
 
 /// The CPU a waiting RT thread at `level` on `this_cpu` is pushed to, read
-/// from at most [`RT_PUSH_SCAN_CPUS`] other CPUs below `cpu_count`, in index
-/// order from `start` and wrapping: of those whose effective rank by `rank`
+/// from the window of `this_cpu` from `start` ([`ScanWindow`]: at most
+/// [`CPU_SCAN_WINDOW`] other CPUs, every other CPU of a boot of up to one
+/// more, so the push's bound is one tick there): of those whose effective rank by `rank`
 /// is below `level`'s, so that the thread outranks everything there, the one
 /// of the lowest rank, a tie going to the lower load by `load`, then to the
 /// fewest busy SMT siblings by `busy_siblings`, then to the first read, as an
@@ -6744,21 +7116,15 @@ fn rt_push_target(
 ) -> PushScan
 {
     let level_rank = run_queue::level_rank(level);
-    let start = start.checked_rem(cpu_count).unwrap_or(0);
-    let mut last = None;
+    let window = ScanWindow::new(cpu_count, start, Some(this_cpu));
     let best = least_loaded_cpu(
-        (start..cpu_count)
-            .chain(0..start)
-            .filter(|&cpu| cpu != this_cpu)
-            .take(RT_PUSH_SCAN_CPUS)
-            .inspect(|&cpu| last = Some(cpu))
-            .filter(|&cpu| rank(cpu) < level_rank),
+        window.cpus().filter(|&cpu| rank(cpu) < level_rank),
         |cpu| (rank(cpu), load(cpu)),
         busy_siblings,
     );
     PushScan {
         target: best.map(|(cpu, _)| cpu),
-        next: last.map_or(start, |cpu| cpu_after(cpu, cpu_count)),
+        next: window.next(),
     }
 }
 
@@ -6766,7 +7132,7 @@ fn rt_push_target(
 /// highest unpinned fully-saved thread of this CPU's waiting RT queues, which
 /// the tick found under this CPU's lock. Picks the target by
 /// [`rt_push_target`] from the other CPUs' ranks, read lock-free from this
-/// CPU's `rt_push_cursor`, which a miss moves past the CPUs it read, and
+/// CPU's `rt_push_cursor`, which a miss moves past the window it read, and
 /// moves the thread through [`pull_unpinned_ready`] under
 /// [`PullRule::Waiting`], which decides again under both locks and wakes the
 /// target: the wake IPI that preempts at a target running a thread, or the
@@ -7490,6 +7856,39 @@ trait WakeView
     fn ranks(&self, cpu: usize) -> CpuRanks;
     /// How many SMT siblings of `cpu` are at work (`topology::busy_siblings`).
     fn busy_siblings(&self, cpu: usize) -> u32;
+    /// Where this CPU's placement scans start (`PerCpuScheduler::wake_cursor`).
+    fn wake_cursor(&self) -> usize;
+    /// Record `cpu` as where this CPU's next placement scan starts.
+    fn set_wake_cursor(&self, cpu: usize);
+}
+
+/// The window a wake's least-load or lowest-rank scan reads ([`ScanWindow`],
+/// which leaves no CPU out): from this CPU's wake cursor, every CPU of a boot of
+/// up to [`CPU_SCAN_WINDOW`] CPUs.
+fn wake_window(view: &impl WakeView, cpu_count: usize) -> ScanWindow
+{
+    // A boot the window covers never moves the cursor from 0, so its wakes
+    // skip the load.
+    let cursor = if cpu_count <= CPU_SCAN_WINDOW
+    {
+        0
+    }
+    else
+    {
+        view.wake_cursor()
+    };
+    ScanWindow::new(cpu_count, cursor, None)
+}
+
+/// Move this CPU's wake cursor past `window`, which a placement scan read, so
+/// successive wakes this CPU makes read successive windows; no store when the
+/// window holds every CPU.
+fn pass_wake_window(view: &impl WakeView, window: ScanWindow)
+{
+    if let Some(next) = window.moved_cursor()
+    {
+        view.set_wake_cursor(next);
+    }
 }
 
 /// The placement decision of [`select_target_cpu_excluding`], rule by rule as
@@ -7589,19 +7988,21 @@ fn place_by_rank_and_load(view: &impl WakeView, exclude: Option<usize>, hint: Wa
         return cpu;
     }
 
-    // Scan ELIGIBLE CPUs for min load, ties going to the CPU with the fewest
-    // siblings at work (core/kernel/docs/scheduler.md § SMT Awareness).
-    // `usize::MAX` marks "no eligible CPU" (degenerate: cpu_count == 1 and that
-    // CPU excluded).
+    // Scan the ELIGIBLE CPUs of this CPU's window for min load, ties going to
+    // the CPU with the fewest siblings at work (core/kernel/docs/scheduler.md
+    // § SMT Awareness), then to the first read. `usize::MAX` marks "no
+    // eligible CPU" (degenerate: cpu_count == 1 and that CPU excluded).
+    let window = wake_window(view, cpu_count);
     let (min_cpu, min_load) = least_loaded_cpu(
-        (0..cpu_count).filter(|&c| eligible(c)),
+        window.cpus().filter(|&c| eligible(c)),
         |cpu| view.load(cpu),
         |cpu| view.busy_siblings(cpu),
     )
     .unwrap_or((usize::MAX, u32::MAX));
+    pass_wake_window(view, window);
 
     // Sticky preferred CPU (eligible only): stay if within the pull-balancer's
-    // imbalance threshold of the global minimum (cache-warmth bias, #128). The
+    // imbalance threshold of the window's minimum (cache-warmth bias, #128). The
     // eligibility guard makes a stale value fall through to the min-load path.
     // A waker that runs on keeps its CPU busy, so the rule skips that CPU for
     // its wake; the min-load path can still pick it.
@@ -7634,9 +8035,10 @@ fn place_by_rank_and_load(view: &impl WakeView, exclude: Option<usize>, hint: Wa
 /// pin and a synchronous wake whose guard failed: for a woken thread at an RT
 /// level, its preferred CPU when it runs there at once (its level ranks above
 /// that CPU's effective rank, [`CpuRanks`]), and otherwise the eligible CPU of
-/// the lowest effective rank, a tie going to the lower load, then to the CPU
-/// with the fewest busy SMT siblings, then to the lowest index
-/// (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
+/// the lowest effective rank in this CPU's wake window ([`wake_window`]), a
+/// tie going to the lower load, then to the CPU with the fewest busy SMT
+/// siblings, then to the first read, the lowest index in a boot no window
+/// narrows (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
 /// "Target CPU selection"). `None` for a fair thread, which the sticky and
 /// least-load rules place, and when no CPU is eligible.
 ///
@@ -7686,12 +8088,16 @@ fn place_rt_wake(
     }
 
     let left_out = waker_cpu.filter(|_| waker_parked && view.outranks_waker());
-    least_loaded_cpu(
-        (0..cpu_count).filter(|&cpu| eligible(cpu) && Some(cpu) != left_out),
+    let window = wake_window(view, cpu_count);
+    let lowest = least_loaded_cpu(
+        window
+            .cpus()
+            .filter(|&cpu| eligible(cpu) && Some(cpu) != left_out),
         |cpu| (rank(cpu), view.load(cpu)),
         |cpu| view.busy_siblings(cpu),
-    )
-    .map(|(cpu, _)| cpu)
+    );
+    pass_wake_window(view, window);
+    lowest.map(|(cpu, _)| cpu)
 }
 
 /// The kernel's [`WakeView`]: the woken thread `tcb`, read without its
@@ -7850,6 +8256,16 @@ impl WakeView for KernelWake
     fn busy_siblings(&self, cpu: usize) -> u32
     {
         crate::topology::busy_siblings(cpu, |sibling| !Self::scheduler(sibling).has_no_work())
+    }
+
+    fn wake_cursor(&self) -> usize
+    {
+        Self::scheduler(self.this_cpu()).wake_cursor()
+    }
+
+    fn set_wake_cursor(&self, cpu: usize)
+    {
+        Self::scheduler(self.this_cpu()).set_wake_cursor(cpu);
     }
 }
 
@@ -9987,58 +10403,140 @@ mod class_tests
 #[cfg(test)]
 mod all_idle_tests
 {
-    use super::all_idle_tick;
+    use super::{AllIdleSweep, CPU_SCAN_WINDOW, all_idle_tick, sweep_window};
 
     const THRESHOLD: u64 = 300;
 
-    /// Run the detector over ticks `from..=to` with every CPU's last non-idle
-    /// dispatch at `stamps`, the system idle at a tick when `idle(tick)`;
-    /// return the first tick that reports a stall.
-    fn first_stall(
-        from: u64,
-        to: u64,
-        stamps: &[u64],
-        last_idle: &mut u64,
-        idle: impl Fn(u64) -> bool,
-    ) -> Option<u64>
+    /// The detector's state across ticks, and the CPU count.
+    struct Detector
     {
-        (from..=to).find(|&now| {
+        cpus: usize,
+        sweep: AllIdleSweep,
+        last_idle: u64,
+    }
+
+    impl Detector
+    {
+        fn new(cpus: usize) -> Self
+        {
+            Self {
+                cpus,
+                sweep: AllIdleSweep::START,
+                last_idle: 0,
+            }
+        }
+
+        /// One tick at `now`, CPU `cpu` having work when `work(now, cpu)`
+        /// and its last non-idle dispatch at `stamp(now, cpu)`.
+        fn tick(
+            &mut self,
+            now: u64,
+            work: impl Fn(u64, usize) -> bool,
+            stamp: impl Fn(u64, usize) -> Option<u64>,
+        ) -> bool
+        {
             all_idle_tick(
                 now,
                 THRESHOLD,
-                idle(now),
-                last_idle,
-                stamps.iter().map(|&s| Some(s)),
+                &mut self.sweep,
+                &mut self.last_idle,
+                self.cpus,
+                |cpu| !work(now, cpu),
+                |cpu| stamp(now, cpu),
             )
-        })
+        }
+
+        /// The first tick of `from..=to` that reports a stall.
+        fn first_stall(
+            &mut self,
+            from: u64,
+            to: u64,
+            work: impl Fn(u64, usize) -> bool,
+            stamp: impl Fn(u64, usize) -> Option<u64>,
+        ) -> Option<u64>
+        {
+            (from..=to).find(|&now| self.tick(now, &work, &stamp))
+        }
+    }
+
+    /// Ticks per sweep of `cpus` CPUs.
+    fn sweep_ticks(cpus: usize) -> u64
+    {
+        cpus.div_ceil(CPU_SCAN_WINDOW) as u64
+    }
+
+    /// The detector as one walk of every CPU per tick decides: a stall when
+    /// the system was not seen idle for the threshold and every CPU's last
+    /// dispatch is that old.
+    fn whole_walk(
+        now: u64,
+        last_idle: &mut u64,
+        cpus: usize,
+        work: impl Fn(usize) -> bool,
+        stamp: impl Fn(usize) -> Option<u64>,
+    ) -> bool
+    {
+        if (0..cpus).all(|cpu| !work(cpu))
+        {
+            *last_idle = now;
+        }
+        now.saturating_sub(*last_idle) >= THRESHOLD
+            && (0..cpus)
+                .all(|cpu| stamp(cpu).is_some_and(|last| now.saturating_sub(last) >= THRESHOLD))
     }
 
     // The defect caught (#965): a system with nothing to run, every thread
     // waiting on a device interrupt or a message with no deadline armed, is
-    // reported as a stall once every CPU's last dispatch is a threshold old.
+    // reported as a stall once every CPU's last dispatch is a threshold old,
+    // at any CPU count.
     #[test]
     fn an_idle_system_is_never_a_stall_however_long_it_waits()
     {
-        let mut last_idle = 0;
-        assert_eq!(
-            first_stall(1, 20 * THRESHOLD, &[1, 1, 1, 1], &mut last_idle, |_| true),
-            None
-        );
+        for cpus in [4, CPU_SCAN_WINDOW, CPU_SCAN_WINDOW + 1, 391, 8192]
+        {
+            let mut detector = Detector::new(cpus);
+            let stall = detector.first_stall(1, 20 * THRESHOLD, |_, _| false, |_, _| Some(1));
+            assert_eq!(stall, None, "cpus={cpus}");
+        }
     }
 
     // The defect caught: work left undispatched after its CPUs stopped
     // dispatching (a non-idle `current` wedged in the kernel, or a queued
     // thread no CPU takes) is not reported, or is reported before it has
-    // waited the threshold.
+    // waited the threshold; or, above CPU_SCAN_WINDOW CPUs, a sweep that does
+    // not restart once work is seen, or that reports more than three sweeps
+    // after one walk of every CPU per tick would, wherever the work lies.
     #[test]
     fn work_undispatched_for_the_threshold_after_the_last_idle_tick_is_a_stall()
     {
-        let mut last_idle = 0;
         let busy_from = 2 * THRESHOLD;
-        let stall = first_stall(1, 10 * THRESHOLD, &[1, 1], &mut last_idle, |t| {
-            t < busy_from
-        });
-        assert_eq!(stall, Some(busy_from - 1 + THRESHOLD));
+        for cpus in [2, CPU_SCAN_WINDOW, CPU_SCAN_WINDOW + 1, 200, 391, 8192]
+        {
+            let bound = busy_from - 1 + THRESHOLD;
+            let slack = if cpus <= CPU_SCAN_WINDOW
+            {
+                0
+            }
+            else
+            {
+                3 * sweep_ticks(cpus)
+            };
+            for busy in [0, cpus / 2, cpus - 1]
+            {
+                let mut detector = Detector::new(cpus);
+                let stall = detector.first_stall(
+                    1,
+                    10 * THRESHOLD,
+                    |now, cpu| now >= busy_from && cpu == busy,
+                    |_, _| Some(1),
+                );
+                let at = stall.unwrap_or_else(|| panic!("cpus={cpus} busy={busy}: no stall"));
+                assert!(
+                    bound <= at && at <= bound + slack,
+                    "cpus={cpus} busy={busy}: stall at {at}, bound {bound} + {slack}"
+                );
+            }
+        }
     }
 
     // The defect caught: the idle sample taken only once every dispatch stamp
@@ -10048,40 +10546,154 @@ mod all_idle_tests
     #[test]
     fn work_woken_a_threshold_after_the_last_dispatch_is_not_a_stall_at_once()
     {
-        let mut last_idle = 0;
-        let wake = 1 + THRESHOLD;
-        let stall = first_stall(1, wake + THRESHOLD, &[1, 1], &mut last_idle, |t| t < wake);
-        assert_eq!(stall, Some(wake - 1 + THRESHOLD));
+        for cpus in [2, 391]
+        {
+            let wake = 1 + THRESHOLD;
+            let mut detector = Detector::new(cpus);
+            let stall = detector.first_stall(
+                1,
+                wake + 2 * THRESHOLD,
+                |now, cpu| now >= wake && cpu == 0,
+                |_, _| Some(1),
+            );
+            let at = stall.unwrap_or_else(|| panic!("cpus={cpus}: no stall"));
+            assert!(at >= wake - 1 + THRESHOLD, "cpus={cpus}: stall at {at}");
+        }
     }
 
     // The defect caught: a CPU that still dispatches, or one whose stamp slot
-    // does not exist yet, read as stalled while the system has work.
+    // does not exist yet, read as stalled while the system has work, at any
+    // CPU count and wherever the CPU lies in the sweep.
     #[test]
     fn a_recent_dispatch_or_a_missing_stamp_on_any_cpu_is_not_a_stall()
     {
-        let now = 10 * THRESHOLD;
-        let mut last_idle = 0;
-        assert!(!all_idle_tick(
-            now,
-            THRESHOLD,
-            false,
-            &mut last_idle,
-            [Some(1), Some(now - THRESHOLD + 1)]
-        ));
-        assert!(!all_idle_tick(
-            now,
-            THRESHOLD,
-            false,
-            &mut last_idle,
-            [Some(1), None]
-        ));
-        assert!(all_idle_tick(
-            now,
-            THRESHOLD,
-            false,
-            &mut last_idle,
-            [Some(1), Some(now - THRESHOLD)]
-        ));
+        for cpus in [2, CPU_SCAN_WINDOW, 200, 391]
+        {
+            for live in [0, CPU_SCAN_WINDOW - 1, CPU_SCAN_WINDOW, cpus - 1]
+            {
+                let live = live.min(cpus - 1);
+                let mut detector = Detector::new(cpus);
+                let dispatching = detector.first_stall(
+                    1,
+                    10 * THRESHOLD,
+                    |_, _| true,
+                    |now, cpu| Some(if cpu == live { now } else { 1 }),
+                );
+                assert_eq!(dispatching, None, "cpus={cpus} live={live}");
+                let mut detector = Detector::new(cpus);
+                let missing = detector.first_stall(
+                    1,
+                    10 * THRESHOLD,
+                    |_, _| true,
+                    |_, cpu| if cpu == live { None } else { Some(1) },
+                );
+                assert_eq!(missing, None, "cpus={cpus} missing={live}");
+            }
+        }
+    }
+
+    // The defect caught: a sweep whose answers are not reset when it starts
+    // again, so work seen once keeps the system from ever reading idle, and a
+    // system that goes idle after work, every dispatch stamp then stale, is
+    // reported as a stall.
+    #[test]
+    fn a_system_idle_again_after_work_is_not_a_stall()
+    {
+        for cpus in [4, 200, 391]
+        {
+            let idle_from = 2 * THRESHOLD;
+            let mut detector = Detector::new(cpus);
+            let stall = detector.first_stall(
+                1,
+                20 * THRESHOLD,
+                |now, cpu| now < idle_from && cpu == cpus - 1,
+                |now, _| Some(now.min(idle_from)),
+            );
+            assert_eq!(stall, None, "cpus={cpus}");
+        }
+    }
+
+    // The defect caught: at up to CPU_SCAN_WINDOW CPUs, a tick whose verdict or
+    // recorded idle tick differs from one walk of every CPU, the detector's
+    // behaviour before the sweep.
+    #[test]
+    fn up_to_a_window_of_cpus_every_tick_decides_as_one_walk_of_every_cpu()
+    {
+        for cpus in [1, 4, CPU_SCAN_WINDOW]
+        {
+            let mut detector = Detector::new(cpus);
+            let mut last_idle = 0;
+            // Work on CPU (now / 7) % cpus over spans of 4 * THRESHOLD ticks
+            // in every eighth, dispatched until 3 * THRESHOLD ticks into its
+            // span.
+            let work = |now: u64, cpu: usize| {
+                now % (8 * THRESHOLD) < 4 * THRESHOLD && cpu == (now / 7) as usize % cpus
+            };
+            let stamp =
+                |now: u64, _cpu: usize| Some(now.min(now - now % (8 * THRESHOLD) + 3 * THRESHOLD));
+            for now in 1..=32 * THRESHOLD
+            {
+                let swept = detector.tick(now, work, stamp);
+                let walked = whole_walk(
+                    now,
+                    &mut last_idle,
+                    cpus,
+                    |cpu| work(now, cpu),
+                    |cpu| stamp(now, cpu),
+                );
+                assert_eq!(swept, walked, "cpus={cpus} now={now}");
+                assert_eq!(detector.last_idle, last_idle, "cpus={cpus} now={now}");
+            }
+        }
+    }
+
+    // The defect caught: a sweep that skips a CPU or reads one twice, so a
+    // CPU's work or stamp goes unread, or that never ends; or a range of up to
+    // CPU_SCAN_WINDOW CPUs not read whole at every call.
+    #[test]
+    fn a_sweep_reads_every_cpu_of_its_range_once()
+    {
+        for (first, cpus) in [
+            (0, 1),
+            (0, CPU_SCAN_WINDOW),
+            (1, CPU_SCAN_WINDOW + 1),
+            (0, 200),
+            (1, 391),
+            (0, 8192),
+        ]
+        {
+            let windows = (cpus - first).div_ceil(CPU_SCAN_WINDOW);
+            let mut cursor = first;
+            for lap in 0..2
+            {
+                let mut read = vec![0u32; cpus];
+                for index in 0..windows
+                {
+                    let (window, next) = sweep_window(cursor, first, cpus);
+                    assert!(window.len() <= CPU_SCAN_WINDOW);
+                    assert_eq!(
+                        next == first,
+                        index + 1 == windows,
+                        "first={first} cpus={cpus}"
+                    );
+                    for cpu in window
+                    {
+                        read[cpu] += 1;
+                    }
+                    cursor = next;
+                }
+                for (cpu, &count) in read.iter().enumerate()
+                {
+                    let expected = u32::from(cpu >= first);
+                    assert_eq!(
+                        count, expected,
+                        "first={first} cpus={cpus} lap={lap} cpu={cpu}"
+                    );
+                }
+            }
+            // A cursor outside the range starts the sweep again.
+            assert_eq!(sweep_window(cpus, first, cpus).0.start, first);
+        }
     }
 }
 
@@ -10089,9 +10701,10 @@ mod all_idle_tests
 mod idle_pull_tests
 {
     use super::{
-        Backlog, IdlePullMemory, IdlePullStep, IdlePullView, IdleScan,
-        LOAD_BALANCE_IMBALANCE_THRESHOLD, PullOutcome, PullRule, exceeds_imbalance, idle_pull_step,
-        idle_pull_tick, idle_scan,
+        Backlog, CPU_SCAN_WINDOW, IdlePullMemory, IdlePullStep, IdlePullView, IdleScan,
+        LOAD_BALANCE_IMBALANCE_THRESHOLD, MAX_CPUS, PullOutcome, PullRule, ScanWindow,
+        balance_cursor_after_pull, cpu_after, empty_queue_victim, exceeds_imbalance,
+        idle_pull_step, idle_pull_tick, idle_scan, initial_scan_cursor,
     };
 
     /// A scan whose most-loaded CPU is `heaviest` and whose first CPU with a
@@ -10179,6 +10792,10 @@ mod idle_pull_tests
         /// lock-free sample and its pull, so the pull's re-check reads a new
         /// backlog episode.
         relink_on_pull: Option<usize>,
+        /// The loads read, one per read.
+        load_reads: core::cell::Cell<usize>,
+        /// The most loads one tick read.
+        most_reads_in_a_tick: usize,
     }
 
     impl Model
@@ -10193,22 +10810,48 @@ mod idle_pull_tests
                 moved_from: None,
                 sibling_busy: false,
                 relink_on_pull: None,
+                load_reads: core::cell::Cell::new(0),
+                most_reads_in_a_tick: 0,
             }
+        }
+
+        /// `count` CPUs, all idle but those of `busy_cpus`.
+        fn idle_but(count: usize, busy_cpus: &[(usize, Cpu)]) -> Self
+        {
+            let mut cpus = vec![IDLE; count];
+            for &(cpu, state) in busy_cpus
+            {
+                cpus[cpu] = state;
+            }
+            Self::new(&cpus)
         }
 
         /// Run idle ticks of `this_cpu` until a thread moves or `ticks` have
         /// passed; the tick (counted from 1) whose pull moved one, if any.
         fn ticks_to_pull(&mut self, this_cpu: usize, ticks: usize) -> Option<usize>
         {
+            self.ticks_to_pull_from(this_cpu, 0, ticks)
+        }
+
+        /// As [`Self::ticks_to_pull`], with `this_cpu`'s cursor at `cursor`.
+        fn ticks_to_pull_from(
+            &mut self,
+            this_cpu: usize,
+            cursor: usize,
+            ticks: usize,
+        ) -> Option<usize>
+        {
             let count = self.cpus.len();
             let mut memory = IdlePullMemory {
                 candidate: None,
                 held: false,
-                cursor: 0,
+                cursor,
             };
             for tick in 1..=ticks
             {
+                self.load_reads.set(0);
                 memory = idle_pull_tick(self, this_cpu, count, memory);
+                self.most_reads_in_a_tick = self.most_reads_in_a_tick.max(self.load_reads.get());
                 if self.moved_from.is_some()
                 {
                     return Some(tick);
@@ -10229,6 +10872,7 @@ mod idle_pull_tests
     {
         fn load(&self, cpu: usize) -> u32
         {
+            self.load_reads.set(self.load_reads.get() + 1);
             let settled = self.settled_load(cpu);
             if self.raised == Some(cpu)
             {
@@ -10919,6 +11563,377 @@ mod idle_pull_tests
         assert_eq!(model.moved_from, Some(1));
         assert!(pulled_at.is_some_and(|tick| tick <= 2));
     }
+
+    /// CPU counts at and past the window's edge, where an idle CPU's window
+    /// holds every other CPU (`CPU_SCAN_WINDOW + 1`) and where it narrows.
+    const WINDOWED_COUNTS: [usize; 3] = [
+        CPU_SCAN_WINDOW + 1,
+        CPU_SCAN_WINDOW + 2,
+        3 * CPU_SCAN_WINDOW + 7,
+    ];
+
+    /// Cursors to start an idle CPU at: the first CPU, `this_cpu` itself, and
+    /// the CPUs at and after `target`, the last of which reads `target` last.
+    fn cursors(count: usize, this_cpu: usize, target: usize) -> [usize; 4]
+    {
+        [0, this_cpu, target, cpu_after(target, count)]
+    }
+
+    // The defect caught: an idle tick that reads every other CPU, so its cost
+    // grows with the CPU count, or a tick that finds no backlog in its window
+    // and keeps its cursor, so a backlog past the window is never recorded.
+    // The bound of core/kernel/docs/scheduler.md § Load Balancing: two ticks,
+    // plus one per window read ahead of the backlog's,
+    // ceil((n - 1) / CPU_SCAN_WINDOW) - 1 at most.
+    #[test]
+    fn a_lone_backlog_past_the_window_is_pulled_within_one_tick_per_window()
+    {
+        for count in WINDOWED_COUNTS
+        {
+            let bound = 2 + (count - 1).div_ceil(CPU_SCAN_WINDOW) - 1;
+            for this_cpu in [0, count / 2, count - 1]
+            {
+                for target in [0, 1, count / 3, count - 2, count - 1]
+                {
+                    if target == this_cpu
+                    {
+                        continue;
+                    }
+                    for cursor in cursors(count, this_cpu, target)
+                    {
+                        let mut model = Model::idle_but(count, &[(target, busy(0, 1))]);
+                        let ticks = model.ticks_to_pull_from(this_cpu, cursor, bound);
+                        let case = format!("n={count} cpu={this_cpu} at={target} from={cursor}");
+                        assert!(ticks.is_some(), "{case}");
+                        assert_eq!(model.moved_from, Some(target), "{case}");
+                        assert!(model.most_reads_in_a_tick <= CPU_SCAN_WINDOW, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    // The defect caught: a load past the threshold outside an idle CPU's
+    // window left for good, or found later than one tick per window.
+    #[test]
+    fn a_lone_imbalance_past_the_window_is_pulled_within_one_tick_per_window()
+    {
+        let heavy = busy(LOAD_BALANCE_IMBALANCE_THRESHOLD, 1);
+        for count in WINDOWED_COUNTS
+        {
+            let bound = (count - 1).div_ceil(CPU_SCAN_WINDOW);
+            for this_cpu in [0, count - 1]
+            {
+                for target in [count / 3, count - 2]
+                {
+                    for cursor in cursors(count, this_cpu, target)
+                    {
+                        let mut model = Model::idle_but(count, &[(target, heavy)]);
+                        let case = format!("n={count} cpu={this_cpu} at={target} from={cursor}");
+                        assert!(
+                            model.ticks_to_pull_from(this_cpu, cursor, bound).is_some(),
+                            "{case}"
+                        );
+                        assert_eq!(model.moved_from, Some(target), "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    // The defect caught: an idle CPU in a boot whose window holds every other
+    // CPU moving its cursor on a tick that found nothing, which reorders its
+    // scan (and so the CPU its ties go to) from the order the bound counts.
+    #[test]
+    fn a_tick_that_finds_nothing_keeps_the_cursor_when_the_window_holds_every_cpu()
+    {
+        let count = CPU_SCAN_WINDOW + 1;
+        let mut model = Model::idle_but(count, &[]);
+        let memory = IdlePullMemory {
+            candidate: None,
+            held: false,
+            cursor: 5,
+        };
+        assert_eq!(idle_pull_tick(&mut model, 4, count, memory), memory);
+        assert_eq!(model.load_reads.get(), count - 1);
+    }
+
+    // The defect caught: a busy CPU with an empty queue whose scan reads every
+    // CPU, so its tick grows with the CPU count, or whose cursor does not move
+    // on a miss (try_pull_balance stores ScanWindow::moved_cursor), so an
+    // imbalance past its window is never found: the bound is one tick per
+    // window.
+    #[test]
+    fn an_empty_busy_cpu_finds_a_lone_imbalance_within_one_tick_per_window()
+    {
+        let heavy_load = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
+        for count in [
+            2,
+            CPU_SCAN_WINDOW + 1,
+            CPU_SCAN_WINDOW + 2,
+            3 * CPU_SCAN_WINDOW + 7,
+            MAX_CPUS,
+        ]
+        {
+            let bound = (count - 1).div_ceil(CPU_SCAN_WINDOW);
+            for this_cpu in [0, count - 1]
+            {
+                let heavy = if this_cpu == 0 { count - 1 } else { 0 };
+                for start in cursors(count, this_cpu, heavy)
+                {
+                    let mut cursor = start;
+                    let mut found = None;
+                    for _ in 0..bound
+                    {
+                        let window = ScanWindow::new(count, cursor, Some(this_cpu));
+                        let reads = core::cell::Cell::new(0usize);
+                        let pick = empty_queue_victim(window, |cpu| {
+                            reads.set(reads.get() + 1);
+                            if cpu == heavy { heavy_load } else { 0 }
+                        });
+                        assert!(reads.get() <= CPU_SCAN_WINDOW);
+                        match pick
+                        {
+                            Ok(cpu) =>
+                            {
+                                found = Some(cpu);
+                                break;
+                            }
+                            Err(moved) => cursor = moved.unwrap_or(cursor),
+                        }
+                    }
+                    assert_eq!(found, Some(heavy), "n={count} cpu={this_cpu} from={start}");
+                }
+            }
+        }
+    }
+    // The defect caught: a busy CPU whose empty-queue scan picks, at every
+    // tick, a CPU past the threshold with nothing pullable on it, its cursor
+    // kept on that window or moved past CPUs it did not take, so a pullable
+    // imbalance elsewhere is never found (empty_queue_victim takes the first
+    // CPU past the threshold, and balance_cursor_after_pull moves the cursor
+    // past such a victim); or a boot the window does not narrow storing a
+    // cursor it never stored. Every pair of a pinned CPU and a lighter
+    // pullable one is tried.
+    #[test]
+    fn a_pinned_heavy_cpu_does_not_hide_a_pullable_imbalance_from_an_empty_busy_cpu()
+    {
+        let pinned_load = LOAD_BALANCE_IMBALANCE_THRESHOLD + 2;
+        let pullable_load = LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
+        for (count, pinned_step) in [
+            (CPU_SCAN_WINDOW + 2, 1),
+            (200, 1),
+            (3 * CPU_SCAN_WINDOW + 7, 7),
+        ]
+        {
+            // One tick per window, and one for the pinned CPU.
+            let bound = (count - 1).div_ceil(CPU_SCAN_WINDOW) + 1;
+            for this_cpu in [0, count / 2]
+            {
+                for pinned in (0..count)
+                    .step_by(pinned_step)
+                    .filter(|&cpu| cpu != this_cpu)
+                {
+                    for pullable in (0..count).filter(|&cpu| cpu != this_cpu && cpu != pinned)
+                    {
+                        let mut cursor = initial_scan_cursor(this_cpu, count, Some(this_cpu));
+                        let mut found = None;
+                        for _ in 0..bound
+                        {
+                            let window = ScanWindow::new(count, cursor, Some(this_cpu));
+                            let load = |cpu: usize| match cpu
+                            {
+                                cpu if cpu == pinned => pinned_load,
+                                cpu if cpu == pullable => pullable_load,
+                                _ => 0,
+                            };
+                            match empty_queue_victim(window, load)
+                            {
+                                Ok(cpu) if cpu == pullable =>
+                                {
+                                    found = Some(cpu);
+                                    break;
+                                }
+                                Ok(cpu) =>
+                                {
+                                    let outcome = PullOutcome::NothingPullable;
+                                    let next = balance_cursor_after_pull(window, cpu, outcome);
+                                    cursor = next.unwrap_or(cursor);
+                                }
+                                Err(moved) => cursor = moved.unwrap_or(cursor),
+                            }
+                        }
+                        assert_eq!(
+                            found,
+                            Some(pullable),
+                            "n={count} cpu={this_cpu} pinned={pinned} pullable={pullable}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let this_cpu = 0;
+        let whole = ScanWindow::new(CPU_SCAN_WINDOW + 1, 0, Some(this_cpu));
+        assert_eq!(
+            balance_cursor_after_pull(whole, 5, PullOutcome::NothingPullable),
+            None
+        );
+        let narrow = ScanWindow::new(3 * CPU_SCAN_WINDOW, 0, Some(this_cpu));
+        for outcome in [
+            PullOutcome::Moved,
+            PullOutcome::RuleFailed,
+            PullOutcome::Deferred,
+        ]
+        {
+            assert_eq!(balance_cursor_after_pull(narrow, 5, outcome), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_window_tests
+{
+    use super::{CPU_SCAN_WINDOW, MAX_CPUS, ScanWindow, initial_scan_cursor};
+
+    /// CPU counts on both sides of the window's edge, for a scan that leaves
+    /// its own CPU out and one that does not.
+    const COUNTS: [usize; 7] = [
+        1,
+        2,
+        CPU_SCAN_WINDOW,
+        CPU_SCAN_WINDOW + 1,
+        CPU_SCAN_WINDOW + 2,
+        3 * CPU_SCAN_WINDOW + 7,
+        MAX_CPUS,
+    ];
+
+    /// The CPUs a scan of `count` CPUs that leaves `own` out may read.
+    fn others(count: usize, own: Option<usize>) -> usize
+    {
+        count - usize::from(own.is_some())
+    }
+
+    // The defect caught: a window that reads past CPU_SCAN_WINDOW CPUs (a scan
+    // whose cost grows with the CPU count), reads its own CPU, or whose next
+    // window leaves a gap after it, so successive scans do not read every
+    // CPU within ceil(m / CPU_SCAN_WINDOW) scans, the bound every windowed
+    // scan's tick count rests on.
+    #[test]
+    fn successive_windows_read_every_cpu_within_one_scan_per_window()
+    {
+        for count in COUNTS
+        {
+            let owns = [None, Some(0), Some(count / 2), Some(count - 1)];
+            let starts: Vec<usize> = if count <= 3 * CPU_SCAN_WINDOW + 7
+            {
+                (0..count).collect()
+            }
+            else
+            {
+                (0..count).step_by(97).chain([count - 1]).collect()
+            };
+            for own in owns
+            {
+                let scans = others(count, own).div_ceil(CPU_SCAN_WINDOW);
+                for &start in &starts
+                {
+                    let mut seen = vec![0u32; count];
+                    let mut cursor = start;
+                    for _ in 0..scans
+                    {
+                        let window = ScanWindow::new(count, cursor, own);
+                        let mut held = 0;
+                        for cpu in window.cpus()
+                        {
+                            seen[cpu] += 1;
+                            held += 1;
+                        }
+                        assert!(held <= CPU_SCAN_WINDOW);
+                        cursor = window.next();
+                    }
+                    let case = format!("n={count} own={own:?} start={start}");
+                    for (cpu, &times) in seen.iter().enumerate()
+                    {
+                        assert_eq!(times == 0, Some(cpu) == own, "{case} cpu={cpu}");
+                    }
+                }
+            }
+        }
+    }
+
+    // The defect caught: a boot no window narrows (up to CPU_SCAN_WINDOW CPUs,
+    // or one more for a scan that leaves its own CPU out) scanned otherwise than
+    // every CPU in index order from its cursor, its cursor moved by a scan, or
+    // its cursors started anywhere but CPU 0, any of which changes the CPU a
+    // tie goes to from the full scan's.
+    #[test]
+    fn a_boot_no_window_narrows_is_read_whole_and_keeps_its_cursor_at_zero()
+    {
+        for (count, own) in [
+            (CPU_SCAN_WINDOW, None),
+            (CPU_SCAN_WINDOW + 1, Some(7)),
+            (2, Some(1)),
+            (1, None),
+        ]
+        {
+            let window = ScanWindow::new(count, 0, own);
+            let read: Vec<usize> = window.cpus().collect();
+            let every: Vec<usize> = (0..count).filter(|&cpu| Some(cpu) != own).collect();
+            assert_eq!(read, every);
+            assert!(window.covers_all());
+            assert_eq!(window.moved_cursor(), None);
+            for cpu in [0, count - 1]
+            {
+                assert_eq!(initial_scan_cursor(cpu, count, own.map(|_| cpu)), 0);
+            }
+        }
+    }
+
+    // The defect caught: every CPU of a large boot starting its scans at the
+    // same cursor, so all idle CPUs read the same window on the same tick and
+    // contend on its CPUs' locks while the rest of the CPUs wait a window per
+    // tick: the first windows of the CPUs read each CPU equally often.
+    #[test]
+    fn the_first_windows_of_a_large_boot_read_each_cpu_equally_often()
+    {
+        for count in [CPU_SCAN_WINDOW + 2, 3 * CPU_SCAN_WINDOW + 7, MAX_CPUS]
+        {
+            let mut pull_reads = vec![0usize; count];
+            let mut wake_reads = vec![0usize; count];
+            for cpu in 0..count
+            {
+                let own = Some(cpu);
+                for read in ScanWindow::new(count, initial_scan_cursor(cpu, count, own), own).cpus()
+                {
+                    pull_reads[read] += 1;
+                }
+                for read in
+                    ScanWindow::new(count, initial_scan_cursor(cpu, count, None), None).cpus()
+                {
+                    wake_reads[read] += 1;
+                }
+            }
+            assert!(
+                pull_reads.iter().all(|&n| n == CPU_SCAN_WINDOW),
+                "n={count}"
+            );
+            assert!(
+                wake_reads.iter().all(|&n| n == CPU_SCAN_WINDOW),
+                "n={count}"
+            );
+        }
+    }
+
+    // The defect caught: a cursor past the CPU count (a stale value, or the CPU
+    // after the last) read as a CPU index rather than wrapped.
+    #[test]
+    fn a_cursor_past_the_count_wraps()
+    {
+        let count = 3 * CPU_SCAN_WINDOW;
+        let wrapped = ScanWindow::new(count, count + 5, None);
+        assert_eq!(wrapped.cpus().next(), Some(5));
+    }
 }
 
 #[cfg(test)]
@@ -10991,16 +12006,16 @@ mod rt_push_tests
         None
     }
 
-    // Defect caught: a scan that reads more than RT_PUSH_SCAN_CPUS CPUs, so a
+    // Defect caught: a scan that reads more than CPU_SCAN_WINDOW CPUs, so a
     // tick's cost grows with the CPU count, or a cursor that skips or
     // revisits CPUs, so a CPU running lower is not found within
-    // ceil((n - 1) / RT_PUSH_SCAN_CPUS) ticks, the bound scheduler.md states.
+    // ceil((n - 1) / CPU_SCAN_WINDOW) ticks, the bound scheduler.md states.
     #[test]
     fn missed_scans_read_every_other_cpu_within_one_tick_per_window()
     {
-        for cpu_count in [2, RT_PUSH_SCAN_CPUS + 1, RT_PUSH_SCAN_CPUS + 2, MAX_CPUS]
+        for cpu_count in [2, CPU_SCAN_WINDOW + 1, CPU_SCAN_WINDOW + 2, MAX_CPUS]
         {
-            let bound = (cpu_count - 1).div_ceil(RT_PUSH_SCAN_CPUS);
+            let bound = (cpu_count - 1).div_ceil(CPU_SCAN_WINDOW);
             let this_cpus = [0, cpu_count / 2, cpu_count - 1];
             for this_cpu in this_cpus
             {
@@ -11021,7 +12036,7 @@ mod rt_push_tests
     #[test]
     fn one_scan_reads_at_most_one_window_and_moves_past_it()
     {
-        let cpu_count = 3 * RT_PUSH_SCAN_CPUS;
+        let cpu_count = 3 * CPU_SCAN_WINDOW;
         let reads = core::cell::Cell::new(0usize);
         let above = run_queue::level_rank(RT_PRIORITY_MIN + 1);
         let scan = rt_push_target(
@@ -11036,18 +12051,18 @@ mod rt_push_tests
             |_| 0,
             |_| 0,
         );
-        assert_eq!(reads.get(), RT_PUSH_SCAN_CPUS);
+        assert_eq!(reads.get(), CPU_SCAN_WINDOW);
         assert_eq!(
             scan,
             PushScan {
                 target: None,
-                next: RT_PUSH_SCAN_CPUS + 1
+                next: CPU_SCAN_WINDOW + 1
             }
         );
         // A CPU running lower past the window is found by the next scan.
         let fair = run_queue::level_rank(syscall::PRIORITY_MIN);
         let rank = |cpu: usize| {
-            if cpu == 2 * RT_PUSH_SCAN_CPUS
+            if cpu == 2 * CPU_SCAN_WINDOW
             {
                 fair
             }
@@ -11067,7 +12082,7 @@ mod rt_push_tests
             |_| 0,
             |_| 0,
         );
-        assert_eq!(second.target, Some(2 * RT_PUSH_SCAN_CPUS));
+        assert_eq!(second.target, Some(2 * CPU_SCAN_WINDOW));
     }
 
     // Defect caught: a push to a CPU whose effective rank is at or above the
@@ -11109,8 +12124,9 @@ mod placement_tests
 {
     use super::run_queue::{CpuRanks, level_rank};
     use super::{
-        AFFINITY_ANY, IDLE_PRIORITY, RT_PRIORITY_MIN, SyncDecision, WakeHint, WakeView,
-        WakerMobility, least_loaded_cpu, link_cpu, place_wake, reply_wake_exclusion,
+        AFFINITY_ANY, CPU_SCAN_WINDOW, IDLE_PRIORITY, LOAD_BALANCE_IMBALANCE_THRESHOLD,
+        RT_PRIORITY_MIN, SyncDecision, WakeHint, WakeView, WakerMobility, least_loaded_cpu,
+        link_cpu, place_wake, reply_wake_exclusion,
     };
 
     // The defect caught: a link that keeps the waker's target after a
@@ -11201,6 +12217,11 @@ mod placement_tests
         ranks: Vec<CpuRanks>,
         waker_reads: core::cell::Cell<u32>,
         syncs: core::cell::Cell<(u32, u32)>,
+        /// The waker CPU's wake cursor, and how often the placement stored it.
+        cursor: core::cell::Cell<usize>,
+        cursor_stores: core::cell::Cell<u32>,
+        /// The loads and ranks the placement read, one each per read.
+        cpu_reads: core::cell::Cell<usize>,
     }
 
     impl Wake
@@ -11226,6 +12247,9 @@ mod placement_tests
                 ranks: vec![runs(IDLE_PRIORITY); cpus],
                 waker_reads: core::cell::Cell::new(0),
                 syncs: core::cell::Cell::new((0, 0)),
+                cursor: core::cell::Cell::new(0),
+                cursor_stores: core::cell::Cell::new(0),
+                cpu_reads: core::cell::Cell::new(0),
             }
         }
 
@@ -11282,15 +12306,26 @@ mod placement_tests
         }
         fn load(&self, cpu: usize) -> u32
         {
+            self.cpu_reads.set(self.cpu_reads.get() + 1);
             self.loads[cpu]
         }
         fn ranks(&self, cpu: usize) -> CpuRanks
         {
+            self.cpu_reads.set(self.cpu_reads.get() + 1);
             self.ranks[cpu]
         }
         fn busy_siblings(&self, _cpu: usize) -> u32
         {
             0
+        }
+        fn wake_cursor(&self) -> usize
+        {
+            self.cursor.get()
+        }
+        fn set_wake_cursor(&self, cpu: usize)
+        {
+            self.cursor_stores.set(self.cursor_stores.get() + 1);
+            self.cursor.set(cpu);
         }
         fn note_sync(&self, decision: SyncDecision)
         {
@@ -11720,6 +12755,92 @@ mod placement_tests
         assert!(!outranks(20, RT_PRIORITY_MIN));
         assert!(outranks(RT_PRIORITY_MIN + 3, RT_PRIORITY_MIN + 2));
         assert!(!outranks(RT_PRIORITY_MIN + 3, RT_PRIORITY_MIN + 3));
+    }
+
+    /// Place `wakes` successive wakes of `wake` with no hint, each reading at
+    /// most `reads` loads and ranks; the CPUs they chose.
+    fn successive_placements(wake: &Wake, wakes: usize, reads: usize) -> Vec<usize>
+    {
+        (0..wakes)
+            .map(|_| {
+                wake.cpu_reads.set(0);
+                let cpu = wake.place(None, WakeHint::None);
+                assert!(
+                    wake.cpu_reads.get() <= reads,
+                    "{} reads",
+                    wake.cpu_reads.get()
+                );
+                cpu
+            })
+            .collect()
+    }
+
+    // The defect caught: a fair wake's least-load scan that reads every CPU,
+    // so the wake path's cost grows with the CPU count, or a wake cursor that
+    // does not move, so no wake from this CPU ever sees the idle CPU past its
+    // first window.
+    #[test]
+    fn a_fair_wake_reads_one_window_and_the_next_wake_reads_the_next()
+    {
+        let count = 3 * CPU_SCAN_WINDOW;
+        let idle = 2 * CPU_SCAN_WINDOW + 5;
+        let mut wake = Wake::new(count, 7, 1);
+        wake.loads = vec![4; count];
+        wake.loads[7] = 4 + LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
+        wake.loads[idle] = 0;
+        // One load per CPU of the window, and the preferred CPU's.
+        let picks = successive_placements(&wake, 3, CPU_SCAN_WINDOW + 1);
+        assert_eq!(picks, vec![0, CPU_SCAN_WINDOW, idle]);
+        assert_eq!(wake.cursor.get(), 0);
+        assert_eq!(wake.cursor_stores.get(), 3);
+    }
+
+    // The defect caught: an RT wake's lowest-rank scan that reads every CPU,
+    // or a cursor that does not move, so a CPU running lower outside the first
+    // window is never a wake's pick (the RT push then the only way there).
+    #[test]
+    fn an_rt_wake_reads_one_window_and_the_next_wake_reads_the_next()
+    {
+        let count = 3 * CPU_SCAN_WINDOW;
+        let lower = 2 * CPU_SCAN_WINDOW + 9;
+        let mut wake = Wake::new(count, 3, 1);
+        wake.level = RT_PRIORITY_MIN + 1;
+        wake.ranks = vec![runs(RT_PRIORITY_MIN + 2); count];
+        wake.ranks[lower] = runs(FAIR);
+        // A rank and a load per CPU of the window, and the preferred CPU's rank.
+        let picks = successive_placements(&wake, 3, 2 * CPU_SCAN_WINDOW + 1);
+        assert_eq!(picks, vec![0, CPU_SCAN_WINDOW, lower]);
+        assert_eq!(wake.cursor_stores.get(), 3);
+    }
+
+    // The defect caught: a boot of up to CPU_SCAN_WINDOW CPUs placed otherwise
+    // than by the full scan in index order (a tie to another CPU than the
+    // lowest), or a wake there that stores its cursor, a store the wake path
+    // did not make before the window.
+    #[test]
+    fn a_boot_no_window_narrows_is_placed_by_the_full_scan_with_no_cursor_store()
+    {
+        let count = CPU_SCAN_WINDOW;
+        let mut fair = Wake::new(count, 0, 0);
+        fair.loads = vec![4; count];
+        fair.loads[0] = 4 + LOAD_BALANCE_IMBALANCE_THRESHOLD + 1;
+        fair.loads[count - 2] = 0;
+        fair.loads[count - 1] = 0;
+        assert_eq!(
+            successive_placements(&fair, 2, count + 1),
+            vec![count - 2; 2]
+        );
+        assert_eq!(fair.cursor_stores.get(), 0);
+
+        let mut rt = Wake::new(count, 0, 0);
+        rt.level = RT_PRIORITY_MIN;
+        rt.ranks = vec![runs(RT_PRIORITY_MIN + 1); count];
+        rt.ranks[count - 1] = runs(FAIR);
+        assert_eq!(
+            successive_placements(&rt, 2, 2 * count + 1),
+            vec![count - 1; 2]
+        );
+        assert_eq!(rt.cursor_stores.get(), 0);
     }
 }
 

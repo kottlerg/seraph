@@ -688,7 +688,21 @@ fn service_loop(service_ep: u64, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let msg = match unsafe { next_request(service_ep, &mut reply, ipc_buf) }
+        let got = unsafe { next_request(service_ep, &mut reply, ipc_buf) };
+        // The last turn's reply is sent, whether or not a request came: a
+        // partition grant whose reply did not reach its caller is retired
+        // before any request is served.
+        rt.grants.settle_delivery(
+            if reply.undelivered()
+            {
+                virtio_blk::Delivery::Lost
+            }
+            else
+            {
+                virtio_blk::Delivery::Delivered
+            },
+        );
+        let msg = match got
         {
             Ok(msg) => msg,
             Err(e) =>
@@ -1134,8 +1148,8 @@ fn handle_register_partition(msg: &IpcMessage, rt: &mut BlkRuntime, out: &mut Re
         return;
     };
 
-    // A failed derivation retires the grant, which no cap carries, so the
-    // table holds only grants some cap was minted for.
+    // A failed derivation retires the grant at once, since no cap carries
+    // it; the table holds only grants a delivered cap carries.
     let Ok(partition_cap) =
         syscall::cap_derive_badge(rt.service_ep, syscall::RIGHTS_EP_SEND_GRANT, badge)
     else
@@ -1145,10 +1159,14 @@ fn handle_register_partition(msg: &IpcMessage, rt: &mut BlkRuntime, out: &mut Re
         return;
     };
 
+    // The reply carries the grant's only cap: when it is not delivered, the
+    // send deletes the cap and the service loop's next turn retires the grant
+    // (`Grants::settle_delivery`).
     let reply = IpcMessage::builder(ipc::blk_errors::SUCCESS)
         .cap(partition_cap)
         .build();
     out.set_or_delete_caps(reply);
+    rt.grants.await_delivery(badge);
 }
 
 /// Handle a `BLK_GET_GEOMETRY` request: reply the logical block size and

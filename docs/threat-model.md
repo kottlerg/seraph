@@ -199,10 +199,6 @@ service executes as built, since procmgr verified it.
 - Each server's dispatcher checks its own labels, word counts, versions and badges; no shared layer
   checks them, and no review has yet covered every label of every service against this attacker. The
   audit of this section ([#680](https://github.com/kottlerg/seraph/issues/680)) is the first.
-- gdbstub's fault receiver retries a failed receive every 10 ms without `RecvGuard`
-  (`start_receiver` in `services/gdbstub/src/main.rs`), against [ipc-design.md](ipc-design.md)
-  § Receive-Failure Policy; only kernel-delivered faults reach its endpoint
-  ([#1534](https://github.com/kottlerg/seraph/issues/1534)).
 - No standard governs how a server reads a structure from memory a client lent it and can still
   write, so a check and a later read of the same bytes can see different values.
 

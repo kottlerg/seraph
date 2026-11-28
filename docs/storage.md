@@ -78,10 +78,12 @@ kernel (phase 7) mints Mmio caps from BootInfo.mmio_apertures and the root IRQ r
                       → init distributes copies via CONFIGURE_NAMESPACE
 ```
 
-The swap partition takes a shorter branch from the `REGISTER_PARTITION` step: vfsd keeps the
-partition cap virtio-blk returns, runs no fs driver on it, and hands a derivation of it to the
-holder of the `vfsd.swap` SEND on `GET_SWAP_PARTITION`, revoking the derivation it handed out
-before ([`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md)
+The swap partition takes a shorter branch from the `REGISTER_PARTITION` step: on each
+`GET_SWAP_PARTITION` from the holder of the `vfsd.swap` SEND, vfsd cuts off the grant it made
+before (revoke its derivations, retire its badge, delete the kept cap), registers the partition
+again as a new grant, runs no fs driver on it, and hands the caller a derivation of the new
+partition cap
+([`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md)
 § Label 14).
 
 The kernel half (BootInfo → Mmio mint → devmgr → driver binding)
@@ -189,7 +191,7 @@ label, or a filesystem UUID. The model is:
   only.
 - **The swap partition is never mounted.** It carries no filesystem: vfsd
   resolves it, by the statement's `swap` line or else on the boot disk by
-  the arch-neutral `SERAPH_SWAP` type GUID, on the first
+  the arch-neutral `SERAPH_SWAP` type GUID, on each
   `GET_SWAP_PARTITION` request, not at startup, and hands the swap
   service a raw partition cap on it. A boot with no swap partition boots
   as one with: the request then replies `NO_MOUNT`. The in-tree image
@@ -202,8 +204,10 @@ label, or a filesystem UUID. The model is:
   serves with the PCI location devmgr reports for its device
   (`QUERY_DEVICE_LOCATION`), and parses each disk's GPT: the primary, or, when the primary's
   header or entry array fails its CRC32 or `MyLBA` check or cannot be read, the backup at the
-  disk's last LBA, as UEFI 2.10 § 5.3.2 directs; vfsd writes neither copy. Before a runtime
-  `MOUNT` and the first `GET_SWAP_PARTITION` resolve their role, vfsd queries again from
+  disk's last LBA, as UEFI 2.10 § 5.3.2 directs, and the backup too when the primary's array
+  holds more used entries than vfsd keeps of one disk (`MAX_PARTITIONS`, 256, in
+  `services/vfsd/gpt`); vfsd writes neither copy. Before a runtime
+  `MOUNT` and each `GET_SWAP_PARTITION` resolve their role, vfsd queries again from
   the first ordinal not yet queried and holds each disk devmgr served
   since, a disk added or inserted again after startup among them, so a
   partition the statement names on such a disk is found. A disk neither
@@ -301,7 +305,7 @@ by structure. See
 
 ## fs ↔ block IPC Contract
 
-The contract between fs drivers and the block driver has three
+The contract between fs drivers and the block driver has four
 elements:
 
 - **Two-tier endpoint.** Whole-disk `blk_labels::MOUNT_AUTHORITY`-badged (vfsd;
@@ -321,10 +325,18 @@ elements:
   replies and then fails every later read or write with `DeviceFault`;
   if the device does not acknowledge the reset, the driver exits without
   replying and the cap is destroyed with it.
+- **Registered DMA regions.** A partition holder may instead register a
+  Memory cap as a region (`BLK_REGISTER_REGION`), which the driver keeps,
+  mapped for the device, and transfer through the region cap it gets back
+  (`BLK_READ_REGION`, `BLK_WRITE_REGION`) with no cap on each request,
+  until the region is unregistered (`BLK_UNREGISTER_REGION`, the end of
+  the holder's lease, or `BLK_RETIRE_PARTITION`, which whoever revokes a
+  partition cap sends on the cap it kept, ending that grant of the
+  partition for good).
 
 Authoritative wire shapes for `REGISTER_PARTITION`,
-`BLK_READ_INTO_MEMORY`, `BLK_WRITE_FROM_MEMORY`, and `BLK_GET_GEOMETRY`
-live in
+`BLK_READ_INTO_MEMORY`, `BLK_WRITE_FROM_MEMORY`, `BLK_GET_GEOMETRY`, and
+the region labels 6 to 10 live in
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
 The fs-driver side — `FS_MOUNT`, `FS_UNMOUNT`, `FS_SESSION`, `FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`,
 `FS_RELEASE_MEMORY`, `FS_RELEASE_ACK`, `FS_WRITE`, `FS_WRITE_MEMORY`,

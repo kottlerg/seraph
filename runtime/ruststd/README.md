@@ -1003,8 +1003,9 @@ pressure):
 
 - `memory_pressure()` reads the level (`MemoryPressure::Normal`, `Low` or `Critical`) from
   `QUERY_POOL_STATUS`.
-- `commit_draw_room_bytes()` reads memmgr's draw room, the free bytes a fault on a committed page
-  may take, from `QUERY_POOL_STATUS`; it is open at a demand chunk's bytes or more
+- `commit_draw_room()` reads memmgr's draw room, the free bytes a fault on a committed page may
+  take, and whether memmgr evicts for a committed draw found short since the room last opened, from
+  one `QUERY_POOL_STATUS` reply; the room is open at a demand chunk's bytes or more
   ([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md#commit) § Commit,
   Overcommit).
 - `memory_pressure_notification()` is the registered Notification, with every right, which memmgr

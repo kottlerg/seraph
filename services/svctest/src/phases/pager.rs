@@ -68,12 +68,32 @@
 //! chunk table in memmgr has six directory levels, and touches a spread of
 //! its chunks and its last one: each fault must find its chunk's entry, back
 //! it, and leave every other chunk's data in place.
+//!
+//! A phase of its own, **concurrent faults**, which runs after the swap
+//! phases ([`concurrent_faults`]), starts one `program-modes
+//! faultstorm` per CPU, at least two and at most eight, each with two threads
+//! on CPUs of their own, and has all of them fault fresh chunks at once for
+//! several rounds, every page checked to read zero when backed and to keep its
+//! tag; all then die together holding their last regions. Once they are gone
+//! the identity holds, no page of the pool is in no account beyond the
+//! phase's baseline, and nothing stays charged below svctest's node.
 
 use std::os::seraph::process::CommandExt;
 use std::os::seraph::startup_info;
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
+
+/// The concurrent-faults phase, which runs among the swap phases
+/// (`phases::all`): its baseline and its settle need memmgr's store and
+/// swapped total empty, which they are only once those phases have run.
+pub fn concurrent_faults() -> &'static [Phase]
+{
+    &[Phase {
+        name: CONCURRENT_PHASE,
+        run: demand_fault_concurrent_phase,
+    }]
+}
 
 pub fn phases() -> &'static [Phase]
 {
@@ -425,6 +445,156 @@ fn assert_ram_identity()
         kernel_reserved.saturating_add(pool_total),
         "RAM identity broken after demand paging: \
          system_ram={system_ram} kernel_reserved={kernel_reserved} pool_total={pool_total}"
+    );
+}
+
+/// The phase name [`demand_fault_concurrent_phase`] reports under.
+const CONCURRENT_PHASE: &str = "demand_fault_concurrent";
+
+/// Threads of each `faultstorm` process of [`demand_fault_concurrent_phase`].
+const CONCURRENT_THREADS: u32 = 2;
+
+/// Chunks each of those threads faults per round.
+const CONCURRENT_CHUNKS: u64 = 16;
+
+/// Rounds of [`demand_fault_concurrent_phase`]; each after the first faults a
+/// region registered for it.
+const CONCURRENT_ROUNDS: u32 = 4;
+
+/// One `faultstorm` process of [`demand_fault_concurrent_phase`].
+struct Storming
+{
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::process::ChildStdout,
+}
+
+impl Storming
+{
+    /// Spawn one process whose main thread is pinned to `cpu` modulo the CPUs
+    /// online, in `verify`.
+    fn spawn(cpu: u32) -> Self
+    {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(super::PROGRAM_MODES_PATH)
+            .args([
+                "faultstorm",
+                &cpu.to_string(),
+                &CONCURRENT_CHUNKS.to_string(),
+                &CONCURRENT_THREADS.to_string(),
+                "verify",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("{CONCURRENT_PHASE}: spawn faultstorm for CPU {cpu}: {e}"));
+        let stdin = child.stdin.take().expect("faultstorm stdin pipe");
+        let stdout = child.stdout.take().expect("faultstorm stdout pipe");
+        Self {
+            child,
+            stdin,
+            stdout,
+        }
+    }
+
+    /// Send `byte`.
+    fn send(&mut self, byte: u8)
+    {
+        use std::io::Write;
+
+        self.stdin
+            .write_all(&[byte])
+            .and_then(|()| self.stdin.flush())
+            .unwrap_or_else(|e| panic!("{CONCURRENT_PHASE}: send {:?}: {e}", char::from(byte)));
+    }
+
+    /// Read one byte, which must be `byte`; a process that ended instead is
+    /// reported with its exit status, whose code names its failure
+    /// (services/fixtures/program-modes/README.md § faultstorm).
+    fn expect(&mut self, byte: u8)
+    {
+        use std::io::Read;
+
+        let mut got = [0u8; 1];
+        if self.stdout.read_exact(&mut got).is_err()
+        {
+            let status = self.child.wait();
+            panic!(
+                "{CONCURRENT_PHASE}: faultstorm ended before {:?}: {status:?}",
+                char::from(byte)
+            );
+        }
+        let [answer] = got;
+        assert_eq!(
+            answer,
+            byte,
+            "{CONCURRENT_PHASE}: faultstorm answered {:?}, not {:?}",
+            char::from(answer),
+            char::from(byte)
+        );
+    }
+}
+
+/// Several processes, each with several threads, fault fresh chunks at once
+/// and die together holding what they backed; memmgr's accounts must return
+/// to the phase's baseline. Each round starts only once every process answered
+/// its region ready, so the rounds of all of them overlap.
+fn demand_fault_concurrent_phase(_: &Caps)
+{
+    let cpus = syscall::system_info(syscall_abi::SystemInfoType::CpuCount as u64)
+        .ok()
+        .and_then(|n| u32::try_from(n).ok())
+        .expect("demand_fault_concurrent: CPU count");
+    let procs = cpus.clamp(2, 8);
+    let baseline = super::swap::phase_baseline(CONCURRENT_PHASE);
+    let mut storm: Vec<Storming> = (0..procs).map(Storming::spawn).collect();
+    for p in &mut storm
+    {
+        p.expect(b'r');
+    }
+    for round in 0..CONCURRENT_ROUNDS
+    {
+        if round > 0
+        {
+            for p in &mut storm
+            {
+                p.send(b'n');
+            }
+            for p in &mut storm
+            {
+                p.expect(b'r');
+            }
+        }
+        for p in &mut storm
+        {
+            p.send(b'g');
+        }
+        for p in &mut storm
+        {
+            p.expect(b'd');
+        }
+    }
+    for p in &mut storm
+    {
+        p.send(b'x');
+    }
+    for (i, mut p) in storm.into_iter().enumerate()
+    {
+        drop(p.stdin);
+        let status = p
+            .child
+            .wait()
+            .unwrap_or_else(|e| panic!("{CONCURRENT_PHASE}: wait for process {i}: {e}"));
+        assert!(
+            status.success(),
+            "{CONCURRENT_PHASE}: process {i} exited: {status}"
+        );
+    }
+    super::swap::settle(CONCURRENT_PHASE, Some(&baseline));
+    std::os::seraph::log!(
+        "demand_fault_concurrent phase passed: procs={procs} threads={CONCURRENT_THREADS} \
+         rounds={CONCURRENT_ROUNDS} chunks={CONCURRENT_CHUNKS}"
     );
 }
 

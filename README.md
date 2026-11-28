@@ -127,6 +127,8 @@ Overall project design documents live in [`docs/`](docs/):
   branch and PR workflow, CI gating, release production
 - [Testing](docs/testing.md) — tier taxonomy, marker format, per-program tester protocol,
   sysroot layout, gating
+- [Performance](docs/performance.md) — measurement method, cost model, budgets as relations, and
+  the benchmark line each performance claim rests on
 - [Release Notes](docs/releases/README.md) — per-tag notes catalogue, naming,
   source-of-truth discipline, workflow integration
 

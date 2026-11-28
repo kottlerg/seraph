@@ -1,23 +1,93 @@
-# Host-mode bands of the x86_64 benchmarks at 4 CPUs (KVM, release build): three times
-# the larger spread of each benchmark's p50 over two 5-run calibrations on the reference host,
-# a benchmark's spread being the range of its five p50s over their median.
-# Format: xtask/README.md (`cargo xtask bench-check`).
-ktest.null_syscall_roundtrip cpus=4 band=3.18
-ktest.ipc_round_trip words=0 cpus=4 band=3.15
-ktest.ipc_round_trip words=6 cpus=4 band=84.59
-ktest.ipc_round_trip words=7 cpus=4 band=2.62
-ktest.notification_roundtrip cpus=4 band=73.30
-ktest.cap_create_delete cpus=4 band=57.84
-ktest.cap_info_lookup cpus=4 band=54.95
-ktest.mem_map_unmap cpus=4 band=33.43
-ktest.mem_protect_pair cpus=4 band=24.78
-ktest.aspace_harvest_all_accessed pages=32 cpus=4 band=38.80
-ktest.aspace_harvest_none_accessed pages=32 cpus=4 band=12.15
-ktest.thread_lifecycle cpus=4 band=16.28
-ktest.context_switch_pair cpus=4 band=1.08
-ktest.thread_read_mem_page cpus=4 band=2.07
-ktest.event_post_recv cpus=4 band=0.94
-ktest.wait_set_cycle cpus=4 band=68.78
-ktest.tlb_shootdown_unmap cpus=4 band=78.82
-ktest.tlb_shootdown_concurrent op=map cpus=4 band=46.27
-ktest.tlb_shootdown_concurrent op=unmap cpus=4 band=48.92
+# Host-mode bands, written by `cargo xtask bench-baseline --host --bands`: each
+# 3 times its measurement's spread over the calibration runs, the range of
+# their p50s over their median. Format: xtask/README.md (`cargo xtask bench-check`).
+fsbench.open depth=3 cpus=4 band=145.05
+fsbench.open depth=3 affinity=any cpus=4 band=13.83
+fsbench.read size=1024 path=frame cpus=4 band=42.47
+fsbench.read size=1024 path=inline cpus=4 band=67.95
+fsbench.read size=16 path=frame cpus=4 band=49.62
+fsbench.read size=16 path=inline cpus=4 band=72.81
+fsbench.read size=16 path=inline affinity=any cpus=4 band=82.41
+fsbench.read size=16384 path=frame cpus=4 band=39.31
+fsbench.read size=16384 path=inline cpus=4 band=18.72
+fsbench.read size=4096 path=frame cpus=4 band=99.06
+fsbench.read size=4096 path=inline cpus=4 band=29.65
+fsbench.read size=65536 path=frame cpus=4 band=11.84
+fsbench.read size=65536 path=inline cpus=4 band=6.95
+fsbench.write size=4096 path=frame cpus=4 band=73.27
+fsbench.write size=65536 path=frame cpus=4 band=30.77
+ktest.aspace_harvest_all_accessed pages=32 cpus=4 band=9.71
+ktest.aspace_harvest_none_accessed pages=32 cpus=4 band=0.97
+ktest.cap_create_delete cpus=4 band=0.87
+ktest.cap_info_lookup cpus=4 band=3.93
+ktest.context_switch_pair cpus=4 band=1.69
+ktest.context_switch_pair iopb=bound cpus=4 band=2.39
+ktest.context_switch_pair iopb=none cpus=4 band=1.03
+ktest.empty_window cpus=4 band=4.00
+ktest.event_post_recv cpus=4 band=4.89
+ktest.fault_round_trip placement=apart leg=total cpus=4 band=76.31
+ktest.fault_round_trip placement=same leg=delivery cpus=4 band=3.90
+ktest.fault_round_trip placement=same leg=handler cpus=4 band=16.88
+ktest.fault_round_trip placement=same leg=resume cpus=4 band=4.77
+ktest.fault_round_trip placement=same leg=total cpus=4 band=6.49
+ktest.ipc_round_trip words=0 cpus=4 band=1.76
+ktest.ipc_round_trip words=0 aspace=cross cpus=4 band=6.08
+ktest.ipc_round_trip words=0 aspace=same cpus=4 band=1.75
+ktest.ipc_round_trip words=0 fpu=both cpus=4 band=69.98
+ktest.ipc_round_trip words=0 iopb=none cpus=4 band=5.72
+ktest.ipc_round_trip words=0 placement=apart cpus=4 band=13.12
+ktest.ipc_round_trip words=0 placement=fan_in cpus=4 band=62.07
+ktest.ipc_round_trip words=0 placement=fan_in server=reply_recv cpus=4 band=106.92
+ktest.ipc_round_trip words=0 placement=same cpus=4 band=1.02
+ktest.ipc_round_trip words=0 placement=unpinned cpus=4 band=1.52
+ktest.ipc_round_trip words=0 placement=unpinned server=reply_recv cpus=4 band=2.02
+ktest.ipc_round_trip words=0 server=reply_recv cpus=4 band=2.42
+ktest.ipc_round_trip words=1 cpus=4 band=0.84
+ktest.ipc_round_trip words=16 cpus=4 band=2.49
+ktest.ipc_round_trip words=6 cpus=4 band=1.31
+ktest.ipc_round_trip words=64 cpus=4 band=0.71
+ktest.ipc_round_trip words=7 cpus=4 band=1.02
+ktest.mem_map_unmap cpus=4 band=17.64
+ktest.mem_protect_pair cpus=4 band=24.79
+ktest.notification_cross_cpu cpus=4 band=19.13
+ktest.notification_roundtrip cpus=4 band=0.96
+ktest.null_syscall_roundtrip cpus=4 band=10.96
+ktest.thread_lifecycle cpus=4 band=5.88
+ktest.thread_read_mem_page cpus=4 band=1.91
+ktest.tlb_reach pages=1024 cpus=4 band=70.36
+ktest.tlb_reach pages=16 cpus=4 band=0.28
+ktest.tlb_reach pages=256 cpus=4 band=70.20
+ktest.tlb_reach pages=4096 cpus=4 band=56.46
+ktest.tlb_reach pages=64 cpus=4 band=0.28
+ktest.tlb_shootdown_concurrent op=map cpus=4 band=54.02
+ktest.tlb_shootdown_concurrent op=unmap cpus=4 band=62.30
+ktest.tlb_shootdown_unmap cpus=4 band=67.53
+ktest.wait_set_cycle cpus=4 band=73.68
+ubench.console_write bytes=4096 cpus=4 band=27.65
+ubench.console_write bytes=64 cpus=4 band=47.18
+ubench.empty_window cpus=4 band=4.00
+ubench.fault_fill path=fault pages=16 cpus=4 band=21.40
+ubench.fault_fill path=grant pages=16 cpus=4 band=102.00
+ubench.fault_fill path=grant pages=16 affinity=any cpus=4 band=383.08
+ubench.fault_rate procs=1 pages=16 cpus=4 band=26.99
+ubench.fault_rate procs=2 pages=16 cpus=4 band=52.49
+ubench.fault_rate procs=4 pages=16 cpus=4 band=45.73
+ubench.fault_scaling threads=1 pages=16 cpus=4 band=165.76
+ubench.fault_scaling threads=2 pages=16 cpus=4 band=434.50
+ubench.fault_scaling threads=4 pages=16 cpus=4 band=73.11
+ubench.ipc_rt words=0 cpus=4 band=108.43
+ubench.ipc_rt words=6 cpus=4 band=1.32
+ubench.ipc_rt words=64 cpus=4 band=70.01
+ubench.ipc_rt words=7 cpus=4 band=68.08
+ubench.pipeline work=0 cpus=4 band=1.54
+ubench.pipeline work=1024 cpus=4 band=10.33
+ubench.pipeline work=65536 cpus=4 band=22.61
+ubench.pipeline work=8192 cpus=4 band=138.60
+ubench.shmem_ring bytes=4096 wrap=no cpus=4 band=4.38
+ubench.shmem_ring bytes=4096 wrap=yes cpus=4 band=9.68
+ubench.shmem_ring bytes=512 wrap=no cpus=4 band=50.17
+ubench.shmem_ring bytes=512 wrap=yes cpus=4 band=2.54
+ubench.shmem_ring bytes=64 wrap=no cpus=4 band=1.10
+ubench.shmem_ring bytes=64 wrap=yes cpus=4 band=46.50
+ubench.shmem_ring bytes=65536 wrap=no cpus=4 band=88.29
+ubench.shmem_ring bytes=65536 wrap=yes cpus=4 band=1.44

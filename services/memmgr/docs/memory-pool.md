@@ -193,22 +193,46 @@ Object Memory). memmgr does not rely on any path that returns a run to the pool 
 clears each run once, at hand-out, after selection and before the run is accounted, derived, or
 mapped into the process. A restore's full write of the run, below, takes the place of that clear.
 
-memmgr maps the run read-write into its own address space through a scrub window of 512 pages
-(2 MiB, the span of one leaf page table, at a base aligned to it), zeroes it, and unmaps it again,
-one window at a time for a larger run. A plain unmap keeps the window's page table, so only the
-first scrub funds page tables, from the free pool as every map into memmgr's own address space
-does ([Metadata Arena](#metadata-arena)). The window holds a run only while memmgr clears it, and
-no other process can read memmgr's address space.
+The kernel clears the run through its direct map: memmgr calls `SYS_MEMORY_ZERO` on the run's
+capability, again from where a call stopped until every page is zero
+([core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md#sys_memory_zero-79)
+§ `SYS_MEMORY_ZERO` (79)). The clear maps nothing into memmgr's address space, so it takes no page
+table and unmaps nothing. A zero frame of the zero object ([Memory objects](#memory-objects)) is
+cleared the same way when memmgr takes it.
 
-When a run cannot be mapped into the window, memmgr unmaps whatever part the failed map left
-mapped and keeps the run: a grant goes back to the pool whole and the request fails with `QUOTA`,
-and a demand fault's run goes back to the pool and the fault is declined with code 9
-([`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message).
+When the kernel refuses the zero, memmgr keeps the run: a grant goes back to the pool whole and the
+request fails with `QUOTA`, and a demand fault's run goes back to the pool and the fault is
+declined with code 9 ([`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message).
 
-The clearing costs one map, one pass of stores over the run, and one unmap per hand-out. The
-ubench suite's `ubench.fault_fill` lines report the cycles of a 16-page demand fault and of a
-grant-and-map of the same size, the measure of a change to that work
+The clearing costs one `SYS_MEMORY_ZERO` call per run, the kernel's stores over its pages in its
+16-page batches. The ubench suite's `ubench.fault_fill` lines report the cycles of a 16-page demand
+fault and of a grant-and-map of the same size, the measure of a change to that work
 ([services/ubench/README.md](../../ubench/README.md#benchmarks) § Benchmarks).
+
+**Copy window.** A run memmgr writes whole before it hands it out needs no clear. memmgr writes
+such a run, and the pages of a Memory capability a request carries for memmgr to write into,
+through a copy window of 512 pages in its own address space (2 MiB, the span of one leaf page table,
+at a base aligned to it): it maps the pages read-write there, writes them, and unmaps them again.
+Five request paths map the window, and no other does:
+
+- a write fault in a private attachment of an object, and `MAKE_PRIVATE`, which gives a page as
+  that fault does: the copy of the object page ([Memory objects](#memory-objects), Faults);
+- `FILL_REGION`: the copies of an object's pages that back the caller's pages (Memory objects,
+  Read and fill);
+- `OBJECT_READ`: the caller's destination pages (Memory objects, Read and fill);
+- `CAPTURE_CHUNKS`: the destination pages procmgr's request carries
+  ([`ipc-interface.md`](ipc-interface.md) § Label 31: `CAPTURE_CHUNKS`);
+- a restore of a compressed or on-disk chunk: each new run ([Eviction](#eviction)).
+
+memmgr funds the window's leaf page table at startup, before its first receive, while the pool is
+full: it maps one free page there, unmaps it, and returns the page to the pool. A plain unmap keeps
+the table, so no copy funds page tables, a restore under memory pressure among them, which the
+restore headroom ([Eviction](#eviction)) counts no page-table page for. Should the startup map
+fail, the first copy funds the table from the free pool, as every map into memmgr's own address
+space does ([Metadata Arena](#metadata-arena)). The
+window holds a run only while memmgr writes it, and no other process can read memmgr's address
+space. Each unmap of the window invalidates its leaves on every CPU that runs memmgr's address
+space before it returns.
 
 ---
 
@@ -1129,9 +1153,14 @@ Kernel-origin fault message); with no swap slot registered that is a pool with n
 The draw room is open at a demand chunk's pages or more, room for any one committed draw, and memmgr
 signals its opening to every `REGISTER_PRESSURE` registrant that gave bits for it ([Memory
 pressure](#memory-pressure), Signal); crashd holds a commit overrun until then ([crashd Operation §
-Hold](../../crashd/docs/operation.md#hold)). The admission and draw rules and A are the host-tested
-`free-pool` ledger's (`promise_free`, `uncommitted_free`, `draw_room`, `frames_short` and
-`allowance`).
+Hold](../../crashd/docs/operation.md#hold)). The turn that ends with the draw room open ends that
+eviction, signalled or not, and another draw can close the room again before crashd reads it, so
+`QUERY_POOL_STATUS` reports in `data[22]`, with the draw room in the same reply, whether a committed
+draw has found too few pages since the room last opened. A held commit overrun that reads the room
+short and that word 0 is re-asked: crashd resumes it, and memmgr backs it or declines it again,
+which starts the eviction again. A decline of code 7 does not start it. The admission and draw
+rules and A are the host-tested `free-pool` ledger's (`promise_free`, `uncommitted_free`,
+`draw_room`, `frames_short` and `allowance`).
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
@@ -1246,7 +1275,7 @@ Grant), so no leaf of an origin carries write, and `SYS_MEM_PROTECT` cannot make
 writable; a text write, which an executable leaf's grant admits, the frame's other leaves refuse
 (Own view). A write to a private attachment gives the faulting page a page of its own, drawn from
 the commitment as a committed region's fault draws its run (Commit, Faults) and recorded on its
-chunk as any run is. For an object it is one page: memmgr maps the page at its scrub window ([Frame
+chunk as any run is. For an object it is one page: memmgr maps the page at its copy window ([Frame
 contents](#frame-contents)) and copies the object page into it from its own view, which leaves no
 byte to clear, unmaps the page's read-only leaf from the process, and maps the copy with the
 region's protection. For the zero object it is the span a committed region's fault backs, zeroed,
@@ -1288,12 +1317,12 @@ is freed with its attachment.
 
 **Read and fill.** `OBJECT_READ` ([ipc-interface.md](ipc-interface.md) § Label 35) copies pages of
 an object whose handle the caller presents from memmgr's own view into Memory caps it presents,
-mapped at the scrub window only while the copy runs; a process with no pager, procmgr among them,
+mapped at the copy window only while the copy runs; a process with no pager, procmgr among them,
 reads an object so. `FILL_REGION` (§ Label 36) backs pages of the caller's own demand regions, or of
 its private zero-object attachments, with copies of an object's pages, as a write fault backs a
 page: the run selection, the charge to the caller's budget node, the page-table funding and the
 chunk record are the fault's ([Demand faults](#demand-faults)), with the copy from the own view in
-place of the scrub. A named page that holds data already is left as it is, so a repeated request,
+place of the zero. A named page that holds data already is left as it is, so a repeated request,
 after a failure part way or a lost reply, backs only the pages still holding none; a chunk the clock
 has taken takes no run, and a request naming a page of it that holds no data is refused. The pages
 are the caller's own, sharing no frame with the object, so the object can be released once the fill
@@ -1477,7 +1506,7 @@ committed chunk, which only registered swap slots let memmgr evict, is a committ
 finds no frame. The chunk is the granule, so a restore is never clamped to part of a chunk. memmgr
 takes runs covering exactly the chunk's backed pages (no run spans an unbacked page of a chunk
 backed in parts), selected as a demand fault selects ([Demand faults](#demand-faults), run selection
-only), maps the chunk's store runs at a stream window and each new run at the scrub window of its
+only), maps the chunk's store runs at a stream window and each new run at the copy window of its
 own address space ([Frame contents](#frame-contents)), and writes every byte of every page of each
 run there before it maps the run into the process: it decompresses each stored page and zero-fills
 each all-zero page. That full write replaces the hand-out clear of [Frame
@@ -1685,7 +1714,7 @@ and the slot map's pages are memmgr's metadata.
 | `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take a page `promised` holds, or the growth floor by a charge to a node outside the system reserve | Reply with error label; caller may retry without the flag, or fail |
 | `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant, or a committed registration or growth, would take a page `promised` holds, or the growth floor by a charge to a node outside the system reserve ([Commit](#commit)) | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `LIMIT` | `want_pages`, or a committed registration's or growth's charge, would take the subtree of the budget node it is charged to (the caller's own, or with `REQUEST_CHARGE_NODE` the handle's), or of an ancestor, over its max | Reply with error label; caller treats as that node's budget refusing, not as RAM exhaustion |
-| `QUOTA` | Tracking-metadata arena could not grow, or a selected run could not be mapped to zero it ([Frame contents](#frame-contents)); either means system RAM exhausted | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), or the kernel refused to zero a selected run ([Frame contents](#frame-contents)) | Reply with error label; caller treats the arena's failure as system-wide RAM exhaustion |
 | `TOO_MANY_PROCESSES` | A process record, its caps node or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 
 memmgr never panics on allocation failure. The caller's response policy

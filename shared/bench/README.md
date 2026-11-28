@@ -175,9 +175,9 @@ halt between them, or its counter runs through a halt
 ([docs/testing.md § Benchmarks](../../docs/testing.md#benchmarks-bench-cell)). A row whose reads are
 taken by a thread pinned to the measuring CPU, which does not itself run the measured path, meets
 the first condition by its pin. When that thread blocks while the measured threads run, its CPU
-may halt in the window, so such a row (`ubench.pipeline`) checks each window against a clock that
-runs through a halt (§ Window rate check) and counts the windows it leaves out in
-`clock_stopped=`. A row whose reads are taken by the measured thread, with no affinity
+may halt in the window, so such a row (`ubench.pipeline`, `ubench.fault_rate`) checks each window
+against a clock that runs through a halt (§ Window rate check) and counts the windows it leaves
+out in `clock_stopped=`. A row whose reads are taken by the measured thread, with no affinity
 between them, cannot, and meets it as fsbench's rows do: pinned to the measuring CPU, the thread
 opens its idle-halt span (§ Idle halts) and takes the opening read, then clears its affinity, which
 moves nothing, so the window holds that syscall too; after the window's operations it takes the
@@ -225,7 +225,7 @@ where a count says that the loop waited on an event.
 | Harness | Span | CPU |
 |---|---|---|
 | [ktest](../../core/ktest/README.md) Tier 3 | `Harness::recorder`, taken right before the loop, to its `Recorder::summary`, right after; in `fault_round_trip`, `Harness::legs` to `Legs::summaries` | CPU 0 |
-| [ubench](../../services/ubench/README.md) | `IdleSpan::open` and `close` around each loop, its warm-up iterations included; in `fault_scaling`, each worker around its own loop, the line summing them; in `fault_fill path=grant affinity=any`, a window row whose reads the measured thread takes, around each window, the line summing the spans that closed (§ Window rows); in `pipeline`, one span around its calibration, warm-up and timed windows | `BENCH_CPU` (0); each worker's CPU |
+| [ubench](../../services/ubench/README.md) | `IdleSpan::open` and `close` around each loop, its warm-up iterations included; in `fault_scaling`, each worker around its own loop, the line summing them; in `fault_fill path=grant affinity=any`, a window row whose reads the measured thread takes, around each window, the line summing the spans that closed (§ Window rows); in `pipeline` and `fault_rate`, one span around the calibration, warm-up and timed windows | `BENCH_CPU` (0); each worker's CPU |
 | [fsbench](../../services/fixtures/fsbench/README.md) | Around each timed loop, after its warm-up; in a window row, around each window, the line summing the spans that closed (§ Window rows) | CPU 0 |
 
 A line whose samples other threads took on their own CPUs (`ktest.tlb_shootdown_concurrent`,
@@ -236,8 +236,8 @@ A line whose samples other threads took on their own CPUs (`ktest.tlb_shootdown_
 ## Window rate check
 
 A window whose reading thread blocks while other threads do its work elsewhere
-(`ubench.pipeline`) leaves the reading CPU with nothing to run, and the CPU halts in it. The
-window then counts its elapsed time only if the counter runs through a halt:
+(`ubench.pipeline`, `ubench.fault_rate`) leaves the reading CPU with nothing to run, and the CPU
+halts in it. The window then counts its elapsed time only if the counter runs through a halt:
 
 | Counter | Through a halt |
 |---|---|
@@ -275,13 +275,13 @@ such a delay leaves a window out, and the check rests on the invariant TSC § Co
 | [`core/ktest`](../../core/ktest/README.md) | `ktest` | Tier 3, one line per kernel benchmark (§ Tier 3) |
 | [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3`; at more than one CPU, the window rows `fsbench.read size=16 path=inline affinity=any` and `fsbench.open depth=3 affinity=any` |
 | [`core/kernel`](../../core/kernel/README.md), with its `sched-stages` feature | none: it prints no result line | `SYS_SYSTEM_INFO(SchedStages)`, the cycles of each stage of `schedule()`, which ktest's `context_switch_pair` line reports as extras |
-| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.pipeline`, `ubench.console_write`, per variant, and `ubench.empty_window` |
+| [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.pipeline`, `ubench.console_write`, `ubench.fault_rate`, per variant, and `ubench.empty_window` |
 
 ---
 
 ## Summarized By
 
 [Scheduler Internals](../../core/kernel/docs/scheduler.md),
-[core/ktest/README.md](../../core/ktest/README.md),
+[core/ktest/README.md](../../core/ktest/README.md), [Performance](../../docs/performance.md),
 [services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md),
 [services/ubench/README.md](../../services/ubench/README.md)

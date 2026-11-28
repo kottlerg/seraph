@@ -38,7 +38,7 @@ use free_pool::{
 use syscall_abi::PAGE_SIZE;
 
 use crate::{
-    Answer, FaultDecline, FaultTarget, MemLedger, SCRUB_VA, SCRUB_WINDOW_PAGES, coalesce,
+    Answer, COPY_VA, COPY_WINDOW_PAGES, FaultDecline, FaultTarget, MemLedger, coalesce,
     current_pressure, ensure_slots, insert_run, map_client_chunk, map_self, pool_total_pages,
     quiescent, recheck_deferred, release_unmapped_chunk, return_taken, select, self_aspace,
 };
@@ -1153,7 +1153,7 @@ fn give_back(l: &mut MemLedger, runs: &[FrameDesc])
 /// the system reserve, once direct reclaim has made room when needed
 /// ([`admit_restore`]), or, for a chunk of a committed region, which draws
 /// from `promised`, when the draw finds its frames ([`draw_room`]); then runs
-/// covering exactly its backed pages, each filled whole through the scrub
+/// covering exactly its backed pages, each filled whole through the copy
 /// window from the source, mapped into the process, and the chunk resident on
 /// them, its store back in the pool. The chunk's pages are charged already.
 ///
@@ -1574,7 +1574,7 @@ fn fill_runs(
 }
 
 /// Write every byte of every page of `runs`, in page order, from `reader`:
-/// each run mapped at the scrub window, its pages read there, and unmapped.
+/// each run mapped at the copy window, its pages read there, and unmapped.
 ///
 /// # Errors
 /// [`FaultDecline::MapFailed`]: a map failed (its error's magnitude the
@@ -1589,28 +1589,27 @@ fn decode_runs(
     for run in runs
     {
         let count = u64::from(run.page_count);
-        // A run covers at most a chunk, which the scrub window holds.
-        debug_assert!(count <= SCRUB_WINDOW_PAGES);
-        // SAFETY: the scrub window is memmgr's own zone, which every use
+        // A run covers at most a chunk, which the copy window holds.
+        debug_assert!(count <= COPY_WINDOW_PAGES);
+        // SAFETY: the copy window is memmgr's own zone, which every use
         // leaves unmapped.
-        if let Err(e) = unsafe { map_self(l, run.cap_slot, SCRUB_VA, 0, count) }
+        if let Err(e) = unsafe { map_self(l, run.cap_slot, COPY_VA, 0, count) }
         {
             result = Err((FaultDecline::MapFailed, e.unsigned_abs()));
             break;
         }
         let decoded = (0..count).try_for_each(|p| {
-            // SAFETY: page `p` of the run is mapped read-write in the scrub
+            // SAFETY: page `p` of the run is mapped read-write in the copy
             // window, and nothing else refers to it.
             let page = unsafe {
-                &mut *(SCRUB_VA.saturating_add(p.saturating_mul(PAGE_SIZE))
-                    as *mut [u8; PAGE_BYTES])
+                &mut *(COPY_VA.saturating_add(p.saturating_mul(PAGE_SIZE)) as *mut [u8; PAGE_BYTES])
             };
             reader.next_page(page)
         });
-        // SAFETY: the span is the scrub window mapped above. The unmap is
+        // SAFETY: the span is the copy window mapped above. The unmap is
         // inline assembly without `nomem`, so the decoded stores are made before
         // it.
-        let _ = unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, count) };
+        let _ = unsafe { syscall::mem_unmap(self_aspace(), COPY_VA, count) };
         if decoded.is_err()
         {
             result = Err((FaultDecline::MapFailed, 0));

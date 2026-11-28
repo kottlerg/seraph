@@ -37,7 +37,7 @@ use virtio_core::{
 };
 
 use crate::decode::ModifierState;
-use crate::input::EventRing;
+use crate::input::{Completion, EventRing};
 
 // ── Declaration ────────────────────────────────────────────────────────────
 
@@ -528,13 +528,15 @@ fn handle_read_events(rt: &mut InputRuntime, out: &mut Reply)
         let mut reposted = false;
         while let Some(entry) = events.get_mut(count)
         {
-            let Some(ev) = rt.ring.drain(&mut rt.vq)
+            let Some(completion) = rt.ring.drain(&mut rt.vq)
             else
             {
                 break;
             };
             reposted = true;
-            if let Some(decoded) = rt.mods.decode(ev)
+            // A short completion carries no event; its buffer is re-posted.
+            if let Completion::Event(ev) = completion
+                && let Some(decoded) = rt.mods.decode(ev)
             {
                 *entry = keysym::pack_event(decoded.keysym, decoded.modifiers, decoded.pressed);
                 // `count` indexed an entry, so it is below the array's

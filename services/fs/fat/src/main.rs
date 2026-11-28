@@ -2519,7 +2519,7 @@ fn handle_write(
         .filter(|_| byte_len != 0)
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, reply);
+        reply_err(ipc::fs_errors::INVALID_ARGUMENT, reply);
         return;
     };
 
@@ -2922,14 +2922,17 @@ fn new_entry_rights_ceiling(kind: NewEntryKind) -> NamespaceRights
 }
 
 /// The name an `FS_CREATE` or `FS_MKDIR` carries: `label[16..32]` bytes
-/// from word 0. `None` when it is empty, longer than the message, or not a
-/// valid name (`namespace_protocol::validate_name`).
+/// from word 0. `None` when it is empty, longer than the message, not a
+/// valid name (`namespace_protocol::validate_name`), or one no long name
+/// can hold (`fat_parse::is_storable_name`).
 fn create_name(msg: &IpcMessage) -> Option<&[u8]>
 {
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
-    msg.data_bytes()
-        .get(..name_len)
-        .filter(|name| !name.is_empty() && namespace_protocol::validate_name(name).is_ok())
+    msg.data_bytes().get(..name_len).filter(|name| {
+        !name.is_empty()
+            && namespace_protocol::validate_name(name).is_ok()
+            && fat_parse::is_storable_name(name)
+    })
 }
 
 /// Write a new entry `name` of `kind` in the directory at `parent_cluster`:
@@ -3039,7 +3042,7 @@ fn create_entry_common(
     let Some(name) = create_name(msg)
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, reply);
+        reply_err(ipc::fs_errors::INVALID_ARGUMENT, reply);
         return;
     };
     // The node's slot is taken before the entry is written, so a full node
@@ -3255,7 +3258,7 @@ fn prepare_create_open<'a>(
     let Some(name) = create_name(msg)
     else
     {
-        open.refuse(ipc::fs_errors::IO_ERROR, reply);
+        open.refuse(ipc::fs_errors::INVALID_ARGUMENT, reply);
         return None;
     };
     let id = record_open(session, open, opens, cache, ipc_buf, reply)?;
@@ -3378,7 +3381,7 @@ fn handle_remove_node_cap(
     let Some(name) = msg.data_bytes().get(..name_len).filter(|_| name_len != 0)
     else
     {
-        reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
+        reply_err_now(ipc::fs_errors::INVALID_ARGUMENT, reply, service, ipc_buf);
         return;
     };
 
@@ -3552,14 +3555,17 @@ fn handle_rename_node_cap(
     })
     else
     {
-        reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
+        reply_err_now(ipc::fs_errors::INVALID_ARGUMENT, reply, service, ipc_buf);
         return;
     };
 
+    // A source no long name can hold names no entry, so it is answered
+    // `NOT_FOUND` by the lookup below.
     if namespace_protocol::validate_name(src_name).is_err()
         || namespace_protocol::validate_name(dst_name).is_err()
+        || !fat_parse::is_storable_name(dst_name)
     {
-        reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
+        reply_err_now(ipc::fs_errors::INVALID_ARGUMENT, reply, service, ipc_buf);
         return;
     }
 

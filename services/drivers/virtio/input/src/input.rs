@@ -14,6 +14,7 @@
 //! scope for a v0.1.0 keyboard.
 
 use virtio_core::virtqueue::SplitVirtqueue;
+use virtio_input::{EVENT_SIZE, is_whole_event};
 
 /// virtio-input event type: key press/release (`EV_KEY`, Linux `input.h`).
 pub const EV_KEY: u16 = 1;
@@ -22,9 +23,6 @@ pub const EV_KEY: u16 = 1;
 /// `configure_queue_size`). One descriptor and one 8-byte buffer per entry; at
 /// 64 entries the buffers occupy 512 bytes, well within a single DMA page.
 pub const EVENT_QUEUE_SIZE: u16 = 64;
-
-/// Bytes per virtio-input event buffer (`size_of::<VirtioInputEvent>()`).
-const EVENT_SIZE: u32 = 8;
 
 /// Buffer `slot`'s offset in the event page.
 fn slot_offset(slot: u16) -> u64
@@ -44,6 +42,20 @@ pub struct VirtioInputEvent
     pub event_type: u16,
     pub code: u16,
     pub value: u32,
+}
+
+// Each eventq buffer holds one event, read at its fields' offsets.
+const _: () = assert!(core::mem::size_of::<VirtioInputEvent>() == EVENT_SIZE as usize);
+
+/// One completion [`EventRing::drain`] took off the used ring; its buffer is
+/// re-posted either way.
+pub enum Completion
+{
+    /// The device wrote a whole event.
+    Event(VirtioInputEvent),
+    /// The device wrote fewer bytes than an event ([`is_whole_event`]): the
+    /// buffer carries no event.
+    Short,
 }
 
 /// Owns the eventq receive buffers and maps completed descriptor heads back to
@@ -87,19 +99,21 @@ impl EventRing
         }
     }
 
-    /// Pull one filled event off the used ring, re-posting its buffer. Returns
-    /// `None` when the used ring is empty.
+    /// Pull one completion off the used ring, re-posting its buffer: its
+    /// event, or [`Completion::Short`] when the device wrote less than one,
+    /// whose stale bytes are not read. Returns `None` when the used ring is
+    /// empty.
     ///
     /// A used element or index `poll_used` refuses (an id heading no
     /// outstanding chain, or an index past the outstanding chains) is
     /// skipped: the refusal frees nothing, and the free list is untouched.
-    pub fn drain(&mut self, vq: &mut SplitVirtqueue) -> Option<VirtioInputEvent>
+    pub fn drain(&mut self, vq: &mut SplitVirtqueue) -> Option<Completion>
     {
         loop
         {
             match vq.poll_used()
             {
-                Ok(Some((head, _len))) =>
+                Ok(Some((head, len))) =>
                 {
                     // poll_used returns only outstanding heads, which add_chain
                     // handed out below queue_size <= EVENT_QUEUE_SIZE, so the
@@ -109,9 +123,16 @@ impl EventRing
                     {
                         continue;
                     };
-                    let event = self.read_event(slot);
+                    let completion = if is_whole_event(len)
+                    {
+                        Completion::Event(self.read_event(slot))
+                    }
+                    else
+                    {
+                        Completion::Short
+                    };
                     self.post(vq, slot);
-                    return Some(event);
+                    return Some(completion);
                 }
                 Ok(None) => return None,
                 Err(_) =>

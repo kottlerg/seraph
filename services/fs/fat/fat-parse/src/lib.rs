@@ -43,6 +43,8 @@ use core::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 pub mod file_write;
 pub mod node_slab;
 pub mod page_index;
+#[cfg(any(test, kani, fuzzing))]
+pub mod property;
 pub mod session_pool;
 pub mod sweep;
 
@@ -202,7 +204,9 @@ pub enum BpbError
     /// rather than read with mismatched offsets.
     UnsupportedSectorSize,
     /// The geometry is inconsistent: the volume has no FAT copy or no
-    /// reserved sector (the FAT would overlay the boot sector), the data
+    /// reserved sector (the FAT would overlay the boot sector), its
+    /// `sectors_per_cluster` is not one the FAT specification permits (a
+    /// power of two up to 128), the data
     /// region's start overflows a 32-bit sector number, the volume has
     /// more clusters than its FAT has entries for (or than FAT32's largest
     /// cluster number allows), so a cluster in the data region would have
@@ -271,7 +275,8 @@ pub struct BpbGeometry
 /// [`MIN_SECTOR_SIZE`],
 /// [`BpbError::Fat12`] for a FAT12 cluster count, or
 /// [`BpbError::BadGeometry`] when `num_fats` or `reserved_sectors` is zero,
-/// the data region's start overflows, the FAT cannot hold an entry for
+/// `sectors_per_cluster` is not a power of two, the data region's start
+/// overflows, the FAT cannot hold an entry for
 /// every cluster, a FAT32 root cluster lies outside the data region, or the
 /// volume's sector count exceeds `partition_sectors`.
 pub fn parse_bpb_geometry(
@@ -318,19 +323,20 @@ fn decode_bpb(sector_data: &[u8; MIN_SECTOR_SIZE]) -> Result<BpbGeometry, BpbErr
     let root_entry_count = u16::from_le_bytes([sector_data[17], sector_data[18]]);
 
     // Validate fields used as divisors to prevent division by zero.
-    let Some(cluster_divisor) =
-        NonZeroU32::new(u32::from(sectors_per_cluster)).filter(|_| bytes_per_sector != 0)
-    else
+    if sectors_per_cluster == 0 || bytes_per_sector == 0
     {
         return Err(BpbError::ZeroDivisor);
-    };
+    }
     if !is_sector_size(usize::from(bytes_per_sector))
     {
         return Err(BpbError::UnsupportedSectorSize);
     }
     // The FAT starts after the reserved sectors, the boot sector among
     // them, and every FAT write goes to each of the num_fats copies.
-    if num_fats == 0 || reserved_sectors == 0
+    // The specification permits only a power of two sectors per cluster
+    // (`BPB_SecPerClus`), so a cluster count is the data region's sectors
+    // shifted down, with no division.
+    if num_fats == 0 || reserved_sectors == 0 || !sectors_per_cluster.is_power_of_two()
     {
         return Err(BpbError::BadGeometry);
     }
@@ -377,7 +383,13 @@ fn decode_bpb(sector_data: &[u8; MIN_SECTOR_SIZE]) -> Result<BpbGeometry, BpbErr
     };
 
     // Root directory sectors (FAT16 only).
-    let root_dir_sectors = (u32::from(root_entry_count) * 32).div_ceil(u32::from(bytes_per_sector));
+    // The sector size is a power of two, so the ceiling of the division is a
+    // shift of the bytes rounded up; the bytes stay below 2^22.
+    let root_dir_sectors = u32::from(root_entry_count)
+        .wrapping_mul(32)
+        .wrapping_add(u32::from(bytes_per_sector))
+        .wrapping_sub(1)
+        >> bytes_per_sector.trailing_zeros();
 
     let data_start_sector = u32::from(num_fats)
         .checked_mul(fat_size)
@@ -386,7 +398,7 @@ fn decode_bpb(sector_data: &[u8; MIN_SECTOR_SIZE]) -> Result<BpbGeometry, BpbErr
         .ok_or(BpbError::BadGeometry)?;
 
     let data_sectors = total_sectors.saturating_sub(data_start_sector);
-    let total_clusters = data_sectors / cluster_divisor;
+    let total_clusters = data_sectors >> sectors_per_cluster.trailing_zeros();
 
     // FAT type determination per the Microsoft specification. FAT12 is
     // refused: the driver reads only 16- and 32-bit FAT entries.
@@ -1035,21 +1047,20 @@ impl LfnAccum
 
         // The slot's 13 UCS-2 characters, in three runs of the 32-byte
         // entry: 5 at byte 1, 6 at byte 14, 2 at byte 28.
-        let units = raw[1..11]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .chain(raw[14..26].as_chunks::<2>().0)
-            .chain(raw[28..32].as_chunks::<2>().0)
-            .map(|&pair| u16::from_le_bytes(pair));
         let mut saw_terminator = false;
-        for (pos, ch) in (base..).zip(units)
+        for (k, &at) in LFN_UNIT_OFFSETS.iter().enumerate()
         {
-            let Some(slot) = self.chars.get_mut(pos)
+            // `base` is at most 247 and `k` below 13, so this never wraps.
+            let pos = base.wrapping_add(k);
+            let (Some(slot), Some(&pair)) = (
+                self.chars.get_mut(pos),
+                raw.get(at..).and_then(<[u8]>::first_chunk::<2>),
+            )
             else
             {
                 break;
             };
+            let ch = u16::from_le_bytes(pair);
             if ch == 0x0000 || ch == 0xFFFF
             {
                 if !saw_terminator
@@ -1086,13 +1097,14 @@ impl LfnAccum
     #[must_use]
     pub fn assemble_utf8(&self, out: &mut [u8]) -> Option<usize>
     {
-        let units = self.chars.iter().take(self.len).copied();
+        let units = self.chars.get(..self.len).unwrap_or(&self.chars);
+        let mut at = 0usize;
         let mut pos = 0usize;
-        for unit in char::decode_utf16(units)
+        while let Some(rest) = units.get(at..).filter(|rest| !rest.is_empty())
         {
-            let ch = unit.ok()?;
-            let end = pos.checked_add(ch.len_utf8())?;
-            ch.encode_utf8(out.get_mut(pos..end)?);
+            let (width, end) = utf8_step(rest, out, pos)?;
+            // `width` is at most `rest.len()`, so this never saturates.
+            at = at.saturating_add(width);
             pos = end;
         }
         Some(pos)
@@ -1110,15 +1122,57 @@ impl LfnAccum
         {
             return false;
         }
-        let mut buf = [0u8; MAX_LFN_UTF8];
-        let Some(len) = self.assemble_utf8(&mut buf)
-        else
+        // Compare a character at a time, as [`utf8_step`] writes it, so no
+        // buffer holds the whole form.
+        let units = self.chars.get(..self.len).unwrap_or(&self.chars);
+        let mut at = 0usize;
+        let mut pos = 0usize;
+        while let Some(rest) = units.get(at..).filter(|rest| !rest.is_empty())
         {
-            return false;
-        };
-        buf.get(..len)
-            .is_some_and(|assembled| assembled.eq_ignore_ascii_case(name))
+            let mut ch = [0u8; 4];
+            let Some((width, len)) = utf8_step(rest, &mut ch, 0)
+            else
+            {
+                return false;
+            };
+            let Some(part) = pos.checked_add(len).and_then(|end| name.get(pos..end))
+            else
+            {
+                return false;
+            };
+            // A fixed count of four, the most one character takes, so a
+            // proof's unwinding of the compare does not depend on `len`.
+            let same = (0..4).all(|k| {
+                k >= len
+                    || ch
+                        .get(k)
+                        .zip(part.get(k))
+                        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+            });
+            if !same
+            {
+                return false;
+            }
+            // `width` is at most `rest.len()`, and `pos` indexes `name`, so
+            // neither saturates.
+            at = at.saturating_add(width);
+            pos = pos.saturating_add(len);
+        }
+        pos == name.len()
     }
+}
+
+/// One step of [`LfnAccum::assemble_utf8`]: write the UTF-8 form of the
+/// character the UTF-16 code units `units` start with into `out` at `pos`.
+/// Returns the code units the character takes and the position past its
+/// bytes; `None`, with `out` unchanged, when `units` is empty or starts with
+/// an unpaired surrogate, or the bytes do not fit `out`.
+fn utf8_step(units: &[u16], out: &mut [u8], pos: usize) -> Option<(usize, usize)>
+{
+    let ch = char::decode_utf16(units.iter().copied()).next()?.ok()?;
+    let end = pos.checked_add(ch.len_utf8())?;
+    ch.encode_utf8(out.get_mut(pos..end)?);
+    Some((ch.len_utf16(), end))
 }
 
 impl Default for LfnAccum
@@ -1128,6 +1182,10 @@ impl Default for LfnAccum
         Self::new()
     }
 }
+
+/// Byte offsets of a long-name slot's 13 UCS-2 characters, in three runs of
+/// the 32-byte entry: 5 at byte 1, 6 at byte 14, 2 at byte 28.
+const LFN_UNIT_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
 
 /// FAT LFN checksum: rotate-right-1 + add, computed over the 11-byte 8.3 name.
 ///
@@ -1561,24 +1619,76 @@ impl<L: Copy + Default> FreeRunScan<L>
 /// surrogate pair, the form [`LfnAccum::assemble_utf8`] decodes), into
 /// `out`. Returns the code-unit count.
 ///
-/// Returns `None` when `name` is not UTF-8 or needs more than
-/// [`MAX_LFN_CHARS`] code units.
+/// Returns `None` when `name` is not UTF-8, holds U+0000 or U+FFFF, whose
+/// code units a long name's slots take as its end
+/// ([`LfnAccum::add_lfn_entry`]), or needs more than [`MAX_LFN_CHARS`] code
+/// units.
 #[must_use]
 pub fn encode_lfn(name: &[u8], out: &mut [u16; MAX_LFN_CHARS]) -> Option<usize>
 {
-    let text = core::str::from_utf8(name).ok()?;
     let mut len = 0usize;
-    for ch in text.chars()
+    let mut at = 0usize;
+    while let Some(rest) = name.get(at..).filter(|rest| !rest.is_empty())
     {
+        let (ch, width) = utf8_char(rest)?;
+        // `width` is at most `rest.len()`, so this never saturates.
+        at = at.saturating_add(width);
         let mut units = [0u16; 2];
         for &unit in ch.encode_utf16(&mut units).iter()
         {
+            if unit == 0x0000 || unit == 0xFFFF
+            {
+                return None;
+            }
             *out.get_mut(len)? = unit;
             // `len` indexes `out`, so this never saturates.
             len = len.saturating_add(1);
         }
     }
     Some(len)
+}
+
+/// Whether `name` can be stored as a FAT long name: [`encode_lfn`] encodes
+/// it into at least one code unit. A name this refuses (empty, not UTF-8,
+/// holding U+0000 or U+FFFF, or longer than [`MAX_LFN_CHARS`] code units)
+/// is no name a directory entry can hold.
+#[must_use]
+pub fn is_storable_name(name: &[u8]) -> bool
+{
+    let mut units = [0u16; MAX_LFN_CHARS];
+    encode_lfn(name, &mut units).is_some_and(|len| len > 0)
+}
+
+/// The UTF-8 character `bytes` starts with and its width in bytes, by the
+/// table of well-formed byte sequences (Unicode § 3.9, Table 3-7; RFC 3629
+/// § 4); `None` when `bytes` starts with none, an empty `bytes` included.
+pub(crate) fn utf8_char(bytes: &[u8]) -> Option<(char, usize)>
+{
+    let lead = *bytes.first()?;
+    // The width, the range of the second byte, and the lead's payload bits.
+    let (width, low, high, bits) = match lead
+    {
+        0x00..=0x7F => return Some((char::from(lead), 1)),
+        0xC2..=0xDF => (2, 0x80, 0xBF, lead & 0x1F),
+        0xE0 => (3, 0xA0, 0xBF, lead & 0x0F),
+        0xE1..=0xEC | 0xEE..=0xEF => (3, 0x80, 0xBF, lead & 0x0F),
+        0xED => (3, 0x80, 0x9F, lead & 0x0F),
+        0xF0 => (4, 0x90, 0xBF, lead & 0x07),
+        0xF1..=0xF3 => (4, 0x80, 0xBF, lead & 0x07),
+        0xF4 => (4, 0x80, 0x8F, lead & 0x07),
+        _ => return None,
+    };
+    let mut scalar = u32::from(bits);
+    for (k, &byte) in bytes.get(1..width)?.iter().enumerate()
+    {
+        let (lo, hi) = if k == 0 { (low, high) } else { (0x80, 0xBF) };
+        if !(lo..=hi).contains(&byte)
+        {
+            return None;
+        }
+        scalar = scalar.wrapping_shl(6) | u32::from(byte & 0x3F);
+    }
+    Some((char::from_u32(scalar)?, width))
 }
 
 /// Attribute byte of a long-name directory slot.
@@ -1788,6 +1898,460 @@ impl TailSet
                 .get(t as usize / 64)
                 .is_some_and(|word| word & (1 << (t % 64)) == 0)
         })
+    }
+}
+
+/// Proofs of this crate's parsers of hostile input (docs/testing.md
+/// § Bounded verification, Parser proofs), each a check of
+/// [`property`] on every input up to its bounds:
+///
+/// - the BPB decode on every sector 0 of up to 512 bytes, which hold every
+///   field and the boot signature (a longer sector's bytes past 512 are not
+///   read), for every device block size and partition length, and the place
+///   of every data cluster of every volume it accepts;
+/// - the FAT entry read and write at every offset of every sector of up to
+///   8 bytes, one past the bytes on either side of the widest entry, so an
+///   entry inside, across and past the sector's end;
+/// - the short-entry decode and its listed name on every 32-byte slot, and
+///   the short-name match on every component of up to 13 bytes, one past
+///   the longest spelled name (8, a dot, 3);
+/// - the long-name run by induction: the empty accumulator (`new`, `reset`)
+///   is in the invariant, and each slot steps it from any state in the
+///   invariant as `property::lfn_step_holds` says, so after a run's slots
+///   from its first down to number 1 the name is the units of its slots
+///   before the first ending unit; its validation from any state; the
+///   UTF-8 assembly of that name by induction too, each step from any two
+///   code units into any position of any buffer of up to 8 bytes, and the
+///   whole on every name of up to 3 units, which starts, steps past a
+///   character of each width, stops at an unpaired surrogate, and ends;
+///   with the match against a name on those names;
+/// - the long-name encoding and its packing on every name of up to 5 bytes,
+///   which holds a character of each UTF-8 width and one past the longest;
+/// - each step of the removal and free-run scans from any state;
+/// - the numeric tails, read from every short name and composed for every
+///   tail, against every basis.
+///
+/// What lies outside them is the code that drives the steps: the loop of
+/// [`LfnAccum::assemble_utf8`] over a name's units, the slot walks of the
+/// `fatfs` driver that feed the accumulator and the scans, and the bit set
+/// and search of [`TailSet`]. The fuzz target `fat`, the replay of the
+/// checked-in inputs and the unit tests check them.
+#[cfg(kani)]
+mod proofs
+{
+    use super::{
+        ATTR_LFN, FatType, FreeRunScan, LfnAccum, MAX_SLOT_RUN, MIN_SECTOR_SIZE, RemoveRunScan,
+        SlotRun, property,
+    };
+
+    /// Either FAT width.
+    fn any_fat_type() -> FatType
+    {
+        if kani::any()
+        {
+            FatType::Fat16
+        }
+        else
+        {
+            FatType::Fat32
+        }
+    }
+
+    /// Any accumulator state in the invariant.
+    fn any_lfn() -> LfnAccum
+    {
+        let acc = LfnAccum {
+            chars: kani::any(),
+            len: kani::any(),
+            chksum: kani::any(),
+            last_seq: kani::any(),
+            saw_last: kani::any(),
+            active: kani::any(),
+        };
+        kani::assume(property::lfn_invariant(&acc));
+        acc
+    }
+
+    /// Any state in the invariant whose name has at most `max` units, the
+    /// units past them zero: the assembly and the match read only the name's
+    /// units (`chars[..len]`), and a slot's step writes its units whatever
+    /// the others hold, so the rest cannot change what they do, and fixing
+    /// them keeps the problem small.
+    fn any_lfn_up_to(max: usize) -> LfnAccum
+    {
+        let mut chars = [0u16; super::MAX_LFN_CHARS];
+        for unit in chars.iter_mut().take(max)
+        {
+            *unit = kani::any();
+        }
+        let acc = LfnAccum {
+            chars,
+            len: kani::any(),
+            chksum: kani::any(),
+            last_seq: kani::any(),
+            saw_last: kani::any(),
+            active: kani::any(),
+        };
+        kani::assume(acc.len <= max && property::lfn_invariant(&acc));
+        acc
+    }
+
+    /// Any run of slot places of up to [`MAX_SLOT_RUN`].
+    fn any_run() -> SlotRun<u32>
+    {
+        let run = SlotRun {
+            slots: kani::any(),
+            len: kani::any(),
+        };
+        kani::assume(run.len <= MAX_SLOT_RUN);
+        run
+    }
+
+    /// BPB: the decode contract on the first `len` bytes of any 512-byte
+    /// sector 0, `len` up to 512, for any device block size and partition
+    /// length. The decode has no loop; the property's only loops are the
+    /// short fixed reads of its fields, so an unwind bound of 5 covers them.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_boot_sector_holds_the_bpb_contract()
+    {
+        let sector: [u8; MIN_SECTOR_SIZE] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MIN_SECTOR_SIZE);
+        property::bpb_holds(&sector[..len], kani::any(), kani::any());
+    }
+
+    /// Clusters: on every volume a 512-byte sector 0 describes that the
+    /// decode accepts, any cluster lies in the data region exactly when it is
+    /// one of its clusters, and a data cluster's FAT entry lies in the first
+    /// FAT copy and its sectors in the volume and partition. No loop.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_data_cluster_lies_inside_its_fat_and_volume()
+    {
+        let sector: [u8; MIN_SECTOR_SIZE] = kani::any();
+        property::geometry_cluster_holds(&sector, kani::any(), kani::any(), kani::any());
+    }
+
+    /// FAT entries: the entry of either width at any offset of any sector of
+    /// up to 8 bytes is read and written in place. The longest loops walk the
+    /// property's 6-byte copy, so an unwind bound of 8 covers them.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn every_fat_entry_is_read_and_written_in_place()
+    {
+        let sector: [u8; 8] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= sector.len());
+        property::fat_entry_holds(&sector[..len], any_fat_type(), kani::any(), kani::any());
+    }
+
+    /// Short entries: every 32-byte slot is skipped or decoded, and listed
+    /// under its short name, as the specification places its fields. The
+    /// longest loops walk the 13-byte name buffer, so an unwind bound of 14
+    /// covers them.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn every_directory_slot_holds_the_entry_contract()
+    {
+        let raw: [u8; 32] = kani::any();
+        property::dir_entry_holds(&raw);
+    }
+
+    /// Short-name match: every component of up to 13 bytes matches any short
+    /// name exactly when it spells it. The longest loops walk the component,
+    /// so an unwind bound of 15 covers them.
+    #[kani::proof]
+    #[kani::unwind(15)]
+    fn every_component_matches_the_short_name_it_spells()
+    {
+        let entry: [u8; 11] = kani::any();
+        let component: [u8; 13] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= component.len());
+        property::name_matches_holds(&entry, &component[..len]);
+    }
+
+    /// Base of the long-name run: a new accumulator, and one reset from any
+    /// state, holds no run and stands in the invariant. No loop.
+    #[kani::proof]
+    fn an_lfn_accumulator_starts_and_resets_empty()
+    {
+        assert!(property::lfn_invariant(&LfnAccum::new()));
+        let mut acc = any_lfn();
+        acc.reset();
+        assert!(property::lfn_invariant(&acc) && !acc.active && acc.len == 0);
+    }
+
+    /// Step of the long-name run: from any state in the invariant, any slot
+    /// steps the run as the specification lays a run out, its units checked
+    /// at any name position, so at every one. The longest loops walk the
+    /// slot's 13 units, so an unwind bound of 14 covers them.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn each_long_name_slot_steps_its_run()
+    {
+        let acc = any_lfn();
+        let raw: [u8; 32] = kani::any();
+        property::lfn_step_holds(&acc, &raw, Some(kani::any()));
+    }
+
+    /// Validation: from any state, a run is valid for any short name exactly
+    /// when it is complete and carries the name's checksum. The loops walk
+    /// the 11-byte name, so an unwind bound of 12 covers them.
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn a_run_is_valid_by_its_order_and_checksum()
+    {
+        let acc = any_lfn();
+        let sfn: [u8; 11] = kani::any();
+        property::validate_holds(&acc, &sfn);
+    }
+
+    /// Step of the name's UTF-8 assembly: any two code units, the most one
+    /// character takes, and fewer, into any position of any buffer of up to
+    /// 8 bytes, past the longest character's 4. The longest loop walks the
+    /// buffer, so an unwind bound of 9 covers it.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn each_character_of_a_long_name_is_assembled()
+    {
+        let units: [u16; 2] = kani::any();
+        let count: usize = kani::any();
+        kani::assume(count <= units.len());
+        property::utf8_step_holds(&units[..count], kani::any(), kani::any(), kani::any());
+    }
+
+    /// Base of the assembly: every name of up to 3 units, in any state, into
+    /// any buffer, its forms held in 12 bytes (a 3-unit name's takes at most
+    /// 9). The longest loops walk those 12 bytes, so an unwind bound of 13
+    /// covers them.
+    #[kani::proof]
+    #[kani::unwind(13)]
+    fn every_short_long_name_is_assembled()
+    {
+        let acc = any_lfn_up_to(3);
+        property::assemble_holds::<12>(&acc, kani::any());
+    }
+
+    /// The match: every name of up to 3 units, in any state, against any
+    /// name of up to 5 bytes, bounded as the assembly's.
+    #[kani::proof]
+    #[kani::unwind(13)]
+    fn every_short_long_name_is_matched()
+    {
+        let acc = any_lfn_up_to(3);
+        let name: [u8; 5] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= name.len());
+        property::match_holds::<12>(&acc, &name[..len]);
+    }
+
+    /// A character of a name to encode: any start of up to 4 bytes, the most
+    /// one character holds. The longest loops walk those 4 bytes, so an
+    /// unwind bound of 6 covers them.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn each_character_of_a_name_to_encode_is_decoded()
+    {
+        let bytes: [u8; 4] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        property::utf8_char_holds(&bytes[..len]);
+    }
+
+    /// Encoding: every name of up to 4 bytes, one character of every width or
+    /// up to four of the narrowest, is encoded as its UTF-16 code units, or
+    /// refused, the units read back in 12 bytes. With the character read
+    /// proven above, the loops walk at most those 4 bytes, so an unwind bound
+    /// of 6 covers them.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn every_short_name_is_encoded()
+    {
+        let name: [u8; 4] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= name.len());
+        property::encode_contract_holds::<12>(&name[..len]);
+    }
+
+    /// Packing: any slot of any name of up to 27 code units (three slots'
+    /// worth, the third holding the terminator or padding) is laid out as the
+    /// specification lays it out. With the accumulator's step proven above,
+    /// which reads any slot so laid out, a name's slots read back. The longest
+    /// loops walk the slot's 13 characters, so an unwind bound of 14 covers
+    /// them.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn every_long_name_slot_is_packed_in_place()
+    {
+        let units: [u16; 27] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= units.len());
+        property::pack_slot_holds(kani::any(), kani::any(), kani::any(), &units[..len]);
+    }
+
+    /// Step of the removal scan for a slot of the kind `long` names (a
+    /// long-name slot, or any other), at any place, and any name of up to 3
+    /// bytes, the accumulator compared at any name position, so at every one.
+    /// A long-name slot's attribute is fixed, so the problem holds no other
+    /// slot's path. The step's two parts are proven apart, each with the
+    /// other's input held small. `places` takes a run of any length, up to
+    /// 21 places, since the places a step records depend only on the run, on
+    /// a long-name slot's first-slot bit and on whether the entry is found and
+    /// its run valid: so an accumulator whose name is empty and the name `A`,
+    /// which the short name alone matches or not, with the run valid or not;
+    /// and a long-name slot of sequence 1, first or not, whose units are zero.
+    /// Otherwise the run is empty and the accumulator's name has up to one unit
+    /// ([`any_lfn_up_to`]), which against a name of up to 3 bytes takes both
+    /// answers of `LfnAccum::matches`, proven above, and the slot's units are
+    /// any.
+    fn removal_step(long: bool, places: bool)
+    {
+        let scan = if places
+        {
+            let lfn = LfnAccum {
+                chars: [0u16; super::MAX_LFN_CHARS],
+                len: 0,
+                chksum: kani::any(),
+                last_seq: kani::any(),
+                saw_last: kani::any(),
+                active: kani::any(),
+            };
+            kani::assume(property::lfn_invariant(&lfn));
+            RemoveRunScan {
+                lfn,
+                slots: any_run(),
+            }
+        }
+        else
+        {
+            RemoveRunScan {
+                lfn: any_lfn_up_to(1),
+                slots: SlotRun {
+                    slots: kani::any(),
+                    len: 0,
+                },
+            }
+        };
+        let mut raw: [u8; 32] = if long && places
+        {
+            let mut raw = [0u8; 32];
+            raw[0] = if kani::any() { 0x41 } else { 0x01 };
+            raw[13] = kani::any();
+            raw
+        }
+        else
+        {
+            kani::any()
+        };
+        if long
+        {
+            raw[11] = ATTR_LFN;
+            kani::assume(raw[0] != 0xE5);
+        }
+        else
+        {
+            kani::assume(raw[0] == 0xE5 || raw[11] != ATTR_LFN);
+        }
+        let name: [u8; 3] = if places { [b'A', 0, 0] } else { kani::any() };
+        let len: usize = if places { 1 } else { kani::any() };
+        kani::assume(len <= name.len());
+        property::remove_step_holds(&scan, &raw, kani::any(), &name[..len], Some(kani::any()));
+    }
+
+    /// Step of the removal scan, a long-name slot, the places it records
+    /// ([`removal_step`]). The longest loops compare runs of up to 21
+    /// places, so an unwind bound of 23 covers them.
+    #[kani::proof]
+    #[kani::unwind(23)]
+    fn each_long_name_slot_steps_a_removal_scan_places()
+    {
+        removal_step(true, true);
+    }
+
+    /// Step of the removal scan, a long-name slot, the units it writes
+    /// ([`removal_step`]). The longest loops walk the slot's 13 units, so an
+    /// unwind bound of 14 covers them.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn each_long_name_slot_steps_a_removal_scan_name()
+    {
+        removal_step(true, false);
+    }
+
+    /// Step of the removal scan, any other slot, the places it records
+    /// ([`removal_step`]), bounded as the long-name slot's.
+    #[kani::proof]
+    #[kani::unwind(23)]
+    fn each_other_slot_steps_a_removal_scan_places()
+    {
+        removal_step(false, true);
+    }
+
+    /// Step of the removal scan, any other slot, the match it makes
+    /// ([`removal_step`]). The longest loops walk the 11 bytes of a short
+    /// name, so an unwind bound of 12 covers them.
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn each_other_slot_steps_a_removal_scan_match()
+    {
+        removal_step(false, false);
+    }
+
+    /// Base and step of the free-run scan: a new scan for any count stands in
+    /// the invariant, and from any state in it any slot steps the scan. The
+    /// longest loops copy a run of up to 21 places, so an unwind bound of 23
+    /// covers them.
+    #[kani::proof]
+    #[kani::unwind(23)]
+    fn each_slot_steps_a_free_run_scan()
+    {
+        assert!(property::free_invariant(&FreeRunScan::<u32>::new(
+            kani::any()
+        )));
+        let scan = FreeRunScan {
+            slots: any_run(),
+            count: kani::any(),
+            past_end: kani::any(),
+            end_marker: kani::any(),
+        };
+        kani::assume(property::free_invariant(&scan));
+        property::free_step_holds(&scan, kani::any(), kani::any());
+    }
+
+    /// Numeric tails read: any short name's tail against any basis composes
+    /// back to it. The longest loops walk the 11-byte names, so an unwind
+    /// bound of 12 covers them.
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn every_numeric_tail_read_composes_back()
+    {
+        let sfn: [u8; 11] = kani::any();
+        let basis: [u8; 11] = kani::any();
+        property::tail_read_holds(&sfn, &basis);
+    }
+
+    /// Numeric tails composed: any tail with any basis. The longest loops walk
+    /// the 11-byte names and the tail's up to 6 digits, so an unwind bound of
+    /// 12 covers them.
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn every_numeric_tail_composes_its_name()
+    {
+        let basis: [u8; 11] = kani::any();
+        property::compose_holds(&basis, kani::any());
+    }
+
+    /// Numeric tails round trip: any tail composed with any basis reads back
+    /// from the name. The longest loops walk the 11-byte names, so an unwind
+    /// bound of 12 covers them.
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn every_composed_numeric_tail_reads_back()
+    {
+        let basis: [u8; 11] = kani::any();
+        property::tail_round_trip_holds(&basis, kani::any());
     }
 }
 
@@ -2069,6 +2633,21 @@ mod tests
             parse_bpb_geometry(&zero_spc, 512, u64::MAX),
             Err(BpbError::ZeroDivisor)
         ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_rejects_sectors_per_cluster_not_a_power_of_two()
+    {
+        // Defect caught: a cluster size the specification does not permit
+        // was accepted and its cluster count divided out.
+        for spc in [3u8, 6, 255]
+        {
+            let sector = bpb_sector(512, spc, 1, 2, 512, 60_000, 20, 0, 0, 0, 0);
+            assert!(matches!(
+                parse_bpb_geometry(&sector, 512, u64::MAX),
+                Err(BpbError::BadGeometry)
+            ));
+        }
     }
 
     #[test]
@@ -3145,5 +3724,105 @@ mod tests
         // Never more than the volume holds.
         assert_eq!(dir_chain_limit(10, 1, 512), 10);
         assert_eq!(dir_chain_limit(100, 0, 512), 0);
+    }
+
+    /// Every checked-in input of fuzz/fat/ of the `kinds` given (`seeds`,
+    /// `regressions`).
+    fn fuzz_inputs(kinds: &[&str]) -> Vec<Vec<u8>>
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/fat");
+        let mut inputs = Vec::new();
+        for kind in kinds
+        {
+            let Ok(entries) = std::fs::read_dir(dir.join(kind))
+            else
+            {
+                continue;
+            };
+            for entry in entries
+            {
+                inputs.push(std::fs::read(entry.unwrap().path()).unwrap());
+            }
+        }
+        inputs
+    }
+
+    // Defect caught: a parser change that breaks its contract on an input
+    // the fuzz target once found or started from; `cargo xtask test` replays
+    // every checked-in input of fuzz/fat/ on each change.
+    #[test]
+    fn every_checked_in_fuzz_input_holds_the_parser_contract()
+    {
+        let inputs = fuzz_inputs(&["seeds", "regressions"]);
+        assert!(!inputs.is_empty(), "no checked-in input under fuzz/fat");
+        for input in &inputs
+        {
+            property::fat_holds(input);
+        }
+    }
+
+    // Defect caught: seeds that no longer reach an accepted volume of each
+    // type and size, a volume refused for its cluster size, or a valid long
+    // name, so the search starts from inputs that stop at the first refusal.
+    #[test]
+    fn the_seeds_reach_both_fat_types_and_a_valid_long_name()
+    {
+        let seeds = fuzz_inputs(&["seeds"]);
+        let accepted = |fat32: bool, size: u32| {
+            seeds.iter().any(|seed| {
+                parse_bpb_geometry(seed, size, u64::MAX)
+                    .is_ok_and(|g| matches!(g.fat_type, FatType::Fat32) == fat32)
+            })
+        };
+        assert!(accepted(false, 512), "no FAT16 seed");
+        assert!(accepted(true, 512), "no FAT32 seed");
+        assert!(accepted(true, 4096), "no 4096-byte-sector seed");
+        assert!(
+            seeds.iter().any(|seed| seed.get(13) == Some(&3)
+                && matches!(
+                    parse_bpb_geometry(seed, 512, u64::MAX),
+                    Err(BpbError::BadGeometry)
+                )),
+            "no seed refused for a cluster size that is not a power of two"
+        );
+        let long_name = seeds.iter().any(|seed| {
+            let mut acc = LfnAccum::new();
+            seed.as_chunks::<32>().0.iter().any(|raw| {
+                if raw[11] == ATTR_LFN
+                {
+                    acc.add_lfn_entry(raw);
+                    return false;
+                }
+                let valid = parse_dir_entry(raw).is_some_and(|e| acc.validate(&e.name));
+                acc.reset();
+                valid
+            })
+        });
+        assert!(long_name, "no seed holds a valid long-name run");
+    }
+
+    // Defect caught: a name holding U+0000 or U+FFFF, whose code units a
+    // long name's slots take as its end, written as a long name that reads
+    // back cut short at that character.
+    #[test]
+    fn encode_lfn_refuses_a_character_that_ends_a_long_name()
+    {
+        let mut units = [0u16; MAX_LFN_CHARS];
+        assert_eq!(encode_lfn("a\u{FFFF}b".as_bytes(), &mut units), None);
+        assert_eq!(encode_lfn(b"a\0b", &mut units), None);
+        assert_eq!(encode_lfn("a\u{FFFE}b".as_bytes(), &mut units), Some(3));
+    }
+
+    // Defect caught: a create or rename of a name no long name can hold
+    // reached the directory write, which refused it as a corrupt volume.
+    #[test]
+    fn is_storable_name_refuses_what_encode_lfn_refuses_or_an_empty_name()
+    {
+        assert!(is_storable_name(b"a.txt"));
+        assert!(is_storable_name(&[b'a'; MAX_LFN_CHARS]));
+        assert!(!is_storable_name(b""));
+        assert!(!is_storable_name("a\u{FFFF}".as_bytes()));
+        assert!(!is_storable_name(&[0xFF]));
+        assert!(!is_storable_name(&[b'a'; MAX_LFN_CHARS + 1]));
     }
 }

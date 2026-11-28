@@ -1777,13 +1777,8 @@ fn require_no_evict(thread: u64, ready: &Ready)
     }
 }
 
-/// Make every listed process resident, then wait until memmgr's store and
-/// swapped total are empty, the identity holds and, given a `baseline`, the
-/// pool's pages in no account ([`Pool::unaccounted`]) are not above the
-/// baseline's and the charge below svctest's node ([`children_charge`]) is
-/// back to it: no page the phase moved is lost, and the children it started
-/// hold none. `phase` names the phase in a panic. Returns the pages in no
-/// account then, in bytes.
+/// Make every listed process resident, then [`settle`]. Returns the pages in
+/// no account then, in bytes.
 pub(super) fn settle_resident(authority: u64, phase: &str, baseline: Option<&Baseline>) -> u64
 {
     let top = syscall::user_va_top()
@@ -1796,6 +1791,17 @@ pub(super) fn settle_resident(authority: u64, phase: &str, baseline: Option<&Bas
             "{phase}: MAKE_RESIDENT of process {badge:#x} replied {label:#x}"
         );
     }
+    settle(phase, baseline)
+}
+
+/// Wait until memmgr's store and swapped total are empty, the identity holds
+/// and, given a `baseline`, the pool's pages in no account
+/// ([`Pool::unaccounted`]) are not above the baseline's and the charge below
+/// svctest's node ([`children_charge`]) is back to it: no page the phase moved
+/// is lost, and the children it started hold none. `phase` names the phase in
+/// a panic. Returns the pages in no account then, in bytes.
+pub(super) fn settle(phase: &str, baseline: Option<&Baseline>) -> u64
+{
     let start = Instant::now();
     loop
     {
@@ -1818,7 +1824,7 @@ pub(super) fn settle_resident(authority: u64, phase: &str, baseline: Option<&Bas
                 |b| format!("{} and {} bytes", b.unaccounted, b.children),
             );
             panic!(
-                "{phase}: {SETTLE_BOUND:?} after everything was made resident: identity {} (ram \
+                "{phase}: {SETTLE_BOUND:?} into the settle: identity {} (ram \
                  {} reserved {} total {}), store {} bytes, swapped {} bytes, bytes in no account \
                  {unaccounted:?} (free {} deferred {} metadata {} held {}) and charged below \
                  svctest's node {children}, against {expected} at the start",

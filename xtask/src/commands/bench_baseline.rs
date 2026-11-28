@@ -4,8 +4,8 @@
 // xtask/src/commands/bench_baseline.rs
 
 //! bench-baseline command: rewrite the benchmark baselines, icount mode's
-//! from the bench cell's artifacts of a CI run, host mode's from saved logs
-//! of this host.
+//! from the bench cell's artifacts of a CI run, host mode's, and with
+//! `--bands` its bands, from saved logs of this host.
 //!
 //! Which files a rewrite touches is `crate::benchmark::regenerate`'s rule;
 //! the readers are `bench-check`'s.
@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Context as _, Result, bail};
 
-use crate::benchmark::{BenchMode, ENV_FILE, Rewrite, gather, regenerate, write_env};
+use crate::benchmark::{
+    BANDS_FILE, BenchMode, ENV_FILE, Rewrite, calibrate_bands, gather, regenerate, write_env,
+};
 use crate::cli::BenchBaselineArgs;
 use crate::commands::bench_check::{
     host_env, mode_dir, read_bands, read_baselines, read_runs, write_file,
@@ -122,20 +124,24 @@ fn rewrite(
     let dir = mode_dir(ctx, &args.baselines, mode, &set.arch);
     let stored = read_baselines(&dir)?;
     let bands = read_bands(&dir, mode)?;
-    let files = regenerate(
-        mode,
-        &set,
-        &stored,
-        &bands,
-        if args.all
-        {
-            Rewrite::All
-        }
-        else
-        {
-            Rewrite::Moved
-        },
-    )?;
+    let which = if args.all
+    {
+        Rewrite::All
+    }
+    else
+    {
+        Rewrite::Moved
+    };
+    let files = regenerate(mode, &set, &stored, &bands, which)?;
+    // Calibrated before any file is written, so a refusal writes nothing.
+    let calibrated = if args.bands
+    {
+        Some(calibrate_bands(&runs, &bands, which)?)
+    }
+    else
+    {
+        None
+    };
     for (bench, content) in &files
     {
         let path = dir.join(bench);
@@ -165,6 +171,12 @@ fn rewrite(
         };
         write_file(&env_path, &content)?;
         println!("wrote {}", env_path.display());
+    }
+    if let Some(content) = calibrated
+    {
+        let path = dir.join(BANDS_FILE);
+        write_file(&path, &content)?;
+        println!("wrote {}", path.display());
     }
     Ok(())
 }

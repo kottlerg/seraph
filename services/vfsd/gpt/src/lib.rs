@@ -36,6 +36,16 @@ pub const MAX_BLOCK_SIZE: usize = 4096;
 /// minimum size both fit it.
 pub const MIN_BLOCK_SIZE: usize = 512;
 
+/// The most used entries [`collect_partitions`] takes from one copy's entry
+/// array; an array with more is refused ([`ScanStop::TooManyPartitions`]).
+/// The GPT spec bounds the used entries by `num_parts` alone, a `u32`, so
+/// without this a disk could fill the caller's heap with its partition list.
+/// No disk a real system shares reaches it: Linux takes at most 256
+/// partitions of a disk (`DISK_MAX_PARTS`), Windows 128, and the 16 KiB
+/// array the spec's minimum reserves holds 128 entries. A list at the
+/// ceiling takes 16 KiB of heap (256 [`GptEntry`] values of 64 bytes).
+pub const MAX_PARTITIONS: usize = 256;
+
 /// A discovered GPT partition.
 ///
 /// `type_guid` is the role-identifying partition type GUID; `uuid` is the
@@ -355,6 +365,10 @@ pub enum ScanStop
     /// every slot and the array's CRC32 matched, but the list holds only the
     /// entries before that one.
     OutOfMemory,
+    /// The array holds more than [`MAX_PARTITIONS`] used entries: the walk
+    /// ended at the first past it, the list holds the ones before it, and the
+    /// array is unverified.
+    TooManyPartitions,
 }
 
 /// The used partitions of a GPT entry array, in on-disk order.
@@ -472,7 +486,7 @@ impl Iterator for ArrayWalk
 }
 
 /// Walk the partition-entry array `header` describes, collect every used
-/// entry, however many the header declares, and check the array's CRC32.
+/// entry, up to [`MAX_PARTITIONS`], and check the array's CRC32.
 ///
 /// `read_block(lba, buf)` fills `buf`, `header.block_size` bytes long, with
 /// the logical block at `lba` and returns whether the read succeeded. The
@@ -481,11 +495,13 @@ impl Iterator for ArrayWalk
 /// from `header.part_entry_lba` and checks exactly `num_parts` entries; their
 /// `num_parts * entry_size` bytes are the bytes the array's CRC32 covers
 /// (UEFI 2.10 § 5.3.2), compared with `header.entries_crc` at the end. The
-/// list grows on the heap, one element per used entry, so its size follows
-/// the disk, not a fixed table; when it cannot grow, the walk goes on to check
-/// the CRC32 and reports [`ScanStop::OutOfMemory`]. A header whose block size
-/// or entry size [`parse_header`] would refuse yields an empty scan stopped at
-/// its first LBA.
+/// list grows on the heap, one element per used entry, up to
+/// [`MAX_PARTITIONS`]; a used entry past it ends the walk with
+/// [`ScanStop::TooManyPartitions`]. When the list cannot grow, the walk goes
+/// on to count the used entries and check the CRC32, and reports
+/// [`ScanStop::OutOfMemory`]. A header whose block size or entry size
+/// [`parse_header`] would refuse yields an empty scan stopped at its first
+/// LBA.
 pub fn collect_partitions(
     header: &GptHeader,
     mut read_block: impl FnMut(u64, &mut [u8]) -> bool,
@@ -509,6 +525,8 @@ pub fn collect_partitions(
     let mut loaded = None;
     let mut crc = CRC32_INIT;
     let mut out_of_memory = false;
+    // The used entries the walk has decoded, kept or not.
+    let mut used = 0usize;
     for (index, slot) in walk.enumerate()
     {
         let slot = match slot
@@ -535,22 +553,34 @@ pub fn collect_partitions(
         }
         let bytes = slot.bytes(block_buf).unwrap_or_default();
         crc = bytes.iter().fold(crc, |crc, &byte| crc32_update(crc, byte));
+        // The walk yields at most `num_parts` slots, a `u32`, so the
+        // number fits.
+        let number = u32::try_from(index).map_or(u32::MAX, |i| i.saturating_add(1));
+        let Some(entry) = parse_entry(bytes, number)
+        else
+        {
+            continue;
+        };
+        // At most one more than `MAX_PARTITIONS`, where the walk ends: no
+        // saturation.
+        used = used.saturating_add(1);
+        if used > MAX_PARTITIONS
+        {
+            return PartitionScan {
+                entries,
+                stop: Some(ScanStop::TooManyPartitions),
+            };
+        }
         if out_of_memory
         {
             continue;
         }
-        // The walk yields at most `num_parts` slots, a `u32`, so the
-        // number fits.
-        let number = u32::try_from(index).map_or(u32::MAX, |i| i.saturating_add(1));
-        if let Some(entry) = parse_entry(bytes, number)
+        if entries.try_reserve(1).is_err()
         {
-            if entries.try_reserve(1).is_err()
-            {
-                out_of_memory = true;
-                continue;
-            }
-            entries.push(entry);
+            out_of_memory = true;
+            continue;
         }
+        entries.push(entry);
     }
     let stop = if !crc != header.entries_crc
     {
@@ -584,8 +614,9 @@ pub enum GptFault
     /// The copy's header could not be read, or [`parse_header`] refused it.
     Header(GptError),
     /// The copy's array could not be read whole
-    /// ([`ScanStop::ReadFailed`]), or its CRC32 did not match
-    /// ([`ScanStop::ChecksumMismatch`]).
+    /// ([`ScanStop::ReadFailed`]), its CRC32 did not match
+    /// ([`ScanStop::ChecksumMismatch`]), or it holds more used entries than
+    /// the parser takes ([`ScanStop::TooManyPartitions`]).
     Array(ScanStop),
     /// The disk has no LBA past LBA 1 to hold a backup header: it is two
     /// blocks long or shorter.
@@ -611,6 +642,13 @@ impl core::fmt::Display for GptFault
             GptFault::Array(ScanStop::OutOfMemory) =>
             {
                 f.write_str("no memory for the partition list")
+            }
+            GptFault::Array(ScanStop::TooManyPartitions) =>
+            {
+                write!(
+                    f,
+                    "entry array holds more than {MAX_PARTITIONS} used entries"
+                )
             }
         }
     }
@@ -698,10 +736,11 @@ fn read_copy(
     let scan = collect_partitions(&header, &mut *read_block);
     match scan.stop
     {
-        Some(stop @ (ScanStop::ReadFailed { .. } | ScanStop::ChecksumMismatch)) =>
-        {
-            Err(GptFault::Array(stop))
-        }
+        Some(
+            stop @ (ScanStop::ReadFailed { .. }
+            | ScanStop::ChecksumMismatch
+            | ScanStop::TooManyPartitions),
+        ) => Err(GptFault::Array(stop)),
         None | Some(ScanStop::OutOfMemory) => Ok((header, scan)),
     }
 }
@@ -1688,6 +1727,58 @@ mod tests
         assert_eq!(reads, [] as [u64; 0]);
     }
 
+    /// An array of `slots` 128-byte entries, as for a disk at LBA 2, with
+    /// entry `i` used (type GUID byte `0xAA`, first LBA `1000 * (i + 1)`)
+    /// when `used(i)` holds; unlike [`entry_array`], for any slot count.
+    fn many_entries(slots: u32, used: impl Fn(u32) -> bool) -> Vec<u8>
+    {
+        let mut disk = vec![0u8; (slots * 128) as usize];
+        for i in (0..slots).filter(|&i| used(i))
+        {
+            let first = 1000 * u64::from(i + 1);
+            let off = (i * 128) as usize;
+            disk[off..off + 128].copy_from_slice(&entry_bytes(0xAA, first, first + 99, 0));
+        }
+        disk
+    }
+
+    #[test]
+    fn collect_keeps_max_partitions_used_entries()
+    {
+        // Twice as many slots as the ceiling, every other one used.
+        let slots = 2 * u32::try_from(MAX_PARTITIONS).unwrap();
+        let disk = many_entries(slots, |i| i % 2 == 1);
+        let mut reads = Vec::new();
+        let h = header_of(&disk, slots, 128);
+        let scan = collect_partitions(&h, reader(&disk, None, &mut reads));
+        assert_eq!(scan.stop, None);
+        assert_eq!(scan.entries.len(), MAX_PARTITIONS);
+        assert_eq!(scan.entries.last().map(|e| e.number), Some(slots));
+    }
+
+    // Defect caught: a header that declares a huge array of used entries,
+    // its CRC32s recomputed, has vfsd keep one entry per used slot until its
+    // heap is full (docs/threat-model.md § Disk Images).
+    #[test]
+    fn collect_refuses_an_array_of_more_used_entries_than_max_partitions()
+    {
+        // Slot MAX_PARTITIONS, the first used entry past the ceiling, lies in
+        // the block at LBA 2 + 256 / 4 = 66; two blocks of slots follow it.
+        let slots = u32::try_from(MAX_PARTITIONS).unwrap() + 9;
+        let disk = many_entries(slots, |_| true);
+        let mut reads = Vec::new();
+        let h = header_of(&disk, slots, 128);
+        let scan = collect_partitions(&h, reader(&disk, None, &mut reads));
+        assert_eq!(scan.stop, Some(ScanStop::TooManyPartitions));
+        assert!(!scan.verified());
+        assert_eq!(scan.entries.len(), MAX_PARTITIONS);
+        assert_eq!(
+            reads,
+            (2..=66).collect::<Vec<u64>>(),
+            "the walk read past the refused entry"
+        );
+    }
+
     /// Partition number `number` of type GUID `[tg; 16]`, unique GUID
     /// `[uuid; 16]`, at `first_lba` for `length_lba` blocks, with DPS
     /// priority `priority`.
@@ -2209,6 +2300,31 @@ mod tests
             read_gpt(512, 0, |_, _| false).err(),
             Some([GptFault::Header(GptError::IoError), GptFault::NoBackup])
         );
+    }
+
+    #[test]
+    fn read_gpt_refuses_a_primary_of_more_used_entries_than_max_partitions()
+    {
+        let parts = [(0xE5, 34, 99, 0)];
+        let intact = discover(&disk_image(&parts));
+        let mut disk = disk_image(&parts);
+        // A primary of one used entry past the ceiling, 65 blocks from LBA 2,
+        // whose header's first usable LBA follows them and whose CRC32s match.
+        let slots = u32::try_from(MAX_PARTITIONS).unwrap() + 1;
+        let array = many_entries(slots, |_| true);
+        disk[1024..1024 + array.len()].copy_from_slice(&array);
+        let mut h = header_sector(*b"EFI PART", 2, slots, 128);
+        h[40..48].copy_from_slice(&67u64.to_le_bytes());
+        h[88..92].copy_from_slice(&crc32(&array).to_le_bytes());
+        seal(&mut h);
+        disk[512..1024].copy_from_slice(&h);
+        let gpt = read_disk(&disk, &[]).expect("backup GPT");
+        assert_eq!(gpt.copy, GptCopy::Backup);
+        assert_eq!(
+            gpt.primary_fault,
+            Some(GptFault::Array(ScanStop::TooManyPartitions))
+        );
+        assert_eq!(gpt.scan.entries, intact);
     }
 
     // Defect caught: a parser change that breaks its contract on an input

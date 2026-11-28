@@ -300,7 +300,10 @@ impl Port
 /// Start receiver `id` on `endpoint`: each message it takes goes to the
 /// serve loop on `events`, and it replies with the label the loop sends back
 /// on its own channel before it receives again. One receiver holds one
-/// thread stopped, since a receive cancels the pending reply.
+/// thread stopped, since a receive cancels the pending reply. Each receiver's
+/// receive outcomes go through its own `RecvGuard`, which backs off a failed
+/// receive and ends the stub once failures prove persistent
+/// (docs/ipc-design.md § Receive-Failure Policy).
 fn start_receiver(id: usize, endpoint: u64, events: Sender<Stop>) -> Option<Sender<u64>>
 {
     let (reply_tx, reply_rx): (Sender<u64>, Receiver<u64>) = channel();
@@ -309,15 +312,20 @@ fn start_receiver(id: usize, endpoint: u64, events: Sender<Stop>) -> Option<Send
             let ipc_buf = std::os::seraph::current_ipc_buf();
             // The other receivers receive on `endpoint` too.
             let mut slot = Reply::pooled();
+            let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
             loop
             {
                 // SAFETY: ipc_buf is this thread's registered IPC buffer.
-                let Ok(msg) = (unsafe { next_request(endpoint, &mut slot, ipc_buf) })
-                else
+                let msg = match unsafe { next_request(endpoint, &mut slot, ipc_buf) }
                 {
-                    std::thread::sleep(Duration::from_millis(POLL_MS));
-                    continue;
+                    Ok(msg) => msg,
+                    Err(e) =>
+                    {
+                        guard.on_failure(e);
+                        continue;
+                    }
                 };
+                guard.on_success();
                 let stop = Stop {
                     receiver: id,
                     badge: msg.badge,
@@ -339,6 +347,23 @@ fn start_receiver(id: usize, endpoint: u64, events: Sender<Stop>) -> Option<Send
         })
         .ok()?;
     Some(reply_tx)
+}
+
+/// `RecvGuard` diagnostic hook of the fault receivers: one line at the start
+/// of a failure streak, one more before the fatal exit.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!(warn: "receiver ipc_recv failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!(error: "receiver ipc_recv wedged (err={err}); exiting");
+        }
+    }
 }
 
 // ── The kernel the session drives ────────────────────────────────────────────

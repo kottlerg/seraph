@@ -15,6 +15,7 @@ bin = [
     { name = "devmgr-firmware", path = "src/bin/devmgr-firmware.rs", test = false },
     { name = "driver-binding", path = "src/bin/driver-binding.rs", test = false },
     { name = "elf", path = "src/bin/elf.rs", test = false },
+    { name = "fat", path = "src/bin/fat.rs", test = false },
     { name = "firmware-tables", path = "src/bin/firmware-tables.rs", test = false },
     { name = "gpt", path = "src/bin/gpt.rs", test = false },
     { name = "hwrng-protocol", path = "src/bin/hwrng-protocol.rs", test = false },
@@ -41,6 +42,7 @@ boot-protocol = { path = "../../../abi/boot-protocol" }
 devmgr-firmware = { path = "../../../services/devmgr/firmware" }
 driver-binding = { path = "../../../shared/driver-binding" }
 elf = { path = "../../../shared/elf" }
+fatfs-parse = { path = "../../../services/fs/fat/fat-parse" }
 firmware-tables = { path = "../../../shared/firmware-tables" }
 fuzz-engine = { path = "../engine" }
 hwrng-protocol = { path = "../../../shared/hwrng-protocol" }

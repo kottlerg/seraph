@@ -55,15 +55,15 @@ use worker_pool::WorkerPool;
 /// storage statement after a runtime root `MOUNT` (the `NS_LOOKUP` walk to
 /// it and procmgr's `READ_VERIFIED`, whose read goes to the root fs
 /// driver) nor the discovery of new
-/// disks a `MOUNT` and the first `GET_SWAP_PARTITION` run before their role
+/// disks a `MOUNT` and each `GET_SWAP_PARTITION` run before their role
 /// lookup: devmgr's `QUERY_DEVICE`, the GPT reads of each new disk, a
 /// scratch page from memmgr when a failed read lost the one held, and the
 /// forced unmount of a mount on a new disk found withdrawn, which blocks as
 /// an `UNMOUNT` does. A `GET_SWAP_PARTITION` handler also waits for the
 /// discovery lock, held across one discovery, and for the swap lock, which
-/// its holder keeps across the first request's discovery and one
-/// `REGISTER_PARTITION` call to the block driver; none of devmgr, memmgr
-/// and the block drivers calls vfsd.
+/// its holder keeps across a hand-out: one `BLK_RETIRE_PARTITION` and one
+/// `REGISTER_PARTITION` call to the block driver and one discovery; none of
+/// devmgr, memmgr and the block drivers calls vfsd.
 const SERVICE_THREAD_COUNT: usize = 4;
 
 /// Bound on a fall-through call the namespace thread makes to the root
@@ -481,7 +481,7 @@ pub struct VfsdRuntime
     /// Every block device devmgr served vfsd, each with its whole-disk cap
     /// and its used GPT partition entries, in the order found: at startup,
     /// then by the discovery before each runtime role lookup (`find_partition`
-    /// and the first `GET_SWAP_PARTITION`). A disk devmgr
+    /// and each `GET_SWAP_PARTITION`). A disk devmgr
     /// withdrew stays, marked removed, so a mount record's disk index keeps
     /// naming it. Held only across reads and updates of the table, never
     /// across IPC, and never together with `root_backend`.
@@ -507,10 +507,10 @@ pub struct VfsdRuntime
     /// on each successful MOUNT; the namespace dispatcher reads on each
     /// `NS_*` request.
     pub root_backend: Mutex<VfsdRootBackend>,
-    /// The swap partition cap vfsd keeps, registered by the first
-    /// `GET_SWAP_PARTITION` that finds the partition. The lock is held
-    /// across a whole hand-out, so the first request's registration and a
-    /// later request's revoke never interleave.
+    /// The partition cap of the swap partition's current grant, which each
+    /// `GET_SWAP_PARTITION` cuts off and registers anew. The lock is held
+    /// across a whole hand-out, so one request's registration and another's
+    /// cut-off never interleave.
     pub swap: Mutex<swap::SwapPartition>,
     /// The disk the firmware booted from, identified once at startup
     /// ([`identify_boot_disk`]); `None` when there is none, and then no
@@ -599,8 +599,8 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///
 /// No `do_mount`- or `do_unmount`-touched state is shared without one of
 /// these locks. `GET_SWAP_PARTITION` holds `rt.swap` across a hand-out;
-/// the first one runs a discovery while it holds it, taking `rt.discovery`
-/// and then `rt.disks`, and nothing takes `rt.swap` while it holds either.
+/// each runs a discovery while it holds it, taking `rt.discovery` and then
+/// `rt.disks`, and nothing takes `rt.swap` while it holds either.
 fn service_loop(rt: &'static VfsdRuntime) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -1161,6 +1161,24 @@ struct SwapIo<'a>
     ipc_buf: *mut u64,
 }
 
+impl grant::GrantOps for SwapIo<'_>
+{
+    fn revoke_descendants(&mut self, cap: u64) -> grant::Step
+    {
+        PartitionIo(self.ipc_buf).revoke_descendants(cap)
+    }
+
+    fn retire(&mut self, cap: u64) -> grant::Step
+    {
+        PartitionIo(self.ipc_buf).retire(cap)
+    }
+
+    fn delete(&mut self, cap: u64)
+    {
+        PartitionIo(self.ipc_buf).delete(cap);
+    }
+}
+
 impl swap::SwapOps for SwapIo<'_>
 {
     fn lookup(&mut self) -> Result<gpt::PartitionLocation, gpt::GptLookupError>
@@ -1186,21 +1204,6 @@ impl swap::SwapOps for SwapIo<'_>
         )
     }
 
-    fn revoke_descendants(&mut self, cap: u64) -> bool
-    {
-        match syscall::cap_revoke_all(cap)
-        {
-            Ok(()) => true,
-            Err(code) =>
-            {
-                std::os::seraph::log!(
-                    warn: "GET_SWAP_PARTITION: cap_revoke_all failed: code={code}"
-                );
-                false
-            }
-        }
-    }
-
     fn derive(&mut self, cap: u64) -> Option<u64>
     {
         syscall::cap_derive(cap, syscall::RIGHTS_EP_SEND_GRANT).ok()
@@ -1208,17 +1211,17 @@ impl swap::SwapOps for SwapIo<'_>
 }
 
 /// Handle [`vfsd_labels::GET_SWAP_PARTITION`]: hand the caller a
-/// `SEND_GRANT` on the swap partition, revoking the cap an earlier
-/// hand-out returned ([`swap::SwapPartition::hand_out`]).
+/// `SEND_GRANT` on the swap partition from a grant of its own, cutting off
+/// the grant an earlier hand-out made ([`swap::SwapPartition::hand_out`]).
 ///
-/// The dispatcher admits only a `SWAP_AUTHORITY` badge. The partition is
-/// resolved and registered on the first request, never at startup
+/// The dispatcher admits only a `SWAP_AUTHORITY` badge. Each request
+/// resolves and registers the partition, never startup
 /// ([`resolve_role`], after [`discover_new_disks`]): the one the storage
 /// statement names, else the boot disk's by type and priority. With none,
 /// the request replies [`vfsd_errors::NO_MOUNT`]; so does a tie, and a
 /// named partition that is no swap partition.
-/// A failed registration, revoke or derivation replies
-/// [`vfsd_errors::IO_ERROR`].
+/// A failed cut-off of the previous grant, registration or derivation
+/// replies [`vfsd_errors::IO_ERROR`].
 fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime, reply: &mut Reply)
 {
     let handed = rt
@@ -1240,8 +1243,8 @@ fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime, reply: &mut Re
                 {
                     ipc::vfsd_errors::NO_MOUNT
                 }
-                swap::HandOutError::Register
-                | swap::HandOutError::Revoke
+                swap::HandOutError::CutOff
+                | swap::HandOutError::Register
                 | swap::HandOutError::Derive => ipc::vfsd_errors::IO_ERROR,
             };
             IpcMessage::new(label)
@@ -2020,15 +2023,16 @@ fn driver_unmount(endpoint: u64, force: Force, ipc_buf: *mut u64) -> DriverUnmou
     }
 }
 
-/// Tear down the driver of a mount whose unmount began: revoke its
-/// partition cap, so it reaches the disk no more; revoke its service
+/// Tear down the driver of a mount whose unmount began: cut off its
+/// partition grant ([`release_partition`]), so it reaches the disk no more,
+/// its block regions included; revoke its service
 /// endpoint ([`driver::teardown_driver`]), which invalidates every cap a
 /// client holds on the mount; wait, bounded, for its death to post; then
 /// destroy its process ([`destroy_driver`]), which a driver that did not
 /// exit needs and one that did takes as a no-op.
 fn teardown_mount(mount: &Mount, ipc_buf: *mut u64)
 {
-    revoke_partition(mount.partition);
+    release_partition(mount.partition, ipc_buf);
     driver::teardown_driver(mount.endpoint);
     match syscall::event_recv_timeout(mount.death_queue, DRIVER_DEATH_TIMEOUT_MS)
     {
@@ -2042,12 +2046,12 @@ fn teardown_mount(mount: &Mount, ipc_buf: *mut u64)
 }
 
 /// Tear down the driver of a mount whose removal began after its death:
-/// revoke its partition cap and its service endpoint, as
+/// cut off its partition grant and revoke its service endpoint, as
 /// [`teardown_mount`] does, and destroy what is left of its process; its
 /// death has posted, so nothing is waited for.
 fn teardown_dead_mount(mount: &Mount, ipc_buf: *mut u64)
 {
-    revoke_partition(mount.partition);
+    release_partition(mount.partition, ipc_buf);
     driver::teardown_driver(mount.endpoint);
     destroy_driver(mount, ipc_buf);
 }
@@ -2181,7 +2185,7 @@ fn find_partition(
 
 /// The whole-disk cap of the held disk at `disk`; `None` once it is
 /// removed.
-fn held_disk_cap(rt: &VfsdRuntime, disk: usize) -> Option<u64>
+pub(crate) fn held_disk_cap(rt: &VfsdRuntime, disk: usize) -> Option<u64>
 {
     rt.disks
         .lock()
@@ -2316,7 +2320,7 @@ fn do_mount_internal(
     else
     {
         std::os::seraph::log!(warn: "MOUNT: partition cap derive failed");
-        revoke_partition(partition);
+        release_partition(partition, ipc_buf);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
 
@@ -2350,7 +2354,7 @@ fn do_mount_internal(
     {
         std::os::seraph::log!(warn: "MOUNT: failed to spawn fatfs");
         log_cap_delete("module_cap (spawn-fail)", module_cap_for_spawn);
-        revoke_partition(partition);
+        release_partition(partition, ipc_buf);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
     let driver_ep = fatfs.send;
@@ -2398,7 +2402,7 @@ fn do_mount_internal(
             std::os::seraph::log!(warn: "MOUNT: root fall-through cap derive failed");
             // Revoking the endpoint also invalidates `caller_root_cap` and
             // stops the driver, which nothing would reach otherwise.
-            release_failed_mount(&fatfs, partition);
+            release_failed_mount(&fatfs, partition, ipc_buf);
             return Err(ipc::vfsd_errors::IO_ERROR);
         };
         c
@@ -2427,6 +2431,7 @@ fn do_mount_internal(
             partition,
             disk: location.disk,
             first_lba: partition_lba,
+            length_lba: partition_len,
         };
         // A concurrent MOUNT of the partition may have installed since the
         // check before the spawn: one driver serves a partition.
@@ -2464,7 +2469,7 @@ fn do_mount_internal(
             warn: "MOUNT: synthetic-root install failed (mount point or partition taken, \
              mount limit, no memory, or driver not observed)"
         );
-        release_failed_mount(&fatfs, partition);
+        release_failed_mount(&fatfs, partition, ipc_buf);
         return Err(ipc::vfsd_errors::TABLE_FULL);
     };
 
@@ -2493,28 +2498,83 @@ fn do_mount_internal(
 }
 
 /// Release what a mount transaction holds once it fails after its driver
-/// started: the partition cap is revoked, cutting the driver off its
-/// partition; the driver's service endpoint is revoked
+/// started: the partition grant is cut off ([`release_partition`]),
+/// cutting the driver off its partition; the driver's service endpoint is revoked
 /// ([`driver::teardown_driver`]), invalidating every cap minted from it
 /// and stopping the driver; and the process handle and death queue are
 /// deleted.
-fn release_failed_mount(fatfs: &driver::FatfsDriver, partition: u64)
+fn release_failed_mount(fatfs: &driver::FatfsDriver, partition: u64, ipc_buf: *mut u64)
 {
-    revoke_partition(partition);
+    release_partition(partition, ipc_buf);
     driver::teardown_driver(fatfs.endpoint);
     log_cap_delete("driver process handle", fatfs.process);
     log_cap_delete("driver death queue", fatfs.death_queue);
 }
 
-/// Revoke and delete a partition cap vfsd registered: the driver's
-/// derivation of it stops reaching the block driver.
-fn revoke_partition(partition: u64)
+/// End a partition grant vfsd made and nothing grants again from
+/// ([`grant::release`]): revoke the caps derived from `partition`, retire
+/// its badge with the block driver, delete it, the cap deleted whatever the
+/// outcome. A retire that failed for a reason other than the driver's death
+/// is logged: the cut-off holder may keep a block region of the badge.
+pub(crate) fn release_partition(partition: u64, ipc_buf: *mut u64)
 {
-    if let Err(code) = syscall::cap_revoke_all(partition)
+    if grant::release(&mut PartitionIo(ipc_buf), partition).is_err()
     {
-        std::os::seraph::log!(warn: "partition revoke: cap_revoke_all failed: code={code}");
+        std::os::seraph::log!(warn: "partition grant not retired");
     }
-    log_cap_delete("partition cap", partition);
+}
+
+/// The operations of a partition cut-off ([`grant::GrantOps`]) on this
+/// thread's IPC buffer, the registered IPC buffer page.
+pub(crate) struct PartitionIo(pub(crate) *mut u64);
+
+impl grant::GrantOps for PartitionIo
+{
+    fn revoke_descendants(&mut self, cap: u64) -> grant::Step
+    {
+        let revoked = syscall::cap_revoke_all(cap);
+        if let Err(code) = revoked
+        {
+            std::os::seraph::log!(warn: "partition cap_revoke_all failed: code={code:#x}");
+        }
+        grant::Step::of(revoked.map(|()| true))
+    }
+
+    /// `BLK_RETIRE_PARTITION` on `cap`
+    /// (`services/drivers/virtio/blk/README.md` § Label 10:
+    /// `BLK_RETIRE_PARTITION`), classified by [`grant::Step::of_retire`].
+    /// Anything but its success is logged.
+    fn retire(&mut self, cap: u64) -> grant::Step
+    {
+        let msg = IpcMessage::builder(blk_labels::BLK_RETIRE_PARTITION)
+            .word(0, u64::from(ipc::BLK_LABELS_VERSION))
+            .build();
+        // SAFETY: self.0 is the registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(cap, &msg, self.0) };
+        match &reply
+        {
+            Ok(r) if r.label == ipc::blk_errors::SUCCESS =>
+            {}
+            Ok(r) if r.label == ipc::blk_errors::OUT_OF_BOUNDS =>
+            {
+                std::os::seraph::log!(debug: "partition grant already retired");
+            }
+            Ok(r) =>
+            {
+                std::os::seraph::log!(warn: "BLK_RETIRE_PARTITION refused: code={:#x}", r.label);
+            }
+            Err(code) =>
+            {
+                std::os::seraph::log!(warn: "BLK_RETIRE_PARTITION call failed: code={code:#x}");
+            }
+        }
+        grant::Step::of_retire(reply.as_ref().map(|r| r.label).map_err(|&code| code))
+    }
+
+    fn delete(&mut self, cap: u64)
+    {
+        log_cap_delete("partition cap", cap);
+    }
 }
 
 /// For each synthetic intermediate the install made visible, walk the
@@ -2671,8 +2731,9 @@ fn idle_loop() -> !
 /// minted by devmgr), so vfsd cannot mint partition caps locally — the
 /// kernel rejects re-badging of a badged source. Partition cap
 /// derivation lives server-side in virtio-blk; this call just sends the
-/// bounds and consumes the cap from the reply.
-fn derive_and_register_partition(
+/// bounds and consumes the cap from the reply. Each call is a new grant,
+/// under a badge no earlier one had.
+pub(crate) fn derive_and_register_partition(
     blk_ep: u64,
     base_lba: u64,
     length_lba: u64,

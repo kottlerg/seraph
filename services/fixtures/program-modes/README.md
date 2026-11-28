@@ -1,8 +1,8 @@
 # program-modes
 
-svctest's shared program-role fixture: the processes svctest's phases spawn in the program role
-whose checks need no image of their own. One binary serves every mode, chosen by the first
-argument, with the mode's own arguments after it. It installs at
+svctest's shared program-role fixture: the processes svctest's phases, and ubench's `fault_rate`,
+spawn in the program role whose checks need no image of their own. One binary serves every mode,
+chosen by the first argument, with the mode's own arguments after it. It installs at
 `/tests/fixtures/programs/program-modes`, whose `programs` path component gives it the program
 signing role ([docs/signing.md](../../../docs/signing.md)); see
 [docs/testing.md](../../../docs/testing.md#sysroot-layout) for where test fixtures install.
@@ -15,6 +15,7 @@ first argument.
 | [`capexhaust`](#capexhaust) | `program-modes capexhaust` | `recv_wedge`, `console_whole_lines` |
 | [`deadline`](#deadline) | `program-modes deadline`; `program-modes deadline idle` for its idle child | `deadline` |
 | [`demandpaged`](#demandpaged) | `program-modes demandpaged [oor\|ptdrain\|teardown]` | `demand_paging`, `demand_paging_segfault`, `demand_paging_pinned`, `demand_paging_pt_drain`, `demand_paging_teardown` |
+| [`faultstorm`](#faultstorm) | `program-modes faultstorm <cpu> <chunks> <threads> <touch\|verify>` | `demand_fault_concurrent`; also ubench's `fault_rate` |
 | [`narrow`](#narrow) | `program-modes narrow` | `procmgr_program_narrowing` |
 | [`pipefault`](#pipefault) | `program-modes pipefault` | `pipe_fault_eof` |
 | [`pipestress`](#pipestress) | `program-modes pipestress <token>`; `program-modes pipestress sink` | `pipestress` |
@@ -249,6 +250,76 @@ equal to `ptdrain` the page-table drain mode, and any equal to `teardown` the te
 | [docs/fault-handling.md](../../../docs/fault-handling.md) | Default system pager and the pinned opt-out |
 | [docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md) | Page-reservation surface |
 | [memmgr IPC Interface](../../memmgr/docs/ipc-interface.md) | `REGISTER_REGION` and the fault arm |
+
+---
+
+## faultstorm
+
+Demand faults on fresh chunks of a region of the process's own, taken by one or more threads at
+once in rounds its spawner starts. Its spawner drives it over its stdin and stdout, so several of
+them, one per CPU, fault at once: svctest's `demand_fault_concurrent` phase checks that memmgr's
+accounts survive that, and [ubench](../../ubench/README.md)'s `fault_rate` times it. It prints
+nothing but its protocol's bytes and reports a failure through its exit status. Source:
+`src/faultstorm.rs`.
+
+---
+
+### Arguments and Protocol
+
+`program-modes faultstorm <cpu> <chunks> <threads> <touch|verify>`. The main thread pins itself to
+CPU `<cpu>`, and helper thread t to CPU `<cpu>` + t, each modulo the CPUs online. The process
+registers one demand region (`register_demand_paged`) of `<chunks>` chunks per thread, a chunk
+being `DEMAND_CHUNK_PAGES` (16) pages, the run memmgr backs on one fault
+([memmgr Memory Pool § Demand faults](../../memmgr/docs/memory-pool.md#demand-faults)); thread t
+owns its t-th slice of them. Once registered it writes `r`, then serves one byte of stdin at a time:
+
+| Byte | Action | Answer |
+|---|---|---|
+| `g` | A round: every thread, released together, makes the first store into each chunk of its slice, which is the chunk's fault | `d`, once every thread finished |
+| `n` | Tears the region down (`unregister_demand_paged`) and registers a fresh one of the same size, so the next round faults chunks no earlier round backed | `r` |
+| `x` | Exits with status 0, the process dying with the region and the pages backed in it | none |
+
+In `touch` a round makes one store per chunk, the fault alone. In `verify` each thread also reads
+every page of a chunk it just backed, which must read zero but for the tag its first store left,
+then tags each page with its slice, chunk, page, round and the main thread's CPU; once every thread
+finished, the main thread reads every tag of the region back before it answers.
+
+---
+
+### Exit Status
+
+| Status | Meaning |
+|---|---|
+| `0` | `x` received |
+| `2` | An argument is missing or does not parse |
+| `3` | A thread could not be pinned to its CPU, or the CPU count could not be read |
+| `4` | A region could not be registered |
+| `5` | A region could not be torn down |
+| `6` | `verify`: a page of a freshly backed chunk did not read zero |
+| `7` | `verify`: a tag did not read back after the round |
+| `8` | stdin carried a byte the protocol does not define, or ended |
+| `9` | An answer could not be written to stdout |
+| `10` | A helper thread could not be spawned |
+
+---
+
+### Driven By
+
+| Consumer | Spawn | Expected outcome |
+|---|---|---|
+| svctest `demand_fault_concurrent` | One process per CPU, at least 2 and at most 8, each with 2 threads and 16 chunks per thread, in `verify`; 4 rounds, each after the first on a fresh region, started on all processes at once, then `x` | Every process answers each byte and exits 0; once all are gone, memmgr's all-RAM-accounted identity holds, no page of the pool is in no account beyond the phase's baseline, and nothing stays charged below svctest's node |
+| ubench `fault_rate` | k processes, process i on CPU i, each with 1 thread and 16 chunks, in `touch`; a calibration, then 2 untimed and 16 timed rounds, each on a fresh region | Every process answers each byte and exits 0 |
+
+---
+
+### Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/fault-handling.md](../../../docs/fault-handling.md) | Default system pager |
+| [memmgr Memory Pool](../../memmgr/docs/memory-pool.md) | Demand faults and the receive loop that serves them |
+| [memmgr IPC Interface](../../memmgr/docs/ipc-interface.md) | `REGISTER_REGION`, `UNREGISTER_REGION` and the fault arm |
+| [services/ubench/README.md](../../ubench/README.md) | `fault_rate` |
 
 ---
 

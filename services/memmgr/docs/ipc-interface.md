@@ -308,7 +308,7 @@ charge. The charge stays on the node when the node's handle state goes
 |---|---|---|
 | 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies, or the grant, charged to a node outside the system reserve, would take the growth floor |
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, the grant, charged to a node outside the system reserve, would take the growth floor, or deriving the caller's copy failed |
-| 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), memmgr could not map a selected run to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or the caller's region-id sequence is spent (unreachable: 2^64 − 1 grants) |
+| 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), the kernel's zero of a selected run failed ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or the caller's region-id sequence is spent (unreachable: 2^64 − 1 grants) |
 | 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, badge unknown, or, with `REQUEST_CHARGE_NODE`, `cap[0]` missing, not a node handle, or naming no handle state |
 | 8 | `LIMIT` | `want_pages` would take the subtree of the node the grant is charged to, or of an ancestor, over its max |
 
@@ -617,6 +617,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[19] | `cspace_used_slots` — the used slots of memmgr's own `CSpace` (`CAP_INFO_CSPACE_USED`), a count, not bytes: the caps memmgr holds, its free runs' and grants' among them, so a cap it kept by mistake raises it for good ([`memory-pool.md`](memory-pool.md#cspace-headroom) § CSpace headroom; § Capability Transfer) |
 | data[20] | `metadata_bytes` — subset of `pool_total_bytes` memmgr holds as its own metadata, charged to no node: its arena's pages, its process index's and its swap slot map's, the zero frames it keeps, and the pages it retyped into its own page tables, `CSpace` growth and eviction worker ([`memory-pool.md`](memory-pool.md#metadata-arena) § Metadata Arena); none goes back to the free runs but a zero frame a refused request took |
 | data[21] | `held_bytes` — subset of `pool_total_bytes` the frame records of processes and memory objects hold, each charged to a budget node: grants and page-table donations, the runs backing regions, a copy a make-private drew, and an object's frames; a run on the deferred list or in the store is not counted ([`memory-pool.md`](memory-pool.md#per-process-tracking) § Per-Process Tracking) |
+| data[22] | `draw_short` — 1 while a committed draw has found too few free pages since the draw room (`data[16]`) last opened, which keeps memmgr evicting for frames until it opens again, and 0 from the turn that ends with it open; read with `data[16]` in the one reply. It is that latch alone: with it 0, memmgr may still evict while `data[3]` is below `data[8]` ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -677,7 +678,7 @@ the pages in no account do not rise while it loses none; a reader that finds
 them above an earlier read once eviction has settled (`data[9]` and `data[10]`
 zero) has found pages memmgr lost. Each of the five accounts is kept as a
 running sum, so the reply costs no walk.
-`data[3]` to `data[21]` are appended after the identity terms;
+`data[3]` to `data[22]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`
@@ -1981,7 +1982,7 @@ page holds, or its zero frame at each page, through a capability derived with
 the map right alone, and the execute right for an executable attachment, so no
 leaf of an origin carries a write grant. A write to a private attachment gives
 the faulting page a copy of its object page, a page drawn as a committed
-region's fault draws it, mapped at memmgr's scrub window and copied from
+region's fault draws it, mapped at memmgr's copy window and copied from
 memmgr's own view of the object, mapped once memmgr has
 unmapped the page's read-only leaf; in a zero-object attachment it backs the
 span as a committed region's fault does, once memmgr has unmapped the span's
@@ -1999,9 +2000,9 @@ not executable, is declined with code 4.
 | 6 | The metadata arena cannot grow for the slots recording the run takes: its descriptor, and the chunk's path in the region's chunk table |
 | 7 | No free page can back the faulting page: for a fault in an uncommitted region, the free pool is empty after the deferred runs are rechecked, every free page outside `promised` is in the growth floor and the process's budget node is outside the system reserve, or none is outside `promised`; for any fault, the split of a run larger than the pages to back failed. A fault in a committed region whose draw finds no page is code 11 |
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
-| 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents) or to copy an attachment's object page into it, or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
+| 9 | The kernel's zero of the run failed ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or a map of the run failed: into memmgr's copy window, to copy an attachment's object page into it, or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
 | 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Committed fault declines); for a fault on a chunk memmgr is evicting, holds raw or evicted, in either kind of region, the page-table funding the map of the chunk's runs needs would, past what a committed region's page-table reservation still holds; a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
-| 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the growth floor, for a process outside the system reserve, while a swap service has registered swap slots) even after memmgr evicted victims in its turn; only registered swap slots, or memmgr's own metadata taking free pages without admission, make it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it until the draw room opens (`QUERY_POOL_STATUS` `data[16]`) |
+| 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the growth floor, for a process outside the system reserve, while a swap service has registered swap slots) even after memmgr evicted victims in its turn; only registered swap slots, or memmgr's own metadata taking free pages without admission, make it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it until the draw room opens (`QUERY_POOL_STATUS` `data[16]`), and re-asks it while the room reads short and `data[22]` 0 |
 | 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost, detail 2 when the swap service could not read the chunk's slot (swapd forwards a held fault with it) and the chunk stays on disk; memmgr itself produces details 0 and 1 only |
 
 Each demand run is recorded on its chunk in the region's chunk table, so
@@ -2036,7 +2037,7 @@ declined only:
   node or an ancestor (10) or the growth floor (9) refuses it; only the process spends the
   reservation early, by a thread that maps between the rounds of one map, or by a reclaiming unmap
   of page tables in the region's span that it made or asked for (§ Commit, Faults);
-- with code 9, when a map of the run fails as any map can: the map into memmgr that zeroes it, or
+- with code 9, when the kernel's zero of the run fails, or a map of the run fails as any map can:
   the map into the process when no two contiguous free pages remain for a donation, or when a
   thread of the process takes the donated pages faster than four rounds fund them;
 - with code 6 or 8, when memmgr's metadata arena cannot grow, past what is left of the region's
@@ -2060,7 +2061,7 @@ it evicted restores the chunk; either is declined only:
 
 An attachment (§ Label 28) is a committed region here, never evicted. A write to a private one is
 declined as a first touch above; one that copies an object page also with code 9 when the map of
-its copy into memmgr's scrub window fails, or the unmap of the page's
+its copy into memmgr's copy window fails, or the unmap of the page's
 read-only leaf from the process does. A read of either kind takes no page but the page-table
 donations its map needs, so it is declined only with code 10 or 9 for a donation as above, with
 code 9 when the derivation of its map capability or the map fails as any map can, and with code 6

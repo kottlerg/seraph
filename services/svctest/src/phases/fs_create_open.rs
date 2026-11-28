@@ -14,8 +14,9 @@
 //! asks to open it (`CREATE_OPEN_EXISTING`), and then opens it unless the
 //! directory's cap lacks `LOOKUP` (`PERMISSION_DENIED`), a directory of that
 //! name is `IS_A_DIRECTORY`, a request with no session cap or with
-//! the second flag alone is `INVALID_ARGUMENT`, and in a session whose node is
-//! at its max a create, and an open of an existing file, are `LIMIT` and make
+//! the second flag alone is `INVALID_ARGUMENT`, every invalid name
+//! ([`INVALID_NAMES`]) is `INVALID_ARGUMENT` with no entry made, and in a
+//! session whose node is at its max a create, and an open of an existing file, are `LIMIT` and make
 //! no entry. Three children drive std's create: a `fs-create-open-full` child
 //! ([`full_session_main`]) fills its node to its max and its session with the
 //! `/data` driver to its pages, and its `File::create` and `create_new` fail
@@ -40,6 +41,7 @@ use crate::ipc_util::fs::{
 };
 use crate::ipc_util::ns::ns_lookup;
 use crate::phases::budget;
+use crate::phases::fs_ipc::{INVALID_NAMES, listing};
 use crate::phases::fs_sessions::{
     AT_MAX_NO_LIMIT, AT_MAX_PAGES, ESP_PROBE, NO_MAX, SESSION_MAX, at_max_fill, at_max_touch_stack,
     charge_handle, sub_node,
@@ -175,8 +177,30 @@ fn create_open(
     ipc_buf: *mut u64,
 ) -> Result<(u64, u64), u64>
 {
-    let label = fs_labels::FS_CREATE | flags | ((name.len() as u64) << 16);
-    let mut builder = IpcMessage::builder(label).bytes(0, name.as_bytes());
+    create_open_raw(
+        dir,
+        name.as_bytes(),
+        name.len() as u64,
+        flags,
+        caps,
+        ipc_buf,
+    )
+}
+
+/// [`create_open`] of the bytes `name_bytes`, the request claiming `len`
+/// name bytes.
+fn create_open_raw(
+    dir: u64,
+    name_bytes: &[u8],
+    len: u64,
+    flags: u64,
+    caps: &[u64],
+    ipc_buf: *mut u64,
+) -> Result<(u64, u64), u64>
+{
+    let name = String::from_utf8_lossy(name_bytes);
+    let label = fs_labels::FS_CREATE | flags | (len << 16);
+    let mut builder = IpcMessage::builder(label).bytes(0, name_bytes);
     for &cap in caps
     {
         builder = builder.cap(cap);
@@ -376,6 +400,26 @@ fn raw_creates(svctest: u64, session: u64, ipc_buf: *mut u64)
         entry_size(svctest, EXISTING_ALONE, ipc_buf),
         None,
         "{EXISTING_ALONE} was created"
+    );
+
+    // Every invalid name is refused by a create that opens, whether or not
+    // it would open an existing file, and makes no entry.
+    let before = listing(svctest, ipc_buf);
+    for &(what, name, len) in INVALID_NAMES
+    {
+        for flags in [OPEN, OPEN_EXISTING]
+        {
+            assert_eq!(
+                create_open_raw(svctest, name, len, flags, &[session_copy(session)], ipc_buf).err(),
+                Some(fs_errors::INVALID_ARGUMENT),
+                "a create that opens {what} (flags {flags:#x})"
+            );
+        }
+    }
+    assert_eq!(
+        listing(svctest, ipc_buf),
+        before,
+        "a create that opens an invalid name changed the directory"
     );
 }
 

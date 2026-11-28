@@ -10,7 +10,8 @@
 //! A benchmark returns `Err` with a reason when it fails; `main` logs that
 //! reason as the benchmark's FAIL line (services/ubench/README.md § Output).
 
-use bench::{IDLE_HALTS, Report, Unit, Value};
+use bench::{Counters, CycleRate, IDLE_HALTS, Report, Unit, Value};
+use syscall_abi::SystemInfoType;
 
 /// The suite of every result line ubench logs itself.
 pub const SUITE: &str = "ubench";
@@ -27,6 +28,41 @@ pub const LOG_LINE_BYTES: usize = 256;
 /// A benchmark's outcome: `Ok` once it logged its result lines and the SKIP
 /// lines of the cases it could not run, `Err` with the reason it failed.
 pub type Outcome = Result<(), String>;
+
+/// The microseconds over which [`calibrate`] measures the counter's rate.
+const CALIBRATION_MICROS: u64 = 2000;
+
+/// A benchmark's timed region: the cycles `region` took between two counter
+/// reads. Each window row passes its own, so that its calibration and its
+/// windows read the counter at the same two addresses, which
+/// `cargo xtask path-account` divides a program's windows by
+/// (xtask/README.md § `cargo xtask path-account`).
+pub type Timed = fn(&Counters, &mut dyn FnMut() -> Outcome) -> Result<u64, String>;
+
+/// The counter's rate against the elapsed clock, over [`CALIBRATION_MICROS`]
+/// in which the calling thread keeps its CPU busy, so that the CPU does not
+/// halt, read through `timed`.
+pub fn calibrate(counters: &Counters, timed: Timed) -> Result<CycleRate, String>
+{
+    let first = elapsed_us()?;
+    let mut last = first;
+    let cycles = timed(counters, &mut || {
+        while last.saturating_sub(first) < CALIBRATION_MICROS
+        {
+            last = elapsed_us()?;
+        }
+        Ok(())
+    })?;
+    CycleRate::new(cycles, last.saturating_sub(first))
+        .ok_or_else(|| format!("no counter rate: {cycles} cycles in {CALIBRATION_MICROS} us"))
+}
+
+/// The kernel's elapsed microseconds (`SystemInfoType::ElapsedUs`).
+pub fn elapsed_us() -> Result<u64, String>
+{
+    syscall::system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|e| format!("elapsed time: error {e}"))
+}
 
 /// Pin the calling thread to `cpu` and move it there.
 ///

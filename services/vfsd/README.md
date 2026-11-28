@@ -154,9 +154,10 @@ vfsd/
   and parses each disk's GPT
   partition table through one scratch memory cap reused across the reads (replaced from memmgr
   before the next disk when a failed read left it lost), keeping every
-  used entry of each header's `num_parts`-entry array, from the primary
-  GPT or, when the primary fails its CRC32 or `MyLBA` checks, the backup at
-  the disk's last LBA (a disk neither of whose GPT copies can be read and
+  used entry of each header's `num_parts`-entry array, at most
+  `gpt::MAX_PARTITIONS` (256), from the primary GPT or, when the primary
+  fails its CRC32 or `MyLBA` checks or holds more used entries than that,
+  the backup at the disk's last LBA (a disk neither of whose GPT copies can be read and
   validated contributes none). It then identifies the boot disk
   (`gpt::find_boot_disk`: the held disk at the PCI location the bootloader
   reported that carries the boot ESP) and resolves the arch-conditional

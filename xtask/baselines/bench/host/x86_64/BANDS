@@ -69,6 +69,9 @@ ubench.empty_window cpus=4 band=4.00
 ubench.fault_fill path=fault pages=16 cpus=4 band=21.40
 ubench.fault_fill path=grant pages=16 cpus=4 band=102.00
 ubench.fault_fill path=grant pages=16 affinity=any cpus=4 band=383.08
+ubench.fault_rate procs=1 pages=16 cpus=4 band=26.99
+ubench.fault_rate procs=2 pages=16 cpus=4 band=52.49
+ubench.fault_rate procs=4 pages=16 cpus=4 band=45.73
 ubench.fault_scaling threads=1 pages=16 cpus=4 band=165.76
 ubench.fault_scaling threads=2 pages=16 cpus=4 band=434.50
 ubench.fault_scaling threads=4 pages=16 cpus=4 band=73.11

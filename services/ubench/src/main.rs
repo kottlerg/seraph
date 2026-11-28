@@ -11,7 +11,8 @@
 //! of fresh memory by a demand fault and by a grant, the fault path on several
 //! CPUs at once, the stdio pipe's byte ring, a producer and a consumer
 //! thread handing items through it, console text on the framebuffer,
-//! `std::fs::File` reads and writes, and the counter reads' own cost
+//! `std::fs::File` reads and writes, the counter reads' own cost, and the
+//! demand faults per second of one process per CPU faulting at once
 //! (services/ubench/README.md § Benchmarks).
 //!
 //! Each benchmark logs its result lines (shared/bench/README.md § Result
@@ -22,6 +23,7 @@
 mod console;
 mod empty_window;
 mod fault;
+mod fault_rate;
 mod fsbench;
 mod harness;
 mod ipc_rt;
@@ -81,7 +83,7 @@ fn setup() -> Result<(Counters, u32), String>
 /// FAIL line.
 fn run_all(counters: &Counters, cpus: u32, fb_class: u64) -> usize
 {
-    let benches: [(&str, &dyn Fn() -> Outcome); 8] = [
+    let benches: [(&str, &dyn Fn() -> Outcome); 9] = [
         ("ipc_rt", &|| ipc_rt::run(counters, cpus)),
         ("fault_fill", &|| fault::fill(counters, cpus)),
         ("fault_scaling", &|| fault::scaling(cpus)),
@@ -90,6 +92,7 @@ fn run_all(counters: &Counters, cpus: u32, fb_class: u64) -> usize
         ("console_write", &|| console::run(fb_class, counters, cpus)),
         ("fsbench", &fsbench::run),
         ("empty_window", &|| empty_window::run(counters, cpus)),
+        ("fault_rate", &|| fault_rate::run(counters, cpus)),
     ];
     let mut failed = 0usize;
     for (name, bench) in benches

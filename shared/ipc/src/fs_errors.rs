@@ -53,10 +53,14 @@ pub const BUSY: u64 = 13;
 /// over the max of the session's node, or of an ancestor
 /// (`FS_SESSION`, `FS_OPEN` and `FS_READ_MEMORY` in a session).
 pub const LIMIT: u64 = 14;
-/// A capability the request carries is not what the label takes: memmgr
-/// refuses the node handle of an `FS_SESSION`, or of the session an
-/// `FS_OPEN` or `FS_READ_MEMORY` needs a page for, or the handle is
-/// missing.
+/// The request is not one the label takes: a capability it carries is not
+/// what the label takes (memmgr refuses the node handle of an `FS_SESSION`,
+/// or of the session an `FS_OPEN` or `FS_READ_MEMORY` needs a page for, or
+/// the handle is missing), or its lengths or names are malformed: an
+/// `FS_WRITE` payload length of zero or past the message, an empty
+/// `FS_REMOVE` name or one past the message, a name an `FS_CREATE` or
+/// `FS_MKDIR` cannot create, an `FS_RENAME` source `validate_name` refuses
+/// or destination it cannot create, and malformed `FS_RENAME` lengths.
 pub const INVALID_ARGUMENT: u64 = 15;
 /// Refused for want of memory: memmgr refused the page a session needs
 /// (`FS_SESSION`, `FS_OPEN` and `FS_READ_MEMORY` in a session) as

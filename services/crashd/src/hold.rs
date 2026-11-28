@@ -26,7 +26,10 @@
 //! other, or, when it has not arrived, replaces the slot's endpoint, so a
 //! slot's endpoint only ever queues the one fault crashd holds there. memmgr
 //! signals the draw room's opening and not its closing, so crashd reads the
-//! draw room again for each code-7 or code-11 fault that reaches it. No core
+//! draw room again for each code-7 or code-11 fault that reaches it, and for
+//! each held code-11 fault that reaches its slot. A held code-11 fault that
+//! has arrived while the room reads short and memmgr not evicting for a short
+//! draw is re-asked after each read ([`Hold::end_reasked`]). No core
 //! is written while a fault is held or memmgr's memory is short
 //! ([`Hold::dump`]). Every receive crashd makes from the crash and live-core
 //! endpoints and the slots' endpoints goes through one receive guard, so a
@@ -120,7 +123,9 @@ impl Message
 /// messages, and the wait set the thread waits on.
 struct Hold
 {
-    holds: Holds,
+    /// On the heap: the slots' state, kept beside the messages and the
+    /// endpoints, would put crashd's serving frame past the stack-frame bound.
+    holds: Box<Holds>,
     /// The endpoint each slot's fault is redirected to; crashd alone holds a
     /// cap to it.
     endpoints: [u64; SLOTS],
@@ -212,7 +217,7 @@ impl Hold
         // A change signalled before now is in the read made here.
         let _ = syscall::notification_try_wait(pressure);
         Some(Self {
-            holds: Holds::new(stall_ms),
+            holds: Box::new(Holds::new(stall_ms)),
             endpoints,
             messages: [None; SLOTS],
             wait_set,
@@ -245,6 +250,7 @@ impl Hold
             {
                 self.end(slot, Why::Due, policy, authority, ipc_buf);
             }
+            self.end_reasked(policy, authority, ipc_buf);
             // 0 waits without bound; a deadline due within the millisecond
             // waits one.
             let timeout = self
@@ -442,6 +448,13 @@ impl Hold
                 std::os::seraph::log!(warn: "hold slot {slot} not watched (err={e})");
             });
         }
+        // The repeat of a re-asked fault is held again, wherever a slot is
+        // free, to the re-asked hold's deadline: its re-ask's line stands for
+        // it.
+        if self.holds.held(slot).is_some_and(|h| h.reasked)
+        {
+            return;
+        }
         bounded(|| {
             std::os::seraph::log!(
                 "fault badge={} addr={:#x} held: {} (reason={}), up to {stall_ms} ms",
@@ -467,6 +480,27 @@ impl Hold
         for (slot, _) in opened.iter().enumerate().filter(|(_, open)| **open)
         {
             self.end(slot, Why::RoomOpened, policy, authority, ipc_buf);
+        }
+    }
+
+    /// Re-ask every held commit overrun that has arrived while the last read
+    /// gives the draw room short and memmgr not evicting for it
+    /// ([`Holds::reasks`]). Each read crashd makes is followed by this, at the
+    /// loop's top: after a signal from memmgr, after a fault it dispatched,
+    /// and after a held fault arrived.
+    fn end_reasked(&mut self, policy: &Policy, authority: u64, ipc_buf: *mut u64)
+    {
+        let mut reask = [false; SLOTS];
+        for slot in self.holds.reasks(self.rooms)
+        {
+            if let Some(cell) = reask.get_mut(slot)
+            {
+                *cell = true;
+            }
+        }
+        for (slot, _) in reask.iter().enumerate().filter(|(_, ask)| **ask)
+        {
+            self.end(slot, Why::Reask, policy, authority, ipc_buf);
         }
     }
 
@@ -532,6 +566,20 @@ impl Hold
                     );
                 });
             }
+            Ended::Reasked(held) =>
+            {
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ipc_buf) };
+                bounded(|| {
+                    std::os::seraph::log!(
+                        "fault badge={} addr={:#x} re-asked after {} ms: no commit draw room \
+                         and memmgr not evicting",
+                        fault.badge,
+                        fault.addr(),
+                        held_ms(&held)
+                    );
+                });
+            }
             Ended::Decline(held) =>
             {
                 bounded(|| {
@@ -584,6 +632,15 @@ impl Hold
         };
         let _ = syscall::wait_set_remove(self.wait_set, target);
         self.holds.arrived(slot);
+        // memmgr may have stopped evicting for this fault since crashd read
+        // the room for it ([`Hold::end_reasked`]).
+        if self
+            .holds
+            .held(slot)
+            .is_some_and(|h| h.waits == Waits::DrawRoom)
+        {
+            self.rooms = read_rooms();
+        }
     }
 
     /// Give `slot` a new endpoint in place of the one its undelivered fault
@@ -628,9 +685,10 @@ fn holdable(msg: &IpcMessage) -> Option<Key>
 
 /// memmgr's memory: the level, short at `CRITICAL`, and the draw room, short
 /// below a demand chunk's bytes (`ipc::memmgr_labels::DEMAND_CHUNK_BYTES`),
-/// the most one committed draw takes; each short when it cannot be read, so a
-/// held fault is declined at its deadline rather than resumed into another
-/// decline.
+/// the most one committed draw takes, with whether memmgr evicts for a short
+/// committed draw, read in the same reply; each short, and memmgr taken as
+/// evicting, when it cannot be read, so a held fault is declined at its
+/// deadline rather than resumed into another decline.
 fn read_rooms() -> Rooms
 {
     let level = match std::os::seraph::memory_pressure()
@@ -638,12 +696,17 @@ fn read_rooms() -> Rooms
         Some(std::os::seraph::MemoryPressure::Critical) | None => Room::Short,
         Some(_) => Room::Open,
     };
-    let draw = match std::os::seraph::commit_draw_room_bytes()
+    let room = std::os::seraph::commit_draw_room();
+    let draw = match room
     {
-        Some(bytes) if bytes >= ipc::memmgr_labels::DEMAND_CHUNK_BYTES => Room::Open,
+        Some(r) if r.bytes >= ipc::memmgr_labels::DEMAND_CHUNK_BYTES => Room::Open,
         Some(_) | None => Room::Short,
     };
-    Rooms { level, draw }
+    Rooms {
+        level,
+        draw,
+        evicting: room.is_none_or(|r| r.evicting),
+    }
 }
 
 /// What a held fault that waits for `waits` is short of, as its hold's line

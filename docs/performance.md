@@ -132,7 +132,7 @@ The Issues that state a performance claim, and the lines each states it on:
 | #762 | A synchronous IPC recipient runs on the caller's CPU | `ktest.ipc_round_trip words=0 placement=same|apart|unpinned|fan_in`, with `server=reply_recv` | host, pinned threads reported apart |
 | #227 | The fault-IPC round trip | `ktest.fault_round_trip`, each `leg=`; `ubench.fault_fill path=fault` | icount and host |
 | #236 | An adaptive demand fault window | `ubench.fault_fill path=fault`'s `faults=` and `backed_pages=` against the pages touched | icount |
-| #266 | The SMP pager | `ubench.fault_scaling threads=1|2|4|8`, each thread pinned and set up on its own CPU | host, past 4 vCPUs under the grant |
+| #266 | The SMP pager | `ubench.fault_rate procs=1|2|4|8`, one process per CPU, its `faults_per_s=` at 1 and 8 vCPUs; `ubench.fault_scaling threads=1|2|4|8`, each thread pinned and set up on its own CPU | host, past 4 vCPUs under the grant |
 | #44 | Transparent large pages | `ktest.tlb_reach pages=`, cycles per access | host |
 | #321, #1483 | Throughput of the ring and render paths | `ubench.shmem_ring`, `ubench.console_write` | icount and host |
 | #87 | The file write path's inline-versus-frame crossover | `fsbench.write`, `fsbench.read` per `path=` | host for `fsbench.write`, which icount reports only |

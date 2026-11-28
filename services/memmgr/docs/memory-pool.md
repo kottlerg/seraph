@@ -1153,9 +1153,14 @@ Kernel-origin fault message); with no swap slot registered that is a pool with n
 The draw room is open at a demand chunk's pages or more, room for any one committed draw, and memmgr
 signals its opening to every `REGISTER_PRESSURE` registrant that gave bits for it ([Memory
 pressure](#memory-pressure), Signal); crashd holds a commit overrun until then ([crashd Operation §
-Hold](../../crashd/docs/operation.md#hold)). The admission and draw rules and A are the host-tested
-`free-pool` ledger's (`promise_free`, `uncommitted_free`, `draw_room`, `frames_short` and
-`allowance`).
+Hold](../../crashd/docs/operation.md#hold)). The turn that ends with the draw room open ends that
+eviction, signalled or not, and another draw can close the room again before crashd reads it, so
+`QUERY_POOL_STATUS` reports in `data[22]`, with the draw room in the same reply, whether a committed
+draw has found too few pages since the room last opened. A held commit overrun that reads the room
+short and that word 0 is re-asked: crashd resumes it, and memmgr backs it or declines it again,
+which starts the eviction again. A decline of code 7 does not start it. The admission and draw
+rules and A are the host-tested `free-pool` ledger's (`promise_free`, `uncommitted_free`,
+`draw_room`, `frames_short` and `allowance`).
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
@@ -1709,7 +1714,7 @@ and the slot map's pages are memmgr's metadata.
 | `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take a page `promised` holds, or the growth floor by a charge to a node outside the system reserve | Reply with error label; caller may retry without the flag, or fail |
 | `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant, or a committed registration or growth, would take a page `promised` holds, or the growth floor by a charge to a node outside the system reserve ([Commit](#commit)) | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `LIMIT` | `want_pages`, or a committed registration's or growth's charge, would take the subtree of the budget node it is charged to (the caller's own, or with `REQUEST_CHARGE_NODE` the handle's), or of an ancestor, over its max | Reply with error label; caller treats as that node's budget refusing, not as RAM exhaustion |
-| `QUOTA` | Tracking-metadata arena could not grow, or a selected run could not be mapped to zero it ([Frame contents](#frame-contents)); either means system RAM exhausted | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), or the kernel refused to zero a selected run ([Frame contents](#frame-contents)) | Reply with error label; caller treats the arena's failure as system-wide RAM exhaustion |
 | `TOO_MANY_PROCESSES` | A process record, its caps node or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 
 memmgr never panics on allocation failure. The caller's response policy

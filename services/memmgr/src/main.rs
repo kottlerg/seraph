@@ -2082,7 +2082,9 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 /// outside `promised`, the part of `promised` the evicted chunks of
 /// committed regions hold, the used slots of memmgr's own `CSpace`, a
 /// count, which a cap memmgr kept by mistake raises for good, memmgr's
-/// metadata pages and the pages the frame records hold, one snapshot so the
+/// metadata pages and the pages the frame records hold, and whether a
+/// committed draw found too few free pages since the draw room last opened,
+/// so memmgr evicts for frames until it opens, one snapshot so the
 /// pool's accounts sum (services/memmgr/docs/ipc-interface.md § Label 6).
 /// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
 /// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
@@ -2124,6 +2126,7 @@ fn handle_query_pool_status(answer: &mut Answer, boot: &InitBootstrap)
         syscall::cap_info(boot.self_cspace, syscall_abi::CAP_INFO_CSPACE_USED).unwrap_or(0),
         l.metadata_pages().saturating_mul(PAGE_SIZE),
         l.held_pages().saturating_mul(PAGE_SIZE),
+        u64::from(l.draw_short()),
     ];
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .words(0, &words)

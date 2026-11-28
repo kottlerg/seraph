@@ -599,7 +599,7 @@ pub fn listing(dir: u64, ipc_buf: *mut u64) -> Vec<Vec<u8>>
     names
 }
 
-/// `label` (`FS_CREATE` or `FS_MKDIR`) in `dir`, carrying `name` and claiming
+/// `label` (`FS_CREATE`, `FS_MKDIR` or `FS_REMOVE`) in `dir`, carrying `name` and claiming
 /// `len` name bytes. Returns the reply's label; a cap a success replies is
 /// deleted.
 fn name_request(dir: u64, label: u64, name: &[u8], len: u64, ipc_buf: *mut u64) -> u64
@@ -609,7 +609,7 @@ fn name_request(dir: u64, label: u64, name: &[u8], len: u64, ipc_buf: *mut u64) 
         .build();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(dir, &msg, ipc_buf) }
-        .expect("fs_invalid_names: FS_CREATE or FS_MKDIR ipc_call failed");
+        .expect("fs_invalid_names: a name request's ipc_call failed");
     for &cap in reply.caps()
     {
         let _ = syscall::cap_delete(cap);
@@ -638,6 +638,40 @@ fn concat(a: &[u8], b: &[u8]) -> Vec<u8>
     let mut out = a.to_vec();
     out.extend_from_slice(b);
     out
+}
+
+/// The malformed requests of [`fs_invalid_names_phase`] on other labels, each
+/// `INVALID_ARGUMENT`: an inline `FS_WRITE` to `file` with a payload length of
+/// zero or one past the message, and an `FS_REMOVE` in `dir` of an empty name
+/// or one longer than the message.
+fn malformed_write_and_remove(dir: u64, file: u64, ipc_buf: *mut u64)
+{
+    use ipc::fs_errors::INVALID_ARGUMENT;
+
+    for (byte_len, payload) in [(0u64, &b""[..]), (100, &b"short"[..])]
+    {
+        let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_WRITE | (byte_len << 16))
+            .word(0, 0)
+            .bytes(1, payload)
+            .build();
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(file, &msg, ipc_buf) }
+            .expect("fs_invalid_names: FS_WRITE ipc_call failed");
+        assert_eq!(
+            reply.label,
+            INVALID_ARGUMENT,
+            "an FS_WRITE claiming {byte_len} bytes and carrying {}",
+            payload.len()
+        );
+    }
+    for (name, len) in [(&b""[..], 0u64), (&b"short"[..], 200)]
+    {
+        assert_eq!(
+            name_request(dir, ipc::fs_labels::FS_REMOVE, name, len, ipc_buf),
+            INVALID_ARGUMENT,
+            "an FS_REMOVE claiming {len} name bytes"
+        );
+    }
 }
 
 /// The refusals of [`fs_invalid_names_phase`] that need no invalid name:
@@ -731,6 +765,7 @@ pub fn fs_invalid_names_phase(_: &Caps)
     let (dir, _kind) = fs_mkdir(svctest, dname, ipc_buf).expect("FS_MKDIR invn failed");
     let (file, _kind) = fs_create(dir, src, ipc_buf).expect("FS_CREATE invn/src.bin failed");
     fs_write_inline(file, 0, payload, ipc_buf).expect("FS_WRITE invn/src.bin failed");
+    malformed_write_and_remove(dir, file, ipc_buf);
     let _ = syscall::cap_delete(file);
     let before = listing(dir, ipc_buf);
 

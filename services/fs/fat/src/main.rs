@@ -2519,7 +2519,7 @@ fn handle_write(
         .filter(|_| byte_len != 0)
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, reply);
+        reply_err(ipc::fs_errors::INVALID_ARGUMENT, reply);
         return;
     };
 
@@ -3381,7 +3381,7 @@ fn handle_remove_node_cap(
     let Some(name) = msg.data_bytes().get(..name_len).filter(|_| name_len != 0)
     else
     {
-        reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
+        reply_err_now(ipc::fs_errors::INVALID_ARGUMENT, reply, service, ipc_buf);
         return;
     };
 

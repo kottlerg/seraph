@@ -767,8 +767,9 @@ end and the offset read as zeros, through [`FS_READ`](#label-2-fs_read) and
 never held, whatever its on-disk format leaves in the storage the write takes: a freed file's
 data, or a block past the old end.
 
-**Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `IO_ERROR`,
-`PERMISSION_DENIED`, `NO_SPACE` (no free cluster, or the write would end
+**Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `INVALID_ARGUMENT` (a
+`byte_len` of zero, or one past the payload bytes the message carries),
+`IO_ERROR`, `PERMISSION_DENIED`, `NO_SPACE` (no free cluster, or the write would end
 past `u32::MAX` bytes, the largest FAT file size; the driver refuses
 the latter before allocating).
 
@@ -909,9 +910,10 @@ Unlink a file or empty directory. Badge = parent-directory cap with
 
 **Reply (success)**: `label = 0`, empty body.
 
-**Errors**: `NOT_FOUND`, `NOT_EMPTY` (directory has entries other
-than `.` and `..`), `IO_ERROR`, `PERMISSION_DENIED`, `INVALID_BADGE`
-(the badge is not a directory node).
+**Errors**: `INVALID_ARGUMENT` (an empty name, or one longer than the
+message), `NOT_FOUND`, `NOT_EMPTY` (directory has entries other than `.`
+and `..`), `IO_ERROR`, `PERMISSION_DENIED`, `INVALID_BADGE` (the badge is
+not a directory node).
 
 `FS_REMOVE` is not atomic: the driver marks the entry's LFN slots, then
 its 8.3 slot, each with its own block write (see

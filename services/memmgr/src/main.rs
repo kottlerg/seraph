@@ -2990,12 +2990,13 @@ fn select_fault_run(
 {
     if let Some(reg) = target.committed
     {
-        // The chunk the fault backs, which its own draw does not evict.
-        let spare = l
+        // The chunk the fault backs, which its own draw does not evict and
+        // which a declined draw is noted for.
+        let chunk = l
             .region_for(target.rec, target.page_base)
             .map(|(_, region)| (reg, chunk_for(&region, target.page_base).0));
         // The span is a preference: the draw evicts only for the faulting page.
-        let room = evict::draw_room(l, target.rec, u64::from(span_pages), 1, spare);
+        let room = evict::draw_room(l, target.rec, u64::from(span_pages), 1, chunk);
         // At most `span_pages`, so it fits a `u32`.
         let pages = u32::try_from(room).unwrap_or(span_pages);
         if pages == 0
@@ -4005,8 +4006,9 @@ fn signal_pressure(answer: &mut Answer)
     }
     if open
     {
-        // A committed draw short from here on is noted again.
-        l.clear_short_draw();
+        // A declined draw memmgr could not name ends with the opening once no
+        // named one is left; a named one ends only when it is served.
+        l.note_draw_open();
     }
     // SAFETY: as above.
     unsafe { DRAW_OPEN = open };

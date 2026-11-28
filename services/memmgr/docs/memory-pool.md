@@ -1116,9 +1116,9 @@ floor, and the frames that cover `promised` can then be the reserve's and the re
 That is the draw room, which `QUERY_POOL_STATUS` reports in `data[16]` for a node outside the
 reserve. So an overcommitted pool leaves the reserve to the reserve nodes and the restore headroom
 to the restores of uncommitted chunks. While the free pool does not cover `promised`, or a
-committed draw has found too few free pages since the draw room last opened, and the free frames
-stand at or below the growth floor and the hysteresis band, memmgr evicts for frames in the
-background ([Eviction](#eviction), Selection), so write-out to swap brings the draw room back while
+committed draw memmgr declined is not yet served (below), and the free frames stand at or below the
+growth floor and the hysteresis band, memmgr evicts for frames in the background
+([Eviction](#eviction), Selection), so write-out to swap brings the draw room back while
 the level stays `CRITICAL`. When a draw finds no page, memmgr also evicts victims in its turn
 as a restore's direct reclaim does ([Eviction](#eviction), Direct reclaim), each evictable chunk
 whose eviction frees a page above the growth floor (a committed chunk, or an uncommitted one once H
@@ -1129,9 +1129,18 @@ Kernel-origin fault message); with no swap slot registered that is a pool with n
 The draw room is open at a demand chunk's pages or more, room for any one committed draw, and memmgr
 signals its opening to every `REGISTER_PRESSURE` registrant that gave bits for it ([Memory
 pressure](#memory-pressure), Signal); crashd holds a commit overrun until then ([crashd Operation §
-Hold](../../crashd/docs/operation.md#hold)). The admission and draw rules and A are the host-tested
-`free-pool` ledger's (`promise_free`, `uncommitted_free`, `draw_room`, `frames_short` and
-`allowance`).
+Hold](../../crashd/docs/operation.md#hold)). memmgr names each draw it declined by its chunk and
+keeps it until a draw for that chunk finds its frames or the chunk ends, cut by `SHRINK_REGION`, its
+region unregistered or its process gone. An opening of the draw room does not end one: a reserve
+node's draw takes any free page, so it can take the room back below a demand chunk before crashd
+reads it, and the held fault, the only draw short, would then wait with nothing evicting for it. The
+ledger names `SHORT_DRAWS` declined draws at once; one past them, or one whose chunk memmgr cannot
+name, holds until no named one is left and the draw room opens. A thread whose draw is declined and
+that never draws again (killed with its process alive) keeps memmgr evicting for frames until its
+process ends, but only while the free frames stand at or below the growth floor and the band:
+eviction for it stops once they pass that. The admission and draw rules and A are the host-tested
+`free-pool` ledger's (`promise_free`, `uncommitted_free`, `draw_room`, `frames_short`,
+`note_short_draw` and `allowance`).
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
@@ -1395,17 +1404,17 @@ page above the growth floor (Selection, below).
 
 **Selection.** While the pool's pressure level reads `LOW` ([Memory pressure](#memory-pressure)),
 memmgr reclaims in the background until it reads `NORMAL`, and stops there. It also evicts for
-frames: while the free pool does not cover `promised`, or a committed draw has found too few free
-pages since the draw room last opened ([Commit](#commit), Overcommit), and the free frames stand at
-or below the growth floor and the hysteresis band (or a demand chunk's pages, when the band is
-less), it evicts in the background at either level, each evictable idle chunk whose eviction frees
-a page above the growth floor a victim (a committed chunk, or an uncommitted one once the restore
-headroom has reached the reserve), since the frames go to the committed draws, which `promised`
-keeps them for or which wait for them, and to the restores. While the free pool covers `promised`
-only the growth floor keeps a draw short, and a frame an eviction frees above the floor can go to
-the next admission as well, so memmgr waits for a draw that found too few and stops when the draw
-room opens. Otherwise it
-does not reclaim in the background at `CRITICAL`: the free pages above the growth floor are gone, so
+frames: while the free pool does not cover `promised`, or a committed draw memmgr declined is not
+yet served ([Commit](#commit), Overcommit), and the free frames stand at or below the growth floor
+and the hysteresis band (or a demand chunk's pages, when the band is less), it evicts in the
+background at either level, each evictable idle chunk whose eviction frees a page above the growth
+floor a victim (a committed chunk, or an uncommitted one once the restore headroom has reached the
+reserve), since the frames go to the committed draws, which `promised` keeps them for or which wait
+for them, and to the restores. While the free pool covers `promised` only the growth floor keeps a
+draw short, and a frame an eviction frees above the floor can go to the next admission as well, so
+memmgr waits for a declined draw and stops when every declined draw is served, not when the draw
+room opens, which a reserve node's draw can take back first. Otherwise it does not reclaim in the
+background at `CRITICAL`: the free pages above the growth floor are gone, so
 every frame an eviction frees past the restore headroom goes to the next admission, which a process
 draining the pool makes before any victim faults. Eviction makes room for the processes that run
 while memory is low; at `CRITICAL` only a restore or a committed draw evicts, for itself (Direct
@@ -1741,4 +1750,3 @@ terminal fault tears down the whole process (see
 [services/gdbstub/README.md](../../gdbstub/README.md),
 [services/memmgr/README.md](../README.md),
 [memmgr IPC Interface](ipc-interface.md)
-

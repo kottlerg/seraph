@@ -74,6 +74,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `stop_authority` | no | `yes` or `no` (default `no`). Endows the service with svcmgr's stop authority, a `STOP_AUTHORITY` SEND on svcmgr's service endpoint, in the bootstrap slot after its `seed` caps and its debug-authority slot. Mutually exclusive with `log_sink`. See [`stop_authority`](#stop_authority). |
 | `entropy_authority` | no | `yes` or `no` (default `no`). Endows the service with the kernel's entropy-contribution authority, an `EntropyControl` capability carrying `Contribute`, in the bootstrap slot after its `seed` caps and its debug- and stop-authority slots. One service holds it: the first recipe in launch order that sets it. Mutually exclusive with `log_sink`. A core role. See [`entropy_authority`](#entropy_authority). |
+| `pmu_authority` | no | `yes` or `no` (default `no`). Endows the service with the kernel's performance-counter authority, a `PmuControl` capability carrying `Configure`, in the bootstrap slot after its `seed` caps and its debug-, stop- and entropy-authority slots. One service holds it: the first recipe in launch order that sets it. With no recipe holding it, svcmgr deletes its source once the recipes are read. Mutually exclusive with `log_sink`. A core role. See [`pmu_authority`](#pmu_authority). |
 | `stop_source` | no | `program`. Makes the service a stop source of that class: svcmgr creates it contained and lists it, with a stop-badged SEND on its endpoint, to a stop-authority holder. A core role. Needs `provides` with every entry badged, and `restart` other than `never`. See [`stop_source`](#stop_source). |
 | `oom_stop` | no | `yes` or `no` (default `no`). Opts the service in to being stopped by a stop-authority holder. Refused, as a parser error, on a recipe the eligibility rule refuses. See [`oom_stop`](#oom_stop). |
 | `reserve` | no | `yes` or `no` (default `no`). Creates the service inside memmgr's system reserve. A core role: the eligibility rule never stops it. See [`reserve`](#reserve). |
@@ -231,7 +232,8 @@ svcmgr-launched services.
 Space-separated discovery-registry names. svcmgr resolves each name to a freshly-derived
 `RIGHTS_EP_SEND` cap on the published endpoint (`RIGHTS_EP_SEND_GRANT` for `devmgr.bind`, whose
 `BIND_DRIVERS` moves a directory cap and so needs `GRANT`, for `memmgr.swap`, whose swap labels
-move caps to memmgr, for `svcmgr.grant`, whose requests carry caps, and for each
+move caps to memmgr, for `logd.query` and `logd.follow`, whose `LOG_SUBSCRIBE` moves a signal to
+logd, for `svcmgr.grant`, whose requests carry caps, and for each
 [`:grant`](#provides) name) and injects them positionally into the child's bootstrap rounds:
 
 ```
@@ -285,7 +287,9 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `memmgr.swap` | svcmgr (endowed `SWAP_AUTHORITY` `SEND\|GRANT`) | `SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint, the swap labels of memmgr's disk tier; its seeds keep `GRANT` (seeded by swapd's recipe; by svctest's too, as a second swap client that registers nothing) | no |
 | `sessiond.operator` | svcmgr (`sessiond.svc` provider) | `:grant`-badged `SEND\|GRANT` on sessiond's service endpoint, the operator authority, which carries no stop bit (seeded by terminal and svctest) | no |
 | `crashd.core` | svcmgr (`crashd.svc` provider) | `:grant`-badged (`LIVE_CORE_AUTHORITY`) `SEND\|GRANT` on crashd's live-core endpoint, the authority to ask for a live core, whose request moves the account the capture is charged to (seeded by usertest only) | no |
-| `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
+| `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged `SEND\|GRANT` on the master log endpoint: logd's `QUERY_SLOTS`, `QUERY_HISTORY` and `LOG_SUBSCRIBE` from the `SUBSCRIBERS_MAX` pool ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries, § Subscriptions); its seeds keep `GRANT`, since `LOG_SUBSCRIBE` moves a signal to logd (seeded by svctest only) | no |
+| `logd.follow` | svcmgr (minted from the reserved master-log source) | `LOG_FOLLOW_AUTHORITY`-badged (bit 60) `SEND\|GRANT` on the master log endpoint, for external sinks: the same reads and `LOG_SUBSCRIBE` from the `SINK_SUBSCRIBERS_MAX` pool ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries, § Subscriptions); its seeds keep `GRANT` (seeded by svctest only) | no |
+| `logd.control` | svcmgr (minted from the reserved master-log source) | `LOG_CONTROL_AUTHORITY`-badged (bit 61) SEND on the master log endpoint: logd's `SINK_LIST` and `SINK_SET` ([logd IPC interface](../../logd/docs/ipc-interface.md) § Sink control; seeded by svctest only) | no |
 | `logd.flush` | svcmgr (minted from the reserved master-log source) | `LOG_FLUSH_AUTHORITY`-badged SEND on the master log endpoint: logd's `LOG_FLUSH` barrier ([logd IPC interface](../../logd/docs/ipc-interface.md) § Flush barrier; seeded by pwrmgr, which waits on it before a power-off or reset, acpid, which waits on it before the register write of one, crashd, which waits on it before it declines a fault, and svctest) | no |
 
 ## `provides`
@@ -336,8 +340,8 @@ A log-sink service's bootstrap round is **not** assembled from `seed` or
 at handover (the master-log endpoint source, the procmgr `SEND|GRANT`
 death-auth source and the `KernelLog` source — see
 [`process-lifecycle.md`](../../../docs/process-lifecycle.md)) and from
-its `devmgr.class.serial` and `devmgr.class.framebuffer` publications. The round has six
-positional slots, carried with a presence word as
+its `devmgr.class.serial`, `devmgr.class.framebuffer` and `timed` publications. The round has
+seven positional slots, carried with a presence word as
 [`seed`](#seed) describes, so an absent slot rides as no cap:
 
 | Index | Cap |
@@ -348,15 +352,15 @@ positional slots, carried with a presence word as
 | 3 | the `serial` class SEND, derived from the `devmgr.class.serial` publication (logd resolves the serial driver via `QUERY_DEVICE`; see [logd README](../../logd/README.md#bootstrap-caps)) |
 | 4 | the `framebuffer` class SEND, derived from the `devmgr.class.framebuffer` publication (logd resolves the framebuffer driver via `QUERY_DEVICE`) |
 | 5 | a `KernelLog` cap carrying `Read`, derived with `RIGHTS_KLOG_READ` from the endowed `KernelLog` source (logd reads the kernel's console lines through it; see [logd handover protocol](../../logd/docs/handover-protocol.md#kernel-log)) |
+| 6 | the `timed` SEND, derived from the `timed` publication (logd reads the wall clock once through it; see [logd sinks](../../logd/docs/sinks.md#wall-time)) |
 
 Because these slots are svcmgr-minted, `seed` and `provides` have no
 position in the round; declaring either alongside `log_sink = yes` is a
-parser error. The same svcmgr-minted round drives the first launch (`cap[1]`
-present, history pulled from init-logd per the
-[logd handover protocol](../../logd/docs/handover-protocol.md)). A slot whose source is absent
-from the endowment or not published (slots 3 and 4 when no class file configured the class, slot 5
-when init held no `KernelLog`), or whose derive fails, is absent from the round; logd requires only
-`cap[0]`.
+parser error. The same svcmgr-minted round drives the first launch (`cap[1]` present, history pulled
+from init-logd per the [logd handover protocol](../../logd/docs/handover-protocol.md)). A slot whose
+source is absent from the endowment or not published (slots 3 and 4 when no class file configured
+the class, slot 5 when init held no `KernelLog`, slot 6 when no recipe provides `timed`), or whose
+derive fails, is absent from the round; logd requires only `cap[0]`.
 svcmgr holds the master-log source and the `KernelLog` source for the system's life, so the round
 also drives every restart (`cap[1]` absent and the history pull skipped once
 procmgr reports init reaped; present, with the pull, on a
@@ -416,7 +420,7 @@ Pager](../../../docs/fault-handling.md#default-system-pager)); the role sets the
 recipe key does. On each launch it also serves the actuator a derivation carrying only the receive
 right of the core-death queue, which the death observers of svcmgr's, memmgr's and procmgr's main
 threads and address spaces post to, in the bootstrap slot after the `seed` caps and after any
-debug-authority, stop-authority and entropy-authority slots (`cap[4]` for pwrmgr). A derive that
+debug-, stop-, entropy- and PMU-authority slots (`cap[4]` for pwrmgr). A derive that
 fails, or a queue svcmgr could not make, leaves the slot absent. A recipe that declares the key but
 is not recognised is created demand-paged and gets no such slot.
 
@@ -503,6 +507,31 @@ seed              = devmgr.class.hwrng
 entropy_authority = yes
 ```
 
+## `pmu_authority`
+
+`yes` endows the service with the kernel's performance-counter authority: on its first launch and
+on every restart, svcmgr derives a copy of the `PmuControl` source init endows it
+([ipc-interface.md § Handover endowment](ipc-interface.md#handover-endowment-bootstrap-rounds)),
+carrying `Configure`, the type's one right, and delivers it in the bootstrap slot after the `seed`
+caps and, for a service that sets them, after the debug-, stop- and entropy-authority slots. A
+source init could not endow, a source svcmgr has deleted, or a derive that fails, leaves the slot
+absent. The capability serves `SYS_PMU_INFO`, `SYS_PMU_CONFIGURE` and `SYS_PMU_BIND`, through
+which the holder programs a CPU's counters and grants its own threads their reads
+([docs/capability-model.md § `PmuControl`](../../../docs/capability-model.md#pmucontrol)); this key
+is the only path that delivers it, and svcmgr never publishes the source.
+
+One service holds the authority. svcmgr keeps the key on the first recipe that sets it in launch
+order (`svcmgr_defs::keep_one_pmu_holder`) and clears it on every later one, which it launches
+without the capability and logs (`<name> also declares pmu_authority; not given`).
+
+Once it has read the recipes at the handover, whatever the scan's outcome, svcmgr deletes the
+source when no recipe it keeps sets the key, and logs `PmuControl source deleted`: a system that
+measures nothing keeps no counter authority past the scan. The default image sets the key on no
+recipe, so it holds none; svctest's recipe sets it, for its `pmu_authority` phase.
+
+`pmu_authority = yes` alongside `log_sink = yes` is a parser error, as for `debug_authority`. The
+key is a core role, so the [`oom_stop`](#oom_stop) rule never stops the holder.
+
 ## `stop_source`
 
 `program` makes the service a stop source of the program class
@@ -555,7 +584,7 @@ refusing for the first row that applies:
 | 1 | was started by init (memmgr, procmgr, devmgr, vfsd), so svcmgr only binds it | not launched by svcmgr |
 | 2 | has `restart = never`, so a stop would end it for good | never restarted |
 | 3 | has `critical = yes` | the system is not viable without it |
-| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `entropy_authority`, `reserve`, `shutdown_actuator` or `stop_source` | the system's log, crash reporting, stopping, shutdown and entropy contribution rest on it |
+| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `entropy_authority`, `pmu_authority`, `reserve`, `shutdown_actuator` or `stop_source` | the system's log, crash reporting, stopping, shutdown, entropy contribution and measurement rest on it |
 | 5 | does not set `oom_stop = yes` | not opted in |
 
 Eligibility is read from the recipe's keys alone, never from the service's name. The parser
@@ -672,7 +701,7 @@ At `HANDOVER_COMPLETE` svcmgr reads the recipes of `/config/svcmgr/services/`, p
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`, `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
+| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, PMU-authority, `oom_stop`, `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop`, `stop_source` and `private_image` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`, `CREATE_PRIVATE_IMAGE`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (whatever the `restart` policy, so they are in place before the thread runs; a bind that fails destroys the child and the launch fails), `START_PROCESS`, serve the seed bootstrap rounds, and record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 

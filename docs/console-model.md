@@ -131,7 +131,7 @@ direct console paths remain as fallbacks for the life of the system.
    gives it ([logd handover protocol](../services/logd/docs/handover-protocol.md) § Kernel log): a
    thread of its own waits on a notification the kernel signals and retains each record as the
    kernel's `[kernel]` line in the kernel's slot, which the sinks write as any line and every
-   `logd.query` holder can read. A record is acknowledged on the
+   `logd.query` or `logd.follow` holder can read. A record is acknowledged on the
    reader's next read once its line is written or its sink stalled, so a record a failure report
    flushes is one no sink took.
 
@@ -171,10 +171,13 @@ direct console paths remain as fallbacks for the life of the system.
      informational and more severe lines before it that it did not show, up to its `backlog`
      (64 by default), so the screen of a dead machine carries its context. The level, the
      backlog and the tag's colour are settings of logd's recipe
-     ([services/logd/docs/sinks.md](../services/logd/docs/sinks.md) § Settings). The sink has its
-     own cursor into the journal and its own writer, and it never holds a sender, so a framebuffer
-     driver that is stopped or dead holds neither the serial output nor the log stream; what the
-     journal drops before the sink reaches it, of the lines it shows, is counted in a notice line.
+     ([services/logd/docs/sinks.md](../services/logd/docs/sinks.md) § Settings), which a
+     `SINK_SET` on `logd.control` changes for the life of the logd instance
+     ([services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md) § Sink
+     control). The sink has its own cursor into the journal and its own writer, and it never holds
+     a sender, so a framebuffer driver that is stopped or dead holds neither the serial output nor
+     the log stream; what the journal drops before the sink reaches it, of the lines it shows, is
+     counted in a notice line.
      The framebuffer driver, when present, is spawned from the root filesystem in devmgr's
      drivers-directory pass, which svcmgr posts with `SET_DRIVERS_DIR` before it launches logd, and
      a `QUERY_DEVICE` of logd's that would find no driver waits for that pass; logd's emit path
@@ -303,11 +306,14 @@ early-kernel console; svctest's and usertest's reach serial only:
 - **svctest / usertest** are std-built services whose output flows through
   the system log stream at informational, below the framebuffer sink's default level of critical
   (path 5 above), so it reaches the screen only through that sink's emergency walk, or when a
-  recipe lowers its level. No harness-specific framebuffer path exists.
+  recipe, or a `SINK_SET` on `logd.control`, lowers its level. No harness-specific framebuffer
+  path exists.
 
 Serial is the authoritative marker channel: CI scrapes serial and
-runs the harnesses headless, where logd's framebuffer sink writes nothing (see
-[docs/testing.md](testing.md)).
+runs the harnesses headless, where logd's framebuffer sink writes nothing, but for the release
+svctest cells, which attach a framebuffer for svctest's framebuffer cases, and the `bench` cell's
+ubench boots, which attach one for ubench's framebuffer measurements (see
+[docs/testing.md](testing.md#coverage-tiers) § Coverage tiers).
 
 Every framebuffer renderer — the bootloader, kernel, and ktest direct
 renderers and the userspace driver — shares one byte→glyph chain

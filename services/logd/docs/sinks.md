@@ -11,13 +11,17 @@ a program reads, follows and steers the log.
 Built: the eight severities and their console tags, the console prefix `[sec.usfrac] LEVEL  [name] `
 that both receivers write, its seconds right-aligned to five columns, the kernel's records read and
 written as `[kernel]` lines, each device sink's settings from logd's recipe (§ Settings) with the
-console format's field list and the framebuffer's coloured tag, the rfc5424 format with no
-timestamp, the history as the journal the sinks write from, the serial and framebuffer outputs as
-two sinks with a cursor and a writer thread each, the hold window and its `WINDOW_FULL` refusal, the
-serial sink's `hold` pace (its writes of an entry as plain chunks and then a zero-length
-`SERIAL_WRITE_SENT` barrier, its cursor moving once the entry is sent) and the framebuffer's `skip`
-pace, the drop lines, and `LOG_FLUSH` over the `hold` sinks' cursors, whose token is the next `seq`
-([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks, § Hold window, § Flush barrier).
+console format's field list, its wall-clock display and the framebuffer's coloured tag, the boot
+wall offset read from timed (§ Wall time), the rfc5424 format with its timestamp, the history as the
+journal the sinks write from, the serial and framebuffer outputs as two sinks with a cursor and a
+writer thread each, the hold window and its `WINDOW_FULL` refusal, the serial sink's `hold` pace
+(its writes of an entry as plain chunks and then a zero-length `SERIAL_WRITE_SENT` barrier, its
+cursor moving once the entry is sent) and the framebuffer's `skip` pace, the drop lines,
+`LOG_FLUSH` over the `hold` sinks' cursors, whose token is the next `seq`, the record's slot
+serial, name generation and `live` and `relayed` origins, the reads, subscriptions and sink
+control of § Queries, follow and control, and the `logd.query`, `logd.follow` and `logd.control`
+names ([ipc-interface.md](ipc-interface.md) § Levels, § Output sinks, § Hold window, § Flush
+barrier, § Queries, § Subscriptions, § Sink control).
 
 Everything else this document states is design intent, not yet implemented, unless a sentence names
 it as built. Each section names the Issue that builds it. Until an Issue lands,
@@ -58,8 +62,8 @@ These points of RFC 5424 bind a sink that emits it:
 
 ## The record
 
-*Design intent: the slot serial and the origin are #1492's and #1496's work and #928's; the
-history entry's other fields are built.*
+*Built (#1494), but for the `previous` origin, which is #1498's, and the instance number of
+§ Display names, #1492's.*
 
 logd's history entry is the record. Every sink renders from it, and the query interface returns it
 (§ Queries, follow and control).
@@ -139,8 +143,8 @@ emergency for a fault or panic print (#1491; today every record is informational
 serial and framebuffer device sinks' writers, serial's answers to `STALLED` and to a failed call,
 `LOG_FLUSH` ([ipc-interface.md](ipc-interface.md) § Output sinks, § Hold window, § Flush
 barrier), and each device sink's settings, the `off` level, the framebuffer's level and its
-emergency walk (#1493). Design intent: `SINK_SET` and external sinks (#1494), and pstore
-(#1498).*
+emergency walk (#1493), and `SINK_LIST`, `SINK_SET`, the severity filter and subscriptions
+(#1494). Design intent: external sinks (#1496, #1499), and pstore (#1498).*
 
 A sink is one output of the log. Every sink, inside logd or outside it, follows one contract: it
 reads the history in `seq` order through a cursor, shows the entries at or above its level, renders
@@ -313,9 +317,8 @@ an unknown gap, and starts from the new instance's oldest entry.
 
 ## Settings
 
-*Built (#1493): the `SERIAL` and `FRAMEBUFFER` entries with every key but `time`, and
-`LOGD_HOSTNAME`. Design intent: `time` (#1493, § Wall time), the `PSTORE` entry (#1498), and
-`SINK_SET` (#1494).*
+*Built (#1493): the `SERIAL` and `FRAMEBUFFER` entries with every key, and `LOGD_HOSTNAME`.
+Built (#1494): `SINK_SET`. Design intent: the `PSTORE` entry (#1498).*
 
 Each device sink's settings come from one `env` entry of logd's recipe
 (`rootfs/config/svcmgr/services/logd.svc`), so they are set per distribution, signed as
@@ -332,7 +335,7 @@ LOGD_SINK_<NAME>=<key>=<value>,<key>=<value>,...
 | `level` | one of the eight keywords, or `off` | least severe level shown; `off` shows none |
 | `format` | `console`, `rfc5424` | the output format |
 | `fields` | a `:`-separated list of `time`, `host`, `level`, `name`, `procid`, `msg` | the console format's fields, in the order given |
-| `time` | `uptime`, `wall` | what the console format's `time` field shows |
+| `time` | `uptime`, `wall` | what the console format's `time` field shows (default `uptime`) |
 | `pace` | `hold`, `skip` | § Pace |
 | `backlog` | 0 to 256 | § Device sinks |
 | `relayed` | `yes`, `no` | whether `relayed` entries are shown |
@@ -374,8 +377,8 @@ An external sink's settings are its own recipe's, in the same keys.
 
 ## The console format
 
-*Built: the prefix with the tag padded to six, the seconds' alignment, the field list and the
-colour (#1493). Design intent: the instance numbers (#1492) and wall-clock display (#1493).*
+*Built: the prefix with the tag padded to six, the seconds' alignment, the field list, the
+wall-clock display and the colour (#1493). Design intent: the instance numbers (#1492).*
 
 The default console line, the same on serial and the framebuffer:
 
@@ -393,8 +396,9 @@ The default console line, the same on serial and the framebuffer:
   column while the seconds are below 100000.
 - **Time.** Uptime: the seconds right-aligned to five columns, as Linux's `dmesg` writes them, wider
   past 99999 s; six digits of microseconds. With `time=wall`, an RFC 3339 UTC time with microseconds
-  once the boot wall offset is known, and uptime before it. A `previous` entry always shows its own
-  uptime.
+  in brackets, `[2026-11-25T09:01:11.123456Z]`, once the boot wall offset is known, and uptime
+  before it and for a time past 9999-12-31, which RFC 3339's four-digit year cannot show. A
+  `previous` entry always shows its own uptime.
 - **Level.** Every line shows its level, informational included: `EMERG`, `ALERT`, `CRIT`, `ERROR`,
   `WARN`, `NOTICE`, `INFO`, `DEBUG` (`logd_codec::level::tag`).
 - **Name.** `[name]` for a sender's first instance, `[name#n]` for its n-th, `[?]` for a sender that
@@ -445,9 +449,7 @@ line reaches the screen rarely.
 
 ## The rfc5424 format
 
-*Built for a device sink (#1493), with TIMESTAMP and STRUCTURED-DATA `-` until logd reads the
-boot wall offset (§ Wall time). Design intent: the timestamp and `timeQuality` (#1493), the
-network sink (#1499).*
+*Built for a device sink (#1493). Design intent: the network sink (#1499).*
 
 A sink in the `rfc5424` format writes each entry as one RFC 5424 message:
 
@@ -455,35 +457,40 @@ A sink in the `rfc5424` format writes each entry as one RFC 5424 message:
 |---|---|
 | PRI | facility × 8 + severity; the facility is 0 (kernel) for the kernel's entries, the sink's `facility` for every other |
 | VERSION | `1` |
-| TIMESTAMP | `us` plus the boot wall offset, RFC 3339 UTC with microseconds; `-` while no offset is known and for a `previous` entry |
+| TIMESTAMP | `us` plus the boot wall offset, RFC 3339 UTC with microseconds; `-` while no offset is known, for a time past 9999-12-31 and for a `previous` entry |
 | HOSTNAME | `LOGD_HOSTNAME` (or the external sink's own setting), `-` when unset |
 | APP-NAME | the slot's display name without the instance number; each byte outside printable US-ASCII (33 to 126) written `_`, at most 48 bytes; `-` for an unnamed sender |
 | PROCID | the badge in lower-case hex; it tells instances of one name apart; `-` when the sink cannot resolve the entry's slot (§ External sinks) |
 | MSGID | `-` |
-| STRUCTURED-DATA | `[timeQuality tzKnown="1" isSynced="0"]` while the offset comes from an unsynchronised clock, `-` once it is synchronised |
+| STRUCTURED-DATA | `[timeQuality tzKnown="1" isSynced="0"]` beside a TIMESTAMP while the offset comes from an unsynchronised clock, `-` beside a `-` TIMESTAMP and once the clock is synchronised |
 | MSG | the byte order mark, then the console format's message field, each byte of an invalid UTF-8 sequence written `\xNN` as the record renderer writes it, so MSG is valid UTF-8 |
 
 timed sets its offset once, from the RTC, and synchronises to no external source
-([services/timed/README.md](../../timed/README.md)), so every message carries `timeQuality` today. A
+([services/timed/README.md](../../timed/README.md)), so every message with a TIMESTAMP carries
+`timeQuality` today (`logd_codec::rfc5424::TIME_QUALITY`). A
 message longer than the transport carries is cut at a character boundary of MSG.
 
 ---
 
 ## Wall time
 
-*Design intent (#1493). The svcmgr change below is #1493's.*
+*Built (#1493) for logd's device sinks; an external sink's reading of the offset is design intent
+with the external sinks (§ External sinks).*
 
-- svcmgr's `log_sink` round gains a slot 6: the SEND of the `timed` publication, absent when no
+- svcmgr's `log_sink` round carries in slot 6 the SEND of the `timed` publication, absent when no
   recipe provides `timed` ([service-definitions.md](../../svcmgr/docs/service-definitions.md) §
   `log_sink`).
 - A helper thread of logd calls `timed_labels::GET_WALL_TIME` once, with no bound, and stores the
-  boot wall offset, the wall time less the uptime of the same instant. timed answers from memory;
-  its own log calls are served by logd's receive workers, which wait on no call of logd's, so the
-  call cannot deadlock. No receive worker and not the main thread calls timed.
+  boot wall offset, the wall time less the uptime of the same instant (`read_wall_clock`), then
+  deletes the SEND. timed answers from memory; its own log calls are served by logd's receive
+  workers, which wait on no call of logd's, so the call cannot deadlock. No receive worker and not
+  the main thread calls timed.
 - On the answer, logd logs one notice line giving the wall time and the uptime it corresponds to,
   so every uptime in a capture converts:
   `[    3.201440] NOTICE [logd] wall clock 2026-11-25T09:01:11Z at uptime 3.201440`.
-  `WALL_CLOCK_UNAVAILABLE` leaves the offset unknown and logs that at notice.
+  `WALL_CLOCK_UNAVAILABLE` leaves the offset unknown and logs that at notice
+  (`wall clock unavailable`); a failed call leaves it unknown and logs at warning. With no slot 6,
+  the offset stays unknown and nothing is logged.
 - Until the offset is known, a sink that shows wall time shows uptime (console) or `-` (rfc5424).
   A restarted logd reads the offset again.
 - An external sink reads the offset from timed itself, through a `timed` seed of its own recipe.
@@ -543,9 +550,8 @@ waits on no sink's progress for a sender.
 
 ## Queries, follow and control
 
-*Design intent (#1494), but for `QUERY_SLOTS` and the descending `QUERY_HISTORY` walk, which are
-built ([ipc-interface.md](ipc-interface.md) § Queries). `LOG_LABELS_VERSION` is bumped with the wire
-changes.*
+*Built (#1494; [ipc-interface.md](ipc-interface.md) § Queries, § Subscriptions, § Sink control),
+but for the instance number in `QUERY_SLOTS` rows (#1492) and the previous slots (#1498).*
 
 All of these are answered by a receive worker from logd's state under the state lock, with no call
 out, as the queries are today.
@@ -577,34 +583,43 @@ capability space.
 
 ### Subscriptions
 
-- `LOG_SUBSCRIBE` moves two capabilities to logd over a `logd.query` or `logd.follow` SEND, which
-  svcmgr mints with `GRANT` for it: a signal capability of a Notification the subscriber made, and a
-  token, a capability to a second object of the subscriber's that nobody waits on. logd checks each
-  capability's type and rights and deletes what it does not keep, since any holder of the name can
-  move it any capability.
+- `LOG_SUBSCRIBE` moves one capability to logd over a `logd.query` or `logd.follow` SEND, which
+  svcmgr mints with `GRANT` for it: a signal capability of a Notification the subscriber made. logd
+  checks its type and rights and deletes what it does not keep, since any holder of the name can
+  move it any capability. The reply moves the subscriber a token, a capability with no rights to a
+  Notification logd made at start for the subscription's index, which nobody signals or waits on.
+  logd makes the token so that no other reference to it exists: one the subscriber chose could
+  share its object with the signal or another subscription's token, and hold the subscription past
+  its subscriber.
 - Subscriptions come from two pools, each a [docs/limits.md](../../../docs/limits.md) row, kept
   apart by the verb bit of the SEND they arrive on: `SUBSCRIBERS_MAX` (8) for `logd.query`, which
   every session program may hold (§ Authority to read and steer), and `SINK_SUBSCRIBERS_MAX` (4) for
   `logd.follow` (`LOG_FOLLOW_AUTHORITY`), which only a recipe seeds, so interactive followers cannot
   take an external sink's place. A full pool refuses one more with `QUERY_FULL`. The reply carries
   the subscription's index, the instance epoch (the monotonic time logd started, which no other
-  instance shares), and the oldest and newest `seq` held.
+  instance shares), the oldest `seq` held and the `seq` the next entry takes.
 - logd signals every subscriber's Notification when it retains an entry. The signals coalesce: a
   subscriber reads everything after its cursor on each wake.
 - **A subscriber's end.** logd binds a sole-reference observer (`SYS_CAP_BIND_SOLE_REFERENCE`,
-  [docs/capability-model.md](../../../docs/capability-model.md)) on the token, posting to an event
-  queue of logd's that its wait-set holds, the correlator naming the subscription's index and a
-  generation. When the subscriber dies its slots go, the token falls to logd's one reference, and
-  logd ends the subscription and deletes both capabilities. The token, not the Notification, is
-  observed because the subscriber's wait on the Notification, and its wait-set membership, are
-  references the kernel counts, so the Notification does not fall to one while the subscriber waits
-  on it. Every holder of a name shares that name's one badge (`log_labels::LOG_QUERY_AUTHORITY`,
-  `LOG_FOLLOW_AUTHORITY`), so a subscriber cannot be told apart by its badge, and the death cascade
-  cannot end it. `LOG_UNSUBSCRIBE` ends a subscription at once.
-- **logd's end.** The subscriber binds a sole-reference observer on the same token, posting to its
-  own event queue. When logd dies, or ends the subscription, the token falls to the subscriber's
-  reference and the post tells the subscriber to subscribe again (§ External sinks). The epoch then
-  tells it whether the instance changed and its cursor's `seq` numbering with it.
+  [docs/capability-model.md](../../../docs/capability-model.md)) on its own capability to the token,
+  posting to an event queue of logd's that its wait-set holds, the correlator naming the
+  subscription's index and a generation. When the subscriber dies its slots go, the token falls to
+  logd's one reference, and logd ends the subscription and deletes the signal, keeping the token for
+  the index's next subscription. The token, not the Notification, is observed because the
+  subscriber's wait on the Notification, and its wait-set membership, are references the kernel
+  counts, so the Notification does not fall to one while the subscriber waits on it. Every holder of
+  a name shares that name's one badge (`log_labels::LOG_QUERY_AUTHORITY`, `LOG_FOLLOW_AUTHORITY`),
+  so a subscriber cannot be told apart by its badge, and the death cascade cannot end it. A
+  subscriber ends its own subscription the same way, by deleting its token; logd ends it on the
+  post, which the kernel makes within a timer tick of the deletion, and its main thread's wake. A
+  reply that does not reach the subscriber deletes its copy and ends the subscription the same way.
+  No label ends a subscription: logd cannot compare a capability a caller presents with the token
+  it holds, so a label could not tie an end to its subscriber, and any holder of the name could end
+  any subscription by its index.
+- **logd's end.** The subscriber binds a sole-reference observer on its copy of the token, posting
+  to its own event queue. When logd dies, or ends the subscription, the token falls to the
+  subscriber's reference and the post tells the subscriber to subscribe again (§ External sinks).
+  The epoch then tells it whether the instance changed and its cursor's `seq` numbering with it.
 - A follower therefore wakes only for entries and for those two ends: idle, it makes no call and
   takes no wake-up, 0 a minute, and neither side polls.
 
@@ -621,7 +636,7 @@ capability space.
 
 ## Authority to read and steer
 
-*Design intent (#1494, #1495, #1501).*
+*Built (#1494), but for `programs/log` (#1495) and `/svc` (#1501).*
 
 - `logd.query` (reads and subscriptions), `logd.follow` (the same, from the external sinks' pool of
   subscriptions) and `logd.control` (sink control) are seed-only names svcmgr mints. `logd.follow`

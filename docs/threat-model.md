@@ -177,15 +177,25 @@ service executes as built, since procmgr verified it.
 - The `proofs` module of `shared/hwrng-protocol/src/lib.rs` proves `requested_len` on every request
   and, by induction over a reply's words, `decode_reply` and `encode_reply`
   ([testing.md](testing.md) § Bounded verification); CI's `kani` jobs run them.
-- Planned: property functions, fuzz targets and proof harnesses for the decoders of `shared/ipc` and
-  `shared/namespace-protocol` (`gate_open`, `compose_forward_lookup_rights`, `validate_name`), in
+- `namespace-protocol` (`xtask/fuzz/targets/src/bin/namespace-protocol.rs`) drives
+  `namespace_protocol::property::namespace_protocol_holds` over a server's rights gate (`gate`,
+  `gate_open`), its rights composition of a forwarded lookup (`compose_forward_lookup_rights`), its
+  decode of an `NS_LOOKUP` path (`validate_name` on each component), and a client's decode of a
+  lookup reply (`PathWalk::advance`), from the seeds in
+  `shared/namespace-protocol/fuzz/namespace-protocol/seeds/`; CI's gating `fuzz` job runs it as it
+  runs `hwrng-protocol`.
+- The `proofs` modules of `shared/namespace-protocol` prove the badge decode and the rights gate on
+  every badge and label, the forwarded rights on every pair of rights words, the path's cut on every
+  request, the name and path checks by their steps (each character from any scan state, and every
+  name and path to a short bound), and a reply's count on every count and its kind on every kind
+  ([testing.md](testing.md) § Bounded verification); CI's `kani` jobs run them.
+- Planned: property functions, fuzz targets and proof harnesses for the decoders of `shared/ipc`, in
   [#680](https://github.com/kottlerg/seraph/issues/680) and
   [#756](https://github.com/kottlerg/seraph/issues/756).
 
 **Gaps.**
 
-- No decoder of `shared/ipc` or `shared/namespace-protocol` has a property function, a fuzz target
-  or a proof harness yet.
+- No decoder of `shared/ipc` has a property function, a fuzz target or a proof harness yet.
 - Each server's dispatcher checks its own labels, word counts, versions and badges; no shared layer
   checks them, and no review has yet covered every label of every service against this attacker. The
   audit of this section ([#680](https://github.com/kottlerg/seraph/issues/680)) is the first.
@@ -228,11 +238,14 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   refuses to register a partition past that capacity (`resolve_lba`, `handle_register_partition` in
   `services/drivers/virtio/blk/src/main.rs`).
 - The FAT decoders are a pure crate, `services/fs/fat/fat-parse`: `parse_bpb_geometry` refuses a bad
-  signature, a zero divisor, a sector size other than the device's, FAT12 and an inconsistent
-  geometry; `is_data_cluster` bounds every cluster number read from disk to the data region. fatfs
-  bounds a directory's chain walk to the volume's cluster count, and a file's to the clusters before
-  the offset it reads, so a cyclic chain ends (`services/fs/fat/src/dir.rs`, `read_file_data` in
-  `services/fs/fat/src/fat.rs`).
+  signature, a zero divisor, a sector size other than the device's, FAT12, an inconsistent
+  geometry, and a volume that declares more sectors than its partition holds, whose length fatfs
+  reads from the block driver (`BLK_GET_GEOMETRY`), so every bound derived from the cluster count
+  follows the disk; `is_data_cluster` bounds every cluster number read from disk to the data
+  region. fatfs bounds a directory's chain walk to the clusters the specification's 65536 entries
+  fill (`fat_parse::dir_chain_limit`), and a file's to the clusters before the offset it reads, so
+  a cyclic chain ends after a bounded number of sector scans (`services/fs/fat/src/dir.rs`,
+  `read_file_data` in `services/fs/fat/src/fat.rs`).
 - A disk's own partition table gives a role on the boot disk alone, the disk at the PCI location
   the bootloader reported that carries the boot ESP it booted (`find_boot_disk` in
   `services/vfsd/gpt/src/lib.rs`). Another disk takes a role only where the storage statement,

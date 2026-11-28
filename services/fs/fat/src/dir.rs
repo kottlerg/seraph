@@ -39,14 +39,16 @@ pub use fat_parse::{
 
 /// Step a directory walk from `cluster` to the next cluster of its chain.
 ///
-/// `steps` counts the clusters the walk has left. A chain longer than the
-/// volume's cluster count must revisit a cluster (a cycle in a corrupt
-/// FAT), so the walk stops there instead of looping forever on the single
-/// service thread.
+/// `steps` counts the clusters the walk has left. A directory holds at most
+/// [`fat_parse::DIR_ENTRIES_MAX`] entries, so its chain holds at most
+/// [`fat_parse::dir_chain_limit`] clusters, never more than the volume has;
+/// a longer chain is corrupt, a cycle among them, and the walk stops there
+/// after a bounded number of sector scans instead of holding the single
+/// service thread for as many as the volume's cluster count allows.
 ///
 /// # Errors
-/// [`FatError::Corrupt`] past `total_clusters` steps; otherwise the errors
-/// of [`chain_next`].
+/// [`FatError::Corrupt`] past the directory's cluster limit; otherwise the
+/// errors of [`chain_next`].
 fn next_dir_cluster(
     state: &mut FatState,
     cluster: u32,
@@ -57,7 +59,12 @@ fn next_dir_cluster(
 ) -> Result<Option<u32>, FatError>
 {
     *steps = steps.saturating_add(1);
-    if *steps > state.total_clusters
+    let limit = fat_parse::dir_chain_limit(
+        state.total_clusters,
+        state.sectors_per_cluster,
+        state.bytes_per_sector,
+    );
+    if *steps > limit
     {
         std::os::seraph::log!(warn: "directory chain through cluster {cluster} has a cycle");
         return Err(FatError::Corrupt);
@@ -589,6 +596,16 @@ pub fn insert_entry(
         return Err(FatError::NoSpace);
     };
 
+    // A run that crossed the end-of-directory marker moves the end of the
+    // directory past it: the slot after it, which may hold any bytes, takes
+    // the new marker before the entry is written, so a reader never parses
+    // it as an entry. Written first, the marker lies past the old one and
+    // changes nothing a reader sees until the entry's slots land.
+    if let Some(after) = scan.end_marker()
+    {
+        write_dir_slot(after, &[0u8; 32], cache, block_dev, ipc_buf)?;
+    }
+
     // Emit LFN slots in reverse-seq order: the highest seq, flagged as the
     // run's last slot, first on disk, then seq counting down to 1.
     let units = chars.get(..unit_count).unwrap_or_default();
@@ -937,10 +954,10 @@ pub fn write_dot_entries(
 /// Find a run of `count` consecutive free slots in a directory for a new
 /// entry. [`FreeRunScan`] defines free: deleted slots, the end-of-directory
 /// slot, and every slot after it, so the run continues past the marker
-/// through the rest of the directory before the directory grows. The
-/// driver zeroes every directory cluster it allocates, as format tools do,
-/// so the slot after a run that crossed the marker still reads as end of
-/// directory. A clustered directory (any but the FAT16 fixed root, which
+/// through the rest of the directory before the directory grows. A run that
+/// crossed the marker also takes the slot after it, when the directory has
+/// one without growing ([`FreeRunScan::end_marker`]), for [`insert_entry`]
+/// to mark as the new end of the directory. A clustered directory (any but the FAT16 fixed root, which
 /// cannot grow) whose chain ends with the run still short is extended by
 /// a free cluster, zeroed while the FAT still holds it free and only then
 /// marked end-of-chain and linked after the last one, so the chain never
@@ -952,8 +969,9 @@ pub fn write_dot_entries(
 /// # Errors
 /// [`FatError::Io`] when a directory or FAT sector cannot be read, or a
 /// new cluster cannot be zeroed or claimed; [`FatError::NoSpace`] when the
-/// FAT16 root area holds no such run or no free cluster remains to extend
-/// a clustered directory; [`FatError::Corrupt`] when the directory's first
+/// FAT16 root area holds no such run, no free cluster remains to extend
+/// a clustered directory, or the directory already holds the most clusters
+/// a directory may ([`fat_parse::dir_chain_limit`]); [`FatError::Corrupt`] when the directory's first
 /// cluster or a link lies outside the data region, a link is a bad-cluster
 /// marker, or the chain has a cycle; any other error of
 /// [`find_free_cluster`] or [`claim_cluster`].
@@ -986,6 +1004,12 @@ fn find_free_slot_run(
                 return Ok(scan);
             }
         }
+        // A run that fills the root area's last slots ends the directory
+        // there, with no slot after it to mark.
+        if scan.run_complete()
+        {
+            return Ok(scan);
+        }
         return Err(FatError::NoSpace);
     }
 
@@ -1017,6 +1041,24 @@ fn find_free_slot_run(
         }
         else
         {
+            // A run that fills the chain's last slots ends the directory
+            // there, with no slot after it to mark.
+            if scan.run_complete()
+            {
+                return Ok(scan);
+            }
+            // `steps` now counts the chain's clusters; a directory already
+            // at its cluster limit takes no more entries, since a walk past
+            // the limit reads as a cycle.
+            if steps
+                >= fat_parse::dir_chain_limit(
+                    state.total_clusters,
+                    state.sectors_per_cluster,
+                    state.bytes_per_sector,
+                )
+            {
+                return Err(FatError::NoSpace);
+            }
             let new_cluster = find_free_cluster(state, cache, block_dev, ipc_buf)?;
             zero_cluster(state, new_cluster, cache, block_dev, ipc_buf)?;
             claim_cluster(state, new_cluster, Some(cluster), cache, block_dev, ipc_buf)?;

@@ -436,16 +436,19 @@ mode ([scheduler.md](scheduler.md) § Wake Preemption) and between two batches o
 all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_flags`,
 `unlock_saved_flags`). `idle_pull_candidate`, the idle pull's confirmation sample,
 `idle_pull_episode`, the backlog episode that sample read, `idle_pull_held`, whether the previous
-idle tick held it for a busy SMT sibling, and `idle_pull_cursor`, where its scan starts
-([scheduler.md](scheduler.md) § Load Balancing, § SMT Awareness), are written and read only by their
-own CPU's `timer_tick`. The CPU's idle wake word, which sits in its own per-CPU slab
+idle tick held it for a busy SMT sibling, `idle_pull_cursor`, where its scan starts, and
+`balance_cursor`, where a busy CPU's empty-queue scan starts ([scheduler.md](scheduler.md) § Load
+Balancing, § SMT Awareness), are written and read only by their own CPU's `timer_tick`, after
+`sched::init` sets the cursors at boot. `wake_cursor`, where the placement scans of the wakes a
+CPU makes start, is written and read only by the placements of wakes made on that CPU. The CPU's
+idle wake word, which sits in its own per-CPU slab
 (`sched::IDLE_WAKES_PTR`, read through `sched::idle_wake_for`) beside the scheduler rather than in
 it, is owned by no lock: its idle thread sets and clears its flag, and any CPU's `wake_idle_cpu`
 clears it, each with a read-modify-write (§ Wake Protocol Invariants, invariant 4).
 `backlog_episode`, the CPU's backlog episode, is owned by `lock`: written only by `link` and
 `remove_from_queue`, under it, and read under it by a pull's re-check and without it by an idle
 CPU's sample, which the pull re-decides. `non_empty`, `load`, `backlog_episode`,
-`idle_pull_candidate`, `idle_pull_episode`, `idle_pull_held`, `idle_pull_cursor` and the
+`idle_pull_candidate`, `idle_pull_episode`, `idle_pull_held`, the scan cursors and the
 deferred-reclaim head are atomics with their own orderings (§ Atomic Ordering Invariants).
 
 **Lock primitive.** All locks above except the derivation tree lock are `crate::sync::Spinlock`
@@ -1378,10 +1381,13 @@ and `commit_blocked`'s `Running→Blocked` commit because all three contend for 
 thread at an RT level, the RT rule below, which places it on its preferred CPU when it
 runs there at once and otherwise on the CPU of the lowest rank, (4) sticky
 `preferred_cpu` when its load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD`
-of the global `min_load`, except, for a `WakeHint::WakerRuns` wake, when
-`preferred_cpu` is the waker's CPU, and (5) the least-loaded CPU, a tie going to
-the CPU with the fewest busy SMT siblings, then the lowest index
-(`least_loaded_cpu`; [scheduler.md](scheduler.md) § SMT Awareness). Hard
+of the `min_load` of the waker CPU's scan window, except, for a `WakeHint::WakerRuns` wake,
+when `preferred_cpu` is the waker's CPU, and (5) the least-loaded CPU of that window, a tie
+going to the CPU with the fewest busy SMT siblings, then the first read (`least_loaded_cpu`;
+[scheduler.md](scheduler.md) § SMT Awareness). The window is every CPU in index order in a boot
+of up to `CPU_SCAN_WINDOW` (128) CPUs, so a tie goes to the lowest index there, and 128 CPUs
+from the waker CPU's `wake_cursor` in a larger boot, which each scan moves past its window
+(`sched::wake_window`; [scheduler.md](scheduler.md) § Load Balancing, "Scan windows"). Hard
 affinity overrides the pin, so an in-window wake of a thread whose affinity
 names another CPU links it there while it is still `current` on the CPU it
 parks on; that CPU's `schedule()` leaves it to the CPU that claims it
@@ -1501,15 +1507,17 @@ affinity mask, less the excluded CPU), the rule returns:
 
 - its `preferred_cpu` when the thread runs there at once, except on a `WakeHint::WakerRuns` wake
   whose waker's CPU k it is, which rule 4 skips too;
-- otherwise the CPU of the lowest effective rank, a tie going to the lower `current_load`, then to
-  the fewest busy SMT siblings, then to the lowest index (`least_loaded_cpu` over the key of rank
-  and load).
+- otherwise the CPU of the lowest effective rank in the waker CPU's scan window (rule 5's), a tie
+  going to the lower `current_load`, then to the fewest busy SMT siblings, then to the first read
+  (`least_loaded_cpu` over the key of rank and load).
 
 It returns nothing only when no CPU is eligible, or when the only eligible CPU is the waker's CPU k
 that a `Sync` wake leaves out of the scan, and rules 4 and 5 then decide as for a fair wake.
 A thread placed behind a thread of its own level shares the CPU within a slice; one placed behind a
-higher level waits for it to block, which the rule chooses only when every eligible CPU runs or
-queues its level or above.
+higher level waits for it to block, which the rule chooses only when every eligible CPU of the
+window runs or queues its level or above; in a boot above 128 CPUs, a CPU outside the window
+that runs a lower level then takes it through the RT push of the CPU it waits on
+([scheduler.md](scheduler.md) § Load Balancing, "RT push").
 
 A `Sync` wake reaches the rule only when the guard failed. k's `current_level` still names the
 waker, whose park has committed, so the rule ranks k by its queued threads alone
@@ -1898,8 +1906,10 @@ the ordering choice is required for correctness; relaxations would introduce a r
 | `idle_pull_episode` (per `PerCpuScheduler`, `AtomicU32`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_candidate` / `set_idle_pull_candidate`, called from `try_pull_idle`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state, meaningful only while `idle_pull_candidate` is set: one CPU writes and reads it, so no ordering edge is needed. |
 | `backlog_episode` (per `PerCpuScheduler`, `AtomicU32`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; written in `link` and `remove_from_queue`; read in `backlog`, by `idle_scan`, `idle_pull_tick` and `pull_under_cpu_locks`) | Relaxed `load` and `store` in `link`, under `lock`, before its Release `non_empty.fetch_or`, when the queues held no thread but the idle thread (an even count two on, an odd one up to the even count before it), and in `remove_from_queue`, under `lock`, before its Release `non_empty.fetch_and`, when its removal leaves no thread but the idle thread queued (the count one lower, odd) | Relaxed `load` in `backlog`, after its Acquire `non_empty` load, rounded up to even | Every write holds `lock`, so a reader under it reads the exact episode. A lock-free sample that sees a link's `non_empty` bit reads that link's episode or a later one (the `non_empty` pair), never an older one; a sample is advisory, and the pull re-checks the episode under the lock. A sample that reads the odd count of a removal it raced rounds it up to the episode that removal continues. A sample that races a dispatch running the backlog dry and the link that refills the queues can read the new episode for the backlog it saw, which costs one pull of a backlog that did not stand a tick, a pull the bound allows. The count wraps: a stale match needs 2^31 backlogs between two samples a tick apart, and would cost one pull, which the bound already allows. |
 | `idle_pull_held` (per `PerCpuScheduler`, `AtomicBool`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_held` / `set_idle_pull_candidate`, which clears it / `hold_idle_pull_candidate` / `forget_idle_pull_candidate`, called from `try_pull_idle` and `try_pull_balance`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only delays a pull by one tick ([scheduler.md](scheduler.md) § SMT Awareness). |
-| `rt_push_cursor` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `rt_push_cursor` / `set_rt_push_cursor`, called from `try_push_waiting_rt`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only orders the RT push's scan, which the push revalidates under the run-queue locks. |
-| `idle_pull_cursor` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_cursor` / `set_idle_pull_cursor`, called from `try_pull_idle`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only orders the idle scan, which every pull revalidates under the run-queue locks. |
+| `rt_push_cursor` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `rt_push_cursor` / `set_rt_push_cursor`, called from `try_push_waiting_rt`) | Relaxed `store`, by `sched::init` at boot, then by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only orders the RT push's scan, which the push revalidates under the run-queue locks. |
+| `idle_pull_cursor` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_cursor` / `set_idle_pull_cursor`, called from `try_pull_idle`) | Relaxed `store`, by `sched::init` at boot, then by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only orders the idle scan, which every pull revalidates under the run-queue locks. |
+| `balance_cursor` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `balance_cursor` / `set_balance_cursor`, called from `try_pull_balance`) | Relaxed `store`, by `sched::init` at boot, then by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only orders a busy CPU's empty-queue scan, whose pull revalidates under the run-queue locks. |
+| `wake_cursor` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `wake_cursor` / `set_wake_cursor`, called through `WakeView` from `place_by_rank_and_load` and `place_rt_wake`) | Relaxed `store`, by `sched::init` at boot, then by a wake's placement on the owning CPU | Relaxed `load`, by a wake's placement on the owning CPU | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed. A wake an interrupt makes on the CPU can fall between another placement's load and store there, and either store leaves a valid cursor: any value is a valid start, taken modulo the CPU count, and it only decides which CPUs a placement reads, whose lock-free reads are advisory with it as without it. |
 | `park_disposition` (per TCB, `AtomicU8`) | `core/kernel/src/sched/thread.rs` (decl; ops `open_park_episode`, `stamp_park_deposit`, `consume_park_interrupted`, `consume_park_cancel`; `consume_call_disposition` in `core/kernel/src/syscall/ipc.rs`) | Release `store` of `NONE` by `open_park_episode` (directly or via `open_call_episode`) before the thread becomes claimable; Release `store` of the disposition by the wake-claim winner in `stamp_park_deposit` (directly or via `stamp_cancelled_deposit`) | Acquire `load` on resume in `consume_park_interrupted` / `consume_park_cancel` / `consume_call_disposition` | The claim winner's Release orders its deposit (`ipc_msg`, `wakeup_value`) before the stamp, so a resuming thread whose Acquire load observes the stamp also observes the deposit; see [ipc-internals.md § Park Dispositions and Episodes](ipc-internals.md#park-dispositions-and-episodes) for the episode protocol. |
 | `deferred_reclaim_head` (per `PerCpuScheduler`, `AtomicPtr<u8>`) | `core/kernel/src/sched/run_queue.rs` (decl); push in `push_deferred_reclaim` and drain in `drain_deferred_reclaim` (`core/kernel/src/cap/object.rs`) | AcqRel `compare_exchange` push (Acquire on failure and on the head load) | Acquire `load` fast-path empty check, then AcqRel `swap(null)` drain | Lock-free Treiber stack: the push's Release publishes the node's intrusive link written before the CAS, and the drain's Acquire swap observes it, so the draining CPU walks fully linked nodes. |
 | `fault_handlers` (per TCB, one per fault class) | `core/kernel/src/sched/thread.rs` (decl) | AcqRel `swap` in `ipc::fault::publish_bindings` (`sys_thread_set_fault_handler` and `sys_thread_inherit_fault_handler`: bind/rebind/unbind of each selected class) under the target's `sched_lock`, and the `dealloc_object(Thread)` release of every class | Acquire `load` in `ipc::fault::fault_dispatch` (`pin_binding`, the faulting class) under the faulting thread's own `sched_lock`, with `inc_ref` of the loaded endpoint in the same hold, and in `ipc::fault::pin_bindings` (an inheritance source) and `sys_thread_get_fault_handler` under the thread's `sched_lock`; lock-free in the `has_handler` pre-check, which decides nothing | The binder holds the thread's `CONTROL` cap and runs on another CPU than the target. Binder and dispatcher serialise on the target's `sched_lock`: the dispatcher's single load under it sees one binding whole, and its `inc_ref` lands while that binding's reference still holds the endpoint, because the binder releases the previous object (`release_ref`) only after it unlocks, exactly once per rebind (the binder's `lookup_cap` pins the target Thread and the new endpoint for the call; [capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel Object Reference Counting). A null load means no handler: the fault is unhandled (the kill, or, for a restartable syscall's user copy, `InvalidAddress`; [docs/fault-handling.md](../../../docs/fault-handling.md) § Reply). The `dealloc_object(Thread)` release runs once the thread is off every CPU and no binder can pin it, so it races neither side. |
@@ -1956,8 +1966,9 @@ take no lock:
 - `outranked` (Relaxed): the owning CPU alone, with interrupts masked, at a return to user mode
   and between two batches of a `SYS_MEMORY_ZERO` (`syscall::mem::sys_memory_zero`, after an
   interrupt window, when `PREEMPT` is set).
-- `has_queued_thread` (Relaxed), through `has_no_work`: the softlockup watchdog's per-tick idle
-  sample (`system_has_no_work`), the SMT core spread, and the idle pull's sibling hold.
+- `has_queued_thread` (Relaxed), through `has_no_work`: the softlockup watchdog's idle
+  sample (`sched::cpu_has_no_work`, a window per BSP tick), the SMT core spread, and the idle
+  pull's sibling hold.
 - `ranks` (Relaxed, with `current_level`): an RT wake's placement on any CPU (§ Wake Protocol
   Invariants, "The RT rule"), and the RT push's choice of a target (§ ThreadState Transitions,
   "The RT push").
@@ -2167,22 +2178,37 @@ RT) finds preemption disabled and must suppress the dispatch — a non-idle `cur
 ticks inside a shootdown ack-wait is live, and without this stamp a map/unmap storm whose ack-waits
 cover every CPU's slice expiries starves all stamps and false-fires the detector (the dump's serial
 output then stalls the acks it misdiagnosed). The BSP `timer_tick` increments a global tick counter
-and, on every tick, samples whether the system is idle (`system_has_no_work`): every CPU's
-`current` is its idle thread and no run queue but the idle queue links a thread
-(`PerCpuScheduler::has_no_work`). A sample that finds it idle records the tick
-(`WATCHDOG_LAST_IDLE_TICK`, printed in the dump's header). The detector fires when the system has
-not been seen idle for `WATCHDOG_THRESHOLD_SECONDS` (3 s, converted to ticks at
-`ticks_per_second()`) and every CPU's last non-idle dispatch is that old (`all_idle_tick`, which
-is host-tested). The sample is taken on every tick, before the decision, so the stall clock
-restarts at the last idle tick: a thread that slept the threshold since the last dispatch, woken
-by the same BSP tick's `sleep_check_wakeups` just before the check, has not waited undispatched
-at all.
+and, on every tick, reads one window of the detector's sweep of the CPUs (`sweep_window`: at most
+`CPU_SCAN_WINDOW`, 128, CPUs from the sweep's cursor, so a sweep of n CPUs takes ceil(n / 128)
+ticks and a boot of up to 128 CPUs reads every CPU at every tick). For each CPU of the window it
+samples whether the CPU has work: whether its `current` is its idle thread and no run queue but
+the idle queue links a thread (`PerCpuScheduler::has_no_work`). A sweep that finds every CPU idle
+records the tick it ends at (`WATCHDOG_LAST_IDLE_TICK`, printed in the dump's header). The
+detector fires at the end of a sweep when the system has not been seen idle for
+`WATCHDOG_THRESHOLD_SECONDS` (3 s, converted to ticks at `ticks_per_second()`) and every CPU's
+last non-idle dispatch, read by that sweep, is that old (`all_idle_tick`, which is host-tested).
+The sample is recorded before the decision, so the stall clock restarts at the last idle sweep: a
+thread that slept the threshold since the last dispatch, woken by the same BSP tick's
+`sleep_check_wakeups` just before the check, has not waited undispatched at all.
+
+The sweep bounds the BSP tick's cost: at most 128 CPUs' samples and 128 dispatch stamps per tick,
+whatever the CPU count. Each window's reads stop at the first CPU that settles the sweep's answer
+(a CPU with work, a recent stamp), and the later windows of that sweep skip them, so a busy system
+reads about one CPU per tick. The stamps are read only while the system has not been seen idle for
+the threshold, so the sweep under way when the stall clock reaches the threshold, some of whose
+windows were read before it did, does not fire. Work left undispatched is
+therefore reported at most 3 * ceil(n / 128) ticks after one walk of every CPU per tick would
+report it: the last idle sweep can end up to a sweep after the CPU's work appeared, the sweep under
+way when the clock reaches the threshold does not fire, and the next sweep fires at its end. In a
+boot of up to 128 CPUs, where every tick is a whole sweep, the detector decides at every tick as
+that walk would; at the 8192-CPU ceiling, with the 1 ms tick, the bound is 192 ms beside the 3 s
+threshold.
 
 The sample takes no lock: it reads each scheduler's `current`, `idle`, and `non_empty` atomics
-Relaxed, dereferences no TCB, and stops at the first CPU with work, so a wedged scheduler-lock
-holder cannot stall the BSP tick and the sample never contends a CPU's lock. It is therefore not
-one snapshot across the CPUs (only every CPU's scheduler lock, taken on every BSP tick, would make
-it one), so its windows are these:
+Relaxed and dereferences no TCB, so a wedged scheduler-lock holder cannot stall the BSP tick and
+the sample never contends a CPU's lock. It is therefore not one snapshot across the CPUs (only every
+CPU's scheduler lock, taken on every BSP tick, would make it one), and above 128 CPUs a sweep reads
+its CPUs over several ticks. Its windows are these:
 
 - *False negatives.* A sample that misses a ready thread in transit (in a window § ThreadState
   Transitions lists between a `Ready` commit and its link; between two run queues during a
@@ -2194,10 +2220,14 @@ it one), so its windows are these:
   below) when one of its rules matches, and is reported by neither otherwise. A thread whose state
   is `Ready` but which no run queue links (a broken enqueue) reads the same way. A CPU wedged on
   its idle thread (inside a deferred reclaim) with nothing queued anywhere is reported only once
-  work becomes ready and waits the threshold undispatched.
+  work becomes ready and waits the threshold undispatched. Above 128 CPUs a sweep reads its windows
+  at different ticks, so work that moves, between them, from a CPU the sweep has not yet read to
+  one it has (an idle pull, a migration) is missed the same way, by that sweep only.
 - *False positives.* A non-idle `current` that takes no stamping tick for the threshold
   (interrupts masked that long) reads as stalled, and so does ready work whose CPU the host does
-  not run for the threshold (an oversubscribed guest's descheduled vCPU).
+  not run for the threshold (an oversubscribed guest's descheduled vCPU). Above 128 CPUs a sweep
+  reads each CPU's stamp at its window's tick, so a stall that ends within the sweep that read it is
+  still reported once that sweep ends; it had lasted the threshold.
 
 **2. Owed-wake detector (BSP, every `DETECTOR_SCAN_INTERVAL_MS`, 0.5 s).** Detects a single
 `Blocked` thread whose wake is provably owed but never arrived — the lost-wakeup wedge signature
@@ -2225,8 +2255,12 @@ derives from a globally consistent counter on both arches — TSC / `time` CSR �
 comparison is sound). Each AP compares the BSP's stamp against its own (`bsp_stall_check`): a BSP
 wedged interrupts-off kills the sleep-list waker and every BSP-hosted detector at once — total
 silence — so the AP-side check is the only detector that can name that state (#375). Symmetrically
-the BSP scans AP stamps (`ap_silence_check`) and fires on an AP silent past the grace window. Both
-defer to an in-flight TLB shootdown, as below.
+the BSP scans AP stamps (`ap_silence_check`) and fires on an AP silent past the grace window. Each
+of its scans, one per `DETECTOR_SCAN_INTERVAL_MS`, reads one window of a sweep of the APs
+(`sweep_window`, at most 128 APs), so in a boot of n CPUs a silent AP is named at most
+ceil((n - 1) / 128) scans, ceil((n - 1) / 128) * 0.5 s, after its grace runs out: one scan up to 129
+CPUs, as a scan of every AP would, and 32 s at the 8192-CPU ceiling, where the grace is 512 s. Both
+checks defer to an in-flight TLB shootdown, as below.
 
 The observer's report would show only its own state, so before it prints, once it holds the latch,
 it has the silent CPU print its own frame (`arch::current::interrupts::dump_remote_frame`). On
@@ -2322,11 +2356,12 @@ thread stranded in a wedged CPU's run queue — were invisible before this enume
 
 **Cost:** per tick per CPU, one `current_tick()` read plus one Relaxed
 heartbeat store (APs add one Relaxed load + compare for the BSP check); one
-Relaxed counter increment per BSP tick and two O(`cpu_count`) early-exit
-loops (the idle sample, which stops at the first CPU with work, and, once the
-system has not been seen idle for the threshold, the dispatch-stamp scan, which
-stops at the first CPU with a recent dispatch); the registry scan and AP-stamp
-sweep run only on the 0.5 s cadence; one plain stamp store per park commit;
+Relaxed counter increment per BSP tick and two early-exit loops over one sweep
+window of at most `CPU_SCAN_WINDOW` (128) CPUs (the idle sample, which stops at
+the first CPU with work, and, once the system has not been seen idle for the
+threshold, the dispatch-stamp scan, which stops at the first CPU with a recent
+dispatch); the registry scan and the AP-stamp sweep, one window of at most 128
+APs per scan, run only on the 0.5 s cadence; one plain stamp store per park commit;
 three Relaxed stores per syscall (the dispatcher's `syscall_nr` stamp on the
 running TCB at entry and exit, which
 feeds the lock-holder line, and its per-CPU `note_cpu_syscall` stamp at
@@ -2359,8 +2394,11 @@ while `tlb_shootdown::any_pending()` reports any per-CPU request slot with
 CPUs still to ack. The shootdown's own escalation ladder (§ IPI Watchdog
 Ladder: at 0.75 s an NMI backtrace on x86-64 or a single logged warning on
 RISC-V, `crate::fatal` at 5 s in arch `wait_for_ack`) is the authoritative detector
-for a genuinely stuck IPI; a non-shootdown stall re-checks on the next tick
-once the pending slots drain.
+for a genuinely stuck IPI. A non-shootdown stall is decided again once the
+pending slots drain: by the all-idle detector at the end of its next sweep (the
+next tick up to 128 CPUs), and by the AP-silence check when its sweep next reads
+the silent AP. The detection bounds stated above count no tick or scan that a
+pending shootdown defers.
 
 **Why kernel-side:** when every CPU is in kernel mode, no userspace monitor
 gets dispatched. The dump, like the stop drain's slow-drain warning below,

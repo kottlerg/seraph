@@ -91,16 +91,17 @@ struct Shared<H>
 /// A pool of threads receiving on one endpoint.
 ///
 /// Each worker receives a request and calls the handler with it, the
-/// worker's own [`IpcBuf`] and the worker's [`Reply`]. The request is already
-/// copied out of the page (`IpcMessage`), so the handler may make nested calls
-/// on that page. The handler ends its turn with its reply left in the
-/// [`Reply`] ([`Reply::set`]), which the worker sends with its next receive
-/// in one `SYS_IPC_REPLY_RECV`; or, when it has work after the reply, it
-/// sets the reply and sends it first with [`Reply::flush`] on the endpoint
-/// the pool receives on, the worker's next receive returning any call that
-/// send took up; or it deliberately leaves the caller
-/// unanswered, which the worker's next receive then releases
-/// (`docs/ipc-design.md` § The Call/Reply Model).
+/// worker's own [`IpcBuf`] and the worker's [`Reply`], a pool thread's slot
+/// ([`Reply::pooled`]). The request is already copied out of the page
+/// (`IpcMessage`), so the handler may make nested calls on that page. The
+/// handler ends its turn with its reply left in the [`Reply`]
+/// ([`Reply::set`]), which the worker sends with its next receive in one
+/// `SYS_IPC_REPLY_RECV`; or, when it has work after the reply, it sets the
+/// reply and sends it first with [`Reply::flush`], which from a pool
+/// thread's slot sends it alone, so a call waiting on the endpoint stays
+/// queued for the next free worker rather than wait for this one's work; or
+/// it deliberately leaves the caller unanswered, which the worker's next
+/// receive then releases (`docs/ipc-design.md` § The Call/Reply Model).
 ///
 /// Workers start behind a gate: [`Self::spawn`] starts threads that wait,
 /// and [`Self::open`] (or [`Self::serve_on_current`]) lets them receive. A
@@ -256,7 +257,7 @@ where
     };
 
     let mut guard = RecvGuard::new(shared.diag);
-    let mut reply = Reply::new();
+    let mut reply = Reply::pooled();
     loop
     {
         // SAFETY: `buf` is this thread's registered IPC buffer page.

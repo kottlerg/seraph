@@ -33,6 +33,7 @@
 mod cap;
 mod counter;
 mod event;
+mod fault;
 mod ipc;
 mod mm;
 mod notification;
@@ -40,6 +41,8 @@ mod null;
 mod thread;
 mod tlb;
 mod wait_set;
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use ::bench::{Counters, IDLE_HALTS, Report, Samples, Summary, Unit, Value};
 
@@ -53,9 +56,9 @@ pub const MAX_ITERS: u32 = 4096;
 pub(super) const MAX_SAMPLES: usize = MAX_ITERS as usize;
 
 /// Most extras a benchmark passes to [`Harness::report`], which adds
-/// `idle_halts` after them: the round trips' placement extras are the most
-/// any passes.
-const MAX_EXTRAS: usize = 8;
+/// `idle_halts` after them: `context_switch_pair`'s two TLB counts and its
+/// nine stage means are the most any passes.
+const MAX_EXTRAS: usize = 11;
 
 /// The `SYS_THREAD_SET_AFFINITY` argument that clears a thread's hard
 /// affinity.
@@ -63,6 +66,20 @@ const AFFINITY_ANY: u32 = u32::MAX;
 
 /// The sample buffer every benchmark records into in turn (ktest has no heap).
 static mut SAMPLES: [u64; MAX_SAMPLES] = [0; MAX_SAMPLES];
+
+/// Samples that child threads time on their own, which the harness reads once
+/// a child has signalled its notification: the stripes of `ipc_round_trip`'s
+/// `fan_in` callers, and from the start the timing child of an `iopb=` case,
+/// which counts them in [`CHILD_COMPLETED`].
+///
+/// Relaxed is sufficient for the samples and the count: the harness reads them
+/// only after the child's signal, and the `notification_send`/
+/// `notification_wait` pair orders them before the read.
+pub(super) static CHILD_SAMPLES: [AtomicU64; MAX_SAMPLES] =
+    [const { AtomicU64::new(0) }; MAX_SAMPLES];
+
+/// Samples the timing child of an `iopb=` case stored in [`CHILD_SAMPLES`].
+pub(super) static CHILD_COMPLETED: AtomicU64 = AtomicU64::new(0);
 
 /// What [`run_all`] hands each benchmark: its iteration count, the sample
 /// buffer, ktest's counters and the CPU count its result lines carry.
@@ -95,6 +112,18 @@ impl Recorder<'_>
         self.samples.record(sample)
     }
 
+    /// Record the samples an `iopb=` case's timing child stored, the first
+    /// [`CHILD_COMPLETED`] of [`CHILD_SAMPLES`]; call it once the child has
+    /// signalled.
+    pub(super) fn record_children(&mut self)
+    {
+        let count = usize::try_from(CHILD_COMPLETED.load(Ordering::Relaxed)).unwrap_or(0);
+        for sample in CHILD_SAMPLES.iter().take(count)
+        {
+            self.samples.record(sample.load(Ordering::Relaxed));
+        }
+    }
+
     /// End the measured loop: the halts of CPU 0 since the recorder was
     /// taken, read first, and the summary of the samples. Call it right after
     /// the loop's last sample, with no `IdleHalts` call of the thread
@@ -106,6 +135,40 @@ impl Recorder<'_>
             idle_halts,
             summary: self.samples.summary(),
         }
+    }
+}
+
+/// Recorders over equal parts of the sample buffer, one per leg of a
+/// benchmark that times several legs of each operation, taken with CPU 0's
+/// idle-halt count marked where the loop began, as a [`Recorder`] is: every
+/// leg's line reports the halts of the one loop.
+pub(super) struct Legs<'a, const K: usize>
+{
+    parts: [Samples<'a>; K],
+}
+
+impl<const K: usize> Legs<'_, K>
+{
+    /// Record one sample of leg `leg`; `false` when its part is full or
+    /// there is no such leg.
+    pub(super) fn record(&mut self, leg: usize, sample: u64) -> bool
+    {
+        self.parts
+            .get_mut(leg)
+            .is_some_and(|part| part.record(sample))
+    }
+
+    /// End the measured loop: the halts of CPU 0 since the legs were taken,
+    /// read once, and each leg's summary. Call it right after the loop, as
+    /// [`Recorder::summary`].
+    pub(super) fn summaries(&mut self) -> [Measured; K]
+    {
+        let idle_halts = syscall::idle_halts().ok();
+        let mut parts = self.parts.iter_mut();
+        core::array::from_fn(|_| Measured {
+            summary: parts.next().and_then(Samples::summary),
+            idle_halts,
+        })
     }
 }
 
@@ -127,7 +190,8 @@ pub(super) struct Measured
 impl Measured
 {
     /// The summary of samples that other threads recorded on their own CPUs
-    /// (`tlb::bench_tlb_shootdown_concurrent`): no idle-halt count.
+    /// (`tlb::bench_tlb_shootdown_concurrent`, `fault_round_trip`'s
+    /// `placement=apart`): no idle-halt count.
     pub(super) const fn of_other_cpus(summary: Option<Summary>) -> Self
     {
         Self {
@@ -156,6 +220,22 @@ impl Harness
         (
             Recorder {
                 samples: Samples::new(&mut self.buf[..]),
+            },
+            &self.counters,
+        )
+    }
+
+    /// [`Harness::recorder`] for a benchmark that times `K` legs of each
+    /// operation: `K` recorders, each over `MAX_SAMPLES / K` samples of the
+    /// buffer, so such a benchmark runs at most that many iterations.
+    pub(super) fn legs<const K: usize>(&mut self) -> (Legs<'_, K>, &Counters)
+    {
+        let _ = syscall::idle_halts();
+        let per_leg = MAX_SAMPLES.checked_div(K).unwrap_or(MAX_SAMPLES).max(1);
+        let mut parts = self.buf.chunks_mut(per_leg);
+        (
+            Legs {
+                parts: core::array::from_fn(|_| Samples::new(parts.next().unwrap_or_default())),
             },
             &self.counters,
         )
@@ -373,6 +453,7 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     mm::bench_mem_map_unmap(ctx, &mut h);
     mm::bench_mem_protect(ctx, &mut h);
     mm::bench_aspace_harvest(ctx, &mut h);
+    fault::bench_fault_round_trip(ctx, &mut h);
     thread::bench_thread_lifecycle(ctx, &mut h);
     thread::bench_context_switch(ctx, &mut h);
     thread::bench_thread_read_mem(ctx, &mut h);
@@ -380,6 +461,7 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     wait_set::bench_wait_set(ctx, &mut h);
     tlb::bench_tlb_shootdown(ctx, &mut h);
     tlb::bench_tlb_shootdown_concurrent(ctx, &mut h);
+    tlb::bench_tlb_reach(ctx, &mut h);
     counter::bench_empty_window(ctx, &mut h);
 
     if syscall::thread_set_affinity(ctx.thread_cap, AFFINITY_ANY).is_err()

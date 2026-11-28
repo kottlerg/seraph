@@ -1,8 +1,8 @@
 # shared/bench
 
 What every Seraph benchmark shares: the counters it reads around a measured operation, the
-samples it records and their summary, and the one result line it reports, with the parser that
-reads the line back.
+hardware event counters it may read with them, the samples it records and their summary, and the
+one result line it reports, with the parser that reads the line back.
 
 ---
 
@@ -15,6 +15,7 @@ bench/
 └── src/
     ├── lib.rs              # Crate root and re-exports
     ├── counters.rs         # Counters, Reading
+    ├── events.rs           # ColumnPlan, Column, EventCounters (feature `pmu`)
     ├── stats.rs            # Samples, Summary, summarize
     ├── rate.rs             # CycleRate: the window rate check
     ├── line.rs             # Report, Unit, Value, parse_line, Parsed, LineError, ParseError
@@ -25,13 +26,16 @@ bench/
         └── riscv64/mod.rs  # ARCH, the cycle read
 ```
 
-`no_std`, no allocation, no dependency. Host-tested (`cargo xtask test`).
+`no_std`, no allocation. Host-tested (`cargo xtask test`).
 
 The counters, the architecture's name (`ARCH`) and `Report::write`, which writes that name,
-exist only on the architectures Seraph runs on and come with the default `counters` feature. A
-reader of result lines builds without it, on any host: xtask's `bench-check` and `bench-baseline`
+exist only on the architectures Seraph runs on and come with the default `counters` feature,
+which adds the dependency on [`shared/pmu`](../pmu/README.md) for the event columns' events and
+their width-masked difference. A reader of result lines builds without it, with no dependency, on
+any host: xtask's `bench-check` and `bench-baseline`
 ([xtask/README.md](../../xtask/README.md#cargo-xtask-bench-check)) take the crate with
-`default-features = false`.
+`default-features = false`. The `pmu` feature adds `EventCounters` (§ Event counters), which
+makes the PMU syscalls through `shared/pmu`'s `client` feature.
 
 ---
 
@@ -41,8 +45,17 @@ A thread opens its own `Counters` with `Counters::open()` after it is pinned to 
 measures on, and reads them only there: each counter is a per-CPU register, and riscv64 keeps no
 two harts' `cycle` counters in step. The handle is neither `Send` nor `Sync`. `read()`
 returns a `Reading` of every column a result line can report: `cycles`, `instret`, and four
-programmable `events`. The cycle counter is the only one read; the others read `None`.
-`Reading::since` subtracts an earlier reading, column by column.
+programmable `events` (`EVENT_SLOTS`). `Counters` reads the cycle counter alone; the others read
+`None`, and `EventCounters` fills them (§ Event counters). `Reading::since` subtracts an earlier
+reading, column by column, each wrapping at 64 bits; `Reading::since_width` subtracts the
+`instret` and `events` columns across at most one wrap of a counter of a given width.
+
+The kernel reads the same counter: a kernel built with its `sched-stages` feature calls
+`Counters::open()` and `read()` from `schedule()`, in kernel mode with interrupts disabled
+([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md#stage-breakdown) § Stage
+Breakdown).
+Both therefore stay free of syscalls, allocation and any other side effect: `open` builds the
+handle alone, and `read` executes the counter read and nothing else.
 
 | Architecture | Cycle counter | User-mode access |
 |---|---|---|
@@ -54,6 +67,36 @@ A read bounds the region between two reads as
 assembly declares that it may read and write memory, so the compiler keeps each load and store on
 the side of the read where the program puts it. On x86-64 the read is `mfence; lfence; rdtsc;
 lfence`, so that the CPU orders it too. On riscv64 the hart orders `csrr cycle` only with itself.
+
+---
+
+## Event counters
+
+`EventCounters` (the `pmu` feature) reads the cycle counter and up to five hardware counters
+(`EVENT_COUNTERS`) through a `PmuControl` capability
+([docs/capability-model.md § `PmuControl`](../../docs/capability-model.md#pmucontrol)), which svcmgr
+gives the one service whose recipe sets
+[`pmu_authority = yes`](../../services/svcmgr/docs/service-definitions.md#pmu_authority). A
+thread pinned to the CPU it measures on, and running there, opens them with
+`EventCounters::open(pmu, thread_cap, events, mode)`, which configures the CPU's counters with the
+portable events (`pmu::PmuEvent`) and grants the thread their reads; `close` revokes the reads and
+releases the counters, on the same CPU. The handle is neither `Send` nor `Sync`.
+
+Each event fills one `Reading` column, by the `ColumnPlan` of the events in the order given:
+`Instructions` fills `instret`, and every other event fills the next `events` slot. `Cycles` is
+one of those: the PMU's core clock cycles, beside the `cycles` column's cycle counter of
+§ Counters, which on x86-64 counts reference cycles. A set of events that a reading cannot hold
+(an event given twice, or more than four besides `Instructions`) is refused `InvalidArgument`
+before any syscall; a CPU with no counters, or one that does not count an event, refuses the open
+`NotSupported`, as `SYS_PMU_CONFIGURE` does. A benchmark that counts more events runs once for
+each group of them.
+
+`read` reads the cycle counter, then each hardware counter in the order of the events, with no
+syscall, so the span between two reads holds the hardware counters' reads of the first and the
+cycle counter's read of the second. The hardware counters are as wide as `SYS_PMU_INFO` reports,
+which may be narrower than 64 bits, so two of their readings are subtracted with
+`EventCounters::since`, which is `Reading::since_width` at the counters' width. `Counters`, which
+the kernel's `sched-stages` build reads, makes no PMU call in either build.
 
 ---
 
@@ -177,12 +220,12 @@ where a count says that the loop waited on an event.
 
 | Harness | Span | CPU |
 |---|---|---|
-| [ktest](../../core/ktest/README.md) Tier 3 | `Harness::recorder`, taken right before the loop, to its `Recorder::summary`, right after | CPU 0 |
+| [ktest](../../core/ktest/README.md) Tier 3 | `Harness::recorder`, taken right before the loop, to its `Recorder::summary`, right after; in `fault_round_trip`, `Harness::legs` to `Legs::summaries` | CPU 0 |
 | [ubench](../../services/ubench/README.md) | `IdleSpan::open` and `close` around each loop, its warm-up iterations included; in `fault_scaling`, each worker around its own loop, the line summing them; in `fault_fill path=grant affinity=any`, a window row whose reads the measured thread takes, around each window, the line summing the spans that closed (§ Window rows); in `pipeline`, one span around its calibration, warm-up and timed windows | `BENCH_CPU` (0); each worker's CPU |
 | [fsbench](../../services/fixtures/fsbench/README.md) | Around each timed loop, after its warm-up; in a window row, around each window, the line summing the spans that closed (§ Window rows) | CPU 0 |
 
-A line whose samples other threads took on their own CPUs (`ktest.tlb_shootdown_concurrent`)
-carries no count.
+A line whose samples other threads took on their own CPUs (`ktest.tlb_shootdown_concurrent`,
+`ktest.fault_round_trip placement=apart`) carries no count.
 
 ---
 
@@ -227,12 +270,14 @@ such a delay leaves a window out, and the check rests on the invariant TSC § Co
 |---|---|---|
 | [`core/ktest`](../../core/ktest/README.md) | `ktest` | Tier 3, one line per kernel benchmark (§ Tier 3) |
 | [`services/fixtures/fsbench`](../../services/fixtures/fsbench/README.md) | `fsbench` | `fsbench.read`, per read size and path; `fsbench.write`, per write size; `fsbench.open`, at `depth=3`; at more than one CPU, the window rows `fsbench.read size=16 path=inline affinity=any` and `fsbench.open depth=3 affinity=any` |
+| [`core/kernel`](../../core/kernel/README.md), with its `sched-stages` feature | none: it prints no result line | `SYS_SYSTEM_INFO(SchedStages)`, the cycles of each stage of `schedule()`, which ktest's `context_switch_pair` line reports as extras |
 | [`services/ubench`](../../services/ubench/README.md) | `ubench` | `ubench.ipc_rt`, `ubench.fault_fill`, `ubench.fault_scaling`, `ubench.shmem_ring`, `ubench.pipeline`, `ubench.console_write`, per variant, and `ubench.empty_window` |
 
 ---
 
 ## Summarized By
 
+[Scheduler Internals](../../core/kernel/docs/scheduler.md),
 [core/ktest/README.md](../../core/ktest/README.md),
 [services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md),
 [services/ubench/README.md](../../services/ubench/README.md)

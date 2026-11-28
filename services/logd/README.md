@@ -86,8 +86,9 @@ under its sender's name, the first after the restart included
   rfc5424), pace, backlog, `relayed` and colour come from the `LOGD_SINK_SERIAL` and
   `LOGD_SINK_FRAMEBUFFER` `env` entries of logd's recipe over built-in defaults, serial at info
   and the framebuffer at critical; an entry that does not parse keeps the defaults and is logged at
-  warning. The history keeps every entry whatever the sinks show (see
-  [`docs/sinks.md`](docs/sinks.md) § Settings).
+  warning. A `SINK_SET` on `logd.control` changes them while logd runs
+  ([`docs/ipc-interface.md`](docs/ipc-interface.md) § Sink control). The history keeps every entry
+  whatever the sinks show (see [`docs/sinks.md`](docs/sinks.md) § Settings).
   See [docs/console-model.md](../../docs/console-model.md).
 
 * **Log records.** Beside the text stream, a sender can send a log record,
@@ -124,13 +125,16 @@ under its sender's name, the first after the restart included
 
 * **Query API.** `QUERY_SLOTS` reads the sender slots, live and retired,
   with each one's name and how it was evicted, and `QUERY_HISTORY` reads the
-  history of every slot or of one badge, newest first, a reply's worth per
-  call. Both are served only on a SEND badged `LOG_QUERY_AUTHORITY`, which
-  svcmgr mints from its master-log source and publishes seed-only as
-  `logd.query`. A receive worker answers them from the state logd owns and
-  calls no other service to do so (see
-  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Queries).
-
+  history of every slot or of one badge, newest first, or oldest first from a
+  given `seq`, filtered by badge and least level, a reply's worth per call.
+  `LOG_SUBSCRIBE` signals a subscriber's Notification on each retained entry
+  until it deletes the token the reply moved it. Those three are served on a SEND badged
+  `LOG_QUERY_AUTHORITY` or `LOG_FOLLOW_AUTHORITY` (`QUERY_SLOTS` and `QUERY_HISTORY` on either),
+  which svcmgr mints from its master-log source and publishes seed-only as `logd.query` and
+  `logd.follow`. `SINK_LIST` and `SINK_SET` read and set the sinks' settings, and are served only
+  on a SEND badged `LOG_CONTROL_AUTHORITY`, published seed-only as `logd.control`. A receive worker
+  answers them from the state logd owns and calls no other service to do so (see
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Queries, § Subscriptions and § Sink control).
 * **Flush barrier.** `LOG_FLUSH` answers whether the sink that holds the log (serial) has written
   the lines logd had taken when the barrier was first asked, `FLUSHED` at once when no sink holds it
   or that sink is stalled, unserved or off, and `FLUSH_PENDING` with a retry hint otherwise. It is
@@ -201,7 +205,8 @@ under its sender's name, the first after the restart included
 Disk persistence with rotation and a network syslog sink are external sinks, processes that follow
 logd's history; logd itself holds no file system and no network stack. Their interface, with
 the per-sink settings and the record's RFC 5424 mapping, is designed in
-[`docs/sinks.md`](docs/sinks.md) (design intent; not yet implemented).
+[`docs/sinks.md`](docs/sinks.md): logd's side of it, the query, follow and control interface, is
+built (#1494), and the external sinks themselves are design intent (#1496, #1499).
 
 ## Source Layout
 
@@ -235,10 +240,11 @@ logd/
 
 ## Bootstrap caps
 
-svcmgr's bootstrap rounds (four slots fit a round, the last marked `done`) fill six positional
+svcmgr's bootstrap rounds (four slots fit a round, the last marked `done`) fill seven positional
 slots, carrying only the present caps and a presence word naming the slot each fills (an absent slot
 reads as `0`), minted from the reserved log-sink sources svcmgr holds (master-log endpoint, procmgr
-`SEND|GRANT`, `KernelLog`, `devmgr.class.serial` and `devmgr.class.framebuffer` publications; see
+`SEND|GRANT`, `KernelLog`) and from the `devmgr.class.serial`, `devmgr.class.framebuffer` and
+`timed` publications; see
 [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md) and
 [`docs/ipc-interface.md`](docs/ipc-interface.md)):
 
@@ -250,9 +256,10 @@ reads as `0`), minted from the reserved log-sink sources svcmgr holds (master-lo
 | 3 | The `serial` class SEND, derived from the `devmgr.class.serial` publication (to resolve the serial driver via `QUERY_DEVICE`) |
 | 4 | The `framebuffer` class SEND, derived from the `devmgr.class.framebuffer` publication (to resolve the framebuffer driver via `QUERY_DEVICE`) |
 | 5 | A `KernelLog` cap carrying `Read`, derived with `RIGHTS_KLOG_READ` from the `KernelLog` source svcmgr holds (to read the kernel's console lines; see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Kernel log). Absent when svcmgr holds none |
+| 6 | The `timed` SEND, derived from the `timed` publication (to read the wall clock once; see [`docs/sinks.md`](docs/sinks.md) § Wall time). Absent when no recipe provides `timed` |
 
-logd registers its death-EQ with procmgr before the handover pull and keeps
-the two class SENDs for its lifetime (see
+logd registers its death-EQ with procmgr before the handover pull and keeps the two class SENDs for
+its lifetime, and deletes the `timed` SEND once it has read the wall clock (see
 [`docs/handover-protocol.md`](docs/handover-protocol.md) § Startup ordering and
 [`docs/ipc-interface.md`](docs/ipc-interface.md) § Bootstrap caps).
 
@@ -270,8 +277,8 @@ the two class SENDs for its lifetime (see
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler and the per-teardown death forward, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
-| [services/logd/docs/sinks.md](docs/sinks.md) | The sink contract (device and external sinks), the record and its RFC 5424 mapping, the per-sink settings, the console format, and the query, follow and control interface (design intent) |
-| [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts, the query API (`QUERY_SLOTS`, `QUERY_HISTORY`) and its `LOG_QUERY_AUTHORITY`, the history's stored form and the retired slots, and the `reclaim:` line logd logs when it evicts a slot |
+| [services/logd/docs/sinks.md](docs/sinks.md) | The sink contract (device and external sinks), the record and its RFC 5424 mapping, the per-sink settings, the console format, and the query, follow and control interface; the external sinks are design intent |
+| [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts, the query API (`QUERY_SLOTS`, `QUERY_HISTORY`, `LOG_SUBSCRIBE`) and its `LOG_QUERY_AUTHORITY` and `LOG_FOLLOW_AUTHORITY`, the sink control (`SINK_LIST`, `SINK_SET`) and its `LOG_CONTROL_AUTHORITY`, the history's stored form and the retired slots, and the `reclaim:` line logd logs when it evicts a slot |
 | [services/crashd/docs/operation.md](../crashd/docs/operation.md) | The core dump, whose outcome line waits on logd, and so writes no core of logd, which declares itself on the core path |
 | [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with, the `reclaim:` line, log record rendering, and the `BoundedStr` diagnostic formatter |
 

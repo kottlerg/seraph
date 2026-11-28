@@ -15,12 +15,18 @@
 # two vfsd seeds ride in a second bootstrap round, so
 # every svctest boot exercises a seed list longer than one round; the
 # svcmgr_second_seed_round phase fails the run if they do not arrive.
-# logd.query is the LOG_QUERY_AUTHORITY SEND on the master log endpoint the
-# logd_death_forward phase reads its dead child's retired slot through, and
-# the logd_restart and logd_sinks phases read logd's history through.
-# logd.flush is the LOG_FLUSH_AUTHORITY SEND on the same endpoint, on which
-# the logd_flush phase checks logd's flush barrier, the one pwrmgr waits on
-# before it powers off.
+# logd.query is the LOG_QUERY_AUTHORITY SEND|GRANT on the master log endpoint
+# the logd_death_forward phase reads its dead child's retired slot through,
+# the logd_restart and logd_sinks phases read logd's history through, and
+# the logd_follow phase subscribes on. logd.flush is the LOG_FLUSH_AUTHORITY
+# SEND on the same endpoint, on which the logd_flush phase checks logd's
+# flush barrier, the one pwrmgr waits on before it powers off, and the
+# logd_sinks phase waits on it before its framebuffer cases and before it
+# stops the serial driver. logd.follow is the LOG_FOLLOW_AUTHORITY
+# SEND|GRANT, whose subscription pool, the external sinks', the logd_follow
+# phase fills, and logd.control the LOG_CONTROL_AUTHORITY SEND the
+# logd_control phase lists and steers the sinks through; both ride after
+# logd.flush.
 # devmgr.class.serial and devmgr.class.input are the class SENDs the
 # drivers stray-cap phase and the devmgr ordinal phase query devices on.
 # devmgr.class.test-dma and devmgr.class.test-fault reach the test-only
@@ -76,10 +82,13 @@
 # devmgr.class.block is the block class SEND, on which devmgr answers
 # QUERY_DEVICE with a MOUNT_AUTHORITY-badged whole-disk cap; the
 # blk_regions phase registers a scratch partition through it to drive
-# virtio-blk's registered regions. No shipped definition seeds it.
+# virtio-blk's registered regions. It rides after logd.control, and no
+# shipped definition seeds it.
 # stop_authority = yes delivers svcmgr's STOP_AUTHORITY SEND in the slot
 # after that, through which the svcmgr_stop_service phase stops and lists
-# services and lists the stop sources.
+# services and lists the stop sources. pmu_authority = yes delivers svcmgr's
+# PmuControl copy in the slot after that, through which the pmu_authority
+# phase counts a loop; no shipped definition sets it.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT
 # scan. `cargo xtask mkdisk --svctest <set>` stages it into
@@ -102,6 +111,7 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny memmgr.swap devmgr.class.rtc svcmgr.grant crashd.core logd.flush devmgr.class.block
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny memmgr.swap devmgr.class.rtc svcmgr.grant crashd.core logd.flush logd.follow logd.control devmgr.class.block
 debug_authority = yes
 stop_authority  = yes
+pmu_authority   = yes

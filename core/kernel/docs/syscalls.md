@@ -252,12 +252,31 @@ reclaimed for a new one, but a number in active use is never reassigned.
 ```
 
 **Implementation status.** Every number 0–82 has a handler; every number at or past
-`SYSCALL_NR_BOUND` (83) returns `UnknownSyscall`. The kernel refuses a number at or past the
-bound, then selects the handler with one `match` on the number, clamped as data
-([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and calls
-it directly. The `match` and a build-time check of its numbers come from one list
-(`syscall_handlers!` in `syscall/mod.rs`). A list that leaves a number below the bound without a
-handler, gives one two, or names one at or past the bound fails the kernel's build.
+`SYSCALL_NR_BOUND` (83) returns `UnknownSyscall`.
+
+### Dispatch
+
+The kernel refuses a number at or past `SYSCALL_NR_BOUND`, reads the number clamped as data
+([capability-internals.md](capability-internals.md) § Speculative-Execution Hardening), and
+matches it against the hot syscalls below, calling a hot syscall's handler directly. Every other
+number goes to one out-of-line `match` of the cold syscalls, which calls its handler directly
+too. The hot `match` holds the hot numbers alone and the cold arms are in another function, so a
+hot syscall's dispatch instructions do not depend on how many syscalls exist or how they are
+numbered. A cold syscall pays the hot `match`'s miss and one more call.
+
+The hot syscalls are `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_REPLY_RECV`,
+`SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_POST`, `SYS_EVENT_RECV`,
+`SYS_WAIT_SET_WAIT`, `SYS_THREAD_YIELD` and `SYS_SYSTEM_INFO`. A syscall is hot when a loop
+makes it once per message, per wakeup or per clock read: a server's or a client's message loop,
+an event or wait-set loop, a yield, and the clock read behind std's `Instant` and the log's
+timestamps (`SYS_SYSTEM_INFO(ElapsedUs)`). Every other syscall is cold. A syscall joins the hot
+set only by a decision this list records, since each hot number adds to the compares of every
+hot syscall's dispatch as the set grows, and to the miss every cold syscall pays.
+
+Both `match`es and a build-time check of their numbers come from one list in two parts, `hot`
+and `cold` (`syscall_handlers!` in `syscall/mod.rs`). A list that leaves a number below the
+bound without a handler, gives one two, or names one at or past the bound fails the kernel's
+build.
 
 ---
 
@@ -3821,14 +3840,16 @@ Query a scalar system value. Returns a single `u64` in `rax`/`a0` — no buffer 
 | # | Name | Description |
 |---|---|---|
 | 0 | `info_type` | Which value to query (see `SystemInfoType` below) |
-| 1 | `class`, `view` or `cpu` | `StackHighWater`: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2). `SpeculationControls`: the view (`SPECULATION_VIEW_INPUTS` 0, `SPECULATION_VIEW_SELECTED` 1, `SPECULATION_VIEW_IN_EFFECT` 2). `SmtSibling`: the CPU index. Ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
+| 1 | `class`, `view`, `cpu` or `word` | `StackHighWater`: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2). `SpeculationControls`: the view (`SPECULATION_VIEW_INPUTS` 0, `SPECULATION_VIEW_SELECTED` 1, `SPECULATION_VIEW_IN_EFFECT` 2). `SmtSibling`: the CPU index. `SchedStages`: the word (`SCHED_STAGE_LOCK` 0 to `SCHED_STAGE_SWITCH` 8, `SCHED_STAGES_SWITCHES` 9, `SCHED_STAGES_RESUMES` 10, `SCHED_STAGES_ARM` 11). Ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
 
 **Return:** `rax`/`a0`: the queried value on success; negative `SyscallError` on failure.
 
 **Capability requirement:** None.
 
 **Errors:** `InvalidArgument` (unknown `info_type`, unknown `class` for `StackHighWater`,
-unknown `view` for `SpeculationControls`, or a `SmtSibling` index at or past `CpuCount`);
+unknown `view` for `SpeculationControls`, a `SmtSibling` index at or past `CpuCount`, an
+unknown `word` for `SchedStages`, or `SchedStages` from a kernel built without its
+`sched-stages` feature);
 `NotSupported` (`StackHighWater` handoff class, when the kernel could not locate the handoff
 stack; `SpeculationControls` on riscv64); `InvalidState` (`IdleHalts`, when the calling
 thread has made no `IdleHalts` call, or made its previous one on another CPU).
@@ -3971,6 +3992,19 @@ pub enum SystemInfoType
     /// ruststd sizes every endpoint's slab request from it
     /// (`std::os::seraph::create_endpoint`).
     EndpointRetypeBytes = 16,
+
+    /// One word of the `schedule()` stage breakdown of a kernel built with its
+    /// `sched-stages` feature, the word arg1 names: a stage's cycles summed
+    /// over the context switches made on the collecting CPU (`SCHED_STAGE_*`),
+    /// the number of switches those sums cover (`SCHED_STAGES_SWITCHES`,
+    /// `SCHED_STAGES_RESUMES`), or, for `SCHED_STAGES_ARM`, a reset that
+    /// zeroes every sum and count and makes the calling CPU the collecting CPU,
+    /// returning 0; no CPU collects before the first reset. The cycles are the
+    /// cycle counter's (`rdtsc` on x86-64, `cycle` on riscv64), the counter
+    /// the benchmarks read. A measurement aid for a benchmark pinned to one
+    /// CPU (scheduler.md § Stage Breakdown): a kernel built without
+    /// the feature answers `InvalidArgument`, as it does for an unknown word.
+    SchedStages         = 17,
 }
 ```
 

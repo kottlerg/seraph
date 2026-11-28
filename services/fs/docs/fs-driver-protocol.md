@@ -104,8 +104,8 @@ its block device endpoint and reply success or a typed error.
 `IO_ERROR` (the block device's `BLK_GET_GEOMETRY` or the BPB read failed),
 or `NOT_FOUND` for a malformed BPB, one whose sector size is not the
 device's logical block size (the driver reads one block per sector, 512 to
-4096 bytes), or one with fewer than 4085 clusters (FAT12, which the driver
-does not read).
+4096 bytes), one that declares more sectors than the partition holds, or
+one with fewer than 4085 clusters (FAT12, which the driver does not read).
 
 The block device endpoint arrives in the driver's bootstrap round;
 see [Bootstrap caps](#bootstrap-caps).
@@ -492,7 +492,11 @@ returned page is an outstanding page of the open the badge names, and of
 no other: the open's own [`FS_RELEASE_MEMORY`](#client-to-driver-release)
 or [`FS_CLOSE`](#label-3-fs_close) releases it, and eviction sends its
 cooperative release to that open's release endpoint. One open holds at
-most as many outstanding pages as the cache has slots.
+most as many outstanding pages as the cache has slots. A success reply
+whose memory cap the client's `CSpace` cannot take arrives as
+`IPC_REPLY_TRANSFER_FAILED` with no cap, and the driver then releases the
+page as `FS_RELEASE_MEMORY` would, so the open holds no page the client
+never received.
 
 **Reply (success)**
 

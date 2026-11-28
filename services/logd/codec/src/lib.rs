@@ -13,7 +13,9 @@
 //! ([`resync`]); the line logd logs when it evicts a slot ([`reclaim`]);
 //! which entries a query page carries ([`query`]); logd's sinks' stall
 //! bound, retry hint, backlog and drop line ([`sink`]); a device sink's
-//! settings and the recipe syntax that sets them ([`settings`]);
+//! settings and the recipe syntax that sets them ([`settings`]); the RFC
+//! 3339 wall time a sink shows and the text of logd's notice of the wall
+//! clock ([`wall`]);
 //! the level tag both log receivers render ([`level`]) and the console-line
 //! prefix both write ([`prefix`]); how both write and
 //! keep the kernel's log records ([`kernel`]); and the line and
@@ -41,6 +43,7 @@ pub mod resync;
 pub mod rfc5424;
 pub mod settings;
 pub mod sink;
+pub mod wall;
 
 mod bounded_str;
 

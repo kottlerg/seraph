@@ -62,10 +62,12 @@ runs on (it took a queued call)
 [scheduler.md](../core/kernel/docs/scheduler.md) § Thread Assignment). Seraph's server loops join
 them through `ipc::serve` ([shared/ipc/README.md](../shared/ipc/README.md) § Serving): a handler
 whose turn ends with its reply leaves the reply for the loop's next receive to send this way, and a
-handler with work after its reply, or a loop with work before its next receive, sends it first with
-a receive that does not wait, holding any call that receive binds for its next turn, so no reply
-waits behind work: a plain reply from a server that outranks its caller and last received through
-`SYS_IPC_REPLY_RECV` leaves the caller's wake queued on its CPU until it parks.
+handler with work after its reply, or a loop with work before its next receive, sends it first. A
+loop that is its endpoint's one receiving thread sends it with a receive that does not wait,
+holding any call that receive binds for its next turn, so no reply waits behind work: a plain reply
+from a server that outranks its caller and last received through `SYS_IPC_REPLY_RECV` leaves the
+caller's wake queued on its CPU until it parks. A thread of a multi-threaded server sends it alone,
+so a waiting call stays queued for the next free thread (§ Multi-threaded servers).
 
 A server that needs to delegate work may make a downstream call before replying: the pending reply
 stays bound to the receiving thread until that thread replies, and the downstream call does not
@@ -166,6 +168,11 @@ server keeps them in its own code.
 - A thread MUST reply, or deliberately leave the caller unanswered, before it receives again: a
   receive while a reply is pending releases the pending caller (§ The Call/Reply Model). A reply
   sent with the receive (`reply_recv`) is made before it.
+- A thread with work after a reply MUST send that reply alone, with no receive (an
+  `ipc::serve::Reply` built with `Reply::pooled` makes its `flush` do so): a receive that does
+  not wait finds a call only when every other thread is busy, and binds that waiting call to this
+  thread for as long as its work lasts, when the next free thread would have taken it from the
+  queue; a call the work needs served cannot then be served (§ The Call/Reply Model).
 - A thread MUST NOT hold a lock across a nested call whose callee can call back into the server,
   directly or through other services: the call back is received by another thread, which may need
   the lock while its holder waits on the callee. A lock held across a call to a service that never

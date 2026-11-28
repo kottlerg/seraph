@@ -71,8 +71,8 @@ pub fn run_all(ctx: &TestContext)
 
     // ── Syscall dispatch ──────────────────────────────────────────────────────
     run_test!(
-        "dispatch::table_edges_reach_their_handlers",
-        dispatch::table_edges_reach_their_handlers(ctx)
+        "dispatch::hot_and_neighbouring_cold_numbers_reach_their_handlers",
+        dispatch::hot_and_neighbouring_cold_numbers_reach_their_handlers(ctx)
     );
     run_test!(
         "dispatch::number_reaches_its_own_handler",
@@ -350,6 +350,10 @@ pub fn run_all(ctx: &TestContext)
         teardown_windows::observer_release_takes_interrupts(ctx)
     );
     run_test!(
+        "teardown_windows::observer_release_held_probe_is_inconclusive",
+        teardown_windows::observer_release_held_probe_is_inconclusive(ctx)
+    );
+    run_test!(
         "teardown_windows::frame_release_takes_interrupts",
         teardown_windows::frame_release_takes_interrupts(ctx)
     );
@@ -360,6 +364,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "teardown_windows::death_post_takes_interrupts",
         teardown_windows::death_post_takes_interrupts(ctx)
+    );
+    run_test!(
+        "teardown_windows::death_post_held_probe_is_inconclusive",
+        teardown_windows::death_post_held_probe_is_inconclusive(ctx)
     );
     run_test!(
         "locked_windows::notification_drain_takes_interrupts",
@@ -1065,6 +1073,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "sysinfo::idle_halts_mark_per_thread_and_cpu",
         sysinfo::idle_halts_mark_per_thread_and_cpu(ctx)
+    );
+    run_test!(
+        "sysinfo::sched_stages_words",
+        sysinfo::sched_stages_words(ctx)
     );
 
     // ── Entropy syscalls ──────────────────────────────────────────────────────

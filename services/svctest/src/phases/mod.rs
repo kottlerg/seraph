@@ -151,6 +151,7 @@ pub mod image_sharing;
 pub mod layout;
 pub mod log_client;
 pub mod logd_flood;
+pub mod logd_follow;
 pub mod logd_restart;
 pub mod logd_sinks;
 pub mod memmgr;
@@ -165,6 +166,7 @@ pub mod oom;
 pub mod pager;
 pub mod pipes;
 pub mod pipestress;
+pub mod pmu;
 pub mod process_faults;
 pub mod process_kill;
 pub mod process_tree;
@@ -263,6 +265,7 @@ fn ordered() -> Vec<Phase>
     out.extend_from_slice(threadstack::phases());
     out.extend_from_slice(random::phases());
     out.extend_from_slice(entropyd::phases());
+    out.extend_from_slice(pmu::phases());
     out.extend_from_slice(recv_guard::phases());
     out.extend_from_slice(procmgr::concurrent_spawn());
     out.extend_from_slice(log_client::phases());
@@ -329,6 +332,7 @@ fn ordered() -> Vec<Phase>
     // probe's lines.
     out.extend_from_slice(logd_flood::phases());
     out.extend_from_slice(logd_sinks::phases());
+    out.extend_from_slice(logd_follow::phases());
     out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());
     out.extend_from_slice(unmount::phases());

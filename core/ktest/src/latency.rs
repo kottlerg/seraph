@@ -20,7 +20,9 @@
 //! A call that opens other windows besides the ones under test is judged by
 //! a [`Bracket`] instead ([`measure_bracketed`]): two reads of kernel state
 //! that the stretch under test changes, so that only a probe acknowledged
-//! between the stretch's first and last steps passes it.
+//! between the stretch's first and last steps passes it. The worker's own exit
+//! ([`measure_exit`]) never returns, so a [`Witness`] the exit's death posts
+//! wake last takes its end.
 //!
 //! The cases are `unit::retype`'s page-pool and placement cases,
 //! `unit::cap_batches`'s derivation-lock cases, `unit::teardown_windows`'s
@@ -33,8 +35,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use syscall::{
     aspace_hold, cap_create_aspace, cap_create_cspace, cap_create_thread, cap_delete, cap_insert,
-    cap_move, cap_revoke, mem_map, mem_unmap, sched_split, system_info, thread_configure,
-    thread_set_affinity, thread_start, thread_yield,
+    cap_move, cap_revoke, event_queue_create_observed, event_recv_entry, mem_map, mem_unmap,
+    sched_split, system_info, thread_bind_notification, thread_configure, thread_set_affinity,
+    thread_start, thread_yield,
 };
 use syscall_abi::{MAP_WRITABLE, SystemInfoType};
 
@@ -63,8 +66,10 @@ const CALL_DEADLINE_US: u64 = 60_000_000;
 /// that probe outwaited the whole call (a CPU was off the host for longer than
 /// the call: a kernel that masks interrupts for the call holds a probe issued
 /// inside it for at most the rest of the call, less than the call's span).
-/// Only an acknowledgement inside a call passes the case, so an inconclusive
-/// call cannot hide a masked stretch: under a kernel that masks the whole
+/// A bracketed call is judged by the same measure inside its stretch, from
+/// the probe's read of the bracket ([`Bracket`]). Only an acknowledgement
+/// inside a call passes the case, so an inconclusive call cannot hide a
+/// masked stretch: under a kernel that masks the whole
 /// call, the probe in flight is acknowledged only at the call's end, and the
 /// call either counts here, when that probe was issued inside it, or is
 /// inconclusive, when it was issued before; either way no call passes, and the
@@ -149,8 +154,8 @@ pub enum Call
         pages: u64,
     },
     /// `SYS_THREAD_EXIT` of the worker itself, which never returns: made by
-    /// [`measure_exit`] alone, which ends the probes once its bracket's stretch
-    /// has ended and takes that time for the call's end.
+    /// [`measure_exit`] alone, whose [`Witness`] takes the time of the exit's
+    /// last death post for the call's end.
     Exit,
 }
 
@@ -231,6 +236,10 @@ static END: AtomicU64 = AtomicU64::new(0);
 /// error.
 static RESULT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static mut STACK: crate::ChildStack = crate::ChildStack::ZERO;
+static mut WITNESS_STACK: crate::ChildStack = crate::ChildStack::ZERO;
+/// Whether the first probe issued inside the next bracketed call's stretch is
+/// held past the call before its map ([`hold_next_inside_probe`]).
+static HOLD_INSIDE_PROBE: AtomicBool = AtomicBool::new(false);
 
 /// Worker entry: measure this CPU's syscall round trip, report ready, wait for
 /// the probe, then make the call `OP` names between two clock reads.
@@ -262,6 +271,111 @@ extern "C" fn latency_worker(_arg: u64) -> !
     syscall::thread_exit()
 }
 
+/// Witness entry: block on `queue` until the worker's exit posts its last
+/// death entry there, write the time into `END`, and exit. A witness that
+/// sees no post within the call's deadline writes nothing.
+extern "C" fn latency_witness(queue: u64) -> !
+{
+    let timeout_ms = crate::scaled_bound(CALL_DEADLINE_US).div_ceil(1000);
+    if event_recv_entry(queue, timeout_ms).is_ok()
+    {
+        END.store(crate::elapsed_us(), Ordering::Release);
+    }
+    syscall::thread_exit()
+}
+
+/// The end of the worker's exit, which never returns to read it: a thread
+/// blocked on a queue the worker is bound to before the case binds its own
+/// observers, so that the exit's death walk, which posts the newest binding
+/// first, posts it last. Woken by that post, the witness writes the time
+/// into `END`, so an exit's span comes from the worker's clock read and the
+/// witness's, as a returning call's comes from the worker's two, and never
+/// from the probe's, which a host may hold off ([`Bracket`]).
+struct Witness
+{
+    queue: u64,
+    thread: u64,
+}
+
+impl Witness
+{
+    /// Create the witness's queue, and the witness, blocked on it on
+    /// `WORKER_CPU`, where it runs once the exit has left the worker's CPU.
+    fn start(ctx: &TestContext) -> Result<Self, &'static str>
+    {
+        let queue = event_queue_create_observed(ctx.memory_base, 1, 1)
+            .map_err(|_| "latency: create the witness's queue failed")?;
+        let mut witness = Self { queue, thread: 0 };
+        witness.thread = cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
+            .map_err(|_| "latency: create the witness failed")?;
+        // SAFETY: `WITNESS_STACK` is a static stack, reached only through
+        // `addr_of!`.
+        let stack = unsafe { crate::ChildStack::top(core::ptr::addr_of!(WITNESS_STACK)) };
+        // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI,
+        // and `WITNESS_STACK` is the witness's own stack, on which no other
+        // live thread runs (one exit is measured at a time, and its witness is
+        // deleted before the measure returns).
+        unsafe {
+            thread_configure(
+                witness.thread,
+                latency_witness as *const () as u64,
+                stack,
+                queue,
+            )
+        }
+        .map_err(|_| "latency: configure the witness failed")?;
+        thread_set_affinity(witness.thread, WORKER_CPU)
+            .map_err(|_| "latency: pin the witness failed")?;
+        thread_start(witness.thread).map_err(|_| "latency: start the witness failed")?;
+        Ok(witness)
+    }
+
+    /// Wait until the witness has exited, its end written or not.
+    fn finish(&self) -> TestResult
+    {
+        crate::spawn::wait_until_exited(self.thread, crate::scaled_polls(60_000)).map(|_| ())
+    }
+}
+
+impl Drop for Witness
+{
+    fn drop(&mut self)
+    {
+        if self.thread != 0
+        {
+            cap_delete(self.thread).ok();
+        }
+        cap_delete(self.queue).ok();
+    }
+}
+
+/// Hold the first probe issued inside the next bracketed call's stretch,
+/// before its map, until longer than the whole call has passed since its read
+/// of the bracket, as a host that keeps the probe's CPU off that long would:
+/// for the cases that show such a call judged inconclusive rather than
+/// failed ([`Bracket`]).
+pub fn hold_next_inside_probe()
+{
+    HOLD_INSIDE_PROBE.store(true, Ordering::Relaxed);
+}
+
+/// Spin until the call has ended and more than its span has passed since
+/// `read`, or until the call's deadline has passed since `read`.
+fn hold_past_call(read: u64)
+{
+    let deadline = crate::scaled_bound(CALL_DEADLINE_US);
+    loop
+    {
+        let held = crate::elapsed_us().saturating_sub(read);
+        let (start, end) = (START.load(Ordering::Acquire), END.load(Ordering::Acquire));
+        if (end != 0 && held > end.saturating_sub(start)) || held > deadline
+        {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// A stretch of the measured call that kernel state shows from outside it,
 /// read through syscalls on the probe's CPU: `begun` reads true once the
 /// stretch has made its first step, and `ended` once it has made its last;
@@ -276,6 +390,22 @@ extern "C" fn latency_worker(_arg: u64) -> !
 /// step. So the CPU took it between two steps of the stretch, whatever the
 /// host's scheduling and whatever windows the rest of the call opens. A call
 /// in which no probe was issued inside the stretch is inconclusive.
+///
+/// A probe issued inside the stretch and answered only after it ended shows
+/// a masked stretch only if the probe could have been answered inside it. A
+/// host that holds the probe's CPU off for longer than the rest of the
+/// stretch (a TCG guest's vCPU thread waiting out a host time slice) lets the
+/// stretch end before the probe returns, whatever the kernel does, and since
+/// probes run one at a time no other probe is issued inside it meanwhile. So
+/// a call is inconclusive too when the first probe issued inside the stretch
+/// took longer, from its read of the bracket to its acknowledgement, than the
+/// whole call: a kernel that masks interrupts for the stretch answers that
+/// probe at the call's next window after the stretch, or at its end, within
+/// the call's span of a read made once the stretch had begun, and a longer
+/// wait is a CPU off the host. The span is the worker's own (a [`Witness`]'s
+/// for an exit), never the probe's. As for every inconclusive call
+/// ([`ATTEMPTS`]), a call misjudged so costs an attempt and never passes a
+/// masked stretch, which only an acknowledgement inside it does.
 pub struct Bracket<'a>
 {
     pub begun: &'a mut dyn FnMut() -> Result<bool, &'static str>,
@@ -295,10 +425,25 @@ impl Bracket<'_>
 #[derive(Clone, Copy, Default)]
 struct Bracketed
 {
-    /// A probe was issued inside the stretch.
-    issued: bool,
     /// A probe issued inside the stretch was acknowledged before it ended.
     acked: bool,
+    /// The read time and the acknowledgement time of the first probe issued
+    /// inside the stretch.
+    first: Option<(u64, u64)>,
+}
+
+impl Bracketed
+{
+    /// Whether a call of `span_us` with this outcome tells nothing about the
+    /// kernel: unacknowledged, with no probe issued inside the stretch or
+    /// with the first one held longer than the whole call ([`Bracket`]).
+    fn inconclusive(&self, span_us: u64) -> bool
+    {
+        !self.acked
+            && self
+                .first
+                .is_none_or(|(read, t1)| t1.saturating_sub(read) > span_us)
+    }
 }
 
 /// What the probe saw of one measured call.
@@ -313,7 +458,9 @@ pub struct Measured
     pub acked_inside: bool,
     /// Whether the call, unacknowledged, tells nothing about the kernel: no
     /// probe was issued inside it, or the first one issued inside it waited
-    /// longer than the whole call ([`ATTEMPTS`]).
+    /// longer than the whole call ([`ATTEMPTS`]); for a bracketed call, inside
+    /// its stretch, and held longer than the whole call from its read of the
+    /// bracket ([`Bracket`]).
     pub inconclusive: bool,
     /// The call's return value, or `u64::MAX` on an error.
     pub result: u64,
@@ -377,8 +524,10 @@ pub fn measure_call(ctx: &TestContext, call: Call) -> Result<Measured, &'static 
 }
 
 /// [`measure_call`], judged by `bracket`: acknowledged inside when a probe
-/// was acknowledged inside its stretch, inconclusive when no probe was issued
-/// inside it.
+/// was acknowledged inside its stretch; otherwise inconclusive when no probe
+/// was issued inside it, or when the first one issued inside it took longer,
+/// from its read of the bracket to its acknowledgement, than the whole call
+/// ([`Bracket`]).
 pub fn measure_bracketed(
     ctx: &TestContext,
     call: Call,
@@ -392,10 +541,12 @@ pub fn measure_bracketed(
     measure(ctx, call, Some(bracket), None)
 }
 
-/// The worker's own `SYS_THREAD_EXIT` ([`Call::Exit`]), judged by `bracket`,
-/// whose stretch must end in the exit: `setup` is given the worker's thread
-/// capability before the worker starts, and the probes end once a read after
-/// an acknowledgement sees the stretch ended.
+/// The worker's own `SYS_THREAD_EXIT` ([`Call::Exit`]), judged by `bracket` as
+/// [`measure_bracketed`] judges a call, whose stretch must end at a death post
+/// of the exit to an observer `setup` binds: `setup` is given the worker's
+/// thread capability before the worker starts, the probes end once a read
+/// after an acknowledgement sees the stretch ended, and a [`Witness`] takes
+/// the call's end.
 pub fn measure_exit(
     ctx: &TestContext,
     setup: &mut dyn FnMut(u64) -> TestResult,
@@ -447,10 +598,11 @@ fn measure(
 }
 
 /// Create the worker in ktest's own `CSpace`, so the handles in its words
-/// are its own, give its thread capability to `setup`, and start it pinned to
-/// `WORKER_CPU`.
+/// are its own, bind it to the witness's queue when there is one, give its
+/// thread capability to `setup`, and start it pinned to `WORKER_CPU`.
 fn start_worker(
     ctx: &TestContext,
+    witness: Option<&Witness>,
     setup: Option<&mut dyn FnMut(u64) -> TestResult>,
 ) -> Result<crate::spawn::SpawnedChild, &'static str>
 {
@@ -459,6 +611,12 @@ fn start_worker(
             .map_err(|_| "latency: create the worker failed")?,
         cs: 0,
     };
+    // Bound before `setup` binds its observers, so the exit posts it last.
+    if let Some(witness) = witness
+    {
+        thread_bind_notification(worker.th, witness.queue, 0)
+            .map_err(|_| "latency: bind the worker to the witness failed")?;
+    }
     if let Some(setup) = setup
     {
         setup(worker.th)?;
@@ -484,8 +642,17 @@ fn probe_worker(
     setup: Option<&mut dyn FnMut(u64) -> TestResult>,
 ) -> Result<Measured, &'static str>
 {
-    let mut worker = start_worker(ctx, setup)?;
+    let hold = HOLD_INSIDE_PROBE.swap(false, Ordering::Relaxed);
     let exits = OP.load(Ordering::Relaxed) == 8;
+    let witness = if exits
+    {
+        Some(Witness::start(ctx)?)
+    }
+    else
+    {
+        None
+    };
+    let mut worker = start_worker(ctx, witness.as_ref(), setup)?;
 
     let deadline = crate::scaled_bound(CALL_DEADLINE_US);
     let begun = crate::elapsed_us();
@@ -514,8 +681,13 @@ fn probe_worker(
     // Whether a read after an acknowledgement saw the stretch ended.
     let stretch_ended = core::cell::Cell::new(false);
     let mut probe = || -> TestResult {
+        let read = crate::elapsed_us();
         // Whether the stretch was under way before this probe's unmap.
         let inside = bracket.as_mut().map(|b| b.under_way()).transpose()? == Some(true);
+        if hold && inside && bracketed.first.is_none()
+        {
+            hold_past_call(read);
+        }
         // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so
         // the page holds no Rust object or IPC page of ktest.
         unsafe { mem_map(frame, ctx.aspace_cap, PROBE_VA, 0, 1, MAP_WRITABLE) }
@@ -531,7 +703,7 @@ fn probe_worker(
             stretch_ended.set(ended);
             if inside
             {
-                bracketed.issued = true;
+                bracketed.first.get_or_insert((read, t1));
                 bracketed.acked |= !ended;
             }
         }
@@ -555,8 +727,7 @@ fn probe_worker(
         }
         if exits && stretch_ended.get()
         {
-            // The worker's exit never returns to write its end.
-            END.store(crate::elapsed_us(), Ordering::Release);
+            // The worker's exit never returns; the witness writes its end.
             break Ok(());
         }
         if let Err(e) = probe()
@@ -570,9 +741,33 @@ fn probe_worker(
     };
     let exited = crate::spawn::wait_until_exited(worker.th, crate::scaled_polls(60_000));
     worker.delete_thread().ok();
+    let witnessed = witness.as_ref().map_or(Ok(()), Witness::finish);
     probed?;
     exited?;
+    witnessed?;
+    if exits && END.load(Ordering::Acquire) == 0
+    {
+        return Err("latency: the exit's witness saw no death post");
+    }
+    Ok(measured_from(
+        margin,
+        max_wait,
+        first_after_start,
+        bracket.is_some().then_some(bracketed),
+    ))
+}
 
+/// The measure of the call just probed, read from the worker's words:
+/// judged by `bracketed`, what the probes saw of a bracket's stretch, when
+/// there is one, and otherwise by the first probe issued `margin` after the
+/// call's start, `first_after_start`.
+fn measured_from(
+    margin: u64,
+    max_wait: u64,
+    first_after_start: Option<(u64, u64)>,
+    bracketed: Option<Bracketed>,
+) -> Measured
+{
     let (start, end) = (START.load(Ordering::Acquire), END.load(Ordering::Acquire));
     let mut measured = Measured {
         span_us: end.saturating_sub(start),
@@ -585,17 +780,17 @@ fn probe_worker(
         margin,
         first: first_after_start,
     };
-    if bracket.is_some()
+    if let Some(bracketed) = bracketed
     {
         measured.acked_inside = bracketed.acked;
-        measured.inconclusive = !bracketed.acked && !bracketed.issued;
+        measured.inconclusive = bracketed.inconclusive(measured.span_us);
     }
     else
     {
         let inside_by = end.saturating_sub(margin);
         measured.judge(inside_by, inside_by);
     }
-    Ok(measured)
+    measured
 }
 
 /// The results of the worker's call, when it made the call: its return

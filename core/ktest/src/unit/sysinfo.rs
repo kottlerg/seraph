@@ -17,15 +17,19 @@
 //! thread pinned to CPU 0, and for its per-thread, per-CPU mark: a new
 //! thread's first call and a moved thread's call; the benchmark harnesses read
 //! it around their timed samples (shared/bench/README.md § Idle halts).
+//! `SchedStages` is read here for the answer each build of the kernel gives;
+//! `bench::thread`'s `context_switch_pair` reports its stage means.
 
 use syscall::{
     MAP_WRITABLE, cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_notification,
     cap_create_thread, cap_delete, cap_info, idle_halts, mem_map, mem_unmap, memory_merge,
-    memory_split, notification_send, notification_wait, smt_sibling, speculation_controls,
-    system_info, thread_exit, thread_set_affinity, thread_sleep, thread_yield,
+    memory_split, notification_send, notification_wait, sched_stages, smt_sibling,
+    speculation_controls, system_info, thread_exit, thread_set_affinity, thread_sleep,
+    thread_yield,
 };
 use syscall_abi::{
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, KERNEL_VERSION, PAGE_SIZE, RIGHTS_NTF_NOTIFY,
+    SCHED_STAGE_LOCK, SCHED_STAGES_ARM, SCHED_STAGES_RESUMES, SCHED_STAGES_SWITCHES,
     SPECULATION_VIEW_IN_EFFECT, SPECULATION_VIEW_INPUTS, SPECULATION_VIEW_SELECTED, SyscallError,
     SystemInfoType,
 };
@@ -101,6 +105,52 @@ pub fn unknown_kind_err(_ctx: &TestContext) -> TestResult
     if err != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("system_info(unknown kind) did not return InvalidArgument");
+    }
+    Ok(())
+}
+
+/// `system_info(SchedStages)` answers as the kernel's build decides: a
+/// kernel without its `sched-stages` feature refuses every word, the arm
+/// included, with `InvalidArgument`; one with it answers the arm with 0 and
+/// every stage and count word after it, never more register switches closed
+/// than switches committed, and refuses the words past the arm
+/// (core/kernel/docs/scheduler.md § Stage Breakdown).
+pub fn sched_stages_words(_ctx: &TestContext) -> TestResult
+{
+    let invalid = Err(SyscallError::InvalidArgument as i64);
+    match sched_stages(SCHED_STAGES_ARM)
+    {
+        Ok(0) =>
+        {}
+        Ok(_) => return Err("sysinfo::sched_stages: the arm returned a non-zero value"),
+        Err(e) if e == SyscallError::InvalidArgument as i64 =>
+        {
+            if sched_stages(SCHED_STAGE_LOCK) != invalid
+            {
+                return Err("sysinfo::sched_stages: a word answered where the arm was refused");
+            }
+            return Ok(());
+        }
+        Err(_) => return Err("sysinfo::sched_stages: the arm failed other than InvalidArgument"),
+    }
+    for word in SCHED_STAGE_LOCK..SCHED_STAGES_ARM
+    {
+        if sched_stages(word).is_err()
+        {
+            return Err("sysinfo::sched_stages: a stage or count word was refused after the arm");
+        }
+    }
+    let resumes =
+        sched_stages(SCHED_STAGES_RESUMES).map_err(|_| "sysinfo::sched_stages: resumes refused")?;
+    let switches = sched_stages(SCHED_STAGES_SWITCHES)
+        .map_err(|_| "sysinfo::sched_stages: switches refused")?;
+    if resumes > switches
+    {
+        return Err("sysinfo::sched_stages: more register switches closed than committed");
+    }
+    if sched_stages(SCHED_STAGES_ARM + 1) != invalid || sched_stages(u64::MAX) != invalid
+    {
+        return Err("sysinfo::sched_stages: a word past the arm was not refused");
     }
     Ok(())
 }

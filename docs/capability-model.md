@@ -633,8 +633,12 @@ kernel's interrupt reaches the CPU ([core/kernel/docs/syscalls.md](../core/kerne
 split or merge. The kernel mints the one root cap at boot into init's CSpace, carrying
 **Configure**, and init finds it by its descriptor's type. `PmuControl` capabilities are not
 creatable at runtime. Which process holds it after init is userspace policy. ktest, loaded as
-init, tests the counters through the root. In the default image no process holds it: the root
-stays in init's CSpace and is released when the reap frees it (see [process-lifecycle.md § Init
+init, tests the counters through the root. Init endows svcmgr with a derived copy carrying
+**Configure**, and svcmgr derives one, on each launch, for the one service whose recipe sets
+`pmu_authority = yes` ([.svc Service
+Definitions](../services/svcmgr/docs/service-definitions.md#pmu_authority)); when no recipe it
+keeps sets the key, svcmgr deletes its copy at the handover. The root stays in init's CSpace and is
+released when the reap frees it (see [process-lifecycle.md § Init
 reap](process-lifecycle.md#init-reap)).
 
 ---

@@ -20,6 +20,11 @@
 //! pass and its pool return, a thread's or an address space's teardown gates)
 //! pass none.
 //!
+//! Two cases hold the first probe issued inside the observer release and
+//! inside the death posts for longer than the whole call, as a host that keeps
+//! the probe's CPU off would, and check that the rig judges such a call
+//! inconclusive rather than failed ([`latency::Bracket`]).
+//!
 //! The sort of a dying `CSpace`'s kept arena pages, their leases and the
 //! release of its holds on them change nothing a guest can read while they
 //! run, so their batching is checked by the kernel's host tests instead.
@@ -324,43 +329,84 @@ pub fn observer_release_takes_interrupts(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     run("ktest: teardown_windows call=observer_release", || {
-        let queue = |observers: u32| {
-            event_queue_create_observed(ctx.memory_base, 1, observers)
-                .map(Owned)
-                .map_err(|_| "teardown_windows::observer_release: create a queue failed")
-        };
-        let (first, last, bulk) = (queue(1)?, queue(1)?, queue(OBSERVERS)?);
-        let mut thread = Owned(
-            cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
-                .map_err(|_| "teardown_windows::observer_release: create the thread failed")?,
-        );
-        let bind = |queue: u64, correlator: u64| {
-            thread_bind_notification(thread.0, queue, correlator)
-                .map_err(|_| "teardown_windows::observer_release: bind an observer failed")
-        };
-        bind(last.0, 0)?;
-        for correlator in 0..u64::from(OBSERVERS)
-        {
-            bind(bulk.0, correlator)?;
-        }
-        bind(first.0, 0)?;
-        if sole(first.0)? || sole(last.0)?
-        {
-            return Err("teardown_windows::observer_release: a binding took no reference");
-        }
-        let m = delete_bracketed(
-            ctx,
-            &mut thread,
-            || sole(first.0),
-            || sole(last.0),
-            "teardown_windows::observer_release: the worker's delete failed",
-        )?;
-        if !sole(first.0)? || !sole(last.0)?
-        {
-            return Err("teardown_windows::observer_release: a binding outlived its thread");
-        }
-        Ok(m)
+        observer_release_once(ctx)
     })
+}
+
+/// A delete of [`observer_release_takes_interrupts`]'s thread whose first
+/// probe inside the release the host held off for longer than the whole call
+/// is judged inconclusive, not a release with interrupts masked
+/// ([`latency::Bracket`]).
+pub fn observer_release_held_probe_is_inconclusive(ctx: &TestContext) -> TestResult
+{
+    if !latency::cpus_present()
+    {
+        return Ok(());
+    }
+    latency::hold_next_inside_probe();
+    let m = observer_release_once(ctx)?;
+    held_probe_judged("ktest: teardown_windows call=observer_release_held", &m)
+}
+
+/// One call of [`observer_release_takes_interrupts`] on a fresh fixture.
+fn observer_release_once(ctx: &TestContext) -> Result<Measured, &'static str>
+{
+    let queue = |observers: u32| {
+        event_queue_create_observed(ctx.memory_base, 1, observers)
+            .map(Owned)
+            .map_err(|_| "teardown_windows::observer_release: create a queue failed")
+    };
+    let (first, last, bulk) = (queue(1)?, queue(1)?, queue(OBSERVERS)?);
+    let mut thread = Owned(
+        cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
+            .map_err(|_| "teardown_windows::observer_release: create the thread failed")?,
+    );
+    let bind = |queue: u64, correlator: u64| {
+        thread_bind_notification(thread.0, queue, correlator)
+            .map_err(|_| "teardown_windows::observer_release: bind an observer failed")
+    };
+    bind(last.0, 0)?;
+    for correlator in 0..u64::from(OBSERVERS)
+    {
+        bind(bulk.0, correlator)?;
+    }
+    bind(first.0, 0)?;
+    if sole(first.0)? || sole(last.0)?
+    {
+        return Err("teardown_windows::observer_release: a binding took no reference");
+    }
+    let m = delete_bracketed(
+        ctx,
+        &mut thread,
+        || sole(first.0),
+        || sole(last.0),
+        "teardown_windows::observer_release: the worker's delete failed",
+    )?;
+    if !sole(first.0)? || !sole(last.0)?
+    {
+        return Err("teardown_windows::observer_release: a binding outlived its thread");
+    }
+    Ok(m)
+}
+
+/// Log `m`, the measure of a call whose first probe inside its stretch was
+/// held for longer than the whole call (`latency::hold_next_inside_probe`), as
+/// `call` (a log line naming it), and check that it was judged inconclusive.
+fn held_probe_judged(call: &'static str, m: &Measured) -> TestResult
+{
+    crate::log(call);
+    crate::log_u64("ktest: latency span_us=", m.span_us);
+    crate::log_u64("ktest: latency acked_inside=", u64::from(m.acked_inside));
+    crate::log_u64("ktest: latency inconclusive=", u64::from(m.inconclusive));
+    if m.acked_inside
+    {
+        return Err("teardown_windows: a probe held past its call was acknowledged inside it");
+    }
+    if !m.inconclusive
+    {
+        return Err("teardown_windows: a call whose probe was held past it was judged conclusive");
+    }
+    Ok(())
 }
 
 /// An address space's teardown lowers the frame-map count of every leaf it
@@ -495,7 +541,15 @@ pub fn mmio_withdrawal_takes_interrupts(ctx: &TestContext) -> TestResult
 /// interrupts between batches of nodes. The rig's worker is bound to `last`
 /// first, to a bulk queue [`OBSERVERS`] times, and to `first` last, and the
 /// walk posts newest binding first, so `first`'s queue receives the walk's
-/// first post and `last`'s its last; then the worker exits.
+/// first post and `last`'s the last of the case's own (the rig's witness, bound
+/// before them, receives the walk's very last); then the worker exits.
+///
+/// The walk lasts a millisecond or two under TCG, less than a host time
+/// slice, so a host that holds the probe's vCPU off after it read the walk
+/// under way lets the walk end before that probe returns, and no other probe
+/// lands inside it. A call so held is inconclusive, not failed: the rig's
+/// witness times the exit's end, and the first probe inside the walk took
+/// longer than the whole call ([`latency::Bracket`]).
 pub fn death_post_takes_interrupts(ctx: &TestContext) -> TestResult
 {
     if !latency::cpus_present()
@@ -503,46 +557,67 @@ pub fn death_post_takes_interrupts(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     run("ktest: teardown_windows call=death_post", || {
-        let queue = |observers: u32| {
-            event_queue_create_observed(ctx.memory_base, 1, observers)
-                .map(Owned)
-                .map_err(|_| "teardown_windows::death_post: create a queue failed")
-        };
-        let (first, last, bulk) = (queue(1)?, queue(1)?, queue(OBSERVERS)?);
-        let mut setup = |thread: u64| -> TestResult {
-            let bind = |queue: u64, correlator: u64| {
-                thread_bind_notification(thread, queue, correlator)
-                    .map_err(|_| "teardown_windows::death_post: bind an observer failed")
-            };
-            bind(last.0, 0)?;
-            for correlator in 0..u64::from(OBSERVERS)
-            {
-                bind(bulk.0, correlator)?;
-            }
-            bind(first.0, 0)
-        };
-        // Whether `queue` has received its post; a received post stays seen.
-        let posted = |queue: u64, seen: &Cell<bool>| {
-            if !seen.get() && event_try_recv_death(queue).is_ok()
-            {
-                seen.set(true);
-            }
-            Ok(seen.get())
-        };
-        let (first_seen, last_seen) = (Cell::new(false), Cell::new(false));
-        let mut begun = || posted(first.0, &first_seen);
-        let mut ended = || posted(last.0, &last_seen);
-        let mut bracket = Bracket {
-            begun: &mut begun,
-            ended: &mut ended,
-        };
-        let m = latency::measure_exit(ctx, &mut setup, &mut bracket)?;
-        // The bracket stops reading once a read sees the last post, which a
-        // stretch run whole between two probes leaves the first one unread.
-        if !posted(first.0, &first_seen)? || !posted(last.0, &last_seen)?
-        {
-            return Err("teardown_windows::death_post: an observer missed the post");
-        }
-        Ok(m)
+        death_post_once(ctx)
     })
+}
+
+/// An exit of [`death_post_takes_interrupts`]'s worker whose first probe
+/// inside the death posts the host held off for longer than the whole call is
+/// judged inconclusive, not a walk with interrupts masked
+/// ([`latency::Bracket`]).
+pub fn death_post_held_probe_is_inconclusive(ctx: &TestContext) -> TestResult
+{
+    if !latency::cpus_present()
+    {
+        return Ok(());
+    }
+    latency::hold_next_inside_probe();
+    let m = death_post_once(ctx)?;
+    held_probe_judged("ktest: teardown_windows call=death_post_held", &m)
+}
+
+/// One exit of [`death_post_takes_interrupts`] on a fresh fixture.
+fn death_post_once(ctx: &TestContext) -> Result<Measured, &'static str>
+{
+    let queue = |observers: u32| {
+        event_queue_create_observed(ctx.memory_base, 1, observers)
+            .map(Owned)
+            .map_err(|_| "teardown_windows::death_post: create a queue failed")
+    };
+    let (first, last, bulk) = (queue(1)?, queue(1)?, queue(OBSERVERS)?);
+    let mut setup = |thread: u64| -> TestResult {
+        let bind = |queue: u64, correlator: u64| {
+            thread_bind_notification(thread, queue, correlator)
+                .map_err(|_| "teardown_windows::death_post: bind an observer failed")
+        };
+        bind(last.0, 0)?;
+        for correlator in 0..u64::from(OBSERVERS)
+        {
+            bind(bulk.0, correlator)?;
+        }
+        bind(first.0, 0)
+    };
+    // Whether `queue` has received its post; a received post stays seen.
+    let posted = |queue: u64, seen: &Cell<bool>| {
+        if !seen.get() && event_try_recv_death(queue).is_ok()
+        {
+            seen.set(true);
+        }
+        Ok(seen.get())
+    };
+    let (first_seen, last_seen) = (Cell::new(false), Cell::new(false));
+    let mut begun = || posted(first.0, &first_seen);
+    let mut ended = || posted(last.0, &last_seen);
+    let mut bracket = Bracket {
+        begun: &mut begun,
+        ended: &mut ended,
+    };
+    let m = latency::measure_exit(ctx, &mut setup, &mut bracket)?;
+    // The bracket stops reading once a read sees the last post, which a
+    // stretch run whole between two probes leaves the first one unread.
+    if !posted(first.0, &first_seen)? || !posted(last.0, &last_seen)?
+    {
+        return Err("teardown_windows::death_post: an observer missed the post");
+    }
+    Ok(m)
 }

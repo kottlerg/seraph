@@ -1101,6 +1101,7 @@ mod tests
                 let Ok(bpb) = fat_parse::parse_bpb_geometry(
                     &boot_sector(&geo, 7).unwrap(),
                     u32::from(sector),
+                    mib * MIB / u64::from(sector),
                 )
                 else
                 {

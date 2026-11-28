@@ -76,9 +76,11 @@ pub const HANDOVER_PULL: u64 = 13;
 pub const HANDOVER_RELEASE: u64 = 14;
 
 /// Badge bit on a SEND on the master log endpoint that authorises
-/// [`QUERY_SLOTS`] and [`QUERY_HISTORY`]. svcmgr mints it from its
-/// master-log source and publishes it seed-only as
-/// [`crate::published_names::LOGD_QUERY`]. No sender's badge carries it:
+/// [`QUERY_SLOTS`], [`QUERY_HISTORY`] and [`LOG_SUBSCRIBE`], the last from
+/// the pool of `SUBSCRIBERS_MAX` subscriptions. svcmgr mints it, with
+/// `GRANT` for [`LOG_SUBSCRIBE`]'s signal, from its master-log source
+/// and publishes it seed-only as [`crate::published_names::LOGD_QUERY`]. No
+/// sender's badge carries it:
 /// procmgr redraws a process badge carrying a
 /// [`crate::VERB_BIT_MASK`] bit, and the reserved
 /// [`crate::log_badges`] carry none.
@@ -88,16 +90,18 @@ pub const LOG_QUERY_AUTHORITY: u64 = 1u64 << 63;
 /// ascending by badge and then state, a page of up to
 /// [`crate::log_query::SLOTS_PAGE`] entries per call, each the badge, its
 /// state (live, or evicted by a death with its exit reason, or by a
-/// resync), and its display name. Served only on a badge carrying
-/// [`LOG_QUERY_AUTHORITY`]. Wire format: [`crate::log_query`]; specified
+/// resync), its display name, its slot serial and its name generation.
+/// Served only on a badge carrying [`LOG_QUERY_AUTHORITY`] or
+/// [`LOG_FOLLOW_AUTHORITY`]. Wire format: [`crate::log_query`]; specified
 /// in `services/logd/docs/ipc-interface.md` § Queries.
 pub const QUERY_SLOTS: u64 = 16;
 
-/// Read logd's history, newest first: every slot's entries or one
-/// badge's, as many whole entries per call as one reply holds, each its
-/// sequence, receipt time, badge, level, kind, and bytes. Served only on
-/// a badge carrying [`LOG_QUERY_AUTHORITY`]. Wire format:
-/// [`crate::log_query`]; specified in
+/// Read logd's history, newest first or oldest first from a `seq`: every
+/// slot's entries or one badge's, at every level or at a level and the more
+/// severe, as many whole entries per call as one reply holds, each its
+/// sequence, receipt time, slot serial, level, kind, origin, name generation,
+/// and bytes. Served only on a badge carrying [`LOG_QUERY_AUTHORITY`] or
+/// [`LOG_FOLLOW_AUTHORITY`]. Wire format: [`crate::log_query`]; specified in
 /// `services/logd/docs/ipc-interface.md` § Queries.
 pub const QUERY_HISTORY: u64 = 17;
 
@@ -116,3 +120,44 @@ pub const LOG_FLUSH_AUTHORITY: u64 = 1u64 << 62;
 /// [`crate::log_flush`]; specified in `services/logd/docs/ipc-interface.md`
 /// § Flush barrier.
 pub const LOG_FLUSH: u64 = 18;
+
+/// Badge bit on a SEND on the master log endpoint that authorises the reads
+/// [`LOG_QUERY_AUTHORITY`] does and [`LOG_SUBSCRIBE`] from the pool of
+/// `SINK_SUBSCRIBERS_MAX` subscriptions, which no holder of
+/// [`LOG_QUERY_AUTHORITY`] can take, kept for the external sinks. svcmgr
+/// mints it with `GRANT` from its master-log source and publishes it
+/// seed-only as [`crate::published_names::LOGD_FOLLOW`]. No sender's badge
+/// carries it, as for [`LOG_QUERY_AUTHORITY`].
+pub const LOG_FOLLOW_AUTHORITY: u64 = 1u64 << 60;
+
+/// Follow the history: the request moves logd a signal, a capability to a
+/// Notification logd signals each time it retains an entry. The reply carries
+/// the subscription's token, a capability to an object of logd's whose
+/// deletion ends the subscription, its index, the instance epoch, and the
+/// oldest and the next `seq`. A full pool is refused. Served
+/// only on a badge carrying [`LOG_QUERY_AUTHORITY`] or
+/// [`LOG_FOLLOW_AUTHORITY`], each its own pool. Wire format:
+/// [`crate::log_query`]; specified in `services/logd/docs/ipc-interface.md`
+/// § Subscriptions.
+pub const LOG_SUBSCRIBE: u64 = 19;
+
+/// Badge bit on a SEND on the master log endpoint that authorises
+/// [`SINK_LIST`] and [`SINK_SET`]. svcmgr mints it from its master-log
+/// source and publishes it seed-only as
+/// [`crate::published_names::LOGD_CONTROL`]. No sender's badge carries it, as
+/// for [`LOG_QUERY_AUTHORITY`].
+pub const LOG_CONTROL_AUTHORITY: u64 = 1u64 << 61;
+
+/// List logd's device sinks, one per call by index: each its name, its
+/// settings in the recipe's syntax, its cursor, its drop count and its state
+/// (served, unserved, stalled). Served only on a badge carrying
+/// [`LOG_CONTROL_AUTHORITY`]. Wire format: [`crate::log_control`]; specified
+/// in `services/logd/docs/ipc-interface.md` § Sink control.
+pub const SINK_LIST: u64 = 20;
+
+/// Change a device sink's settings: its name and a settings string in the
+/// recipe's syntax, applied over the sink's settings, or refused whole when
+/// it does not parse. Served only on a badge carrying
+/// [`LOG_CONTROL_AUTHORITY`]. Wire format: [`crate::log_control`]; specified
+/// in `services/logd/docs/ipc-interface.md` § Sink control.
+pub const SINK_SET: u64 = 21;

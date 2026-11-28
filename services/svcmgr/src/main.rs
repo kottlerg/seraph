@@ -383,17 +383,41 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
         );
     }
 
-    // logd.query — a `LOG_QUERY_AUTHORITY`-badged SEND minted from the
-    // reserved master-log source: logd's query labels. Seed-only, like the
-    // devmgr names above.
-    publish_minted_send(
-        registry,
-        caps.master_log_source,
-        "master-log",
-        ipc::published_names::LOGD_QUERY,
-        ipc::log_labels::LOG_QUERY_AUTHORITY,
-        Visibility::SeedOnly,
-    );
+    publish_logd_names(registry, caps.master_log_source);
+}
+
+/// Publish logd's authority names, each a SEND minted from the reserved
+/// master-log `source`: `logd.query`, `logd.follow`, `logd.control` and
+/// `logd.flush` (`services/logd/docs/ipc-interface.md` § Endpoint).
+fn publish_logd_names(registry: &mut registry::Registry, source: u64)
+{
+    // logd.query, logd.follow and logd.control — SENDs minted from the
+    // reserved master-log source and badged `LOG_QUERY_AUTHORITY` (logd's
+    // query labels and the interactive followers' subscriptions),
+    // `LOG_FOLLOW_AUTHORITY` (the external sinks' reads and subscriptions)
+    // and `LOG_CONTROL_AUTHORITY` (`SINK_LIST` and `SINK_SET`). Seed-only,
+    // as every name whose badge carries a verb bit; the two that subscribe keep `GRANT` for
+    // their seeds, since `LOG_SUBSCRIBE` moves a signal to logd.
+    for (name, badge, visibility) in [
+        (
+            ipc::published_names::LOGD_QUERY,
+            ipc::log_labels::LOG_QUERY_AUTHORITY,
+            Visibility::SeedOnlyGrant,
+        ),
+        (
+            ipc::published_names::LOGD_FOLLOW,
+            ipc::log_labels::LOG_FOLLOW_AUTHORITY,
+            Visibility::SeedOnlyGrant,
+        ),
+        (
+            ipc::published_names::LOGD_CONTROL,
+            ipc::log_labels::LOG_CONTROL_AUTHORITY,
+            Visibility::SeedOnly,
+        ),
+    ]
+    {
+        publish_minted_send(registry, source, "master-log", name, badge, visibility);
+    }
 
     // logd.flush — a `LOG_FLUSH_AUTHORITY`-badged SEND minted from the same
     // source: logd's flush barrier, which the shutdown actuator waits on
@@ -401,7 +425,7 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
     // which can end logd with lines unwritten. Seed-only.
     publish_minted_send(
         registry,
-        caps.master_log_source,
+        source,
         "master-log",
         ipc::published_names::LOGD_FLUSH,
         ipc::log_labels::LOG_FLUSH_AUTHORITY,
@@ -733,6 +757,7 @@ fn event_loop(
         procmgr_death_auth_source: caps.procmgr_death_auth_source,
         kernel_log_source: caps.kernel_log_source,
         entropy_source: caps.entropy_source,
+        pmu_source: core::cell::Cell::new(caps.pmu_source),
         core_death_queue,
         pressure_notification,
         memory_waits: core::cell::Cell::new(MemoryWaits::new(pressure_notification != 0)),
@@ -940,12 +965,16 @@ fn dispatch_ipc(
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             std::os::seraph::log!("handover complete; scanning /config/svcmgr/services/");
-            let reconciled = match definitions::reconcile::reconcile_and_launch(
+            let reconciled = definitions::reconcile::reconcile_and_launch(
                 &mut state.pending,
                 &mut state.table,
                 ctx,
                 &mut state.registry,
-            )
+            );
+            // The recipes are read now, on every outcome: the PMU source
+            // stays only for a recipe svcmgr keeps that holds the key.
+            restart::delete_unheld_pmu_source(ctx, &state.table.recipes);
+            let reconciled = match reconciled
             {
                 Ok(reconciled) => reconciled,
                 Err(exit_reason) =>

@@ -86,6 +86,12 @@ counters.read(&mut start);
 `read_counter` executes `RDPMC` on x86-64 and `csrr hpmcounterN` on riscv64; a read by an
 unbound thread, or by a bound one on a CPU with no configuration, takes the CPU's fault.
 
+A benchmark reads the counters through `shared/bench`'s `EventCounters` (its `pmu` feature),
+which opens and binds them as above and reports each event in a result line's column
+([shared/bench/README.md § Event counters](../bench/README.md#event-counters)). The capability
+comes from svcmgr, to the one service whose recipe sets
+[`pmu_authority = yes`](../../services/svcmgr/docs/service-definitions.md#pmu_authority).
+
 ---
 
 ## Summarized By

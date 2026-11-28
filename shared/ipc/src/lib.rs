@@ -83,8 +83,9 @@ use syscall_abi::{
 //     DEVMGR_LABELS_VERSION     — every devmgr_labels request
 //     DEVMGR_DMA_LABELS_VERSION — every devmgr_dma_labels request
 //     IOMMU_LABELS_VERSION      — every iommu_labels request (devmgr ↔ IOMMU driver)
-//     LOG_LABELS_VERSION        — every log_labels::QUERY_SLOTS, QUERY_HISTORY
-//                                 and LOG_FLUSH request (client ↔ logd)
+//     LOG_LABELS_VERSION        — every log_labels::QUERY_SLOTS, QUERY_HISTORY,
+//                                 LOG_SUBSCRIBE, SINK_LIST, SINK_SET and
+//                                 LOG_FLUSH request (client ↔ logd)
 //     ACPID_LABELS_VERSION      — every acpid_labels request (pwrmgr ↔ acpid)
 //
 //   Implicitly covered by a parent-channel handshake:
@@ -185,7 +186,7 @@ pub mod procmgr_process_state;
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 17;
+pub const SVCMGR_LABELS_VERSION: u32 = 18;
 pub mod svcmgr_labels;
 
 /// Wire-protocol version of [`stop_labels`]; bumped as the block comment above
@@ -353,7 +354,14 @@ const _: () = core::assert!(
         && vfsd_labels::DENY_BADGE & VERB_BIT_MASK == 0
         && log_labels::LOG_QUERY_AUTHORITY & VERB_BIT_MASK != 0
         && log_labels::LOG_FLUSH_AUTHORITY & VERB_BIT_MASK != 0
-        && log_labels::LOG_FLUSH_AUTHORITY != log_labels::LOG_QUERY_AUTHORITY
+        && log_labels::LOG_FOLLOW_AUTHORITY & VERB_BIT_MASK != 0
+        && log_labels::LOG_CONTROL_AUTHORITY & VERB_BIT_MASK != 0
+        && (log_labels::LOG_QUERY_AUTHORITY
+            | log_labels::LOG_FLUSH_AUTHORITY
+            | log_labels::LOG_FOLLOW_AUTHORITY
+            | log_labels::LOG_CONTROL_AUTHORITY)
+            .count_ones()
+            == 4
         && log_badges::LOG_BADGE_INIT & VERB_BIT_MASK == 0
         && log_badges::LOG_BADGE_PROCMGR & VERB_BIT_MASK == 0
 );
@@ -362,7 +370,7 @@ pub mod log_badges;
 
 /// Wire-protocol version of [`log_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const LOG_LABELS_VERSION: u32 = 7;
+pub const LOG_LABELS_VERSION: u32 = 8;
 pub mod log_labels;
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────
@@ -379,6 +387,8 @@ pub mod log_labels;
 // cap-role enum; no per-service sentinels.
 
 pub mod bootstrap;
+
+pub mod log_control;
 
 pub mod log_flush;
 

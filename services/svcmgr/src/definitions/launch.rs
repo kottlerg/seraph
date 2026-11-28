@@ -23,7 +23,8 @@ use crate::registry_lookup_derived;
 use crate::restart::{
     CreatedProcess, RestartCtx, StartupBlobs, bind_instance_observers, caps_death,
     create_label_bits, destroy_partial_child, mint_core_death_recv, mint_debug_authority,
-    mint_entropy_authority, mint_stop_authority, start_process, walk_and_create_from_file,
+    mint_entropy_authority, mint_pmu_authority, mint_stop_authority, start_process,
+    walk_and_create_from_file,
 };
 
 /// Outcome of a successful launch — the bits svcmgr records on the
@@ -152,9 +153,10 @@ pub(crate) enum LaunchKind
     Restart,
 }
 
-/// Mint the six bootstrap caps real-logd expects, from the reserved
-/// log-sink sources svcmgr holds for the system's life and from the
-/// `devmgr.class.*` publications ([`crate::classes`]):
+/// Mint the seven bootstrap caps real-logd expects, from the reserved
+/// log-sink sources svcmgr holds for the system's life, from the
+/// `devmgr.class.*` publications ([`crate::classes`]) and from the `timed`
+/// publication:
 ///   * `[0]` master-log endpoint RECV (svcmgr's source stays valid, so a
 ///     fresh RECV reattaches each (re)launched logd to the same object that
 ///     every sender's `log_send_cap` targets);
@@ -169,7 +171,9 @@ pub(crate) enum LaunchKind
 ///   * `[4]` the `framebuffer` class SEND (`devmgr.class.framebuffer`), the
 ///     same for the framebuffer driver;
 ///   * `[5]` a `KernelLog` cap carrying `Read`, through which logd reads the
-///     kernel's console lines (`services/logd/README.md` § Bootstrap caps).
+///     kernel's console lines (`services/logd/README.md` § Bootstrap caps);
+///   * `[6]` the `timed` SEND, through which logd reads the wall clock once
+///     (`services/logd/docs/sinks.md` § Wall time).
 ///
 /// A publication is named by its class file's stem, not by the class the
 /// file configures; these two carry the `serial` and `framebuffer` classes
@@ -177,7 +181,10 @@ pub(crate) enum LaunchKind
 /// key naming another.
 ///
 /// logd's recipe declares `log_sink`, which excludes `seed`, so svcmgr
-/// resolves these two publications for it here.
+/// resolves these three publications for it here. logd provides no name,
+/// so it launches after every provider, `timed` among them
+/// (`svcmgr_defs::launch_order`), and the publications persist for its
+/// respawns.
 /// A source absent from the endowment, an unpublished class, or a derive
 /// that fails, yields `0` in its slot. The slots are positional; [`serve_boot_slots`] transfers
 /// only the present caps and names the slot each fills in the round's
@@ -225,6 +232,7 @@ pub(crate) fn mint_logd_boot_caps(
     };
     let serial = class_send(b"serial");
     let framebuffer = class_send(b"framebuffer");
+    let timed = registry_lookup_derived(registry, b"timed", Resolver::Seed).unwrap_or(0);
     let kernel_log = if ctx.kernel_log_source != 0
     {
         syscall::cap_derive(ctx.kernel_log_source, syscall::RIGHTS_KLOG_READ).unwrap_or(0)
@@ -239,7 +247,8 @@ pub(crate) fn mint_logd_boot_caps(
         death_auth,
         serial,
         framebuffer,
-        kernel_log
+        kernel_log,
+        timed
     ]
 }
 
@@ -354,8 +363,8 @@ fn assemble_provided_boot_caps(
     // Resolve seeds after namespace setup. Resolution cannot fail: an
     // unresolved name becomes `0` in its slot (see `resolve_seeds`). A
     // debug-authority holder's authority cap rides the slot after them, a
-    // stop-authority holder's the slot after that, and the entropy-authority
-    // holder's the slot after those.
+    // stop-authority holder's the slot after that, and the entropy- and
+    // PMU-authority holders' the slots after those, in that order.
     let mut seed_caps = resolve_seeds(&def.seed, &def.name, registry);
     if def.debug_authority
     {
@@ -368,6 +377,10 @@ fn assemble_provided_boot_caps(
     if def.entropy_authority
     {
         seed_caps.push(mint_entropy_authority(ctx));
+    }
+    if def.pmu_authority
+    {
+        seed_caps.push(mint_pmu_authority(ctx));
     }
     if role == Role::ShutdownActuator
     {

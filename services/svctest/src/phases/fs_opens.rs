@@ -443,6 +443,9 @@ const OPEN_RECLAIM_CHILD_ROLE: &str = "open-reclaim-child";
 /// Role token for [`session_undeliverable_child_main`].
 const SESSION_UNDELIVERABLE_CHILD_ROLE: &str = "session-undeliverable-child";
 
+/// Role token for [`read_undeliverable_child_main`].
+const READ_UNDELIVERABLE_CHILD_ROLE: &str = "read-undeliverable-child";
+
 /// How long the reclaim phase and its children wait for fatfs to end a
 /// session whose client is gone. A test wait bound.
 const RECLAIM_WAIT: Duration = Duration::from_secs(60);
@@ -466,8 +469,8 @@ const RECLAIM_STOP_BADGE: u64 = 0x5704;
 
 /// Child-mode dispatch for argv tokens this module owns. An
 /// `open-reclaim-child` parks until its spawner kills it, and a
-/// `session-undeliverable-child` exits with its result; on a miss control
-/// returns to the caller.
+/// `session-undeliverable-child` and a `read-undeliverable-child` exit with
+/// their result; on a miss control returns to the caller.
 pub fn reentry_main(role: &str)
 {
     if role == OPEN_RECLAIM_CHILD_ROLE
@@ -477,6 +480,10 @@ pub fn reentry_main(role: &str)
     if role == SESSION_UNDELIVERABLE_CHILD_ROLE
     {
         session_undeliverable_child_main();
+    }
+    if role == READ_UNDELIVERABLE_CHILD_ROLE
+    {
+        read_undeliverable_child_main();
     }
 }
 
@@ -653,7 +660,10 @@ fn sole(cap: u64) -> bool
 /// on by starting sessions, while an open in svctest's own session still
 /// reads. A `session-undeliverable-child`, whose `CSpace` cannot take the
 /// `FS_SESSION` reply, sees fatfs end the session it started, its page
-/// leaving the child's node. fatfs once kept a dead client's open, and its
+/// leaving the child's node. A `read-undeliverable-child`, whose `CSpace`
+/// cannot take an `FS_READ_MEMORY` reply's page, sees fatfs give each such
+/// page back, so more reads than an open may hold pages all fail their
+/// transfer and none is refused. fatfs once kept a dead client's open, and its
 /// release SEND, until the open's node was removed.
 pub fn fs_reclaims_dead_opens_phase(_: &Caps)
 {
@@ -691,6 +701,16 @@ pub fn fs_reclaims_dead_opens_phase(_: &Caps)
         "fs_reclaim: session-undeliverable-child exited {status} (2 = lookup, 3 = node or \
          handle, 4 = CSpace exhaustion, 5 = the FS_SESSION reply landed, 6 = the call failed, \
          7 = fatfs kept the session's page)"
+    );
+    let status = std::process::Command::new("/tests/svctest")
+        .arg(READ_UNDELIVERABLE_CHILD_ROLE)
+        .status()
+        .expect("fs_reclaim: spawning read-undeliverable-child failed");
+    assert!(
+        status.success(),
+        "fs_reclaim: read-undeliverable-child exited {status} (2 = lookup, 3 = FS_OPEN or the \
+         first read, 4 = CSpace exhaustion, 5 = fatfs kept the pages of undelivered reads: a \
+         read's reply landed or was refused, 6 = the call failed)"
     );
 
     assert_eq!(fs_close(kept, ipc_buf), ipc::fs_errors::SUCCESS);
@@ -869,6 +889,81 @@ fn session_undeliverable_child_main() -> !
         let _ = syscall::thread_yield();
     }
     std::process::exit(7);
+}
+
+/// A `read-undeliverable-child`: open [`RECLAIM_NAME`] and check that a
+/// memory-cap read of it lands, then exhaust this process's `CSpace`, its IPC
+/// receive reserve included, and make one more `FS_READ_MEMORY` than an open
+/// may hold pages (fatfs's cache slot ceiling), each under a new cookie. Every
+/// reply's page cap finds no slot, so each must arrive as
+/// `IPC_REPLY_TRANSFER_FAILED`: a fatfs that kept the page of a reply that did
+/// not arrive holds the open's limit before the last read and refuses it.
+/// Allocates nothing on the heap after the exhaustion. Exit codes: 0 = every
+/// read failed its transfer, 2 = the lookup failed, 3 = `FS_OPEN` or the
+/// first read failed, 4 = a grant spending the receive reserve neither landed
+/// nor failed its transfer, 5 = a read's reply landed or was refused, 6 = a
+/// call failed.
+fn read_undeliverable_child_main() -> !
+{
+    let info = startup_info();
+    let ipc_buf = current_ipc_buf();
+    let svctest = svctest_dir_cap(ipc_buf);
+    let Ok((node, _, _)) = ns_lookup(svctest, RECLAIM_NAME.as_bytes(), 0xFFFF, ipc_buf)
+    else
+    {
+        std::process::exit(2)
+    };
+    let Ok(open) = fs_open(node, 0, ipc_buf)
+    else
+    {
+        std::process::exit(3)
+    };
+    let Ok((page, _)) = fs_read_memory(open, 0, 1, ipc_buf)
+    else
+    {
+        std::process::exit(3)
+    };
+    let _ = syscall::cap_delete(page);
+    if page == 0 || fs_release_memory(open, 1, ipc_buf) != ipc::fs_errors::SUCCESS
+    {
+        std::process::exit(3);
+    }
+    let reads = crate::phases::fs_ipc::fatfs_slot_ceiling(ipc_buf).saturating_add(1);
+
+    // Fill every general slot, then spend the IPC receive reserve on one-page
+    // memmgr grants, as `session-undeliverable-child` does.
+    while syscall::cap_derive(svctest, syscall::RIGHTS_EP_SEND).is_ok()
+    {}
+    for _ in 0..=syscall_abi::CSPACE_IPC_RECV_RESERVE
+    {
+        match small_call(
+            info.memmgr_endpoint,
+            ipc::memmgr_labels::REQUEST_MEMORY_CAPS,
+            Some(1),
+        )
+        {
+            Some(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED => break,
+            Some(reply) if reply.label == ipc::memmgr_errors::SUCCESS && reply.caps != 0 =>
+            {}
+            _ => std::process::exit(4),
+        }
+    }
+
+    for cookie in 2..=u64::try_from(reads).unwrap_or(u64::MAX).saturating_add(1)
+    {
+        let read = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
+            .word(0, 0)
+            .word(1, cookie)
+            .build();
+        match small_reply(open, &read)
+        {
+            Some(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED =>
+            {}
+            Some(_) => std::process::exit(5),
+            None => std::process::exit(6),
+        }
+    }
+    std::process::exit(0);
 }
 
 /// What a [`small_call`] keeps of its reply: the label, the cap count, the

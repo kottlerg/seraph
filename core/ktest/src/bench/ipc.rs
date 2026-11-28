@@ -3,22 +3,23 @@
 
 // core/ktest/src/bench/ipc.rs
 
-//! Synchronous IPC round-trip benchmark, in three message sizes and one case
+//! Synchronous IPC round-trip benchmark, in six message sizes and one case
 //! that uses the vector registers.
 //!
 //! Each case spawns one child caller that loops `ipc_call`; the parent loops
 //! `ipc_recv` / `ipc_reply`, the request and the reply carrying the case's
 //! number of data words. Per-iteration bracketing on the parent side. The
 //! cases, the variant `words=` of the `ipc_round_trip` line, are an empty
-//! message, the largest message the message registers carry, and one word
-//! more, which travels in the IPC buffer page (docs/ipc-design.md § Message
-//! Format). ktest is soft-float, so none of these touches the FPU. The fourth
+//! message, one word, the largest message the message registers carry, one
+//! word more, which travels in the IPC buffer page (docs/ipc-design.md
+//! § Message Format), 16 words, and the largest message, `MSG_DATA_WORDS_MAX`
+//! words. ktest is soft-float, so none of these touches the FPU. The next
 //! case, `words=0 fpu=both`, is the empty message with each side writing and
 //! reading one vector register per round trip, as every std-built thread does
 //! through its SIMD copies: the line without `fpu=` minus this one is the cost
 //! of the FPU and vector state on the IPC path.
 //!
-//! A sixth case, `words=0 server=reply_recv`, is the empty message served by
+//! The last case, `words=0 server=reply_recv`, is the empty message served by
 //! `ipc_reply_recv`: each sample is one reply-and-receive, the reply to one call
 //! and the receive of the next (core/kernel/docs/syscalls.md
 //! § `SYS_IPC_REPLY_RECV`); the line without `server=` minus this one is what
@@ -35,17 +36,35 @@
 //! `ipc_reply`; `unpinned` and `fan_in` run again with a server that loops
 //! `ipc_reply_recv`, variant `server=reply_recv`, whose reply wake waits for
 //! its receive's outcome (core/kernel/docs/scheduler.md § Thread Assignment).
+//!
+//! Two cases, variant `words=0 aspace=`, isolate the address-space switch:
+//! the harness serves empty calls, timed as the `words=0` case times them,
+//! from a caller pinned to CPU 0 beside it that runs the machine-code stub
+//! `code_stub::syscall_repeat` in ktest's own address space (`same`) or in
+//! one of its own (`cross`), so each round trip of `cross` switches address
+//! space twice and the two lines differ by those switches alone. ktest's text
+//! is not mapped in the caller's space, hence the stub.
+//!
+//! The case `words=0 iopb=none` (x86-64 alone; riscv64 has no I/O ports)
+//! runs the empty message between two children pinned to CPU 0, the caller
+//! timing its own calls while the harness waits: no thread of a round trip
+//! holds an I/O port binding, where the harness thread of every other case
+//! holds ktest's, so the `words=0 placement=same` line minus this one is what
+//! the I/O permission bitmap adds to a round trip
+//! (core/kernel/docs/capability-internals.md § `IoPort` Bindings).
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bench::Value;
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
+    MAP_WRITABLE, cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint,
+    cap_create_notification, cap_create_thread, cap_delete, mem_map, mem_unmap, notification_send,
     notification_wait, thread_exit,
 };
+use syscall_abi::{SYS_IPC_CALL, SYS_NOTIFICATION_SEND, SYS_THREAD_EXIT, ipc_call_count_arg};
 
-use super::{Harness, MAX_SAMPLES};
+use super::{CHILD_SAMPLES, Harness, MAX_SAMPLES};
 use crate::{ChildStack, spawn};
 
 /// The benchmark's name; each case's line carries its `words=`, and the case
@@ -162,9 +181,10 @@ struct Case
 }
 
 /// The cases.
-const CASES: [Case; 5] = [
+const CASES: [Case; 8] = [
+    EMPTY,
     Case {
-        words: 0,
+        words: 1,
         fpu: Fpu::None,
         serve: Serve::RecvReply,
     },
@@ -175,6 +195,16 @@ const CASES: [Case; 5] = [
     },
     Case {
         words: REG_WORDS + 1,
+        fpu: Fpu::None,
+        serve: Serve::RecvReply,
+    },
+    Case {
+        words: 16,
+        fpu: Fpu::None,
+        serve: Serve::RecvReply,
+    },
+    Case {
+        words: syscall_abi::MSG_DATA_WORDS_MAX,
         fpu: Fpu::None,
         serve: Serve::RecvReply,
     },
@@ -190,11 +220,16 @@ const CASES: [Case; 5] = [
     },
 ];
 
-/// The largest message the message registers carry. A literal, so the bench
-/// builds unchanged at a head before `MSG_REGS_DATA_MAX` existed, for a
-/// before-and-after comparison; the assertion keeps the two equal.
-const REG_WORDS: usize = 6;
-const _: () = assert!(REG_WORDS == syscall_abi::MSG_REGS_DATA_MAX);
+/// The largest message the message registers carry.
+const REG_WORDS: usize = syscall_abi::MSG_REGS_DATA_MAX;
+
+/// The empty message served by `ipc_recv` and `ipc_reply`: the first of
+/// [`CASES`], and the timed loop of the `aspace=` cases.
+const EMPTY: Case = Case {
+    words: 0,
+    fpu: Fpu::None,
+    serve: Serve::RecvReply,
+};
 
 /// One caller child's stack per case, so a case's child never shares a stack
 /// with the previous case's, which may still be on its way to exit.
@@ -339,6 +374,9 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, h: &mut Harness)
     bench_fan_in(ctx, h, Serve::RecvReply);
     bench_placement(ctx, h, Layout::Unpinned, Serve::ReplyRecv);
     bench_fan_in(ctx, h, Serve::ReplyRecv);
+    bench_aspace(ctx, h, Aspace::Same);
+    bench_aspace(ctx, h, Aspace::Cross);
+    bench_iopb_none(ctx, h);
 }
 
 /// Run case `case` of [`CASES`], `c`. Returns whether every round trip
@@ -638,8 +676,15 @@ const FAN_IN_SERVER: usize = 3;
 /// the `fan_in` server and its callers.
 const PLACE_SET: usize = FAN_IN_SERVER + 1 + FAN_IN_CALLERS;
 
-/// The placement cases' children: one set per way of serving.
-const PLACE_CHILDREN: usize = 2 * PLACE_SET;
+/// The slot of the `iopb=none` case's server.
+const IOPB_SERVER: usize = 2 * PLACE_SET;
+
+/// The slot of the `iopb=none` case's caller.
+const IOPB_CALLER: usize = IOPB_SERVER + 1;
+
+/// The placement cases' children, one set per way of serving, and the
+/// `iopb=none` case's two.
+const PLACE_CHILDREN: usize = IOPB_SERVER + 2;
 
 /// The `SYS_THREAD_SET_AFFINITY` argument that clears a thread's hard
 /// affinity.
@@ -877,11 +922,8 @@ static FAN_IN_ARGS: spawn::ArgBlock<FanInArgs, { 2 * FAN_IN_CALLERS }> =
 /// calls overlap.
 static FAN_IN_GO: AtomicBool = AtomicBool::new(false);
 
-/// The callers' call latencies (cycles), caller `i`'s in the stripe from
-/// `i * iters`.
-static FAN_IN_SAMPLES: [AtomicU64; MAX_SAMPLES] = [const { AtomicU64::new(0) }; MAX_SAMPLES];
-
-/// Calls each caller completed, its sample stored.
+/// Calls each caller completed, its sample stored in its stripe of
+/// [`CHILD_SAMPLES`], caller `i`'s from `i * iters`.
 ///
 /// Relaxed is sufficient for the samples and this count: the harness reads
 /// them only for a caller whose `done` bit arrived, and the
@@ -929,7 +971,7 @@ extern "C" fn fan_in_caller_entry(arg: u64) -> !
         }
         let t1 = counters.read();
         if let (Some(sample), Some(completed)) = (
-            FAN_IN_SAMPLES.get(stripe.saturating_add(j)),
+            CHILD_SAMPLES.get(stripe.saturating_add(j)),
             FAN_IN_COMPLETED.get(index),
         )
         {
@@ -1050,7 +1092,7 @@ fn fan_in_rounds(
         let count = usize::try_from(completed.load(Ordering::Relaxed))
             .unwrap_or(0)
             .min(per_caller);
-        let stripe = FAN_IN_SAMPLES
+        let stripe = CHILD_SAMPLES
             .iter()
             .skip(index.saturating_mul(per_caller))
             .take(count);
@@ -1120,4 +1162,434 @@ fn start_fan_in_caller(
     unsafe { spawn::configure_and_start_pinned(&child, fan_in_caller_entry, stack_top, arg, cpu) }
         .map_err(|_| "child start failed")?;
     Ok(child)
+}
+
+// ── Address-space cases ───────────────────────────────────────────────────────
+
+/// Where an `aspace=` case's caller runs; its `aspace=` word.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Aspace
+{
+    /// ktest's own address space: `same`.
+    Same,
+    /// An address space of its own: `cross`.
+    Cross,
+}
+
+impl Aspace
+{
+    /// The `aspace=` word.
+    const fn word(self) -> &'static str
+    {
+        match self
+        {
+            Self::Same => "same",
+            Self::Cross => "cross",
+        }
+    }
+}
+
+/// VA of the call-loop stub: a scratch VA of ktest's own space for `same`
+/// (crate docs § Scratch VAs), and the same VA in the caller's space for
+/// `cross`.
+const STUB_VA: u64 = 0x3E_5800_0000;
+/// VA of the caller's program, a scratch VA of ktest's own space, mapped at the
+/// same VA in the caller's space for `cross`.
+const PROGRAM_VA: u64 = 0x3E_5810_0000;
+/// The stub caller's stack pointer; the stub touches no stack.
+const STUB_STACK: u64 = STUB_VA + 0x800;
+
+/// Words of one record of the caller's program (`code_stub::syscall_repeat`):
+/// the number, six arguments, and the repeat count.
+const RECORD_WORDS: usize = 8;
+/// The word of a record that holds its repeat count, and after the run the
+/// calls not completed.
+const REPEAT_WORD: usize = 7;
+
+/// The stub caller of an `aspace=` case and the pages it runs on. Drop
+/// deletes every cap and returns each frame to the pool once no mapping of it
+/// is left; a zero cap or frame holds none.
+#[derive(Default)]
+struct StubCaller
+{
+    /// ktest's own space, from which drop removes the scratch mappings.
+    host: u64,
+    /// Whether the stub is mapped in ktest's own space (`same`).
+    same: bool,
+    /// The caller's own space for `cross`; 0 for `same`.
+    aspace: u64,
+    cspace: u64,
+    thread: u64,
+    /// The stub's frame.
+    stub: u64,
+    /// The program's frame, and whether it is mapped in ktest's own space.
+    program: u64,
+    program_in_host: bool,
+}
+
+impl StubCaller
+{
+    /// Create the caller's thread, not configured, in `space`, with the stub
+    /// mapped executable at [`STUB_VA`] and the program's frame writable at
+    /// [`PROGRAM_VA`], in ktest's own space and, for `cross`, in the
+    /// caller's.
+    fn new(ctx: &crate::TestContext, space: Aspace) -> Result<Self, &'static str>
+    {
+        let mut c = Self {
+            host: ctx.aspace_cap,
+            same: space == Aspace::Same,
+            ..Self::default()
+        };
+        if space == Aspace::Cross
+        {
+            c.aspace =
+                cap_create_aspace(ctx.memory_base, 0, 8).map_err(|_| "cap_create_aspace failed")?;
+        }
+        let target = if c.same { ctx.aspace_cap } else { c.aspace };
+        c.cspace =
+            cap_create_cspace(ctx.memory_base, 0, 4).map_err(|_| "cap_create_cspace failed")?;
+        c.stub = spawn::install_stub(
+            ctx,
+            target,
+            STUB_VA,
+            &crate::arch::code_stub::syscall_repeat(),
+        )?;
+        let frame = crate::frame_pool::alloc().ok_or("frame_pool::alloc returned None")?;
+        // SAFETY: `PROGRAM_VA` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe { mem_map(frame, ctx.aspace_cap, PROGRAM_VA, 0, 1, MAP_WRITABLE) }.is_err()
+        {
+            // SAFETY: `frame` came from `alloc` and the failed map left it
+            // mapped nowhere.
+            unsafe { crate::frame_pool::free(frame) };
+            return Err("program mem_map failed");
+        }
+        c.program = frame;
+        c.program_in_host = true;
+        if !c.same
+        {
+            // SAFETY: `c.aspace` is a space this case created, not ktest's own,
+            // so the mapping changes nothing ktest runs on.
+            unsafe { mem_map(frame, c.aspace, PROGRAM_VA, 0, 1, MAP_WRITABLE) }
+                .map_err(|_| "caller's program mem_map failed")?;
+        }
+        c.thread = cap_create_thread(ctx.memory_base, target, c.cspace, 0, 0)
+            .map_err(|_| "cap_create_thread failed")?;
+        Ok(c)
+    }
+
+    /// The word `word` of record `record` of the program.
+    fn word(record: usize, word: usize) -> *mut u64
+    {
+        (PROGRAM_VA as *mut u64)
+            .wrapping_add(record.saturating_mul(RECORD_WORDS).saturating_add(word))
+    }
+
+    /// Write the program: `calls` empty calls on `ep`, then a signal of
+    /// `done`, the thread's exit, and the terminator; each handle is the
+    /// caller's.
+    fn write_program(ep: u64, done: u64, calls: u64)
+    {
+        let records: [[u64; RECORD_WORDS]; 4] = [
+            [
+                SYS_IPC_CALL,
+                ep,
+                0,
+                ipc_call_count_arg(0, 0),
+                0,
+                0,
+                0,
+                calls,
+            ],
+            [SYS_NOTIFICATION_SEND, done, 1, 0, 0, 0, 0, 1],
+            [SYS_THREAD_EXIT, 0, 0, 0, 0, 0, 0, 1],
+            [u64::MAX, 0, 0, 0, 0, 0, 0, 0],
+        ];
+        for (r, record) in records.iter().enumerate()
+        {
+            for (w, &value) in record.iter().enumerate()
+            {
+                // SAFETY: the four records are 256 bytes of the page mapped
+                // writable at `PROGRAM_VA` in ktest's own space (`new`), which
+                // no Rust reference reaches; the caller has not started.
+                unsafe { Self::word(r, w).write_volatile(value) };
+            }
+        }
+    }
+
+    /// The calls of the program's first record not completed.
+    fn calls_left() -> u64
+    {
+        // SAFETY: as for `write_program`; the caller has signalled `done`,
+        // after its last store to the record.
+        unsafe { Self::word(0, REPEAT_WORD).read_volatile() }
+    }
+
+    /// Start the caller pinned to CPU 0, the stub entered with the
+    /// program's VA.
+    fn start(&self) -> Result<(), &'static str>
+    {
+        // SAFETY: the thread runs the stub, which touches no stack and no
+        // memory but its program's page: for `cross` in a space this case
+        // created; for `same` at scratch VAs of ktest's own space, where no
+        // Rust object lives and no other thread runs.
+        unsafe { syscall::thread_configure(self.thread, STUB_VA, STUB_STACK, PROGRAM_VA) }
+            .map_err(|_| "thread_configure failed")?;
+        syscall::thread_set_affinity(self.thread, 0).map_err(|_| "thread_set_affinity failed")?;
+        syscall::thread_start(self.thread).map_err(|_| "thread_start failed")
+    }
+}
+
+impl Drop for StubCaller
+{
+    fn drop(&mut self)
+    {
+        for cap in [self.thread, self.cspace]
+        {
+            if cap != 0
+            {
+                cap_delete(cap).ok();
+            }
+        }
+        let space_gone = self.aspace == 0 || cap_delete(self.aspace).is_ok();
+        let unmap_host = |va: u64| {
+            // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+            // span holds no Rust object or IPC page of ktest.
+            unsafe { mem_unmap(self.host, va, 1) }.is_ok()
+        };
+        let stub_free = !self.same || unmap_host(STUB_VA);
+        let program_free = !self.program_in_host || unmap_host(PROGRAM_VA);
+        // A frame still mapped somewhere stays out of the pool, which takes
+        // only unmapped frames.
+        for (frame, free) in [(self.stub, stub_free), (self.program, program_free)]
+        {
+            if space_gone && free && frame != 0
+            {
+                // SAFETY: `frame` came from the pool and every mapping of it
+                // is gone.
+                unsafe { crate::frame_pool::free(frame) };
+            }
+        }
+    }
+}
+
+/// Run the `aspace=` case `space`: the harness serves [`Harness::iters`]
+/// empty calls, timed as the `words=0` case times them, from a stub caller
+/// pinned to CPU 0 in ktest's own address space or in one of its own.
+fn bench_aspace(ctx: &crate::TestContext, h: &mut Harness, space: Aspace)
+{
+    let word = space.word();
+    let Ok(ep) = cap_create_endpoint(ctx.memory_base)
+    else
+    {
+        h.skip(
+            NAME,
+            format_args!("words=0 aspace={word}: cap_create_endpoint failed"),
+        );
+        return;
+    };
+    let Ok(done) = cap_create_notification(ctx.memory_base)
+    else
+    {
+        cap_delete(ep).ok();
+        h.skip(
+            NAME,
+            format_args!("words=0 aspace={word}: cap_create_notification failed"),
+        );
+        return;
+    };
+    let outcome = StubCaller::new(ctx, space)
+        .and_then(|caller| stub_round_trips(ctx, h, (ep, done), &caller, space));
+    if let Err(e) = outcome
+    {
+        h.skip(NAME, format_args!("words=0 aspace={word}: {e}"));
+    }
+    cap_delete(done).ok();
+    cap_delete(ep).ok();
+}
+
+/// The measured part of [`bench_aspace`]: the program, the caller's start,
+/// the timed round trips and the report. A caller parked in a call after an
+/// early break is ended by the drop of `caller`.
+fn stub_round_trips(
+    ctx: &crate::TestContext,
+    h: &mut Harness,
+    (ep, done): (u64, u64),
+    caller: &StubCaller,
+    space: Aspace,
+) -> Result<(), &'static str>
+{
+    let n = u64::from(h.iters());
+    let child_ep = cap_copy(ep, caller.cspace, syscall_abi::RIGHTS_EP_SEND)
+        .map_err(|_| "cap_copy of endpoint failed")?;
+    let child_done = cap_copy(done, caller.cspace, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy of notification failed")?;
+    StubCaller::write_program(child_ep, child_done, n);
+    caller.start()?;
+    let start = super::Placement::read(ctx.thread_cap, caller.thread);
+    let (summary, completed) = serve_recv_reply(ctx, h, ep, EMPTY, n);
+    let end = super::Placement::read(ctx.thread_cap, caller.thread);
+    if completed != n
+    {
+        return Err("a round trip failed");
+    }
+    let mut signalled = 0u64;
+    crate::tally::await_all(done, &mut signalled, 1, "the caller never signalled")?;
+    if StubCaller::calls_left() != 0
+    {
+        return Err("a call of the caller failed");
+    }
+    let extras = super::placement_extras(start.as_ref(), end.as_ref());
+    let extras = extras.as_ref().map_or(&[][..], |e| &e[..]);
+    h.report(
+        NAME,
+        &[
+            ("words", Value::Num(0)),
+            ("aspace", Value::Word(space.word())),
+        ],
+        summary,
+        extras,
+    );
+    Ok(())
+}
+
+// ── Port-binding case ─────────────────────────────────────────────────────────
+
+/// The `iopb=none` caller's arguments, handed to `timed_caller_entry` by
+/// address.
+#[derive(Clone, Copy)]
+struct TimedArgs
+{
+    ep: u64,
+    done: u64,
+    /// Calls the caller makes and times.
+    iters: usize,
+}
+
+static TIMED_ARGS: spawn::ArgBlock<TimedArgs, 1> = spawn::ArgBlock::new(TimedArgs {
+    ep: 0,
+    done: 0,
+    iters: 0,
+});
+
+/// The `iopb=none` caller: times each of its empty calls on its own CPU into
+/// [`CHILD_SAMPLES`], counts them in [`super::CHILD_COMPLETED`], and
+/// signals `done`.
+extern "C" fn timed_caller_entry(arg: u64) -> !
+{
+    // SAFETY: `arg` is the entry the bench published for this caller.
+    let TimedArgs { ep, done, iters } = unsafe { spawn::child_args(arg) };
+    let counters = ::bench::Counters::open();
+    if let Some(ipc_buf) = register_place_page(IOPB_CALLER)
+    {
+        let msg = payload(0, 0);
+        for (j, sample) in CHILD_SAMPLES.iter().take(iters).enumerate()
+        {
+            let t0 = counters.read();
+            // SAFETY: ipc_buf was registered as this thread's IPC buffer above.
+            if unsafe { ipc::ipc_call(ep, &msg, ipc_buf) }.is_err()
+            {
+                break;
+            }
+            let t1 = counters.read();
+            sample.store(t1.since(&t0).cycles, Ordering::Relaxed);
+            super::CHILD_COMPLETED.store(j.saturating_add(1) as u64, Ordering::Relaxed);
+        }
+    }
+    notification_send(done, 1).ok();
+    thread_exit()
+}
+
+/// Run the `iopb=none` case (x86-64): a server child and a caller child,
+/// neither holding an I/O port binding, pinned to CPU 0, the caller timing
+/// [`Harness::iters`] empty calls while the harness waits for it.
+fn bench_iopb_none(ctx: &crate::TestContext, h: &mut Harness)
+{
+    // An architecture without I/O ports has no such case, and what an
+    // architecture decides is no SKIP (core/ktest/README.md).
+    if !crate::arch::HAS_IO_PORTS
+    {
+        return;
+    }
+    let Ok(ep) = cap_create_endpoint(ctx.memory_base)
+    else
+    {
+        h.skip(NAME, "words=0 iopb=none: cap_create_endpoint failed");
+        return;
+    };
+    let Ok(done) = cap_create_notification(ctx.memory_base)
+    else
+    {
+        cap_delete(ep).ok();
+        h.skip(NAME, "words=0 iopb=none: cap_create_notification failed");
+        return;
+    };
+    let mut caller = spawn::SpawnedChild::EMPTY;
+    let outcome =
+        start_server(ctx, ep, (IOPB_SERVER, Serve::RecvReply), Some(0)).and_then(|mut server| {
+            let outcome = timed_children(ctx, h, (ep, done), &mut caller);
+            // The server is parked in its receive; deleting its Thread cap
+            // ends it.
+            server.delete_thread().ok();
+            server.delete_cspace().ok();
+            outcome
+        });
+    caller.delete_thread().ok();
+    caller.delete_cspace().ok();
+    match outcome
+    {
+        Ok(measured) => h.report(
+            NAME,
+            &[("words", Value::Num(0)), ("iopb", Value::Word("none"))],
+            measured,
+            &[],
+        ),
+        Err(e) => h.skip(NAME, format_args!("words=0 iopb=none: {e}")),
+    }
+    cap_delete(done).ok();
+    cap_delete(ep).ok();
+}
+
+/// Start the `iopb=none` caller into `caller`, pinned to CPU 0, wait for
+/// it, and return its samples' measurement, with CPU 0's idle halts from its
+/// start to its signal.
+fn timed_children(
+    ctx: &crate::TestContext,
+    h: &mut Harness,
+    (ep, done): (u64, u64),
+    caller: &mut spawn::SpawnedChild,
+) -> Result<super::Measured, &'static str>
+{
+    let iters = h.iters() as usize;
+    super::CHILD_COMPLETED.store(0, Ordering::Relaxed);
+    *caller = spawn::new_child(ctx).map_err(|_| "new_child failed")?;
+    let child_ep =
+        cap_copy(ep, caller.cs, syscall_abi::RIGHTS_EP_SEND).map_err(|_| "cap_copy failed")?;
+    let child_done =
+        cap_copy(done, caller.cs, syscall_abi::RIGHTS_NTF_NOTIFY).map_err(|_| "cap_copy failed")?;
+    // SAFETY: entry 0 belongs to this caller alone, which has not been started
+    // yet.
+    let arg = unsafe {
+        TIMED_ARGS.publish(
+            0,
+            TimedArgs {
+                ep: child_ep,
+                done: child_done,
+                iters,
+            },
+        )
+    };
+    // SAFETY: `PLACE_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top_at(core::ptr::addr_of!(PLACE_STACKS), IOPB_CALLER) }
+        .map_err(|_| "no child stack")?;
+    let (mut samples, _) = h.recorder();
+    // SAFETY: the stack is entry `IOPB_CALLER` of `PLACE_STACKS`, this
+    // caller's own `ChildStack`, on which no other live thread runs
+    // (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(caller, timed_caller_entry, stack_top, arg, 0) }
+        .map_err(|_| "child start failed")?;
+    let mut signalled = 0u64;
+    crate::tally::await_all(done, &mut signalled, 1, "the caller never signalled")?;
+    samples.record_children();
+    Ok(samples.summary())
 }

@@ -47,7 +47,8 @@ pub struct FatState
     pub root_entry_count: u16,
     /// Sectors per FAT table.
     pub fat_size: u32,
-    /// Root cluster number (FAT32 only).
+    /// Root cluster number on FAT32; 0 on FAT16, whose root is the fixed
+    /// area before the data region ([`fat_parse::BpbGeometry::root_cluster`]).
     pub root_cluster: u32,
     /// First sector of the data region.
     pub data_start_sector: u32,
@@ -226,10 +227,16 @@ impl FatState
 /// always produced. Returns `false` after logging the reason on an invalid
 /// boot signature, a zero `bytes_per_sector` / `sectors_per_cluster`, a
 /// sector size other than the device's logical block size `block_size`, an
-/// inconsistent geometry, or a FAT12 cluster count.
-pub fn parse_bpb(sector_data: &[u8], block_size: u32, state: &mut FatState) -> bool
+/// inconsistent geometry (a volume larger than the partition's
+/// `partition_sectors` blocks among them), or a FAT12 cluster count.
+pub fn parse_bpb(
+    sector_data: &[u8],
+    block_size: u32,
+    partition_sectors: u64,
+    state: &mut FatState,
+) -> bool
 {
-    let geom = match fat_parse::parse_bpb_geometry(sector_data, block_size)
+    let geom = match fat_parse::parse_bpb_geometry(sector_data, block_size, partition_sectors)
     {
         Ok(geom) => geom,
         Err(fat_parse::BpbError::BadSignature) =>
@@ -255,9 +262,8 @@ pub fn parse_bpb(sector_data: &[u8], block_size: u32, state: &mut FatState) -> b
         {
             std::os::seraph::log!(
                 warn: "invalid BPB: inconsistent geometry (no FAT copy or reserved sector, \
-                 data-region \
-                 start overflows, cluster count exceeds the FAT, or FAT32 root outside the data \
-                 region)"
+                 data-region start overflows, cluster count exceeds the FAT, FAT32 root outside \
+                 the data region, or volume larger than its {partition_sectors}-sector partition)"
             );
             return false;
         }

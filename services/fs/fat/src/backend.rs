@@ -20,6 +20,8 @@
 //! at lookup time and indexed into [`NodeTable`], which recycles them
 //! under a generation once their on-disk entry is removed or renamed.
 
+use std::hash::RandomState;
+
 use fat_parse::node_slab::{self, NodeSlab};
 
 use crate::bpb::{FatState, FatType};
@@ -89,7 +91,10 @@ fn node_key(loc: DirEntryLocation) -> NodeKey
 /// [`node_slab::MAX_ENTRIES`].
 pub struct NodeTable
 {
-    slab: NodeSlab<NodeKey, FatNode>,
+    /// Keyed per process with std's `RandomState`, a secret from the
+    /// kernel's random source, since whoever wrote the disk chooses the keys
+    /// (`fat_parse::node_slab` module docs).
+    slab: NodeSlab<NodeKey, FatNode, RandomState>,
     /// The node [`Self::invalidate_for_loc`] last freed, whose opens the
     /// dispatch loop releases under the open-file table's lock after the
     /// request. One request frees at most one node (its `FS_REMOVE` or
@@ -100,10 +105,10 @@ pub struct NodeTable
 
 impl NodeTable
 {
-    pub const fn new() -> Self
+    pub fn new() -> Self
     {
         Self {
-            slab: NodeSlab::new(),
+            slab: NodeSlab::with_hasher(RandomState::new()),
             orphaned_node: None,
         }
     }
@@ -345,7 +350,9 @@ impl NamespaceBackend for FatfsBackend<'_>
             return Ok(None);
         };
         let mut name_buf = [0u8; MAX_LFN_UTF8];
-        let len = entry.write_display_name(&mut name_buf);
+        // A long name past the protocol's name limit is listed under its
+        // short name.
+        let len = entry.write_display_name(&mut name_buf, namespace_protocol::MAX_NAME_LEN);
         let kind = Self::entry_kind(&entry);
         // No FAT entry is hidden: `lookup` reports `visible_requires`
         // NONE for every entry, and readdir MUST agree with it.

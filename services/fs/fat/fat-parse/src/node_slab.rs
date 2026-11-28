@@ -16,9 +16,19 @@
 //! generation would wrap is retired instead of reused. The table grows on
 //! the heap with the live entries, every growth fallible, and finds a key
 //! through a hash index in O(1) expected time.
+//!
+//! The index hashes keys with the [`BuildHasher`] its owner supplies, which
+//! must be keyed with a secret the parties choosing the keys cannot learn.
+//! The fat driver's keys are on-disk slots, `(sector_lba, offset_in_sector)`,
+//! and two parties choose them: whoever wrote the disk lays out every
+//! existing directory entry, through the FAT chains of its directories, and
+//! a client holding `MUTATE_DIR` chooses which slots stay live. With an
+//! unkeyed hash the disk writer could place every entry's key in one probe
+//! run, so that each lookup and insert walks the whole run and building n
+//! nodes costs O(n^2); a keyed hash leaves it no way to aim the keys.
 
 use alloc::vec::Vec;
-use core::hash::{Hash, Hasher};
+use core::hash::{BuildHasher, Hash};
 
 /// Bits of a node identifier holding the slab index plus one (0 is the
 /// root's identifier, which the slab never issues).
@@ -41,9 +51,9 @@ struct Slot<K, T>
     generation: u16,
 }
 
-/// A recycling, generation-checked table of `T` keyed by `K`; see the module
-/// docs.
-pub struct NodeSlab<K, T>
+/// A recycling, generation-checked table of `T` keyed by `K`, its key index
+/// hashed with `S`; see the module docs.
+pub struct NodeSlab<K, T, S>
 {
     slots: Vec<Slot<K, T>>,
     /// Indices of freed slots whose generation has not wrapped. Its capacity
@@ -56,6 +66,8 @@ pub struct NodeSlab<K, T>
     buckets: Vec<u32>,
     /// Live entries.
     len: usize,
+    /// The key index's hash, keyed by the owner (module docs).
+    hasher: S,
 }
 
 /// An unused bucket of [`NodeSlab::buckets`].
@@ -64,24 +76,19 @@ const EMPTY: u32 = u32::MAX;
 /// Buckets of the first key index the slab allocates.
 const MIN_BUCKETS: usize = 16;
 
-impl<K: Hash + Eq + Copy, T> Default for NodeSlab<K, T>
+impl<K: Hash + Eq + Copy, T, S: BuildHasher> NodeSlab<K, T, S>
 {
-    fn default() -> Self
-    {
-        Self::new()
-    }
-}
-
-impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
-{
+    /// An empty slab whose key index hashes with `hasher`, which must be
+    /// keyed with a secret (module docs).
     #[must_use]
-    pub const fn new() -> Self
+    pub const fn with_hasher(hasher: S) -> Self
     {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
             buckets: Vec::new(),
             len: 0,
+            hasher,
         }
     }
 
@@ -223,15 +230,13 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     }
 
     /// The bucket `key` hashes to in a table of `mask + 1` buckets.
-    fn home(key: &K, mask: usize) -> usize
+    fn home(&self, key: &K, mask: usize) -> usize
     {
-        let mut h = Fnv1a(FNV_OFFSET);
-        key.hash(&mut h);
         #[expect(
             clippy::cast_possible_truncation,
             reason = "cast is range-safe: the result is masked to a bucket index"
         )]
-        let home = h.finish() as usize & mask;
+        let home = self.hasher.hash_one(key) as usize & mask;
         home
     }
 
@@ -240,7 +245,7 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     fn find(&self, key: &K) -> Option<(usize, u32)>
     {
         let mask = self.buckets.len().checked_sub(1)?;
-        let mut b = Self::home(key, mask);
+        let mut b = self.home(key, mask);
         loop
         {
             let idx = *self.buckets.get(b)?;
@@ -265,7 +270,7 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
         {
             return;
         };
-        let mut b = Self::home(key, mask);
+        let mut b = self.home(key, mask);
         while let Some(bucket) = self.buckets.get_mut(b)
         {
             if *bucket == EMPTY
@@ -295,7 +300,7 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
             {
                 return;
             }
-            let start = self.key_of(idx).map_or(b, |k| Self::home(k, mask));
+            let start = self.key_of(idx).map_or(b, |k| self.home(k, mask));
             // Distance from home to b, and from home to the hole, along the
             // probe direction.
             let from_home = b.wrapping_sub(start) & mask;
@@ -349,33 +354,6 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     }
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-/// FNV-1a over the key's bytes: the key index's hash. The fat driver's keys
-/// are on-disk slots, `(sector_lba, offset_in_sector)`. A client holding
-/// `MUTATE_DIR` chooses which slots stay live, by creating entries and
-/// removing the ones it does not want, but never sees the `sector_lba` an
-/// entry lands at, so it cannot aim its entries at one probe run, and the
-/// hash needs no keying against collision floods.
-struct Fnv1a(u64);
-
-impl Hasher for Fnv1a
-{
-    fn finish(&self) -> u64
-    {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8])
-    {
-        for &b in bytes
-        {
-            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(FNV_PRIME);
-        }
-    }
-}
-
 /// The bucket after `b` in the probe order of a table of `mask + 1` buckets,
 /// wrapping to the first.
 fn next_bucket(b: usize, mask: usize) -> usize
@@ -400,12 +378,121 @@ fn identifier(idx: u32, generation: u16) -> u64
 #[cfg(test)]
 mod tests
 {
+    use std::hash::{BuildHasherDefault, Hasher, RandomState};
+
     use super::*;
+
+    /// A slab keyed as the fat driver keys its own: with a per-process
+    /// secret (std's `RandomState`).
+    fn slab<K: Hash + Eq + Copy, T>() -> NodeSlab<K, T, RandomState>
+    {
+        NodeSlab::with_hasher(RandomState::new())
+    }
+
+    /// FNV-1a, an unkeyed hash: anyone who knows it can choose colliding keys.
+    struct Fnv1a(u64);
+
+    impl Default for Fnv1a
+    {
+        fn default() -> Self
+        {
+            Self(0xcbf2_9ce4_8422_2325)
+        }
+    }
+
+    impl Hasher for Fnv1a
+    {
+        fn finish(&self) -> u64
+        {
+            self.0
+        }
+
+        fn write(&mut self, bytes: &[u8])
+        {
+            for &b in bytes
+            {
+                self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+
+    /// The longest distance any live key sits from its home bucket: the
+    /// probes its lookup takes, less one.
+    fn longest_probe<K: Hash + Eq + Copy, T, S: BuildHasher>(slab: &NodeSlab<K, T, S>) -> usize
+    {
+        let mask = slab.buckets.len() - 1;
+        slab.buckets
+            .iter()
+            .enumerate()
+            .filter(|&(_, &idx)| idx != EMPTY)
+            .map(|(b, &idx)| {
+                let home = slab.home(slab.key_of(idx).expect("live"), mask);
+                b.wrapping_sub(home) & mask
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Keys a disk writer can lay out, `(sector_lba, offset_in_sector)` with
+    /// 32-byte entries, that all share one home bucket under FNV-1a in a
+    /// table of `buckets` buckets.
+    fn colliding_slots(count: usize, buckets: usize) -> Vec<(u64, usize)>
+    {
+        let mask = buckets - 1;
+        let home = |key: &(u64, usize)| {
+            let h = BuildHasherDefault::<Fnv1a>::default().hash_one(key);
+            usize::try_from(h).expect("64-bit host") & mask
+        };
+        let target = home(&(0, 0));
+        (0..u64::MAX)
+            .flat_map(|lba| (0..16).map(move |slot| (lba, slot * 32)))
+            .filter(|k| home(k) == target)
+            .take(count)
+            .collect()
+    }
+
+    #[test]
+    fn disk_chosen_keys_do_not_form_one_probe_run()
+    {
+        // 600 keys fill a 2048-bucket index (it grows at half full past
+        // 512 live entries) to under a third.
+        const KEYS: usize = 600;
+        let keys = colliding_slots(KEYS, 2048);
+
+        // Under the unkeyed hash every key lands in one run: the cost the
+        // disk writer could impose.
+        let mut unkeyed: NodeSlab<(u64, usize), usize, BuildHasherDefault<Fnv1a>> =
+            NodeSlab::with_hasher(BuildHasherDefault::default());
+        for (i, &k) in keys.iter().enumerate()
+        {
+            unkeyed.acquire(k, || i).expect("room");
+        }
+        assert_eq!(unkeyed.buckets.len(), 2048);
+        assert!(longest_probe(&unkeyed) >= KEYS - 1);
+
+        // Under the keyed hash the same keys scatter.
+        let mut keyed = slab();
+        for (i, &k) in keys.iter().enumerate()
+        {
+            keyed.acquire(k, || i).expect("room");
+        }
+        assert_eq!(keyed.buckets.len(), 2048);
+        assert!(
+            longest_probe(&keyed) < 64,
+            "longest probe {}",
+            longest_probe(&keyed)
+        );
+        for (i, k) in keys.iter().enumerate()
+        {
+            let id = keyed.id_of(k).expect("live");
+            assert_eq!(keyed.get(id), Some(&i));
+        }
+    }
 
     #[test]
     fn a_removed_then_reused_index_never_resolves_the_old_identifier()
     {
-        let mut slab: NodeSlab<u32, &str> = NodeSlab::new();
+        let mut slab: NodeSlab<u32, &str, RandomState> = slab();
         let a = slab.acquire(1, || "file A").expect("room");
         assert_eq!(slab.remove_key(&1), Some("file A"));
         // B takes A's index; A's identifier names B's slot at an older
@@ -420,7 +507,7 @@ mod tests
     #[test]
     fn every_lookup_of_a_key_returns_its_one_live_identifier()
     {
-        let mut slab: NodeSlab<u32, u8> = NodeSlab::new();
+        let mut slab: NodeSlab<u32, u8, RandomState> = slab();
         let first = slab.acquire(7, || 1).expect("room");
         let second = slab.acquire(7, || 2).expect("room");
         assert_eq!(first, second);
@@ -435,7 +522,7 @@ mod tests
     #[test]
     fn a_removed_key_is_looked_up_afresh_under_a_new_identifier()
     {
-        let mut slab: NodeSlab<u32, u8> = NodeSlab::new();
+        let mut slab: NodeSlab<u32, u8, RandomState> = slab();
         let id = slab.acquire(3, || 9).expect("room");
         assert_eq!(slab.remove_key(&3), Some(9));
         assert!(slab.is_empty());
@@ -449,7 +536,7 @@ mod tests
     #[test]
     fn an_index_is_retired_when_its_generation_would_wrap()
     {
-        let mut slab: NodeSlab<u32, u8> = NodeSlab::new();
+        let mut slab: NodeSlab<u32, u8, RandomState> = slab();
         let first = slab.acquire(0, || 0).expect("room");
         slab.slots[0].generation = u16::MAX;
         assert_eq!(slab.remove_key(&0), Some(0));
@@ -465,7 +552,7 @@ mod tests
     {
         // Enough keys to grow the index several times and to wrap probe runs;
         // removals in a scattered order exercise the backward shift.
-        let mut slab: NodeSlab<(u32, usize), u32> = NodeSlab::new();
+        let mut slab: NodeSlab<(u32, usize), u32, RandomState> = slab();
         let mut live = std::collections::BTreeMap::new();
         for i in 0..2000u32
         {
@@ -493,7 +580,7 @@ mod tests
     #[test]
     fn id_of_names_a_live_key_without_inserting_one()
     {
-        let mut slab: NodeSlab<u32, u8> = NodeSlab::new();
+        let mut slab: NodeSlab<u32, u8, RandomState> = slab();
         assert_eq!(slab.id_of(&4), None);
         let id = slab.acquire(4, || 1).expect("room");
         assert_eq!(slab.id_of(&4), Some(id));
@@ -508,7 +595,7 @@ mod tests
     {
         // Every insert runs through the growth points of the key index and of
         // the slots; one in four takes a freed index instead of a new one.
-        let mut slab: NodeSlab<u32, u32> = NodeSlab::new();
+        let mut slab: NodeSlab<u32, u32, RandomState> = slab();
         for key in 0..200u32
         {
             if key % 4 == 3
@@ -538,7 +625,7 @@ mod tests
     #[test]
     fn the_first_index_is_never_issued_as_the_root_identifier()
     {
-        let mut slab: NodeSlab<u32, u8> = NodeSlab::new();
+        let mut slab: NodeSlab<u32, u8, RandomState> = slab();
         let id = slab.acquire(0, || 0).expect("room");
         assert_ne!(id, 0);
         assert_eq!(slab.get(0), None);

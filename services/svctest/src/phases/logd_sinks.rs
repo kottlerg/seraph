@@ -20,6 +20,47 @@
 //! waits on a sink, where a logd that wrote a line before it answered would
 //! hold the call until the write ended or the stall bound passed.
 //!
+//! The phase runs the framebuffer cases first, then the serial case and the
+//! debug line. Before each of the two groups it waits on logd's flush
+//! barrier, as the flush phase's running case does, until the serial sink,
+//! holding senders, has written every line of svctest's: earlier phases'
+//! floods can leave that sink behind. The serial case then stops the sink's
+//! driver with none of svctest's lines unwritten, and the phases before this
+//! one, whose whole-lines windows the boot checks, have their lines on
+//! serial before it. The framebuffer cases run before the serial case
+//! because it leaves the serial sink stalled, holding no sender, until the
+//! write in flight at its driver's stop returns
+//! (`services/logd/docs/sinks.md` § Pace): their lines, which serial shows
+//! too, would meanwhile evict svctest's lines the sink has not written.
+//!
+//! - **Framebuffer stopped**, on a boot with a framebuffer driver (CI's
+//!   release svctest cells and the framebuffer cell; otherwise the case logs
+//!   that it skipped). The framebuffer sink is `skip` and holds nobody, and
+//!   shows critical and more severe by default, so the framebuffer cases send
+//!   their lines at critical. While its driver is stopped the phase sends
+//!   more lines than svctest's share of the history holds at its largest
+//!   ([`FLOOD_LINES`]), so the history drops svctest's oldest before the sink
+//!   writes them. A line logd refuses for the running serial sink's window is
+//!   sent again after its hint, as the log client does. Once the driver is
+//!   started again, logd must retain a notice counting the framebuffer's drops
+//!   (`framebuffer: <n> lines dropped`, `services/logd/docs/sinks.md`
+//!   § Drops) that its history did not hold before the stop: a new one, or
+//!   one logd updated in place with a new count while the sink had not
+//!   written it.
+//! - **Framebuffer killed.** The phase then makes the framebuffer driver's main
+//!   thread fault at an unmapped address, waits until procmgr no longer lists
+//!   the driver and devmgr answers its ordinal `WITHDRAWN`, and sends as many
+//!   lines again, under the same bound.
+//! - **Framebuffer restarted.** devmgr restarts the killed driver
+//!   (services/devmgr/docs/responsibilities.md § Driver Restart): the phase
+//!   requires the class's next ordinal to answer with the new instance, and
+//!   logd's framebuffer writer to take it up. devmgr can restart the driver
+//!   within milliseconds, before the lines sent after the kill, so the
+//!   writer may have dropped none of those. The phase therefore stops the new
+//!   instance and sends as many lines again, so the history drops svctest's
+//!   oldest before the sink writes them, and starts it: logd must retain or
+//!   update its notice of the framebuffer's drops, as for the stopped
+//!   driver, which only a writer serving the new instance does.
 //! - **Serial stopped.** The phase stops every thread of the serial driver,
 //!   the `hold` sink's, and sends more lines than logd has receive workers,
 //!   each taken. It then sends lines until logd refuses one `WINDOW_FULL`,
@@ -35,31 +76,6 @@
 //!   entry whatever the sinks show. The serial sink must not write it, which
 //!   the svctest cell's boot checks host-side (`--fail-also` on its text,
 //!   [`HIDDEN_LINE`]; `services/logd/docs/sinks.md` § Settings).
-//! - **Framebuffer stopped**, on a boot with a framebuffer driver (the
-//!   framebuffer cell; otherwise the case logs that it skipped). The
-//!   framebuffer sink is `skip` and holds nobody, and shows critical and more
-//!   severe by default, so the framebuffer cases send their lines at
-//!   critical. While its driver is stopped the phase sends more lines than
-//!   svctest's share of the history holds at its largest, so the history drops svctest's oldest before the sink
-//!   writes them. A line logd refuses for the running serial sink's window
-//!   is sent again after its hint, as the log client does. Once the driver
-//!   is started again, logd must retain its notice counting the
-//!   framebuffer's drops (`framebuffer: <n> lines dropped`,
-//!   `services/logd/docs/sinks.md` § Drops) after the last line.
-//! - **Framebuffer killed.** The phase then makes the framebuffer driver's main
-//!   thread fault at an unmapped address, waits until procmgr no longer lists
-//!   the driver and devmgr answers its ordinal `WITHDRAWN`, and sends as many
-//!   lines again, under the same bound.
-//! - **Framebuffer restarted.** devmgr restarts the killed driver
-//!   (services/devmgr/docs/responsibilities.md § Driver Restart): the phase
-//!   requires the class's next ordinal to answer with the new instance, and
-//!   logd's framebuffer writer to take it up. devmgr can restart the driver
-//!   within milliseconds, before the lines sent after the kill, so the
-//!   writer may have dropped none of those. The phase therefore stops the new
-//!   instance and sends as many lines again, so the history drops svctest's
-//!   oldest before the sink writes them, and starts it: logd must retain its
-//!   notice of the framebuffer's drops after the last line, which only a
-//!   writer serving the new instance retains.
 //!
 //! The serial driver is only stopped, since a kill would end the console the
 //! boot is judged on.
@@ -138,11 +154,12 @@ const SERIAL_STOP_LINES: usize = 9;
 /// than the hold window, so none is refused.
 const RUNNING_BURST: usize = 8;
 
-/// Lines of each framebuffer case: more than a slot's share of the history
-/// at its largest, so svctest's oldest are dropped before the stopped
-/// framebuffer sink writes them whatever logd's bounds, and more than the
-/// sink's backlog on a new driver.
-const FLOOD_LINES: usize = PER_SLOT_HISTORY_MIN * (HISTORY_BYTES_MAX / HISTORY_BYTES_MIN) + 1;
+/// Lines of each framebuffer case: two more than a slot's share of the
+/// history at its largest, so the history evicts svctest's oldest before the
+/// stopped framebuffer sink writes them whatever logd's bounds, and counts at
+/// least one dropped, since the entry the sink's writer has taken is not
+/// counted; and more than the sink's backlog on a new driver.
+const FLOOD_LINES: usize = PER_SLOT_HISTORY_MIN * (HISTORY_BYTES_MAX / HISTORY_BYTES_MIN) + 2;
 
 /// The log client's bound on a log call.
 const LOG_CALL_BOUND: Duration = Duration::from_millis(log::LOG_CALL_TIMEOUT_MS as u64);
@@ -180,6 +197,15 @@ pub fn logd_sinks_phase(caps: &Caps)
     let authority = caps.debug_authority;
     assert_ne!(authority, 0, "logd_sinks: no debug authority");
     assert_ne!(caps.logd_query, 0, "logd_sinks: no logd.query seed");
+    assert_ne!(caps.logd_flush, 0, "logd_sinks: no logd.flush seed");
+
+    // Each case starts with logd's serial sink holding senders and holding
+    // none of svctest's lines; see the module documentation.
+    flush_while_running(caps.logd_flush, "logd_sinks", DEATH_TIMEOUT)
+        .unwrap_or_else(|e| panic!("{e}"));
+    framebuffer_cases(caps);
+    flush_while_running(caps.logd_flush, "logd_sinks", DEATH_TIMEOUT)
+        .unwrap_or_else(|e| panic!("{e}"));
 
     let serial = super::crash::badge_named(authority, SERIAL_NAME)
         .expect("logd_sinks: LIST_PROCESSES lists no serial driver");
@@ -200,7 +226,13 @@ pub fn logd_sinks_phase(caps: &Caps)
     send_taken(&hidden, LEVEL_DEBUG, "below serial's level", 0).unwrap_or_else(|e| panic!("{e}"));
     retained_seq(caps.logd_query, &[hidden], "below serial's level");
     std::os::seraph::log!("logd_sinks: the debug line is in logd's history");
+}
 
+/// The framebuffer stopped, killed and restarted cases, on a boot with a
+/// framebuffer driver; the skip line otherwise (see the module documentation).
+fn framebuffer_cases(caps: &Caps)
+{
+    let authority = caps.debug_authority;
     let Some(fb) = super::crash::badge_named(authority, FRAMEBUFFER_NAME)
     else
     {
@@ -208,13 +240,14 @@ pub fn logd_sinks_phase(caps: &Caps)
         return;
     };
     let threads = attach(authority, fb, "framebuffer");
+    let notices = fb_notices(caps.logd_query);
     stop(&threads, "framebuffer");
     let sent = send_lines("framebuffer stopped", FLOOD_LINES, LEVEL_CRITICAL);
     start(&threads, "framebuffer");
     detach(authority, fb, threads, "framebuffer");
     let lines = sent.unwrap_or_else(|e| panic!("{e}"));
-    let last = retained_seq(caps.logd_query, &lines, "framebuffer stopped");
-    let dropped = await_fb_notice(caps.logd_query, last, "the stopped driver's start");
+    retained_seq(caps.logd_query, &lines, "framebuffer stopped");
+    let dropped = await_fb_notice(caps.logd_query, &notices, "the stopped driver's start");
     std::os::seraph::log!(
         "logd_sinks: {FLOOD_LINES} lines taken while the framebuffer driver was stopped, \
          {dropped} counted dropped"
@@ -238,13 +271,14 @@ pub fn logd_sinks_phase(caps: &Caps)
     let restarted = super::crash::badge_named(authority, FRAMEBUFFER_NAME)
         .unwrap_or_else(|| panic!("logd_sinks: procmgr lists no restarted framebuffer driver"));
     let threads = attach(authority, restarted, "restarted framebuffer");
+    let notices = fb_notices(caps.logd_query);
     stop(&threads, "restarted framebuffer");
     let sent = send_lines("restarted framebuffer stopped", FLOOD_LINES, LEVEL_CRITICAL);
     start(&threads, "restarted framebuffer");
     detach(authority, restarted, threads, "restarted framebuffer");
     let lines = sent.unwrap_or_else(|e| panic!("{e}"));
-    let last = retained_seq(caps.logd_query, &lines, "restarted framebuffer stopped");
-    let dropped = await_fb_notice(caps.logd_query, last, "the restarted driver's start");
+    retained_seq(caps.logd_query, &lines, "restarted framebuffer stopped");
+    let dropped = await_fb_notice(caps.logd_query, &notices, "the restarted driver's start");
     std::os::seraph::log!(
         "logd_sinks: logd's framebuffer writer took up the restarted driver, {dropped} lines \
          counted dropped"
@@ -415,22 +449,32 @@ fn retained_seq(query: u64, lines: &[Vec<u8>], case: &str) -> u64
     })
 }
 
-/// Wait until logd's history holds its notice counting lines its
-/// framebuffer sink dropped, retained after the entry `after`, within
-/// [`DEATH_TIMEOUT`]; `what` names the event that lets the sink's writer go
-/// on. The count it names.
-fn await_fb_notice(query: u64, after: u64, what: &str) -> u64
+/// logd's notices counting lines its framebuffer sink dropped, in its
+/// history now, as (`seq`, count).
+fn fb_notices(query: u64) -> Vec<(u64, u64)>
+{
+    super::procmgr::logd_history_with(query, Some(LOG_BADGE_LOGD), |entry| {
+        fb_drop_count(entry.bytes).map(|count| (entry.seq, count))
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Wait until logd's history holds a notice counting lines its framebuffer
+/// sink dropped that is not among `before` ([`fb_notices`] before the case),
+/// within [`DEATH_TIMEOUT`]: a new notice, or one logd updated in place with
+/// a new count, since logd adds the sink's drops to its notice while the
+/// sink has not written it (`services/logd/docs/sinks.md` § Drops). `what`
+/// names the event that lets the sink's writer go on. The count it names.
+fn await_fb_notice(query: u64, before: &[(u64, u64)], what: &str) -> u64
 {
     let start_at = Instant::now();
     loop
     {
         let mut count = None;
         super::procmgr::logd_history_each(query, Some(LOG_BADGE_LOGD), |entry| {
-            if entry.seq <= after
-            {
-                return false;
-            }
-            count = count.or_else(|| fb_drop_count(entry.bytes));
+            count = fb_drop_count(entry.bytes).filter(|&n| !before.contains(&(entry.seq, n)));
             count.is_none()
         });
         if let Some(count) = count
@@ -489,7 +533,8 @@ pub fn logd_flush_phase(caps: &Caps)
         "logd_flush: a stale version not refused"
     );
 
-    let took = flush_while_running(flush).unwrap_or_else(|e| panic!("{e}"));
+    let took =
+        flush_while_running(flush, "logd_flush", LOG_CALL_BOUND).unwrap_or_else(|e| panic!("{e}"));
     std::os::seraph::log!(
         "logd_flush: flushed in {} ms with the serial driver running",
         took.as_millis()
@@ -516,12 +561,13 @@ pub fn logd_flush_phase(caps: &Caps)
 
 /// With the serial driver running: log [`RUNNING_BURST`] lines and start a
 /// flush, until one is pending, then ask again with its token until it is
-/// flushed, within the log client's bound. A flush answered `FLUSHED` at once
-/// is one the sink did not hold, since it is still stalled from the first
-/// phase or wrote the burst before the call (`services/logd/docs/ipc-interface.md`
-/// § Flush barrier); the burst is repeated after 10 ms for twice the stall
-/// bound. The time from the pending answer to flushed, or the first failure.
-fn flush_while_running(flush: u64) -> Result<Duration, String>
+/// flushed, within `within`. A flush answered `FLUSHED` at once is one the
+/// sink did not hold, since it is still stalled from the serial case or wrote
+/// the burst before the call (`services/logd/docs/ipc-interface.md` § Flush
+/// barrier); the burst is repeated after 10 ms for twice the stall bound.
+/// `phase` names the phase in the burst's lines and the failure. The time
+/// from the pending answer to flushed, or the first failure.
+fn flush_while_running(flush: u64, phase: &str, within: Duration) -> Result<Duration, String>
 {
     let start_at = Instant::now();
     loop
@@ -529,18 +575,18 @@ fn flush_while_running(flush: u64) -> Result<Duration, String>
         for i in 0..RUNNING_BURST
         {
             std::os::seraph::log!(
-                "logd_flush: line {i} before a flush with the serial driver running"
+                "{phase}: line {i} before a flush with the serial driver running"
             );
         }
         let answer = flush_answer(flush, None)?;
         if matches!(answer, FlushAnswer::Pending { .. })
         {
-            return await_flushed(flush, answer, LOG_CALL_BOUND);
+            return await_flushed(flush, answer, within);
         }
         if start_at.elapsed() > STALL_BOUND.saturating_mul(2)
         {
             return Err(format!(
-                "logd_flush: no flush pending with the serial driver running within {} ms",
+                "{phase}: no flush pending with the serial driver running within {} ms",
                 STALL_BOUND.saturating_mul(2).as_millis()
             ));
         }

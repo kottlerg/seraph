@@ -38,7 +38,7 @@ pub struct Caps
     /// `DENY_BADGE`-badged SEND on vfsd's service endpoint (`vfsd.deny`),
     /// in slot 5.
     pub vfsd_deny: u64,
-    /// `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint
+    /// `LOG_QUERY_AUTHORITY`-badged `SEND|GRANT` on the master log endpoint
     /// (`logd.query`), in slot 6.
     pub logd_query: u64,
     /// The `serial` class SEND on devmgr's registry endpoint
@@ -90,17 +90,27 @@ pub struct Caps
     /// `LOG_FLUSH_AUTHORITY`-badged SEND on the master log endpoint
     /// (`logd.flush`), in slot 22.
     pub logd_flush: u64,
+    /// `LOG_FOLLOW_AUTHORITY`-badged `SEND|GRANT` on the master log endpoint
+    /// (`logd.follow`), in slot 23.
+    pub logd_follow: u64,
+    /// `LOG_CONTROL_AUTHORITY`-badged SEND on the master log endpoint
+    /// (`logd.control`), in slot 24.
+    pub logd_control: u64,
     /// The `block` class SEND on devmgr's registry endpoint
-    /// (`devmgr.class.block`), in slot 23, whose `QUERY_DEVICE` answers with a
+    /// (`devmgr.class.block`), in slot 25, whose `QUERY_DEVICE` answers with a
     /// `MOUNT_AUTHORITY`-badged whole-disk cap.
     pub block_class: u64,
     /// `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which the recipe's
-    /// `debug_authority = yes` delivers in slot 24, after the seeds.
+    /// `debug_authority = yes` delivers in slot 26, after the seeds.
     pub debug_authority: u64,
     /// `STOP_AUTHORITY`-badged SEND on svcmgr's service endpoint, which the
-    /// recipe's `stop_authority = yes` delivers in slot 25, after the
+    /// recipe's `stop_authority = yes` delivers in slot 27, after the
     /// debug-authority slot.
     pub stop_authority: u64,
+    /// A `PmuControl` copy carrying `Configure`, which the recipe's
+    /// `pmu_authority = yes` delivers in slot 28, after the stop-authority
+    /// slot.
+    pub pmu_authority: u64,
 }
 
 /// Drain the bootstrap rounds from `creator_endpoint` and pull caps out,
@@ -128,8 +138,8 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    // Twenty-four seeds, the debug-authority slot and the stop-authority slot take seven rounds; an
-    // absent slot decodes as `0`, and a round that does not decode leaves every slot `0`.
+    // Twenty-six seeds and the debug-, stop- and PMU-authority slots take eight rounds; an absent
+    // slot decodes as `0`, and a round that does not decode leaves every slot `0`.
     let Ok(
         [
             root_fs,
@@ -155,11 +165,14 @@ fn request_round() -> Caps
             svcmgr_grant,
             crashd_core,
             logd_flush,
+            logd_follow,
+            logd_control,
             block_class,
             debug_authority,
             stop_authority,
+            pmu_authority,
         ],
-    ) = (unsafe { ipc::bootstrap::request_slots::<26>(info.creator_endpoint, ipc_buf) })
+    ) = (unsafe { ipc::bootstrap::request_slots::<29>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
@@ -187,9 +200,12 @@ fn request_round() -> Caps
     caps.svcmgr_grant = svcmgr_grant;
     caps.crashd_core = crashd_core;
     caps.logd_flush = logd_flush;
+    caps.logd_follow = logd_follow;
+    caps.logd_control = logd_control;
     caps.block_class = block_class;
     caps.debug_authority = debug_authority;
     caps.stop_authority = stop_authority;
+    caps.pmu_authority = pmu_authority;
 
     caps
 }

@@ -25,6 +25,14 @@
 //! of the child's name, so the instance it reads holds a fresh table, not the
 //! one the earlier run of the check left a retired slot in.
 //!
+//! The new instance reads the wall clock again: within the restart bound, its
+//! history must hold its notice
+//! `wall clock <RFC 3339 UTC to the second> at uptime <sec.usfrac>`
+//! (`services/logd/docs/sinks.md` § Wall time), whose wall time is the one
+//! `SystemTime::now()` gives for that uptime, within [`WALL_CLOCK_SLACK_US`].
+//! The check reads the notice right after the restart, while logd's slot in
+//! the fresh table holds few entries, so no eviction can have taken it.
+//!
 //! The phase writes no log line between the kill and the new instance's
 //! service: a line written while no logd receives waits out its bound. The
 //! new instance's table holds no sender's name, and svctest registered its
@@ -80,8 +88,9 @@
 //! frames serve before the fixture's next tick takes them back is destroyed and
 //! made again (`super::critical_creates`).
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ipc::log_badges::LOG_BADGE_LOGD;
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 
 use crate::arch::current::{IP_OFFSET, REGS_SIZE};
@@ -203,8 +212,79 @@ pub fn logd_restart_phase(caps: &Caps)
     let took = start.elapsed().as_millis();
     std::os::seraph::log!("logd_restart: logd restarted in {took} ms");
     check_first_line_named(caps.logd_query);
+    check_wall_clock_notice(caps.logd_query);
+    std::os::seraph::log!("logd_restart: the new instance's wall clock notice agrees with timed");
     check_name_probe(caps.logd_query);
     super::procmgr::logd_death_forward_phase(caps);
+}
+
+/// The text every wall clock notice of logd's starts with.
+const WALL_CLOCK_PREFIX: &[u8] = b"wall clock ";
+
+/// How far the wall time of logd's notice may be from the one svctest
+/// reckons for its uptime: the notice is to the second, and svctest reads
+/// timed's wall time and the uptime in two calls. An offset read wrong, or a
+/// notice whose uptime is not its wall time's, is off by the uptime, a
+/// minute and more by this phase.
+const WALL_CLOCK_SLACK_US: u64 = 2_000_000;
+
+/// Wait, within [`RESTART_TIMEOUT`], until the new instance's history,
+/// read through `query`, holds its wall clock notice, and check the notice
+/// against the wall time `SystemTime::now()` gives for the uptime it names
+/// (see the module documentation).
+fn check_wall_clock_notice(query: u64)
+{
+    let start = Instant::now();
+    let notice = loop
+    {
+        let mut notice = None;
+        super::procmgr::logd_history_each(query, Some(LOG_BADGE_LOGD), |entry| {
+            if entry.bytes.starts_with(WALL_CLOCK_PREFIX)
+            {
+                notice = Some(String::from_utf8_lossy(entry.bytes).trim_end().to_owned());
+                return false;
+            }
+            true
+        });
+        if let Some(notice) = notice
+        {
+            break notice;
+        }
+        assert!(
+            start.elapsed() < RESTART_TIMEOUT,
+            "logd_restart: the new instance logged no wall clock notice within {} s",
+            RESTART_TIMEOUT.as_secs()
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    let uptime = notice
+        .rsplit_once(" at uptime ")
+        .and_then(|(_, up)| up.split_once('.'))
+        .and_then(|(secs, frac)| {
+            let secs = secs.parse::<u64>().ok()?;
+            let frac = frac.parse::<u64>().ok().filter(|_| frac.len() == 6)?;
+            secs.checked_mul(1_000_000)?.checked_add(frac)
+        })
+        .unwrap_or_else(|| panic!("logd_restart: logd's notice {notice:?} names no uptime"));
+    let up_now = super::oom::elapsed_us();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_micros()).ok())
+        .filter(|&us| us > up_now)
+        .expect("logd_restart: SystemTime::now() gives no wall time");
+    // The wall time svctest reckons for the notice's uptime.
+    let reckoned = now.saturating_sub(up_now).saturating_add(uptime);
+    let lowest = reckoned.saturating_sub(WALL_CLOCK_SLACK_US);
+    let agrees = (0..=2 * WALL_CLOCK_SLACK_US / 1_000_000).any(|s| {
+        let wall = lowest.saturating_add(s.saturating_mul(1_000_000));
+        logd_codec::wall::wall_clock_text(wall, uptime).as_str() == notice
+    });
+    assert!(
+        agrees,
+        "logd_restart: logd's notice {notice:?} is not {:?} within {WALL_CLOCK_SLACK_US} us",
+        logd_codec::wall::wall_clock_text(reckoned, uptime).as_str()
+    );
 }
 
 /// The start of svctest's first line after the restart.

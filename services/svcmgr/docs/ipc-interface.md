@@ -43,8 +43,8 @@ and svcmgr decodes with.
 
 **First rounds — `CAPS` (`data[0] = 1`, not terminal):** a positional
 slot list, split into windows of `MSG_CAP_SLOTS_MAX` slots, one `CAPS`
-round per window (`ipc::bootstrap::slot_rounds`); the nine slots below
-take three rounds (slots 0-3, 4-7, then 8), and a longer list takes more with
+round per window (`ipc::bootstrap::slot_rounds`); the ten slots below
+take three rounds (slots 0-3, 4-7, then 8-9), and a longer list takes more with
 no change to the encoding.
 
 | Field | Value |
@@ -58,9 +58,10 @@ no change to the encoding.
 | slot 6 | `vfsd_labels::SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.swap`; absent if its derive fails) |
 | slot 7 | `EntropyControl` source carrying `Contribute`, derived from the root capability the kernel mints into init; svcmgr never publishes it, and derives the [`entropy_authority`](service-definitions.md#entropy_authority) service's copy from it on every launch (absent if init holds none or its derive fails) |
 | slot 8 | `memmgr_labels::SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint (published seed-only, its seeds keeping `GRANT`, as `memmgr.swap`; absent if its derive fails) |
+| slot 9 | `PmuControl` source carrying `Configure`, derived from the root capability the kernel mints into init; svcmgr never publishes it, derives the [`pmu_authority`](service-definitions.md#pmu_authority) service's copy from it on every launch, and deletes it once the recipes are read when no recipe holds the key (absent if init holds none or its derive fails) |
 | caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `17`) handshake, in every `CAPS` round |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `18`) handshake, in every `CAPS` round |
 | data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
@@ -97,7 +98,7 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 | Field | Value |
 |---|---|
 | caps[..] | the present slots, in slot order |
-| slot 0 | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch, and the handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`) on the first launch and on a restart until procmgr reports init reaped (see [`log_sink`](service-definitions.md#log_sink)), and the `LOG_QUERY_AUTHORITY` and `LOG_FLUSH_AUTHORITY` SENDs it publishes as `logd.query` and `logd.flush`; holding it keeps the log endpoint alive across a logd crash (absent if its derive fails) |
+| slot 0 | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch, and the handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`) on the first launch and on a restart until procmgr reports init reaped (see [`log_sink`](service-definitions.md#log_sink)), and the `LOG_QUERY_AUTHORITY`, `LOG_FOLLOW_AUTHORITY`, `LOG_CONTROL_AUTHORITY` and `LOG_FLUSH_AUTHORITY` caps it publishes as `logd.query`, `logd.follow`, `logd.control` and `logd.flush`; holding it keeps the log endpoint alive across a logd crash (absent if its derive fails) |
 | slot 1 | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap from it per launch (absent if its derive fails), and the `DEBUG_AUTHORITY` `SEND\|GRANT` cap of a `debug_authority = yes` service |
 | slot 2 | `kernel_log_source`: `KernelLog` source carrying `Read`, derived by init from the root `KernelLog` capability the kernel mints into it; svcmgr mints real-logd's slot-5 `KernelLog` cap (`RIGHTS_KLOG_READ`) from it per launch (absent if init holds none or its derive fails) |
 | data[0] | `3` (`LOGD_SOURCES`) |
@@ -127,7 +128,7 @@ definition is paired at reconciliation, on
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
 `svcmgr`, `svcmgr.grant`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`, `devmgr.acpi`,
 `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`,
-`logd.flush`) into its own registry,
+`logd.follow`, `logd.control`, `logd.flush`) into its own registry,
 configures devmgr's device classes and publishes each as `devmgr.class.<stem>` (the class file's
 name without `.class`), and installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`,
 with the cap of `/config/devmgr/platform/` as its optional second cap when the walk to it
@@ -172,8 +173,8 @@ to teardown), then runs
      memmgr's and procmgr's observers are already on the core-death
      queue), record the
      recipe's fixed fields on the `ServiceEntry` and its argv/env/cwd/seed,
-     log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`, `reserve` and
-     `private_image` flags, `stop_source` class, and scheduling fields in the parallel
+     log-sink, debug-authority, stop-authority, entropy-authority, PMU-authority, `oom_stop`,
+     `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel
      `RestartRecipe` table.
    * **defined only** — launch via [`definitions::launch`](../src/definitions/launch.rs).
    * **parked without definition** — log `registered without
@@ -231,9 +232,10 @@ freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint. `QUERY_ENDPOINT`
 
 Only public names resolve. A name whose cap carries authority is published seed-only and answers
 `UNKNOWN_NAME`, as an unknown name does: `rootfs.root`, the five `devmgr.*` names (`devmgr.bind` and
-`devmgr.acpi` included), `vfsd.mount`, `vfsd.swap`, `memmgr.swap`, `logd.query`, `logd.flush`, and
-each provider name whose badge carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` and `:grant`
-entries, today `pwrmgr.shutdown`, `acpid.power`, `swapd.restore`, `sessiond.operator` and
+`devmgr.acpi` included), `vfsd.mount`, `vfsd.swap`, `memmgr.swap`, `logd.query`, `logd.follow`,
+`logd.control`, `logd.flush`, and each provider name whose badge carries a verb bit
+(`ipc::VERB_BIT_MASK`; the `:auth` and `:grant` entries, today `pwrmgr.shutdown`, `acpid.power`,
+`swapd.restore`, `sessiond.operator` and
 `crashd.core`).
 `vfsd.deny` and `svcmgr.grant` carry no authority but are seed-only too: they are svctest's test
 twins, reached only through svctest's recipe. `svcmgr.grant` is a `SEND|GRANT` on svcmgr's own
@@ -241,11 +243,11 @@ service endpoint under the published `svcmgr` badge, through which svctest sends
 carry caps, which svcmgr deletes. A seed-only name reaches a process only through a recipe's
 `seed = ...` line, which svcmgr resolves itself, so its authority stays with the recipes that seed
 it ([service-definitions.md § `seed`](service-definitions.md#seed)). A seed is `SEND` except
-`devmgr.bind`, `memmgr.swap`, `svcmgr.grant` and each `:grant` entry (`sessiond.operator`,
-`crashd.core`), which are `SEND|GRANT`: `BIND_DRIVERS` moves a
-directory cap and the kernel requires `GRANT` for that, the swap labels move caps to memmgr, and a
-`:grant` name's seeds move caps to its provider. The public names are `svcmgr`, `pwrmgr.deny`,
-`acpid.deny`, `timed`, and any name published through
+`devmgr.bind`, `memmgr.swap`, `logd.query`, `logd.follow`, `svcmgr.grant` and each `:grant` entry
+(`sessiond.operator`, `crashd.core`), which are `SEND|GRANT`: `BIND_DRIVERS` moves a directory cap
+and the kernel requires `GRANT` for that, the swap labels move caps to memmgr, `LOG_SUBSCRIBE` moves
+a signal to logd, and a `:grant` name's seeds move caps to its provider. The public
+names are `svcmgr`, `pwrmgr.deny`, `acpid.deny`, `timed`, and any name published through
 [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
 
 **Request:**
@@ -404,10 +406,10 @@ no cap, and svcmgr deletes any it carries.
 
 `svcmgr_labels::PUBLISH_AUTHORITY` is a verb-bit (the top bit of the
 caller's cap badge) gating `PUBLISH_ENDPOINT` for *external* publishers.
-svcmgr publishes the well-known names it owns (`rootfs.root`, `svcmgr`,
-`svcmgr.grant`, the four `devmgr.*` names, the three `vfsd.*` names, `logd.query`, `logd.flush`, and
-each provider's `provides` names) directly into
-its own registry, so those need no badge. The gate exists for a future
+svcmgr publishes the well-known names it owns (`rootfs.root`, `svcmgr`, `svcmgr.grant`, the four
+`devmgr.*` names, the three `vfsd.*` names, `logd.query`, `logd.follow`, `logd.control`,
+`logd.flush`, and each provider's `provides` names) directly into its own registry, so those need no
+badge. The gate exists for a future
 external publisher — devmgr holds a `PUBLISH_AUTHORITY`-badged SEND from
 its bootstrap bundle, reserved for driver registrations. The SEND
 distributed to every process via `ProcessInfo.service_registry_cap`

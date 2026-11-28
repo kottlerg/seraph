@@ -23,6 +23,8 @@
 //! [`published_names::VFSD_SWAP`](crate::published_names::VFSD_SWAP),
 //! [`published_names::MEMMGR_SWAP`](crate::published_names::MEMMGR_SWAP),
 //! [`published_names::LOGD_QUERY`](crate::published_names::LOGD_QUERY),
+//! [`published_names::LOGD_FOLLOW`](crate::published_names::LOGD_FOLLOW),
+//! [`published_names::LOGD_CONTROL`](crate::published_names::LOGD_CONTROL),
 //! [`published_names::LOGD_FLUSH`](crate::published_names::LOGD_FLUSH), and each
 //! provider name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; the
 //! `:auth` and `:grant` entries, today `pwrmgr.shutdown`, `acpid.power`,
@@ -32,6 +34,9 @@
 //! without `GRANT`, apart from [`published_names::DEVMGR_BIND`](crate::published_names::DEVMGR_BIND), which its
 //! seeds receive with `GRANT`, since `devmgr_labels::BIND_DRIVERS` moves a cap
 //! to devmgr, [`published_names::MEMMGR_SWAP`](crate::published_names::MEMMGR_SWAP), whose seeds move caps to memmgr,
+//! [`published_names::LOGD_QUERY`](crate::published_names::LOGD_QUERY) and
+//! [`published_names::LOGD_FOLLOW`](crate::published_names::LOGD_FOLLOW), whose seeds move
+//! a subscription's signal to logd,
 //! and `sessiond.operator` and `crashd.core` (`:grant` entries), whose seeds move
 //! caps to sessiond and crashd;
 //! `QUERY_ENDPOINT` never yields `GRANT`.
@@ -152,12 +157,32 @@ pub const VFSD_SWAP: &[u8] = b"vfsd.swap";
 /// client that registers nothing.
 pub const MEMMGR_SWAP: &[u8] = b"memmgr.swap";
 
-/// SEND on the master log endpoint badged
+/// `SEND|GRANT` on the master log endpoint badged
 /// `log_labels::LOG_QUERY_AUTHORITY`: logd's `QUERY_SLOTS` and
-/// `QUERY_HISTORY` surface. svcmgr mints it from its master-log source.
-/// Seed-only; seeded only by svctest, whose `logd_death_forward` phase
-/// reads a dead child's retired slot through it.
+/// `QUERY_HISTORY` surface, and `LOG_SUBSCRIBE` in the interactive
+/// followers' pool (`services/logd/docs/ipc-interface.md` § Queries,
+/// § Subscriptions). svcmgr mints it from its master-log source. Seed-only,
+/// its seeds keeping `GRANT`, since a subscription moves its signal to logd;
+/// seeded only by svctest, whose logd phases read slots and history
+/// and follow the journal through it.
 pub const LOGD_QUERY: &[u8] = b"logd.query";
+
+/// `SEND|GRANT` on the master log endpoint badged
+/// `log_labels::LOG_FOLLOW_AUTHORITY`: the queries and `LOG_SUBSCRIBE` in the
+/// external sinks' pool, which no interactive follower can fill
+/// (`services/logd/docs/ipc-interface.md` § Subscriptions). svcmgr mints it
+/// from its master-log source. Seed-only, its seeds keeping `GRANT`; seeded
+/// by an external sink's recipe, and by svctest, whose `logd_follow` phase
+/// fills its pool.
+pub const LOGD_FOLLOW: &[u8] = b"logd.follow";
+
+/// SEND on the master log endpoint badged
+/// `log_labels::LOG_CONTROL_AUTHORITY`: logd's `SINK_LIST` and `SINK_SET`,
+/// which read and change the sinks' settings
+/// (`services/logd/docs/ipc-interface.md` § Sink control). svcmgr mints it
+/// from its master-log source. Seed-only; seeded only by svctest, whose
+/// `logd_control` phase steers a sink through it.
+pub const LOGD_CONTROL: &[u8] = b"logd.control";
 
 /// SEND on the master log endpoint badged
 /// `log_labels::LOG_FLUSH_AUTHORITY`: logd's `LOG_FLUSH` barrier. svcmgr

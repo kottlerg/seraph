@@ -12,16 +12,17 @@ one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliatio
 
 svcmgr also owns the system-wide discovery registry: it publishes the well-known names it owns
 (`rootfs.root`, `svcmgr`, `svcmgr.grant`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
-`devmgr.acpi`, `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`, `logd.flush`, a
-`devmgr.class.<stem>` per device class file (`<stem>` is the file's name without `.class`), and each
-provider's `provides` names like `pwrmgr.shutdown` / `acpid.power` / `timed`) into the registry
+`devmgr.acpi`, `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`, `logd.follow`,
+`logd.control`, `logd.flush`, a `devmgr.class.<stem>` per device class file (`<stem>` is the file's
+name without `.class`), and each provider's `provides` names like `pwrmgr.shutdown` / `acpid.power`
+/ `timed`) into the registry
 itself — from the source caps init endows it with at handover, and from each provider's launch.
 Consumers resolve any name through their `.svc` `seed = ...` line at launch time, and the public
 names (`svcmgr`, `pwrmgr.deny`, `acpid.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap
 carries authority is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT`
-never yields `GRANT`;
-a seed is `SEND` except `devmgr.bind`, `memmgr.swap`, `svcmgr.grant` and each `:grant` name
-(`sessiond.operator`, `crashd.core`), which are `SEND|GRANT`. The endowment and registry wire
+never yields `GRANT`; a seed is `SEND` except `devmgr.bind`, `memmgr.swap`, `logd.query`,
+`logd.follow`, `svcmgr.grant` and each `:grant` name (`sessiond.operator`, `crashd.core`), which are
+`SEND|GRANT`. The endowment and registry wire
 format are in [docs/ipc-interface.md](docs/ipc-interface.md).
 
 svcmgr is also the stop authority: a service whose recipe sets `stop_authority = yes` receives a
@@ -112,8 +113,9 @@ svcmgr/
   the publish-role source caps (`rootfs.root` SEND, devmgr-registry
   `SEND|GRANT` source, the `vfsd.mount`, `vfsd.deny` and `vfsd.swap` SENDs on vfsd's
   service endpoint), the `EntropyControl` source carrying `Contribute`, which svcmgr never
-  publishes and derives the `entropy_authority` service's copy from, the `memmgr.swap`
-  `SEND|GRANT` on memmgr's endpoint, one
+  publishes and derives the `entropy_authority` service's copy from, the `PmuControl` source
+  carrying `Configure`, which svcmgr never publishes and derives the `pmu_authority` service's copy
+  from, the `memmgr.swap` `SEND|GRANT` on memmgr's endpoint, one
   `(name, thread_cap, observer)` round per substrate service init bootstrapped before svcmgr
   existed (the observer is a Control-only address-space cap or a process handle), and a terminal
   `LOGD_SOURCES` round carrying the log-sink source caps svcmgr holds
@@ -163,9 +165,9 @@ svcmgr/
   re-spawn the service from the recorded recipe. The `.svc` file is the
   single source of truth for both launch and restart — fixed fields on
   `ServiceEntry`, the argv/env/cwd/seed, the log-sink, debug-authority,
-  stop-authority, entropy-authority, `oom_stop`, `reserve` and `private_image` flags, the
-  `stop_source` class, and the scheduling fields on a parallel `RestartRecipe` — so a restart
-  reproduces the first-launch surfaces
+  stop-authority, entropy-authority, PMU-authority, `oom_stop`, `reserve` and `private_image`
+  flags, the `stop_source` class, and the scheduling fields on a parallel `RestartRecipe` — so a
+  restart reproduces the first-launch surfaces
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Recipe storage). Whether a service
   restarts is decided by its `restart` policy + budget alone; `critical` is orthogonal (see
   graceful shutdown below and [docs/restart-protocol.md](docs/restart-protocol.md) § Decision tree).
@@ -227,9 +229,8 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
 (required), `critical` (required), `namespace` (required), `cwd`,
 `seed`, `provides`, `log_sink`, `shutdown_actuator`, `debug_authority`,
-`stop_authority`, `entropy_authority`, `oom_stop`, `reserve`, `priority`, `sched_max`. Unknown
-keys are hard
-errors. Restart values: `never | on_failure | always`.
+`stop_authority`, `entropy_authority`, `pmu_authority`, `oom_stop`, `reserve`, `priority`,
+`sched_max`. Unknown keys are hard errors. Restart values: `never | on_failure | always`.
 Critical values: `yes | no`. Namespace forms:
 `none | universal | subtree:<path>:<rights>`. `priority` / `sched_max`
 are the service's scheduling placement (level and `SchedControl` band
@@ -267,7 +268,9 @@ column). The handover endowment and
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
 | `vfsd.swap` | svcmgr (endowed `SWAP_AUTHORITY` SEND) | `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, the `GET_SWAP_PARTITION` surface (seeded by swapd's recipe; by svctest's too, to drive only the stale-version refusal of `GET_SWAP_PARTITION`) | no |
 | `memmgr.swap` | svcmgr (endowed `SWAP_AUTHORITY` `SEND\|GRANT`) | `SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint, the swap labels of memmgr's disk tier; its seeds keep `GRANT` (seeded by swapd's recipe; by svctest's too, as a second swap client that registers nothing) | no |
-| `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
+| `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged `SEND\|GRANT` on the master log endpoint: logd's `QUERY_SLOTS`, `QUERY_HISTORY` and `LOG_SUBSCRIBE` from the `SUBSCRIBERS_MAX` pool ([logd IPC interface](../logd/docs/ipc-interface.md) § Queries, § Subscriptions); its seeds keep `GRANT`, since `LOG_SUBSCRIBE` moves a signal to logd (seeded by svctest only) | no |
+| `logd.follow` | svcmgr (minted from the reserved master-log source) | `LOG_FOLLOW_AUTHORITY`-badged (bit 60) `SEND\|GRANT` on the master log endpoint, for external sinks: the same reads and `LOG_SUBSCRIBE` from the `SINK_SUBSCRIBERS_MAX` pool ([logd IPC interface](../logd/docs/ipc-interface.md) § Queries, § Subscriptions); its seeds keep `GRANT` (seeded by svctest only) | no |
+| `logd.control` | svcmgr (minted from the reserved master-log source) | `LOG_CONTROL_AUTHORITY`-badged (bit 61) SEND on the master log endpoint: logd's `SINK_LIST` and `SINK_SET` ([logd IPC interface](../logd/docs/ipc-interface.md) § Sink control; seeded by svctest only) | no |
 | `logd.flush` | svcmgr (minted from the reserved master-log source) | `LOG_FLUSH_AUTHORITY`-badged SEND on the master log endpoint: logd's `LOG_FLUSH` barrier ([logd IPC interface](../logd/docs/ipc-interface.md) § Flush barrier; seeded by pwrmgr, which waits on it before a power-off or reset, acpid, which waits on it before the register write of one, crashd, which waits on it before it declines a fault, and svctest) | no |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |

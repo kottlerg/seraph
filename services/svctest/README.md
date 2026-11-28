@@ -225,6 +225,10 @@ services/svctest/
         ├── timed.rs           # `SystemTime::now()` through svcmgr and timed; a timed started
         │                      #   after the RTC driver's restart serves the wall clock; the
         │                      #   RTC driver's create refused under memory pressure, retried
+        ├── fair_load.rs       # timed and logd calls with no load, then under seven CPU-bound
+        │                      #   fair threads (nine timed calls in ten within 2 ms, each
+        │                      #   within 5 ms, the median within 10 times the quiet one),
+        │                      #   seven logd callers, and both, logged
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
         │                      #   fall-through, remount, a mapped page across the unmount,
         │                      #   a killed fs driver, its death's reason from a worker's exit
@@ -697,6 +701,9 @@ unmatched token falls through to the normal run.
 | `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
 | `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the draw room) |
 | `blk-region-child`          | `blk_regions`  | `blk_regions` (registers a region, killed)  |
+| `fair-load-spin`            | `fair_load`    | `fair_load` (seven CPU-bound threads)       |
+| `fair-load-flood`           | `fair_load`    | `fair_load` (seven threads calling logd)    |
+| `fair-load-mixed`           | `fair_load`    | `fair_load` (both kinds of thread)          |
 | `pipestress-spawner`        | `pipestress`   | `pipestress` (spawn-drain loop, doorbell trial) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`shutdown` case) |
 

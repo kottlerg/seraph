@@ -92,8 +92,8 @@ endpoint's receivers (below).
 **Receiver order.** Callers on an endpoint's send queue are bound in arrival order. A call takes
 the receiver most recently parked on the endpoint from the caller's CPU when that CPU queues no
 thread but its idle thread and its table records one, and otherwise the longest-waiting receiver.
-The occupancy condition is the one under which the synchronous wake rule runs the receiver on the
-caller's CPU (scheduling-internals.md
+The occupancy condition is the one under which the synchronous wake rule runs an RT receiver on the
+caller's CPU, a fair one being passed there whatever the CPU queues (scheduling-internals.md
 [§ Target CPU selection](scheduling-internals.md#target-cpu-selection-select_target_cpu)), so a
 receiver parked on the caller's CPU, or one hard-pinned there, is woken there with no wake IPI; a
 call from a CPU with other work queued keeps the arrival order. A fault delivery takes its handler
@@ -364,11 +364,17 @@ released.
    label and count for the caller's return registers and the data words
    for it to write to its own message registers or IPC buffer page when it
    resumes are already there) and stamp REPLY
-6. enqueue_and_wake(caller_tcb) on its selected CPU; return to the server
+6. select_wake_target(caller_tcb, exclude, hint) and enqueue_and_wake_at on the
+   target it returns; return to the server
 ```
 
 `sys_ipc_reply` runs steps 1 to 5 as `deposit_reply`, which step 2's fault arm leaves having woken
-the faulter itself, then step 6 with `WakeHint::None`.
+the faulter itself (`reply_to_fault`, with `WakeHint::WakerRuns` when the handler and the faulter
+are both fair, else `WakeHint::None`), then step 6 with `WakeHint::WakerRuns`: the server runs on,
+and the caller gets back what is left of its turn. A reply whose caller's turn ran out during the
+request wakes it with `WakeHint::None`, to the tail with a fresh turn
+([scheduling-internals.md](scheduling-internals.md) § Target CPU selection, "The waker that runs
+on").
 
 ### Reply-and-Receive Path
 
@@ -391,18 +397,22 @@ the faulter itself, then step 6 with `WakeHint::None`.
    or fails; drop the endpoint pin
 4. Wake the owed caller (wake_replied): with WakeHint::Sync after a
    committed park, the server then blocking in this syscall's schedule();
-   with WakeHint::WakerRuns otherwise, the server running on, this CPU
-   left out when the server outranks the caller (reply_wake_exclusion;
-   scheduling-internals.md § Target CPU selection). The caller's and the
+   with WakeHint::WakerRuns otherwise, the server running on: a fair caller
+   the server does not outrank is passed, linked in the front segment of
+   this CPU's fair queue to run when the server blocks, and this CPU is left
+   out when the server outranks the caller (reply_wake_exclusion;
+   scheduling-internals.md § Target CPU selection). A caller whose turn ran
+   out during the request is woken with WakeHint::None. The caller's and the
    server's levels are read before the wake, after which the caller may
    run and exit elsewhere
 5. Deliver as SYS_IPC_RECV does: a bound message at once (Receive Path
    step 4f), a park's message through schedule() and the disposition
    (step 5d), which also requeues a refused park's server at the tail of
    its level
-6. When step 4's WakerRuns wake placed the caller on this CPU and the server
-   does not outrank it (run_queue::outranks), yield before the return to
-   user mode, after a bound delivery or before an error:
+6. When step 4's WakerRuns wake placed the caller at the tail of this CPU's
+   queue and the server does not outrank it (run_queue::outranks; an RT
+   caller in practice), yield before the return to user mode, after a
+   bound delivery or before an error:
    schedule(Requeue::Always) puts the server at the tail of its level,
    behind the caller
 ```
@@ -517,19 +527,24 @@ the only cancellation channel.
 ### Waking the Recipient
 
 The kernel performs no direct thread switch on IPC. Every call rendezvous and
-every reply wakes the recipient through `enqueue_and_wake` on the CPU
-`select_target_cpu` chooses, after the endpoint lock is released (call) or the
+every reply wakes the recipient through `enqueue_and_wake_at` on the CPU
+`select_wake_target` chooses, after the endpoint lock is released (call) or the
 `reply_tcb` claim is won (reply, which takes no endpoint lock); the run queue
 decides when it runs. A call rendezvous whose caller's park committed
 (`CallRendezvous::Bound` with `hint: WakeHint::Sync`) asks for the caller's
-CPU, which the placement grants when that CPU queues no thread but its idle
-thread and the receiver does not outrank the caller, or outranks it but last
+CPU, which the placement grants a fair receiver the caller does not
+outrank whatever that CPU queues (the pass), and an RT receiver when that
+CPU queues no thread but its idle thread and the receiver does not outrank
+the caller, or outranks it but last
 received through `SYS_IPC_REPLY_RECV` and the caller has no hard affinity and
 is not in a fault delivery
 ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection); a
-refused park and a `SYS_IPC_REPLY` pass `WakeHint::None`. A `SYS_IPC_REPLY_RECV` wakes its replied
-caller after its receive, with `WakeHint::Sync` when the receive parked and
-`WakeHint::WakerRuns` otherwise (§ Reply-and-Receive Path). A fault delivery to a parked
+refused park passes `WakeHint::None`. A `SYS_IPC_REPLY` wakes its caller with
+`WakeHint::WakerRuns`, and a `SYS_IPC_REPLY_RECV` wakes its replied caller after its receive, with
+`WakeHint::Sync` when the receive parked and `WakeHint::WakerRuns` otherwise (§ Reply-and-Receive
+Path); a reply whose caller's turn ran out during the request passes `WakeHint::None`. The
+placement is `select_wake_target`'s, which returns a CPU and the end of its queue to link at. A
+fault delivery to a parked
 handler wakes it the same way. A receive first wakes any caller it releases from an
 earlier unreplied binding (its call returns `Interrupted`, a faulter is
 killed, or, on its restartable syscall's user copy, has that syscall fail with

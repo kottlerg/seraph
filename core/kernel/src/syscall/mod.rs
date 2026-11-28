@@ -278,6 +278,14 @@ pub enum SyscallExit
 /// currently running thread. The caller must have already switched to the
 /// kernel stack.
 #[cfg(not(test))]
+#[expect(
+    clippy::inline_always,
+    reason = "the riscv64 trap dispatcher is the one Rust caller; out of line, every syscall \
+              pays a frame and the callee-saved spills of its body, which the size of the hot \
+              handlers inlined here decides. The x86-64 entry stub names the symbol, which \
+              keeps an out-of-line copy for it"
+)]
+#[inline(always)]
 pub unsafe fn dispatch(tf: *mut TrapFrame) -> SyscallExit
 {
     crate::arch::current::cpu::debug_assert_kernel_entry_flags();

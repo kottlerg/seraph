@@ -373,6 +373,10 @@ pub struct PlacementCounts
     pub sync_wakes: core::sync::atomic::AtomicU32,
     /// Of those, the wakes the rule placed on the waker's CPU.
     pub sync_local: core::sync::atomic::AtomicU32,
+    /// Of the pulls, those that took the thread out of its source CPU's front
+    /// segment while a scan for that puller skips the segment: none, unless
+    /// the scan breaks the segment's rule.
+    pub front_steals: core::sync::atomic::AtomicU32,
 }
 
 impl PlacementCounts
@@ -387,6 +391,7 @@ impl PlacementCounts
             pulls: core::sync::atomic::AtomicU32::new(0),
             sync_wakes: core::sync::atomic::AtomicU32::new(0),
             sync_local: core::sync::atomic::AtomicU32::new(0),
+            front_steals: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -794,9 +799,19 @@ pub struct ThreadControlBlock
     pub priority: u8,
 
     /// Remaining preemption timer ticks before this thread is descheduled.
-    /// Owned by the `scheduler.lock` of the CPU the thread is current on: only
-    /// that CPU's `timer_tick` writes it, under that lock.
+    /// Owned by the CPU the thread is current on: that CPU's `timer_tick`
+    /// writes it under that CPU's `scheduler.lock`, and the thread's own call
+    /// moves it into [`lent_turn`](Self::lent_turn) with interrupts masked
+    /// (`sched::turn::lend_turn_out`), so no tick runs between.
     pub slice_remaining: u32,
+
+    /// The turn this thread runs on before its slice, tagged with whose turn
+    /// it is ([`sched::turn`](super::turn)): its own, moved out of its slice
+    /// at its call, or the caller's whose call it serves. Zero when it holds
+    /// none. Written by atomic read-modify-writes only: by the thread's own
+    /// call, the bind that takes a caller's turn, the reply or the claimant
+    /// that gives one back, and the tick of the CPU running the thread.
+    pub lent_turn: core::sync::atomic::AtomicU64,
 
     /// Hard CPU affinity (`AFFINITY_ANY` = `0xFFFF_FFFF` means no hard affinity).
     /// Honoured by `select_target_cpu` on enqueue, by the `schedule()`

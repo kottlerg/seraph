@@ -59,6 +59,7 @@ pub fn dispatch(role: &str)
     phases::fs_sessions::reentry_main(role);
     phases::fs_create_open::reentry_main(role);
     phases::exit_code::reentry_main(role);
+    phases::fair_load::reentry_main(role);
     phases::recv_guard::reentry_main(role);
     phases::no_receiver::reentry_main(role);
     phases::random::reentry_main(role);

@@ -428,7 +428,6 @@ pub unsafe fn endpoint_call(
         unsafe { ep.lock.unlock_raw(saved) };
         return CallRendezvous::NoReceiver;
     }
-
     // Is a server waiting? A call from a CPU that queues no thread but its
     // idle thread takes the receiver its parked-receiver table records for
     // this endpoint, if any; any other call takes the longest-waiting
@@ -502,6 +501,11 @@ pub unsafe fn endpoint_call(
                 .sleep_deadline
                 .store(deadline, core::sync::atomic::Ordering::Relaxed);
         }
+        // The receiver serves this call on the caller's turn, taken before the
+        // binding publishes, so a claimant that wins the binding finds it.
+        // SAFETY: server is claimed by this dequeue; caller is the running
+        // thread; ep.lock is held with interrupts masked.
+        let prior_turn = unsafe { crate::sched::turn::lend_and_take_turn(server, caller) };
         #[expect(
             clippy::multiple_unsafe_ops_per_block,
             reason = "every access is to an atomic field of server, a live TCB dequeued under the \
@@ -545,6 +549,9 @@ pub unsafe fn endpoint_call(
         };
         if committed != crate::sched::ParkCommit::Committed
         {
+            // The bind did not commit: the turn goes back.
+            // SAFETY: as for take_turn above.
+            unsafe { crate::sched::turn::untake_turn(server, caller, prior_turn) };
             // Refused park (a stop won, or a stray coalesced wake; a pending
             // upcall refuses neither a call's park nor a fault delivery's);
             // tear down the reply linkage. Every refusal cancels the call.
@@ -573,7 +580,11 @@ pub unsafe fn endpoint_call(
         return CallRendezvous::Bound { server, hint };
     }
 
-    // No server available — block caller on send queue.
+    // No server available — block caller on send queue. A fair caller's turn
+    // goes with its call (sched::turn), for the receive that binds it to take.
+    // SAFETY: caller is the running thread; ep.lock is held with interrupts
+    // masked.
+    unsafe { crate::sched::turn::lend_turn_out(caller) };
     // Clear context_saved before enqueuing on the send queue.
     // See notification.rs notification_wait for the full rationale.
     // SAFETY: caller validated by syscall layer; context_saved is AtomicU32.
@@ -671,6 +682,12 @@ unsafe fn release_unreplied_caller(server: *mut ThreadControlBlock)
             .reply_tcb
             .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel)
     };
+    if !caller.is_null()
+    {
+        // The unanswered caller gets its turn back.
+        // SAFETY: server is the running thread; the swap claimed caller.
+        unsafe { crate::sched::turn::reclaim_turn(server, caller) };
+    }
     // SAFETY: a non-null caller is the binding the swap claimed; no lock held.
     unsafe { release_displaced_caller(caller) };
 }
@@ -706,8 +723,7 @@ unsafe fn release_displaced_caller(caller: *mut ThreadControlBlock)
     // woken; no sleep-list lock is held (contract).
     unsafe { crate::ipc::cancel_timed_entry(caller) };
     // SAFETY: the wake_in_flight pin keeps caller a valid TCB.
-    let target_cpu =
-        unsafe { crate::sched::select_target_cpu(caller, crate::sched::WakeHint::None) };
+    let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
     // SAFETY: caller is valid (pinned), target_cpu came from
     // select_target_cpu, and no scheduler lock is held (contract).
     unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
@@ -815,14 +831,24 @@ unsafe fn bind_next_sender(
         // dealloc_object(Thread)'s all-CPU-locks Exited mark and SYS_THREAD_STOP.
         // A timed call keeps its sleep-list entry: the timeout bounds the
         // reply park too.
+        // The receive serves this call on the caller's turn, taken before the
+        // rebind publishes.
+        // SAFETY: server is the running thread; caller is pinned; ep.lock is
+        // held with interrupts masked.
+        let prior_turn = unsafe { crate::sched::turn::take_turn(server, caller) };
         // SAFETY: caller is a valid Blocked TCB dequeued from the send queue;
         // server is the running thread.
         let committed =
             unsafe { crate::sched::commit_reply_rebind_under_local_lock(caller, parked, server) };
         if let Some(displaced) = committed
         {
+            // A displaced binding's caller gets back what is left of its turn.
+            // SAFETY: displaced is null or pinned by the rebind's swap.
+            unsafe { crate::sched::turn::give_displaced_turn(displaced, prior_turn) };
             return Some((BoundSender { cspace }, displaced));
         }
+        // SAFETY: as for take_turn above.
+        unsafe { crate::sched::turn::untake_turn(server, caller, prior_turn) };
         // Refused: the caller is dying or stopped, and nothing was published.
         // The send-queue dequeue above is the episode claim (and why a
         // concurrent cancel_ipc_block's unlink lost and did not stamp): a
@@ -1263,8 +1289,7 @@ pub unsafe fn release_waiters(ep: *mut EndpointState)
                 .store(1, core::sync::atomic::Ordering::Release);
         }
         // SAFETY: tcb is a valid, initialised TCB.
-        let target_cpu =
-            unsafe { crate::sched::select_target_cpu(tcb, crate::sched::WakeHint::None) };
+        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
         // SAFETY: tcb is a valid TCB; target_cpu came from
         // select_target_cpu.
         unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };

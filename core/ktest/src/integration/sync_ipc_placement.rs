@@ -3,10 +3,12 @@
 
 // core/ktest/src/integration/sync_ipc_placement.rs
 
-//! Integration: a call runs its receiver on the caller's CPU when that CPU
-//! queues no other thread and the receiver does not outrank the caller, or
-//! outranks it but last received through `SYS_IPC_REPLY_RECV` and the caller
-//! has no hard affinity, and leaves it to the other placement rules otherwise
+//! Integration: a call runs its receiver on the caller's CPU when the receiver
+//! is a fair thread that does not outrank the caller, whatever that CPU
+//! queues (the pass); when it is an RT thread, the CPU queues no other thread
+//! and it does not outrank the caller, or outranks it but last received
+//! through `SYS_IPC_REPLY_RECV` and the caller has no hard affinity; and
+//! leaves it to the other placement rules otherwise
 //! (core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants,
 //! "Target CPU selection").
 //!
@@ -14,11 +16,12 @@
 //!
 //! Without the synchronous wake rule, a server parked on one CPU is woken on
 //! that CPU by every call from another, so a pair that starts apart stays
-//! apart and each round trip pays a wake IPI to a halted CPU. With the rule
-//! too wide, the server runs ahead of a thread queued on the caller's CPU
-//! while its own CPU idles, or ahead of a caller it outranks and answers with
-//! a plain reply, or calls it from a CPU it is pinned to, whose reply wake
-//! then waits behind it. With the rule too narrow, an RT server that answers
+//! apart and each round trip pays a wake IPI to a halted CPU. Without the
+//! pass, a fair server woken on a CPU that queues fair threads waits a slice
+//! of each before it serves the call. With the rule too wide, an RT server
+//! runs ahead of a thread queued on the caller's CPU while its own CPU idles,
+//! or ahead of a caller it outranks and answers with a plain reply, or calls
+//! it from a CPU it is pinned to, whose reply wake then waits behind it. With the rule too narrow, an RT server that answers
 //! its unpinned fair callers with `SYS_IPC_REPLY_RECV` (which sends such a
 //! caller's reply wake off a CPU the server runs on) stays apart from them.
 //!
@@ -142,7 +145,7 @@ const CASES: [Case; 8] = [
         reply_recv: false,
         caller_pinned: true,
         server_home: P,
-        on_k: false,
+        on_k: true,
     },
     Case {
         name: "RT",

@@ -1,11 +1,11 @@
 # bench baseline, written by `cargo xtask bench-baseline`
 # Format: xtask/README.md (`cargo xtask bench-check`).
-placement=apart leg=total cpus=4 unit=cycles p50=4535
-placement=same leg=delivery cpus=1 unit=cycles p50=1327
-placement=same leg=delivery cpus=4 unit=cycles p50=1327
+placement=apart leg=total cpus=4 unit=cycles p50=4655
+placement=same leg=delivery cpus=1 unit=cycles p50=1364
+placement=same leg=delivery cpus=4 unit=cycles p50=1364
 placement=same leg=handler cpus=1 unit=cycles p50=1112
 placement=same leg=handler cpus=4 unit=cycles p50=1112
-placement=same leg=resume cpus=1 unit=cycles p50=1045
-placement=same leg=resume cpus=4 unit=cycles p50=1045
-placement=same leg=total cpus=1 unit=cycles p50=3484
-placement=same leg=total cpus=4 unit=cycles p50=3484
+placement=same leg=resume cpus=1 unit=cycles p50=1128
+placement=same leg=resume cpus=4 unit=cycles p50=1128
+placement=same leg=total cpus=1 unit=cycles p50=3604
+placement=same leg=total cpus=4 unit=cycles p50=3604

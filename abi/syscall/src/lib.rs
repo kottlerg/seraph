@@ -607,6 +607,11 @@ pub const THREAD_PLACEMENT_SYNC_WAKES: u64 = 5;
 /// the waker's CPU, which queued no other thread and ran a waker the thread
 /// does not outrank.
 pub const THREAD_PLACEMENT_SYNC_LOCAL: u64 = 6;
+/// [`CAP_INFO_THREAD_PLACEMENT`] view: of the pulls, those that took the
+/// thread out of the front segment of its CPU's fair queue, where a woken
+/// thread waits to run next, while the balancer's scan for that destination
+/// skips the segment. Zero unless the scan breaks that rule.
+pub const THREAD_PLACEMENT_FRONT_STEALS: u64 = 7;
 
 /// The word [`CAP_INFO_IRQ_REMAP_ENTRY`] answers, from a remapping entry's
 /// handle, the vector it delivers, and its destination APIC id.

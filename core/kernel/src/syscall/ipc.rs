@@ -867,11 +867,11 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
         // follows before any return to user mode, so the server may run here.
         // SAFETY: woken_server returned by endpoint_call; is valid TCB; a Sync
         // hint's caller is this running thread, its park committed.
-        let target_cpu = unsafe { crate::sched::select_target_cpu(woken_server, hint) };
-        debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-        // SAFETY: woken_server is a valid TCB; target_cpu came from
-        // select_target_cpu.
-        unsafe { crate::sched::enqueue_and_wake(woken_server, target_cpu) };
+        let target = unsafe { crate::sched::select_wake_target(woken_server, None, hint) };
+        debug_assert!(target.cpu < crate::sched::MAX_CPUS);
+        // SAFETY: woken_server is a valid TCB; target came from
+        // select_wake_target.
+        unsafe { crate::sched::enqueue_and_wake_at(woken_server, target) };
     }
     else if let crate::ipc::endpoint::CallRendezvous::NoReceiver = result
     {
@@ -1370,8 +1370,7 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
         );
     }
     // SAFETY: caller is a valid TCB (caller contract).
-    let target_cpu =
-        unsafe { crate::sched::select_target_cpu(caller, crate::sched::WakeHint::None) };
+    let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
     // SAFETY: caller is a valid parked TCB; target_cpu came from
     // select_target_cpu; enqueue_and_wake transitions it to Ready.
     unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
@@ -1447,6 +1446,10 @@ pub fn sys_ipc_reply_recv(tf: UserFrame) -> Result<u64, SyscallError>
         ReplyDeposit::Owed(caller) => Some(caller),
         ReplyDeposit::Woken => None,
     };
+    // The reply gives the caller back its turn, before the receive below can
+    // take the next caller's.
+    // SAFETY: caller is pinned by the claim; tcb is the running thread.
+    let returned = caller.map(|caller| unsafe { crate::sched::turn::return_turn(tcb, caller) });
 
     // Open the park episode before the recv-queue link can publish.
     // SAFETY: tcb is the running caller, not yet claimable.
@@ -1459,7 +1462,11 @@ pub fn sys_ipc_reply_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // The deferred wake. The claim pinned the caller until now, so its level
     // is read before the wake, after which it may run and exit elsewhere.
     let runs_first = caller.is_some_and(|caller| {
-        let hint = if matches!(received, Ok(Received::Parked))
+        let hint = if returned == Some(crate::sched::turn::Returned::RanOut)
+        {
+            crate::sched::WakeHint::None
+        }
+        else if matches!(received, Ok(Received::Parked))
         {
             crate::sched::WakeHint::Sync
         }
@@ -1514,21 +1521,24 @@ pub fn sys_ipc_reply_recv(tf: UserFrame) -> Result<u64, SyscallError>
 /// stamped, placed by `hint`, leaving this CPU out when the server outranks
 /// the caller and runs on ([`reply_wake_exclusion`]). Returns whether the
 /// server must yield to it before returning to user mode: the wake is
-/// [`WakeHint::WakerRuns`], it placed the caller on this CPU, and the server
-/// does not outrank the caller (core/kernel/docs/ipc-internals.md
-/// § Reply-and-Receive Path). A caller above the server's rank would preempt
-/// it at that return anyway; one at the same rank would otherwise wait behind
-/// it until it blocks or its slice ends.
+/// [`WakeHint::WakerRuns`], it placed the caller at the tail of this CPU's
+/// queue, and the server does not outrank the caller
+/// (core/kernel/docs/ipc-internals.md § Reply-and-Receive Path). A caller
+/// above the server's rank would preempt it at that return anyway; one at the
+/// same rank would otherwise wait behind it until it blocks or its slice ends.
+/// A caller the wake passed waits for that in the front segment, where the
+/// server's run-on is bounded by the turns of the callers it serves.
 ///
 /// [`reply_wake_exclusion`]: crate::sched::reply_wake_exclusion
 ///
 /// # Safety
 /// `caller` must be pinned by `server`'s won reply claim, its deposit
 /// stamped, and this its only wake; `server` the running thread. The hint's
-/// contract ([`select_target_cpu`](crate::sched::select_target_cpu)) holds.
+/// contract ([`select_wake_target`](crate::sched::select_wake_target)) holds.
 ///
 /// [`WakeHint::WakerRuns`]: crate::sched::WakeHint::WakerRuns
 #[cfg(not(test))]
+#[inline]
 unsafe fn wake_replied(
     caller: *mut crate::sched::thread::ThreadControlBlock,
     server: *mut crate::sched::thread::ThreadControlBlock,
@@ -1542,14 +1552,17 @@ unsafe fn wake_replied(
     let server_level = unsafe { (*server).priority };
     let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
     let exclude = crate::sched::reply_wake_exclusion(hint, server_level, caller_level, this_cpu);
-    // SAFETY: the contract, which is select_target_cpu's.
-    let target_cpu = unsafe { crate::sched::select_target_cpu_excluding(caller, exclude, hint) };
-    // SAFETY: caller is pinned by the claim; target_cpu came from
-    // select_target_cpu_excluding.
-    unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
+    // SAFETY: the contract, which is select_wake_target's.
+    let target = unsafe { crate::sched::select_wake_target(caller, exclude, hint) };
+    // SAFETY: caller is pinned by the claim; target came from
+    // select_wake_target.
+    unsafe { crate::sched::enqueue_and_wake_at(caller, target) };
+    // On a WakerRuns wake, no exclusion means the server does not outrank the
+    // caller, so the rank test is made once.
     hint == crate::sched::WakeHint::WakerRuns
-        && target_cpu == this_cpu
-        && !crate::sched::run_queue::outranks(server_level, caller_level)
+        && exclude.is_none()
+        && target.cpu == this_cpu
+        && target.link == crate::sched::WakeLink::Tail
 }
 
 /// What [`deposit_reply`] leaves owed.
@@ -1795,13 +1808,27 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller is pinned by the claim.
     debug_assert_eq!(unsafe { (*caller).magic }, crate::sched::thread::TCB_MAGIC);
-    // SAFETY: caller is pinned by the claim.
-    let target_cpu =
-        unsafe { crate::sched::select_target_cpu(caller, crate::sched::WakeHint::None) };
-    debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-    // SAFETY: caller is pinned by the claim; target_cpu came from
-    // select_target_cpu.
-    unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
+    // The reply gives the caller back its turn; the server runs on, so the
+    // wake is a WakerRuns one, unless the turn ran out and the caller goes to
+    // the tail.
+    // SAFETY: caller is pinned by the claim; tcb is the running thread.
+    let hint = match unsafe { crate::sched::turn::return_turn(tcb, caller) }
+    {
+        crate::sched::turn::Returned::RanOut => crate::sched::WakeHint::None,
+        crate::sched::turn::Returned::NotHeld | crate::sched::turn::Returned::InTime =>
+        {
+            crate::sched::WakeHint::WakerRuns
+        }
+    };
+    // SAFETY: caller pinned by the claim, its deposit stamped, and this its
+    // only wake; tcb is the running thread, the waker, which runs on.
+    if unsafe { wake_replied(caller, tcb, hint) }
+    {
+        // The caller waits on this CPU at the server's rank or above: yield
+        // to it, at the tail of the server's level.
+        // SAFETY: syscall context, no lock held.
+        unsafe { crate::sched::schedule(crate::sched::Requeue::Always) };
+    }
     Ok(0)
 }
 
@@ -1882,16 +1909,33 @@ unsafe fn reply_to_fault(
     // SAFETY: caller pinned by the claim; the episode's exclusive claim is the
     // reply_tcb CAS won inside endpoint_reply.
     unsafe { crate::sched::thread::stamp_deposit_episode(caller) };
+    // The fault reply gives the faulter back its turn and, between fair
+    // threads, passes it on this CPU unless that turn ran out; the handler
+    // runs on. Any other pair is placed with no hint, as the faulter's wake
+    // comes before the rest of the handler's syscall.
+    // SAFETY: caller pinned by the claim; server is the running thread.
+    let returned = unsafe { crate::sched::turn::return_turn(server, caller) };
     // SAFETY: caller pinned by the claim.
     debug_assert_eq!(unsafe { (*caller).magic }, crate::sched::thread::TCB_MAGIC);
-    // SAFETY: caller pinned by the claim.
-    let target_cpu =
-        unsafe { crate::sched::select_target_cpu(caller, crate::sched::WakeHint::None) };
-    debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-    // SAFETY: caller pinned by the claim; target_cpu came from
-    // select_target_cpu; it transitions to Ready under sched.lock in
-    // enqueue_and_wake.
-    unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
+    // SAFETY: caller pinned by the claim; the level is read as a hint.
+    let caller_level = unsafe { (*caller).priority };
+    // SAFETY: server is the running thread.
+    let server_level = unsafe { (*server).priority };
+    let both_fair =
+        crate::sched::is_fair_level(caller_level) && crate::sched::is_fair_level(server_level);
+    let hint = if both_fair && returned != crate::sched::turn::Returned::RanOut
+    {
+        crate::sched::WakeHint::WakerRuns
+    }
+    else
+    {
+        crate::sched::WakeHint::None
+    };
+    // SAFETY: caller pinned by the claim, its deposit stamped, and this its
+    // only wake; server is the running thread. The handler does not yield
+    // here, inside its reply's deposit: a fair pair's wake passes, and no
+    // other pair's wake is a WakerRuns one.
+    let _ = unsafe { wake_replied(caller, server, hint) };
     result
 }
 
@@ -2118,8 +2162,7 @@ pub fn sys_notification_send(tf: UserFrame) -> Result<u64, SyscallError>
             "sys_notification_send: woken waiter magic corrupt"
         );
         // SAFETY: waiter returned by notification_send; is valid TCB.
-        let target_cpu =
-            unsafe { crate::sched::select_target_cpu(waiter, crate::sched::WakeHint::None) };
+        let target_cpu = unsafe { crate::sched::select_target_cpu(waiter) };
         debug_assert!(
             target_cpu < crate::sched::MAX_CPUS,
             "sys_notification_send: target_cpu {target_cpu} out of range"
@@ -2301,8 +2344,7 @@ pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
             // SAFETY: woken returned by event_queue_post; is valid TCB.
             debug_assert_eq!(unsafe { (*woken).magic }, crate::sched::thread::TCB_MAGIC);
             // SAFETY: woken returned by event_queue_post; is valid TCB.
-            let target_cpu =
-                unsafe { crate::sched::select_target_cpu(woken, crate::sched::WakeHint::None) };
+            let target_cpu = unsafe { crate::sched::select_target_cpu(woken) };
             debug_assert!(target_cpu < crate::sched::MAX_CPUS);
             // SAFETY: woken is a valid TCB; target_cpu came from
             // select_target_cpu.

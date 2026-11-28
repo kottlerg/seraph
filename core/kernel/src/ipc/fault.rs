@@ -928,10 +928,10 @@ unsafe fn deliver_once(
         // SAFETY: woken_handler is a valid TCB, pinned by the wake_in_flight
         // claim endpoint_call took; a Sync hint's caller is this running
         // thread, its park committed.
-        let target_cpu = unsafe { crate::sched::select_target_cpu(woken_handler, hint) };
-        // SAFETY: woken_handler is valid and claimed, target_cpu came from
-        // select_target_cpu, and no scheduler lock is held.
-        unsafe { crate::sched::enqueue_and_wake(woken_handler, target_cpu) };
+        let target = unsafe { crate::sched::select_wake_target(woken_handler, None, hint) };
+        // SAFETY: woken_handler is valid and claimed, target came from
+        // select_wake_target, and no scheduler lock is held.
+        unsafe { crate::sched::enqueue_and_wake_at(woken_handler, target) };
     }
     // else: no handler waiting; we are queued on the endpoint's send queue as
     // BlockedOnSend + in_fault_delivery, to be picked up by a later recv.
@@ -1207,8 +1207,7 @@ unsafe fn claim_fault_park(
     {
         // SAFETY: the claim is won and the wake_in_flight pin keeps tcb
         // allocated until enqueue_and_wake clears it.
-        let target_cpu =
-            unsafe { crate::sched::select_target_cpu(tcb, crate::sched::WakeHint::None) };
+        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
         // SAFETY: tcb is valid and claimed, target_cpu came from
         // select_target_cpu, and no lock is held.
         unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };
@@ -1323,6 +1322,9 @@ unsafe fn claim_received_fault(tcb: *mut ThreadControlBlock, blocked_on: *mut u8
         };
     if won
     {
+        // The redelivered faulter gets its turn back.
+        // SAFETY: the won CAS claimed tcb's binding to server.
+        unsafe { crate::sched::turn::reclaim_turn(server, tcb) };
         // SAFETY: tcb's sched_lock is held, and the CAS win is the park's
         // exclusive claim.
         unsafe { stamp_redeliver(tcb) };

@@ -316,8 +316,7 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
     // stop (and any restart, which links the thread itself) may have
     // superseded it, and the start then took effect and was stopped.
     // SAFETY: target_tcb is a valid, initialized TCB, pinned by `thread_slot`.
-    let target_cpu =
-        unsafe { crate::sched::select_target_cpu(target_tcb, crate::sched::WakeHint::None) };
+    let target_cpu = unsafe { crate::sched::select_target_cpu(target_tcb) };
     // SAFETY: target_tcb is valid and pinned; Ready at `start_seq` it is
     // neither live nor linked on any CPU (the commit drained it); target_cpu comes from
     // select_target_cpu, so it is an initialised CPU; no run-queue lock is
@@ -1509,6 +1508,10 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
                     // the error path instead of reading a stale ipc_msg.
                     if cancelled
                     {
+                        // The cancelled caller gets its
+                        // turn back.
+                        // SAFETY: the won CAS claimed tcb's binding to server.
+                        unsafe { crate::sched::turn::reclaim_turn(server, tcb) };
                         // A timed call's entry ends with its episode.
                         // SAFETY: tcb is valid, its park was just claimed by
                         // the CAS and not yet woken; no sleep-list lock is
@@ -1594,6 +1597,9 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
                     .is_ok();
                     if cancelled
                     {
+                        // The faulter gets its turn back.
+                        // SAFETY: the won CAS claimed tcb's binding to server.
+                        unsafe { crate::sched::turn::reclaim_turn(server, tcb) };
                         // SAFETY: tcb is valid; fault_outcome is atomic, and
                         // the won CAS makes this the episode's sole depositor.
                         unsafe {

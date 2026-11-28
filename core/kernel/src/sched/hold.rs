@@ -520,7 +520,7 @@ unsafe fn release_visit_thread(tcb: *mut ThreadControlBlock, aspace: *const Addr
     if let Some(seq) = started
     {
         // SAFETY: tcb valid, registered for the walk.
-        let cpu = unsafe { super::select_target_cpu(tcb, super::WakeHint::None) };
+        let cpu = unsafe { super::select_target_cpu(tcb) };
         // A stop or an exit landing since the commit supersedes the link, and
         // takes effect over the release's start, as over a SYS_THREAD_START.
         // SAFETY: tcb valid; `Ready` at `seq` it is unlinked and current

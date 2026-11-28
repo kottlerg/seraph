@@ -143,7 +143,7 @@ pub unsafe fn post(
     {
         // SAFETY: target valid; its park was claimed by the cancel above,
         // whose wake_in_flight keeps it allocated.
-        let cpu = unsafe { crate::sched::select_target_cpu(target, crate::sched::WakeHint::None) };
+        let cpu = unsafe { crate::sched::select_target_cpu(target) };
         // SAFETY: target valid and claimed, cpu came from select_target_cpu,
         // and no lock is held.
         unsafe { crate::sched::enqueue_and_wake(target, cpu) };

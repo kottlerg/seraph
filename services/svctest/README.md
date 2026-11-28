@@ -701,6 +701,9 @@ unmatched token falls through to the normal run.
 | `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
 | `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the draw room) |
 | `blk-region-child`          | `blk_regions`  | `blk_regions` (registers a region, killed)  |
+| `fair-load-spin`            | `fair_load`    | `fair_load` (seven CPU-bound threads)       |
+| `fair-load-flood`           | `fair_load`    | `fair_load` (seven threads calling logd)    |
+| `fair-load-mixed`           | `fair_load`    | `fair_load` (both kinds of thread)          |
 | `pipestress-spawner`        | `pipestress`   | `pipestress` (spawn-drain loop, doorbell trial) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`shutdown` case) |
 

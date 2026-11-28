@@ -629,13 +629,16 @@ which a longer received message overwrites from word 0 (§ Calling Convention).
 3. The receive, as `SYS_IPC_RECV`, with every timeout mode. The binding was consumed in part 2, so
    the receive releases no pending caller.
 
-The reply's caller is then woken: onto this thread's CPU when the receive parked, under the guard
-of a synchronous wake, and otherwise (the receive bound a queued caller, a try-once found none, or
-the receive failed) by the placement rules with this thread's CPU skipped as the caller's preferred
-CPU ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). A caller those
-rules still place on this thread's CPU, at this thread's level or above, runs before this thread
-returns to user mode; when this thread outranks the caller, the reply wake leaves this thread's CPU
-out unless the caller is pinned to it. A call that finds this thread parked in the receive runs it
+The reply's caller is then woken, with what is left of its turn
+([scheduler.md](scheduler.md) § Time Slice Policy): onto this thread's CPU when the receive parked,
+under the guard of a synchronous wake, and otherwise (the receive bound a queued caller, a try-once
+found none, or the receive failed) with this thread running on. A fair caller this thread does not
+outrank is then passed: linked in the front segment of this CPU's fair queue, it runs when this
+thread blocks, and this thread does not yield. Any other caller goes by the placement rules
+([scheduling-internals.md](scheduling-internals.md) § Target CPU selection); one placed at the tail
+of this thread's CPU, at this thread's level or above, runs before this thread returns to user mode.
+When this thread outranks the caller, the reply wake leaves this thread's CPU out unless the caller
+is pinned to it. A call that finds this thread parked in the receive runs it
 on the caller's CPU when that CPU queues nothing else, even when this thread outranks the caller,
 provided the caller has no hard affinity and is not in a fault delivery, since a reply sent this way
 then never leaves the caller queued behind this thread ([scheduler.md](scheduler.md) § Thread

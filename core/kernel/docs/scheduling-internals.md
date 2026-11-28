@@ -430,9 +430,10 @@ not read the running thread's `priority` without that thread's `sched_lock`, and
 hint, by an RT wake's placement on any CPU (`PerCpuScheduler::ranks`, § Target CPU selection, "The
 RT rule"). `outranking`, the `non_empty` bits of the queues above `current_level`'s, is written with
 it by the same CPU, and by `sys_thread_set_priority` on any CPU, with every bit only, under the
-running thread's `sched_lock`; it is read only by its own CPU, by `outranked` at its returns to user
-mode ([scheduler.md](scheduler.md) § Wake Preemption) and between two batches of a `SYS_MEMORY_ZERO`
-(§ Return Work). `saved_lock_flags` is the interrupt word an
+running thread's `sched_lock`; it is read by `outranked`, by its own CPU at its returns to user
+mode ([scheduler.md](scheduler.md) § Wake Preemption) and between two batches of a
+`SYS_MEMORY_ZERO`, and by the CPU that links a thread on it or moves a queued thread's level there
+(`link`, `relink`), under its `lock` (§ Return Work). `saved_lock_flags` is the interrupt word an
 all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_flags`,
 `unlock_saved_flags`). `idle_pull_candidate`, the idle pull's confirmation sample,
 `idle_pull_episode`, the backlog episode that sample read, `idle_pull_held`, whether the previous
@@ -913,7 +914,7 @@ Protocol Invariants, "Target CPU selection"), and `enqueue_and_wake` links the t
 
 | Field group | Fields | Owning lock | Cross-CPU access rule |
 |---|---|---|---|
-| **Scheduling** | `state`, `ipc_state`, `preferred_cpu`, `blocked_on_object`, `wake_pending`, `park_seq`, `start_seq` (plus `priority`, `cpu_affinity`, `park_started_tick`, the park-commit tick stamp the softlockup watchdog's detectors read under the same lock as a diagnostic, and `placement`, the placement counters, whose four link and pull counters every writer increments under this lock, whose two synchronous wake rule counters `place_wake` increments by a `Relaxed` atomic add without it, and all of which `SYS_CAP_INFO` reads without it ([scheduler.md](scheduler.md#placement-counters) § Placement Counters); `slice_remaining` is written only by the running CPU's `timer_tick` under that CPU's `scheduler.lock`) | `(*tcb).sched_lock` — the single authoritative serializer, keyed on the TCB pointer (NOT positional). The same lock owns the group regardless of which CPU's run queue currently links the TCB, or whether it is linked at all. | Cross-CPU writers MUST acquire `(*tcb).sched_lock`. The per-CPU `scheduler.lock` owns the run-queue list structure (each linked TCB's intrusive `run_queue_next` link and `queued_on` tag, and head/tail/`non_empty`/load): every write after boot holds it, a TCB's own link and unlink hold its `sched_lock` outside it, and a neighbour's link and `schedule()`'s dequeue hold only the CPU lock (Phase 9's link of init and `sched::enter`'s dequeue of it hold neither: no other thread exists yet, and the idle APs reach CPU 0's queue only through the load balancer, which runs from `timer_tick` and so not before `sched::enter` ends the BSP boot transient (§ BSP Boot Transient), after its dequeue of init); it no longer owns `state`. `wake_pending` is part of this group and is a plain `bool` accessed only under `sched_lock` (the lock-serialized wake-before-park refuse-to-park flag); so is `start_seq`, a plain `u32`, the start generation `sys_thread_start`'s commit advances and its link checks. `park_seq`, the park-binding generation, is an `AtomicU32`: every write holds `sched_lock`, and its Relaxed readers hold `sched_lock` (the stop protocol, `cancel_ipc_block`'s source-arm claim gate, `ipc::lock_bound_source`, rule 7, and a fault-handler binder's snapshot and queued-arm claim gate in `ipc::fault::redeliver_in_flight`), `SLEEP_LIST_LOCK` (the timer pop), or the source lock (the timer claim; every park on a source advances `park_seq` under that source lock, which orders the source-lock reads) — see [thread-lifecycle-and-sleep.md § Atomic Ordering for Sleep List and Lifecycle](thread-lifecycle-and-sleep.md#atomic-ordering-for-sleep-list-and-lifecycle). |
+| **Scheduling** | `state`, `ipc_state`, `preferred_cpu`, `blocked_on_object`, `wake_pending`, `park_seq`, `start_seq` (plus `priority`, `cpu_affinity`, `park_started_tick`, the park-commit tick stamp the softlockup watchdog's detectors read under the same lock as a diagnostic, and `placement`, the placement counters, whose four link and pull counters every writer increments under this lock, whose two synchronous wake rule counters `place_wake` increments by a `Relaxed` atomic add without it, and all of which `SYS_CAP_INFO` reads without it ([scheduler.md](scheduler.md#placement-counters) § Placement Counters); `slice_remaining` is written only by the running CPU's `timer_tick` under that CPU's `scheduler.lock`, and by the thread's own call (`turn::lend_turn_out`) in syscall context with interrupts masked; `lent_turn`, an `AtomicU64`, is moved by compare-and-swap with no lock, each move out of a server's word holding only while the word carries the caller's tag (`sched::turn`; [scheduler.md](scheduler.md#time-slice-policy) § Time Slice Policy)) | `(*tcb).sched_lock` — the single authoritative serializer, keyed on the TCB pointer (NOT positional). The same lock owns the group regardless of which CPU's run queue currently links the TCB, or whether it is linked at all. | Cross-CPU writers MUST acquire `(*tcb).sched_lock`. The per-CPU `scheduler.lock` owns the run-queue list structure (each linked TCB's intrusive `run_queue_next` link and `queued_on` tag, and head/tail/`non_empty`/load): every write after boot holds it, a TCB's own link and unlink hold its `sched_lock` outside it, and a neighbour's link and `schedule()`'s dequeue hold only the CPU lock (Phase 9's link of init and `sched::enter`'s dequeue of it hold neither: no other thread exists yet, and the idle APs reach CPU 0's queue only through the load balancer, which runs from `timer_tick` and so not before `sched::enter` ends the BSP boot transient (§ BSP Boot Transient), after its dequeue of init); it no longer owns `state`. `wake_pending` is part of this group and is a plain `bool` accessed only under `sched_lock` (the lock-serialized wake-before-park refuse-to-park flag); so is `start_seq`, a plain `u32`, the start generation `sys_thread_start`'s commit advances and its link checks. `park_seq`, the park-binding generation, is an `AtomicU32`: every write holds `sched_lock`, and its Relaxed readers hold `sched_lock` (the stop protocol, `cancel_ipc_block`'s source-arm claim gate, `ipc::lock_bound_source`, rule 7, and a fault-handler binder's snapshot and queued-arm claim gate in `ipc::fault::redeliver_in_flight`), `SLEEP_LIST_LOCK` (the timer pop), or the source lock (the timer claim; every park on a source advances `park_seq` under that source lock, which orders the source-lock reads) — see [thread-lifecycle-and-sleep.md § Atomic Ordering for Sleep List and Lifecycle](thread-lifecycle-and-sleep.md#atomic-ordering-for-sleep-list-and-lifecycle). |
 | **IPC blocking** | `ipc_state`, `blocked_on_object` (committed under `sched_lock`; arbitrated under the source lock), `ipc_msg`, `ipc_wait_next`, `ipc_wait_prev`, `ipc_wait_queue`, `recv_park_slot`, `wakeup_value`, `wakeup_tag`, `timed_out`, `in_fault_delivery`, `fault_delivery_class`, `fault_rebound` | For the `(ipc_state, blocked_on_object)` pair, both `(*tcb).sched_lock` (the commit / clear in `commit_blocked_under_local_lock` / `commit_reply_rebind_under_local_lock` / `enqueue_and_wake` / `cancel_ipc_block`'s snapshot and claimed clear / `ipc::fault::claim_fault_park`'s claimed clear (`stamp_redeliver`) / the `dealloc_object(Thread)` drain's snapshot and clear, steps 11-12) AND the source IPC lock matching `ipc_state` (the waiter-queue arbitration). The remaining fields are owned by the source IPC lock alone (the queue links `ipc_wait_next` / `ipc_wait_prev`, the queue tag `ipc_wait_queue`, an endpoint receiver's parked-receiver slot pointer `recv_park_slot`, `wakeup_value`, `wakeup_tag`, `timed_out`) or by the claim on the thread's park: `ipc_msg` by the thread itself while it runs outside a park (it stages the message it sends and reads the one it received there), by the source lock while the thread is queued, by the dequeue claim (the dequeuer's `wake_in_flight` pin, until its `enqueue_and_wake`) for a dequeued receiver's message copy and capability-transfer results, and by the won `reply_tcb` claim once it is bound for reply; `in_fault_delivery`, written only by the thread itself outside any park and under its `sched_lock` (set by `fault_dispatch` with the binding read that opens a delivery, before its fault park commits, cleared after that park resumes), is read from another CPU under that `sched_lock` (a fault-handler binder's in-flight check, `ipc::fault::delivery_in_flight`, and the register read's hold, `sched::with_held_frame`) or by the holder of that park's claim (the `ep.lock` dequeue, a won `reply_tcb` CAS or swap, a won send-queue unlink, the endpoint dealloc drain's detach), which the commit and the claim order after the write; `fault_delivery_class`, the class of the delivery `in_fault_delivery` marks, is written with it under the same `sched_lock` and read under that lock, by the binder's in-flight check, or by the holder of that park's won `reply_tcb` claim (`sys_ipc_reply`, which honours a `FAULT_REPLY_FORWARD` only on a virtual-memory delivery), which the commit and the claim order after the write; `fault_rebound`, which marks the delivery `in_fault_delivery` marks as cancelled by a binding change, is written under the same `sched_lock` (cleared by the binding read that opens a delivery, set by the binder's `ipc::fault::publish_bindings` when it changes the binding of the class in flight) and read under it by the thread's own close of a delivery that ended without a park (`ipc::fault::close_unparked_delivery`). | A cross-CPU writer of the `(ipc_state, blocked_on_object)` pair MUST hold `sched_lock`; a writer of the source's waiter queue, a TCB's queue links or tag, or the wakeup payload MUST hold the matching source lock, and so MUST a reader from another CPU of the queue, the links, or the payload; a writer of `ipc_msg` other than the thread itself running outside a park MUST hold that thread's park claim, and a reader of `in_fault_delivery` or `fault_delivery_class` on another thread MUST hold that claim or that thread's `sched_lock`. The `ipc_wait_queue` tag is the exception for reads: a holder of any source lock may read it to test membership in that lock's own queue, even while the TCB is linked on another source's queue (only holders of that lock write the tag to that queue's address; `WaitQueue::contains` under the timer claim, `cancel_ipc_block`, the Thread dealloc unlink, and the softlockup watchdog's blocking-object decode rely on this). The source lock may be held outside `sched_lock` (the park commits, the destroy-drain wakes); the reverse nesting is only ever a try-lock, the one `cancel_ipc_block`, `ipc::fault::claim_fault_park`'s queued arm, and the Thread dealloc unlink take through `ipc::lock_bound_source` (Lock Hierarchy rule 7) and the one the softlockup watchdog's blocking-object decode (`watchdog_read_blocked_on`) takes on the same liveness argument. |
 | **Upcall** | `upcall_pending`, `upcall_cookie`, `upcall_any_instruction`, `upcall_masked` | `(*tcb).sched_lock`: the post (`ipc::upcall::post`) writes the cookie, the flag, and `upcall_pending` under the target's lock; the thread's own take at a delivery point clears `upcall_pending` and reads the cookie under its lock; the thread alone writes `upcall_masked`, under its lock (`SYS_THREAD_SET_UPCALL_MASK`). | The poster runs on any CPU and pins the target through its cap lookup. The cancel's snapshot (`cancel_for_upcall`) and the park commit (`commit_blocked_under_local_lock`) read `upcall_pending`, `upcall_masked`, and `in_fault_delivery` under the target's lock, which orders a post against a park ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall Cancel-and-Wake Protocol). The fields are atomics only for the thread's lock-free check at each delivery point, which decides nothing: the take re-reads them under the lock. |
 | **Run limit** | `run_limit`, `run_count`, `run_limit_pending` | None for the tick: the timer tick of the CPU the thread is current on adds to `run_count`, sets it to zero on reaching the limit and sets `run_limit_pending`, under that CPU's `scheduler.lock` and not the thread's. `(*tcb).sched_lock` for the set (`SYS_THREAD_SET_RUN_LIMIT`, `sched::run_limit::set`), which writes all three, and for the thread's own take of the pending fault at its return to user mode, which clears `run_limit_pending` while the thread is `Running` and reads `run_limit`. None for the switch's read of `run_limit_pending` (`sched::run_limit::follow_to_cpu`), which posts `RUN_LIMIT` on the CPU switching to the thread: it follows the Acquire of the thread's `context_saved`, which orders after it every tick of the CPU the thread last ran on. The thread alone sets `run_count` to zero at a reset point's entry and at its fault's resume. | Every field is an atomic accessed `Relaxed`. The tick's add is a `fetch_add`, so a concurrent set's zero is never lost; a set racing a tick may leave the count off by that tick, and a fault the tick marks pending after a set to 0 is dropped by the take, which reads the limit under the lock the set wrote it under. The tick publishes the pending flag before its Release post of `RUN_LIMIT`, which the return's Acquire take orders before its read (§ Return Work, rule 1) ([scheduler.md](scheduler.md#run-limit) § Run Limit). |
@@ -1372,17 +1373,19 @@ and `commit_blocked`'s `Running→Blocked` commit because all three contend for 
 
 ### Target CPU selection (`select_target_cpu`)
 
-`enqueue_and_wake` resolves `target_cpu` via `select_target_cpu(tcb, hint)`, whose rules
-`place_wake` decides. The selection policy is, in priority order: (1) hard affinity
-(`cpu_affinity != AFFINITY_ANY`), (2) save-window pinning to
+A plain wake resolves `enqueue_and_wake`'s `target_cpu` via `select_target_cpu(tcb)`; a call, a
+reply and a fault delivery resolve a `WakeTarget`, a CPU and the end of its queue to link at
+(`WakeLink::Tail` or `WakeLink::Front`), via `select_wake_target(tcb, exclude, hint)`, and link it
+with `enqueue_and_wake_at`. `place_wake` decides both. The selection policy is, in priority
+order: (1) hard affinity (`cpu_affinity != AFFINITY_ANY`), at the tail of that CPU unless the
+pass below takes it there, (P) the pass, (2) save-window pinning to
 `preferred_cpu` while `context_saved == 0` (closes the cross-CPU
 `schedule()` spin against the source CPU's in-flight save), (3) for a
 `WakeHint::Sync` wake, the waker's CPU, under the guard below, then, for a woken
 thread at an RT level, the RT rule below, which places it on its preferred CPU when it
 runs there at once and otherwise on the CPU of the lowest rank, (4) sticky
 `preferred_cpu` when its load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD`
-of the `min_load` of the waker CPU's scan window, except, for a `WakeHint::WakerRuns` wake,
-when `preferred_cpu` is the waker's CPU, and (5) the least-loaded CPU of that window, a tie
+of the `min_load` of the waker CPU's scan window, and (5) the least-loaded CPU of that window, a tie
 going to the CPU with the fewest busy SMT siblings, then the first read (`least_loaded_cpu`;
 [scheduler.md](scheduler.md) § SMT Awareness). The window is every CPU in index order in a boot
 of up to `CPU_SCAN_WINDOW` (128) CPUs, so a tie goes to the lowest index there, and 128 CPUs
@@ -1405,6 +1408,27 @@ cache-warmth alignment with the documented soft-affinity intent in
 to be unrelated (`CSpaceId` namespace exhaustion, see commits on
 that issue).
 
+**The pass (rule P).** A wake of a fair thread (`sched::is_fair_level` of its `priority`) with a
+hint other than `WakeHint::None` passes the thread when it does not outrank the waker and the
+waker's CPU k is eligible (`passes`: below `CPU_COUNT` and not the excluded CPU): the target is k
+with `WakeLink::Front`, ahead of the save-window pin and every later rule. A thread whose hard
+affinity names k passes too; one whose affinity names another CPU goes there at the tail.
+`enqueue_and_wake_at` links a `Front` target at the end of the front segment of k's fair queue
+(`PerCpuScheduler::enqueue_woken`, `QueueEnd::Front`; [scheduler.md](scheduler.md) § Run Queue
+Structure), behind the threads passed there before it and ahead of every thread linked at the
+tail, when the CPU it links on is still k (`WakeTarget::link_on`: a hard affinity read under
+`sched_lock` that sends it elsewhere links it at the tail there) and the level it reads under
+`sched_lock` is still fair. On a `Sync` wake the waker blocks in the same syscall, so k dispatches
+the thread next unless RT work is queued there; on a `WakerRuns` wake the server runs on, and k
+dispatches the thread when the server blocks, yields or expires. A `Sync` pass counts as a
+synchronous wake placed on the waker's CPU (`SyncDecision::WakersCpu`). The pass ignores the
+save-window pin: a thread still saving on its previous CPU is linked on k, whose dispatch waits on
+the save as any dispatch does, rather than at the tail of its previous CPU behind that CPU's
+running thread. It reads only the waker's CPU index and the two ranks, so a passed wake reads no
+queue. Only a wake whose waker the scheduler knows runs a call, a reply or a fault delivery
+passes; every other wake passes `WakeHint::None` and links at the tail. The bound the pass gives,
+and the turn it runs on, are [scheduler.md](scheduler.md) § Service Call Latency's.
+
 **The synchronous wake (rule 3).** A wake passes `WakeHint::Sync` only when its waker is the
 thread running on this CPU, its park committed in the same syscall, and its `schedule()` follows
 before any return to user mode: the call rendezvous (`sys_ipc_call` after `endpoint_call`) and
@@ -1413,12 +1437,13 @@ the fault delivery (`ipc::fault`'s `deliver_once`), each when `CallRendezvous::B
 `SYS_IPC_REPLY_RECV` whose receive parked (`sys_ipc_reply_recv`'s deferred wake, when
 `receive_on` returns `Received::Parked`, which `endpoint_recv` reports only for a committed park).
 A refused park of a call passes `WakeHint::None`: its waker runs on, and a recipient left queued
-behind it would wait out its slice while another CPU idles. Under `Sync`, the woken thread is
-placed on the waker's CPU k when k is eligible and the guard holds:
+behind it would wait out its slice while another CPU idles. Under `Sync`, a woken thread the pass
+did not take, an RT thread whenever k is eligible, is placed on k when k is eligible and the guard
+holds:
 
-- **k queues no thread but its idle thread** (`PerCpuScheduler::has_queued_thread` is false), for
-  both classes. An RT recipient is not placed ahead of a lower RT or fair thread queued on k: that
-  thread would wait behind it while the recipient's own CPU idles, and one pinned to k has no pull
+- **k queues no thread but its idle thread** (`PerCpuScheduler::has_queued_thread` is false). An
+  RT recipient is not placed ahead of a lower RT or fair thread queued on k: that thread would
+  wait behind it while the recipient's own CPU idles, and one pinned to k has no pull
   to bound the wait.
 -  **The woken thread does not outrank the waker** (`run_queue::outranks` on the two `priority`
   values: one run queue above the other), **or its latest receive was a `SYS_IPC_REPLY_RECV`'s and
@@ -1452,31 +1477,38 @@ placed on the waker's CPU k when k is eligible and the guard holds:
   receive can link it on the recv queue: true from `sys_ipc_reply_recv`, false from `sys_ipc_recv`.
   The call that wakes it dequeued it under `ep.lock`, which orders the write before the guard's
   Relaxed read. A recipient that received through `SYS_IPC_REPLY_RECV` and answers with
-  `SYS_IPC_REPLY` after all leaves that caller's reply wake to rule 4 and the RT rule as a plain
-  reply does, queued on k behind it until it parks or an idle CPU pulls the caller
+  `SYS_IPC_REPLY` after all wakes that caller as any plain reply does, with `WakerRuns`: a fair
+  caller it outranks goes to the other rules with k excluded, and an RT caller by the RT rule
   ([scheduler.md](scheduler.md) § Thread Assignment). On the `Sync` wake of a `SYS_IPC_REPLY_RECV`
   whose receive parked, the woken thread is the caller and the bit its own latest receive's; the
   waker, parked in a receive, awaits no reply wake that the woken thread could hold off on k, so the
   bit decides nothing the rank check protects there.
 
-**The waker that runs on (rule 4's exception).** The reply of a `SYS_IPC_REPLY_RECV` whose receive
-did not park (it bound a queued caller, a try-once found none, its park was refused, or it failed)
-passes `WakeHint::WakerRuns`: the server runs on, so its CPU k is busy whatever its load reads.
+**The waker that runs on.** A reply after which the server runs on passes `WakeHint::WakerRuns`:
+a `SYS_IPC_REPLY`, the reply of a `SYS_IPC_REPLY_RECV` whose receive did not park (it bound a
+queued caller, a try-once found none, its park was refused, or it failed), and the reply to a fault
+(`reply_to_fault`) when the handler and the faulter are both fair. Its CPU k is busy whatever its
+load reads. A reply whose caller's turn ran out during the request passes `WakeHint::None` instead
+(`turn::Returned::RanOut`), so the caller goes to the tail with a fresh turn
+([scheduler.md](scheduler.md) § Time Slice Policy). A fair caller that the server does not outrank
+is passed on k (rule P) and runs when the server blocks: it waits in the front segment, where no
+pull takes it, while the server serves its backlog on the turns of the callers that queued it.
 When the server outranks the caller, `wake_replied` places the wake with k excluded
 (`reply_wake_exclusion`, `select_target_cpu_excluding`): every rule after rule 1 leaves k out,
 since the server keeps k past any slice the caller could wait for, and only a caller pinned to k
 lands there.
-Rule 4 then skips k when it is the caller's `preferred_cpu`, and the caller goes to its preferred
-CPU when that is another and within the threshold, and by least load otherwise. The RT rule skips
-k as a preferred pick the same way: an RT caller goes to its preferred CPU when that is another
-where it runs at once, and to the CPU of the lowest rank otherwise. For a server that does not
-outrank the caller, rules 1, 2 and 5, and the RT rule's scan, may still place it on k. When one
+The RT rule skips k as a preferred pick: an RT caller goes to its preferred CPU when that is
+another where it runs at once, and to the CPU of the lowest rank otherwise. A fair caller reaches
+rule 4 on such a wake only off k (k excluded, or its affinity naming another CPU), so rule 4 needs
+no exception for it. For a server that does not outrank an RT caller, rules 1 and 2, and the RT
+rule's scan, may still place the caller on k. When one
 does, `wake_replied` reports it and the server yields to the caller (`schedule(Requeue::Always)`, at
 the tail of its level) before it returns to user mode, after
 delivering a bound message or before returning an error; a refused park yields through its own
 `schedule()` ([ipc-internals.md](ipc-internals.md) § Reply-and-Receive Path). A caller placed
-there would otherwise wait behind the server until the server parks or its slice ends. Every other
-wake passes `WakeHint::None`.
+there would otherwise wait behind the server until the server parks or its slice ends. A passed
+caller has no yield: the server runs on, and the caller runs next. Every other wake passes
+`WakeHint::None`.
 
 When the guard holds, the woken thread is the thread k's `schedule()` dispatches when the waker
 blocks, and `enqueue_and_wake` to k sends no IPI (it skips self-wakes). Between the link and that
@@ -1506,7 +1538,7 @@ rank exceeds ([scheduler.md](scheduler.md) § Wake Preemption). Among the eligib
 affinity mask, less the excluded CPU), the rule returns:
 
 - its `preferred_cpu` when the thread runs there at once, except on a `WakeHint::WakerRuns` wake
-  whose waker's CPU k it is, which rule 4 skips too;
+  whose waker's CPU k it is;
 - otherwise the CPU of the lowest effective rank in the waker CPU's scan window (rule 5's), a tie
   going to the lower `current_load`, then to the fewest busy SMT siblings, then to the first read
   (`least_loaded_cpu` over the key of rank and load).
@@ -1537,7 +1569,7 @@ stale sample places the thread on a CPU where it waits behind a thread it does n
 rule 4 can, or on a CPU of a higher rank than another it could have had; the wait is what
 [scheduler.md](scheduler.md) § Wake Preemption's latency bound names as its residual.
 
-`select_target_cpu_excluding(tcb, exclude, hint)` is the same policy with one CPU
+`select_target_cpu_excluding(tcb, exclude)` is the same policy with one CPU
 removed from the save-window-pin / synchronous / RT / sticky / min-load branches (hard affinity
 still wins, and the excluded CPU is returned only as a single-CPU fallback).
 `dealloc_object(Thread)`'s deferred reply-wake calls it with

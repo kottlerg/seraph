@@ -237,7 +237,8 @@ each change; the binding statement of the resulting invariants is
   not the call sites.
 
 - **`enqueue_and_wake`** is the exclusivity gate. Its signature is unchanged
-  (`target_cpu` is the caller-computed placement *hint* from `select_target_cpu`;
+  (`target_cpu` is the caller-computed placement *hint* from `select_target_cpu` or
+  `select_wake_target`;
   exclusivity is decided by `state` under `sched_lock`, not by the CPU choice).
   It acquires `(*tcb).sched_lock` first and classifies `state`:
   - `Stopped` → clear the park binding (`ipc_state`/`blocked_on_object`),

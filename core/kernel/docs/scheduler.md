@@ -113,7 +113,9 @@ applications in the fair one (`shared/ipc`'s `sched_policy`).
   to their levels, and, while no RT thread is ready on its CPU, no fair thread waits more than
   one turn of the queue, however many threads sit at higher fair levels. The default spawn
   level, 10, has the same slice as an RT thread. A fair thread's level grants no precedence
-  over another fair thread's.
+  over another fair thread's. A fair thread that a call, a reply or a fault delivery wakes can
+  run ahead of the queue, on the turn of the thread that called (§ Service Call Latency); a turn
+  moves between the threads of a call and is never copied, so the bound of one turn holds.
 
 Between the classes, RT always wins. Every scheduling decision takes a ready RT thread before
 any fair one, and a running fair thread is preempted for an RT thread queued on its CPU at the
@@ -195,6 +197,8 @@ struct RunQueue
 {
     head: Option<*mut ThreadControlBlock>,
     tail: Option<*mut ThreadControlBlock>,
+    /// The last TCB of the front segment, `None` when the segment is empty.
+    front: Option<*mut ThreadControlBlock>,
 }
 ```
 
@@ -205,6 +209,16 @@ enables O(1) selection of it: `31 - non_empty.leading_zeros()`
 the queue's bit; dequeue clears it if the queue becomes empty. A queue found by the load
 balancer's scan (`find_runnable`) is reported as a level of that queue, the lowest fair level
 for the fair queue, so the balancer's unlink and relink resolve to the same queue.
+
+The fair queue has a front segment: the run of threads at its head that passes linked
+(§ Thread Assignment), in the order of their links, which `front` ends. A pass links at the end
+of the segment (`PerCpuScheduler::enqueue_woken` with `WakeLink::Front`), behind the threads
+passed before it and ahead of every thread linked at the tail; a dequeue takes the head as before,
+and a dequeue or removal of the segment's last thread moves `front` to the thread ahead of it, or
+empties the segment. A scan for a thread to move away (`find_runnable`, for the load balancer's
+pulls and the RT push) skips the segment, whose threads run on this CPU next, unless RT work runs
+or waits on the CPU (its effective rank is above the fair level's): a passed thread behind RT work
+is pulled as any queued fair thread is (§ Load Balancing).
 
 ### Time Slice Policy
 
@@ -226,6 +240,23 @@ the rank a wake preemption compares, and its slice from the first tick after fol
 until then the thread runs out the slice it holds, and from then on a thread lowered from fair 20
 to 2 runs at most 2 ticks per slice, and one raised from the fair class into the RT class at most
 `TIME_SLICE_TICKS`. A new thread's first slice is its creation level's.
+
+**Lent turns.** A fair thread's call lends its turn to the fair thread that serves it
+(`sched::turn`). The call moves what is left of the caller's slice into the caller's turn word
+(`ThreadControlBlock::lent_turn`), leaving the slice one tick, a marker the word stands in for;
+the receive that binds the call moves the word to the server, tagged with the caller's thread id,
+whether the server was parked or the call queued; a nested call moves it on. While a thread's word
+holds ticks, `timer_tick` charges them before its slice, which is left as it is. Every reply
+moves what is left back to the caller, as does every path that ends a call unanswered (the next
+receive, a cancel, a timed call's expiry, a dealloc, a fault redelivery), each a compare-and-swap
+on the tag, so only the holder of the caller's tag moves its turn. A turn that runs out while the
+server works on the request leaves the server on its own slice, and the reply then sends the
+caller to the tail of its queue with a fresh turn, as a slice expiry does. A slice is refilled
+only at its own expiry, so between two tail links a fair thread runs one turn of its own, plus
+the marker tick, however calls and passes carry it. A call between threads that are not both fair
+moves no turn. What a reply gave back to a server for a call it made on its own turn is dropped
+when the server next binds a call, whose caller's turn replaces it: a thread never gains a turn by
+lending.
 
 Slice expiry never hands the CPU to a lower RT level, nor from an RT thread to a fair one: the
 expiring thread is requeued at its run queue's tail and the highest non-empty queue runs next.
@@ -565,57 +596,63 @@ whence the RT push of that CPU's tick moves it (§ Load Balancing, "RT push"; §
 "Latency bound"), as it does a thread a narrowed window placed behind such a thread while a CPU
 outside the window ran a lower level.
 
-A synchronous wake places its thread by its waker. A call that finds a receiver parked, and a
-fault delivery that finds a handler parked, wake it with `WakeHint::Sync` when the caller's park
-committed: the caller blocks in the same syscall, so one CPU serves both threads. The receiver then
-runs on the caller's CPU when that CPU queues no thread but its idle thread and the receiver does
-not outrank the caller (its run queue is not above the caller's), or outranks it but last
-received through `SYS_IPC_REPLY_RECV` and the caller can leave that CPU (below), whatever CPU it
-last ran on; hard
-affinity and the save-window pin still come first
-([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). A pair that starts
-apart, or that a pull or an affinity change split, so comes together on its first round trip,
-which then wakes no other CPU: the reply's wake finds the caller's preferred CPU on that CPU, and
-the server's next receive blocks. An RT pair stays together so only when its server replies with
-`SYS_IPC_REPLY_RECV` (below). Besides a caller that cannot move (below), two cases stay with the
-other rules: a call made while other
-work is queued on the caller's CPU, whose threads the receiver would otherwise run ahead of while
-its own CPU idles, and a receiver that outranks its caller and last received through
-`SYS_IPC_RECV`, such as an RT server that answers a fair client with `SYS_IPC_REPLY`, which,
-serving a backlog without parking, would hold off the caller's reply wake past any slice (§ Time
-Slice Policy): a `SYS_IPC_REPLY`'s wake goes by the caller's preferred CPU (by rank for an RT
-caller, below). A server that replies with `SYS_IPC_REPLY_RECV` holds off no reply wake of a
-caller that can move, since that wake is placed by whether its receive parks, and when the server
-runs on, on another CPU than the server's (below), so an RT server serving unpinned fair clients
-that way runs on each caller's CPU that queues nothing else. A caller that cannot leave its CPU is
-never made to share it with a receiver that outranks it: one pinned there by hard affinity, which
-its reply wake must return to that CPU whatever the server does, and a thread in a fault delivery,
-whose resume reply wakes it before the handler's receive. Their receivers go by the other rules with
-that CPU left out, even when it is the receiver's preferred CPU, so such a pair stays apart, each
-call and each reply waking another CPU. At the call the kernel
-cannot tell how the receiver will reply; it takes the syscall of the receiver's latest receive as
-the prediction. A
-server that received through `SYS_IPC_REPLY_RECV` and answers the call with a `SYS_IPC_REPLY` after
-all can keep that caller's reply wake queued behind it until it parks, or until an idle CPU pulls
-the caller (§ Load Balancing): the cost the second condition otherwise keeps off, paid by each call
-it answers so.
+A wake from a running waker passes its thread when it is a fair thread that does not outrank
+the waker: a call that finds a receiver parked, a fault delivery that finds a handler parked, and
+a reply. The thread is linked on the waker's CPU, into the front segment of its fair queue
+(§ Run Queue Structure), ahead of every fair thread that CPU queues, whatever its load, its
+preferred CPU or the save-window pin; a hard affinity that names another CPU, or a rule that
+leaves the waker's CPU out (below), sends it to the other rules and the tail instead. A waker that
+blocks in the same syscall (`WakeHint::Sync`) leaves the thread to run at once; one that runs on
+(`WakeHint::WakerRuns`) leaves it to run when the waker blocks, yields or its slice ends. The
+thread runs on the turn its caller lent (§ Time Slice Policy), and the pass is what bounds the
+wait of a fair thread's call to a fair service (§ Service Call Latency)
+([scheduling-internals.md](scheduling-internals.md) § Target CPU selection, "The pass").
 
-A reply's wake is placed by what its server does next. A `SYS_IPC_REPLY` passes
-`WakeHint::None`: the kernel cannot tell whether the server blocks next, so a receiver at its
-fair caller's level that, after its reply, serves other callers' queued calls without parking
-leaves the caller's reply wake queued behind it on that CPU until it parks or its slice expires;
-an RT caller's reply wake goes to another CPU instead (below). A
-`SYS_IPC_REPLY_RECV` wakes its caller after its receive. When the receive parks, the server blocks
-in the same syscall, and the caller is woken with `WakeHint::Sync` onto the server's CPU, under the
-guard above with the server as the waker. Otherwise the server runs on, and the caller is woken
-with `WakeHint::WakerRuns`, for which the preferred-CPU rules skip the server's CPU: the caller
-goes to its preferred CPU when that is another (an RT caller only where it runs at once), and
-otherwise by rank (an RT caller) or least load. When the server outranks the caller, every rule but
-hard affinity leaves the server's CPU out. A caller still placed on the server's CPU, at the
-server's level or above, runs before the server returns to user mode, the server yielding to the
-tail of its level
-([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). Every other wake
-passes `WakeHint::None`.
+A synchronous wake that does not pass places its thread by its waker too. A call that finds a
+receiver parked, and a fault delivery that finds a handler parked, wake it with `WakeHint::Sync`
+when the caller's park committed: the caller blocks in the same syscall, so one CPU serves both
+threads. A receiver the pass does not take, an RT one, then runs on the caller's CPU when that CPU
+queues no thread but its idle thread and the receiver does not outrank the caller (its run queue
+is not above the caller's), or outranks it but last received through `SYS_IPC_REPLY_RECV` and the
+caller can leave that CPU (below), whatever CPU it last ran on; hard affinity and the save-window
+pin still come first ([scheduling-internals.md](scheduling-internals.md) § Target CPU selection).
+A pair that starts apart, or that a pull or an affinity change split, so comes together on its
+first round trip, which then wakes no other CPU: the reply's wake finds the caller's preferred CPU
+on that CPU, and the server's next receive blocks. A fair pair comes together by the pass; an RT
+pair stays together so only when its server replies with `SYS_IPC_REPLY_RECV` (below). Besides a
+caller that cannot move (below), two cases stay with the other rules: a call made while other work
+is queued on the caller's CPU, whose threads the receiver would otherwise run ahead of while its
+own CPU idles, and a receiver that outranks its caller and last received through `SYS_IPC_RECV`,
+such as an RT server that answers a fair client with `SYS_IPC_REPLY`: serving a backlog without
+parking, it runs on past each reply, whose wake then leaves its CPU (below), so the pair would
+meet on the caller's CPU only to split at each reply. A server that replies with
+`SYS_IPC_REPLY_RECV` holds off no reply wake of a caller that can move, since that wake is placed
+by whether its receive parks, and when the server runs on, on another CPU than the server's
+(below), so an RT server serving unpinned fair clients that way runs on each caller's CPU that
+queues nothing else. A caller that cannot leave its CPU is never made to share it with a receiver
+that outranks it: one pinned there by hard affinity, which its reply wake must return to that CPU
+whatever the server does, and a thread in a fault delivery, whose resume reply wakes it before the
+handler's receive. Their receivers go by the other rules with that CPU left out, even when it is
+the receiver's preferred CPU, so such a pair stays apart, each call and each reply waking another
+CPU. At the call the kernel cannot tell how the receiver will reply; it takes the syscall of the
+receiver's latest receive as the prediction.
+
+A reply's wake is placed by what its server does next, and gives the caller back what is left of
+its turn (§ Time Slice Policy). A `SYS_IPC_REPLY_RECV` wakes its caller after its receive. When
+the receive parks, the server blocks in the same syscall, and the caller is woken with
+`WakeHint::Sync`: a fair caller is passed onto the server's CPU and runs at once, and an RT one is
+placed there under the guard above with the server as the waker. Otherwise the server runs on, as
+it does after every `SYS_IPC_REPLY` and, between fair threads, after the reply to a fault, and the
+caller is woken with `WakeHint::WakerRuns`. A fair caller the server does not outrank is passed
+onto the server's CPU: it runs when the server blocks or its slice ends, ahead of every fair thread
+linked at the tail, while the server serves its backlog on the turns of the callers that queued it
+(§ Service Call Latency). When the server outranks the caller, every rule but hard affinity leaves
+the server's CPU out. An RT caller goes to its preferred CPU when that is another where it runs at
+once, and otherwise by rank; one still placed on the server's CPU, at the server's level or above,
+runs before the server returns to user mode, the server yielding to the tail of its level
+([scheduling-internals.md](scheduling-internals.md) § Target CPU selection). A reply whose caller's
+turn ran out during the request wakes it with `WakeHint::None` instead, at the tail with a fresh
+turn, as a slice expiry would. Every other wake passes `WakeHint::None`.
 
 An RT caller's plain `SYS_IPC_REPLY` wake therefore leaves its server's CPU when the server runs at
 the caller's level or above: the server runs on past the reply, so that CPU ranks at the server's
@@ -648,7 +685,10 @@ than the threads queued behind its running one.
 
 The balancer counts queued threads without weighing them by class or level (§ Scheduling
 Classes): it evens out the number of queued threads per CPU, and `find_runnable` scans the
-victim's queues from the highest, so an RT thread is pulled before a fair one.
+victim's queues from the highest, so an RT thread is pulled before a fair one. The scan skips the
+fair queue's front segment, whose passed threads run on the victim next, unless RT work runs or
+waits there (§ Run Queue Structure): a passed thread behind RT work is pulled as any fair thread
+is, so a thread that loops at an RT level cannot strand it.
 
 **Scan windows.** Each scan of the CPUs on a wake or a tick path reads at most `CPU_SCAN_WINDOW`
 (128) of them (`sched::ScanWindow`): consecutive CPUs in index order from a cursor of the
@@ -1287,6 +1327,54 @@ milliseconds and the tick is 1 ms, so a one-shot timer buys no resolution the AB
 one sleep list serviced by one CPU keeps its batch and quiesce invariants
 ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants) § Sleep List
 Invariants). The wake that CPU 0's tick makes preempts wherever it is placed, as any other wake.
+
+### Service Call Latency
+
+A fair thread's call to a fair service is not delayed by the fair threads queued on its CPU, by
+the rule of § Thread Assignment and the turn of § Time Slice Policy:
+
+- **The rule.** The call, the reply and a fault delivery pass the woken thread: it is linked on
+  its waker's CPU ahead of every fair thread queued there. The thread runs on its caller's turn,
+  which the call moved to it, and the reply moves what is left back.
+- **The bound.** For a fair thread T that calls a fair server S, while T's turn lasts, the call
+  completes within the time S's request path takes, two switches, and the RT work on the CPUs
+  that run S and T meanwhile, plus, when no receive thread of S is parked at the call, the
+  requests queued on S ahead of T's. With w the work of one request, and with S's reply finding
+  a backlog, so that S runs on while T waits in the front segment of S's CPU (§ Run Queue
+  Structure) until S blocks:
+
+  ```text
+  wait <= (Q + E) x w + RT
+  ```
+
+  Q is the number of requests queued on S when it replies to T; E the requests S serves
+  meanwhile from threads outside that segment, at most one from each thread not waiting on S at
+  the reply, plus the repeats of callers whose turn ran out or whose hard affinity excludes S's
+  CPU; RT the RT work on S's CPU meanwhile. A caller S replies to during the run-on is passed
+  into the segment behind T and cannot call again before S blocks. Whatever the counts, each tick
+  of the run-on is charged to the turn of a caller S serves or to S's own slice, so it is also
+  bounded by one turn of each other caller of S and one slice of S. No term depends on the number
+  of fair threads queued on either CPU, nor on the length of their slices. A call with a receive
+  thread parked and no backlog, as a probe of a service that answers one caller at a time makes,
+  has Q = E = 0.
+- **The precondition.** The bound holds for a service whose request path blocks only in IPC. A
+  server thread that waits mid-request on a lock or a condition variable of its own process is
+  woken by a notification wake, which links at the tail of its CPU's queue behind the fair threads
+  there, and the lock's holder runs on no caller's turn. Such a service is outside the bound:
+  logd's receive workers wait on its state lock mid-request (#1772).
+- **A turn that runs out.** A caller whose turn runs out during the request is sent to the tail
+  with a fresh turn by the reply (§ Time Slice Policy), so a thread that calls in a loop runs
+  ahead of its CPU's queue for at most one turn between two tail links.
+
+The reverse direction is bounded as the fair class bounds any thread. A pass is made only on the
+waker's CPU, which the waker holds while it makes it, so a pair converges on one CPU and does not
+hop. Every tick of a fair service is charged to a turn of a caller it serves or to its own slice,
+and a turn moves and is never copied, so a fair thread queued on the service's CPU waits at most
+one turn of each thread ahead of it, the service's callers' turns being spent there in their
+place, and at most one slice of the service. A call-and-reply pair handing off on one CPU leaves
+the CPU's other fair threads their turns (`integration::handoff_pair_progress` in ktest). An RT
+service is not charged to any turn: it preempts fair threads as the RT class does
+(§ Scheduling Classes).
 
 ### Kernel-Mode Preemption Points
 

@@ -358,8 +358,7 @@ unsafe fn signal_reader()
     {
         // SAFETY: tcb is the waiter notification_send claimed for wake; the
         // waker is the timer tick, not a thread, so the wake takes no hint.
-        let target_cpu =
-            unsafe { crate::sched::select_target_cpu(tcb, crate::sched::WakeHint::None) };
+        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
         // SAFETY: tcb and target_cpu are valid; as in irq's signal.
         unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };
     }

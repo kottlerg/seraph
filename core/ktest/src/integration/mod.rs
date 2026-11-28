@@ -46,6 +46,7 @@ pub mod fault_resume_modifies_pc;
 pub mod fault_syscall_buffer;
 pub mod fpu_survives_ipc_call;
 pub mod freed_object_bytes_zeroed;
+pub mod handoff_pair_progress;
 pub mod idle_past_watchdog_threshold;
 pub mod idle_pull_starved_ready;
 pub mod ipc_call_interrupted_stop_start;
@@ -228,6 +229,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fair_share_progress",
         fair_share_progress::run(ctx)
+    );
+    run_integration_test!(
+        "integration::handoff_pair_progress",
+        handoff_pair_progress::run(ctx)
     );
     run_integration_test!(
         "integration::idle_pull_starved_ready",

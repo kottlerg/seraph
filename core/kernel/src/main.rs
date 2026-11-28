@@ -1702,6 +1702,7 @@ unsafe fn kernel_entry_post_rebase(
                         state: sched::thread::ThreadState::Ready,
                         priority: sched::INIT_PRIORITY,
                         slice_remaining: sched::quantum_ticks(sched::INIT_PRIORITY),
+                        lent_turn: core::sync::atomic::AtomicU64::new(0),
                         cpu_affinity: sched::AFFINITY_ANY,
                         preferred_cpu: 0,
                         placement: crate::sched::thread::PlacementCounts::new(),

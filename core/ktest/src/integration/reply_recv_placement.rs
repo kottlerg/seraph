@@ -3,17 +3,20 @@
 
 // core/ktest/src/integration/reply_recv_placement.rs
 
-//! Integration: `SYS_IPC_REPLY_RECV` wakes its caller after its receive has
-//! decided: onto the server's CPU when the receive parks, off it when the
-//! receive binds a queued caller, and, when the caller is placed on the
-//! server's CPU anyway at the server's rank, ahead of the server
-//! (core/kernel/docs/scheduler.md § Thread Assignment).
+//! Integration: `SYS_IPC_REPLY_RECV` wakes its fair caller after its receive
+//! has decided: onto the server's CPU, where it runs at once, when the
+//! receive parks; and into the front of the fair queue of that CPU, where it
+//! runs when the server blocks and the server runs on first, when the receive
+//! binds a queued caller (core/kernel/docs/scheduler.md § Service Call
+//! Latency).
 //!
 //! ## The hazard
 //!
-//! A reply wake placed without knowing what the server does next either
-//! sends the caller back to a CPU the server keeps busy, where it waits until
-//! the server blocks, or away from a CPU the server is about to leave idle.
+//! A reply wake placed without knowing what the server does next sends the
+//! caller away from a CPU the server is about to leave idle. A reply wake
+//! that links the caller at the tail of a queue, the server's or another
+//! CPU's, makes it wait a slice of each fair thread queued there; one that
+//! yields the server's CPU to it leaves the queued callers waiting on it.
 //!
 //! ## How this exercises it
 //!
@@ -25,12 +28,12 @@
 //!   finds no other caller and parks.
 //! - binds: C, last run on P, calls; a second caller pinned to K calls while
 //!   the server holds C's request, so the reply-and-receive binds it.
-//! - yields: as binds, with C pinned to P.
+//! - runs on: as binds, with C pinned to P.
 //!
 //! Around each call C reads its own placement counts
 //! (`CAP_INFO_THREAD_PLACEMENT`): the wakes that reached the synchronous wake
 //! rule, those it placed on the waker's CPU, and the load balancer's pulls.
-//! It records them with the CPU its call returned on. In the yields case, C
+//! It records them with the CPU its call returned on. In the runs-on case, C
 //! and the server each mark the round as they return from it, and the first
 //! mark stands.
 //!
@@ -38,10 +41,10 @@
 //!
 //! - parks: every round whose wake reached the rule is placed on P and runs
 //!   there unless pulled, and some round reaches the rule.
-//! - binds: no round runs on P unless pulled, no round reaches the rule
+//! - binds: every round runs on P unless pulled, no round reaches the rule
 //!   (a round that did found the second caller not yet queued and is
 //!   excluded), and some round is counted.
-//! - yields: C returns first in every round.
+//! - runs on: the server returns first in every round, and C returns on P.
 //! - A round whose counts moved by more than its one wake fails.
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -87,7 +90,7 @@ const DONE_POLLS: u32 = 4_000;
 /// queue.
 const SETTLE_MS: u64 = 2;
 
-/// Who marked a round first in the yields case.
+/// Who marked a round first in the runs-on case.
 const FIRST_CALLER: u32 = 1;
 const FIRST_SERVER: u32 = 2;
 
@@ -98,7 +101,7 @@ enum Case
 {
     Parks,
     Binds,
-    Yields,
+    RunsOn,
 }
 
 impl Case
@@ -109,7 +112,7 @@ impl Case
         {
             Self::Parks => "parks",
             Self::Binds => "binds",
-            Self::Yields => "yields",
+            Self::RunsOn => "runs on",
         }
     }
 
@@ -120,7 +123,7 @@ impl Case
     }
 }
 
-const CASES: [Case; 3] = [Case::Parks, Case::Binds, Case::Yields];
+const CASES: [Case; 3] = [Case::Parks, Case::Binds, Case::RunsOn];
 
 /// The case running, as its index in [`CASES`].
 static CASE: AtomicU32 = AtomicU32::new(0);
@@ -140,7 +143,7 @@ static REACHED: [AtomicU32; ROUNDS as usize] = [const { AtomicU32::new(0) }; ROU
 static LOCAL: [AtomicU32; ROUNDS as usize] = [const { AtomicU32::new(0) }; ROUNDS as usize];
 static PULLED: [AtomicU32; ROUNDS as usize] = [const { AtomicU32::new(0) }; ROUNDS as usize];
 
-/// The first mark of each round of the yields case.
+/// The first mark of each round of the runs-on case.
 static FIRST: [AtomicU32; ROUNDS as usize] = [const { AtomicU32::new(0) }; ROUNDS as usize];
 
 /// The `CAP_INFO_THREAD_PLACEMENT` views C reads around a call, in the order
@@ -456,21 +459,28 @@ fn check(case: Case) -> TestResult
                 {
                     continue;
                 }
-                if cpu == P && pulled == 0
+                if cpu != P && pulled == 0
                 {
                     return Err(
                         "reply_recv_placement: a reply whose receive bound a caller ran its \
-                         caller on the server's CPU",
+                         caller off the server's CPU unpulled",
                     );
                 }
             }
-            Case::Yields =>
+            Case::RunsOn =>
             {
-                if first.load(Ordering::Acquire) != FIRST_CALLER
+                if first.load(Ordering::Acquire) != FIRST_SERVER
                 {
                     return Err(
-                        "reply_recv_placement: a caller on the server's CPU at its rank ran \
-                         after the server returned",
+                        "reply_recv_placement: a server whose receive bound a caller did not \
+                         run on ahead of the caller it replied to",
+                    );
+                }
+                if cpu != P
+                {
+                    return Err(
+                        "reply_recv_placement: a caller pinned to the server's CPU returned \
+                         elsewhere",
                     );
                 }
             }
@@ -531,7 +541,7 @@ fn index_of(round: u64) -> Option<usize>
 /// The server: receive once, then serve every request with a
 /// reply-and-receive. C's request names its round; the server holds it
 /// [`SETTLE_MS`] after the second caller (when the case has one) has called,
-/// then marks the round in the yields case once its reply-and-receive
+/// then marks the round in the runs-on case once its reply-and-receive
 /// returns. The second caller's request (round 0) is answered at once. Runs
 /// until a receive fails; its case deletes it, parked.
 extern "C" fn server_entry(arg: u64) -> !
@@ -574,7 +584,7 @@ extern "C" fn server_entry(arg: u64) -> !
             break;
         };
         if round != 0
-            && case == Case::Yields
+            && case == Case::RunsOn
             && let Some(first) = index_of(round).and_then(|i| FIRST.get(i))
         {
             let _ = first.compare_exchange(0, FIRST_SERVER, Ordering::AcqRel, Ordering::Acquire);
@@ -584,7 +594,7 @@ extern "C" fn server_entry(arg: u64) -> !
     thread_exit()
 }
 
-/// C: each round, run on its case's CPU (pinned there for the yields case,
+/// C: each round, run on its case's CPU (pinned there for the runs-on case,
 /// left unpinned after reaching it otherwise), read its placement counts,
 /// call with the round as label, record the CPU the call returned on and the
 /// counts' differences, and mark the round; then report on `done`.
@@ -610,7 +620,7 @@ extern "C" fn caller_entry(arg: u64) -> !
         {
             fail();
         }
-        if case != Case::Yields && thread_set_affinity(me, AFFINITY_ANY).is_err()
+        if case != Case::RunsOn && thread_set_affinity(me, AFFINITY_ANY).is_err()
         {
             fail();
         }

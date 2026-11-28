@@ -5465,6 +5465,10 @@ unsafe fn dealloc_thread(
                     };
                     if claimed
                     {
+                        // The unanswered client gets its
+                        // turn back.
+                        // SAFETY: the won CAS claimed tcb's binding of bound.
+                        unsafe { crate::sched::turn::reclaim_turn(tcb, bound) };
                         // Keep the client TCB alive against a concurrent
                         // dealloc(client) until the deferred enqueue_and_wake
                         // clears it (#160 wake-in-flight gate). A BlockedOnReply
@@ -5618,13 +5622,7 @@ unsafe fn dealloc_thread(
             let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
             // SAFETY: bound kept valid by wake_in_flight = 1 above;
             // select_target_cpu_excluding is lock-free.
-            let bcpu = unsafe {
-                crate::sched::select_target_cpu_excluding(
-                    bound,
-                    Some(this_cpu),
-                    crate::sched::WakeHint::None,
-                )
-            };
+            let bcpu = unsafe { crate::sched::select_target_cpu_excluding(bound, Some(this_cpu)) };
             // The reply-wake is never self-pinned to the wedged
             // dealloc CPU unless hard affinity names it or it is the only
             // CPU.
@@ -5758,6 +5756,11 @@ unsafe fn dealloc_thread(
                             };
                             if cancelled
                             {
+                                // The server keeps no turn
+                                // of a dying client.
+                                // SAFETY: the won CAS claimed server's binding
+                                // of tcb.
+                                unsafe { crate::sched::turn::reclaim_turn(server, tcb) };
                                 // SAFETY: tcb is valid (not yet freed).
                                 unsafe {
                                     (*tcb).wake_in_flight.store(0, Ordering::Release);
@@ -5804,6 +5807,11 @@ unsafe fn dealloc_thread(
                             };
                             if cancelled
                             {
+                                // The server keeps no turn
+                                // of a dying client.
+                                // SAFETY: the won CAS claimed server's binding
+                                // of tcb.
+                                unsafe { crate::sched::turn::reclaim_turn(server, tcb) };
                                 // SAFETY: tcb is valid (not yet freed).
                                 unsafe {
                                     (*tcb).wake_in_flight.store(0, Ordering::Release);

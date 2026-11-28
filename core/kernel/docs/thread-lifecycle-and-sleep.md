@@ -355,7 +355,7 @@ stated explicitly.
    tick mid-spin cannot reschedule the dealloc caller off this CPU.
 10. If a server_reply_wake was prepared in step 5, null the claimed client's
     blocked_on_object under the client's sched_lock, recompute the target CPU
-    via select_target_cpu_excluding(bound, Some(this_cpu), WakeHint::None) — excluding THIS
+    via select_target_cpu_excluding(bound, Some(this_cpu)) — excluding THIS
     dealloc CPU, which spins in this protocol's gates (steps 8-9 and 14), not
     in schedule(), and so cannot dispatch a client linked onto it (#351) —
     then enqueue_and_wake(bound, target). Recomputing here rather than
@@ -983,7 +983,7 @@ upcall that the first three rows admit.
    (`commit_reply_rebind_under_local_lock`), whose parks the upcall leaves in both states, and
    every other park the thread commits with the upcall pending is refused (Park side). A pass that
    loses its claim lost it to a waker or a concurrent cancel, which owns the wake.
-3. **Wake.** On a won claim, `enqueue_and_wake(target, select_target_cpu(target, WakeHint::None))`
+3. **Wake.** On a won claim, `enqueue_and_wake(target, select_target_cpu(target))`
    makes the thread `Ready` and clears `wake_in_flight`. The resumed syscall consumes the
    `INTERRUPTED` stamp and returns `Interrupted`, and `finish_syscall` delivers the upcall
    (`ipc::upcall::deliver_at_syscall`).

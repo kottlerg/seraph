@@ -28,7 +28,7 @@
 //! held simultaneously.
 
 use super::thread::ThreadControlBlock;
-use super::{IDLE_PRIORITY, NUM_PRIORITY_LEVELS, RT_PRIORITY_MIN};
+use super::{IDLE_PRIORITY, NUM_PRIORITY_LEVELS, RT_PRIORITY_MIN, WakeLink};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
@@ -268,16 +268,37 @@ enum QueueEnd
     Tail,
     /// Ahead of every queued TCB.
     Head,
+    /// At the end of the queue's front segment: behind the TCBs linked there
+    /// before it, ahead of every other.
+    Front,
+}
+
+/// Whether a scan for a thread to move away ([`PerCpuScheduler::find_runnable`])
+/// reads the fair queue's front segment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrontSegment
+{
+    /// The segment's threads run on this CPU next: the scan skips them.
+    Skip,
+    /// RT work runs or waits ahead of them: the scan reads them, as it reads
+    /// any fair thread queued behind RT work.
+    Include,
 }
 
 /// Intrusive FIFO queue of the ready TCBs of one run queue (a single RT level,
 /// or every fair level together), except that a TCB just dequeued and handed
 /// back undispatched returns to the head ([`enqueue_head`](Self::enqueue_head)),
-/// keeping its turn.
+/// keeping its turn, and that a passed TCB joins the front segment
+/// ([`enqueue_front`](Self::enqueue_front)): the run of TCBs at the head that
+/// such links put there, in the order of their links.
 struct RunQueue
 {
     head: Option<*mut ThreadControlBlock>,
     tail: Option<*mut ThreadControlBlock>,
+    /// The last TCB of the front segment, `None` when the segment is empty: a
+    /// TCB [`enqueue_front`](Self::enqueue_front) linked and no dequeue or
+    /// removal has taken since, or the TCB ahead of it when it was removed.
+    front: Option<*mut ThreadControlBlock>,
 }
 
 impl RunQueue
@@ -287,7 +308,49 @@ impl RunQueue
         Self {
             head: None,
             tail: None,
+            front: None,
         }
+    }
+
+    /// Link `tcb` at the end of the front segment: behind the TCBs linked
+    /// there before it, at the head when the segment is empty. The
+    /// double-enqueue tripwires are [`enqueue`](Self::enqueue)'s.
+    #[track_caller]
+    fn enqueue_front(&mut self, tcb: *mut ThreadControlBlock)
+    {
+        match self.front
+        {
+            Some(front) =>
+            {
+                #[cfg(debug_assertions)]
+                #[expect(
+                    clippy::pointer_format,
+                    reason = "the TCB address is printed only in an assertion message, which the \
+                              panic handler writes through the serial-only \
+                              `console::panic_write_fmt`"
+                )]
+                // SAFETY: tcb is a valid live TCB pointer; the caller holds the
+                // owning scheduler.lock so its link fields are stable.
+                unsafe {
+                    assert!(
+                        (*tcb).run_queue_next.is_none() && self.tail != Some(tcb),
+                        "run_queue::enqueue_front: tcb {tcb:p} already linked — double-enqueue",
+                    );
+                }
+                // SAFETY: front is a valid TCB linked on this queue.
+                let next = unsafe { (*front).run_queue_next };
+                // SAFETY: tcb is a valid, unlinked TCB.
+                unsafe { (*tcb).run_queue_next = next };
+                // SAFETY: as for front above.
+                unsafe { (*front).run_queue_next = Some(tcb) };
+                if self.tail == Some(front)
+                {
+                    self.tail = Some(tcb);
+                }
+            }
+            None => self.enqueue_head(tcb),
+        }
+        self.front = Some(tcb);
     }
 
     /// Append `tcb` to the tail of the queue (FIFO scheduling within the queue).
@@ -402,6 +465,10 @@ impl RunQueue
     fn dequeue(&mut self) -> Option<*mut ThreadControlBlock>
     {
         let head = self.head?;
+        if self.front == Some(head)
+        {
+            self.front = None;
+        }
         // SAFETY: head is a valid TCB.
         self.head = unsafe { (*head).run_queue_next };
         if self.head.is_none()
@@ -424,11 +491,21 @@ impl RunQueue
     ///
     /// O(n) in queue length. Caller MUST hold the owning
     /// `PerCpuScheduler.lock`.
-    fn find_first_where<F>(&self, mut pred: F) -> Option<*mut ThreadControlBlock>
+    fn find_first_where<F>(
+        &self,
+        front: FrontSegment,
+        mut pred: F,
+    ) -> Option<*mut ThreadControlBlock>
     where
         F: FnMut(*mut ThreadControlBlock) -> bool,
     {
         let mut cur = self.head;
+        if front == FrontSegment::Skip
+            && let Some(front) = self.front
+        {
+            // SAFETY: front is a valid TCB linked on this queue.
+            cur = unsafe { (*front).run_queue_next };
+        }
         while let Some(c) = cur
         {
             if pred(c)
@@ -468,6 +545,10 @@ impl RunQueue
                 if self.tail == Some(c)
                 {
                     self.tail = prev;
+                }
+                if self.front == Some(c)
+                {
+                    self.front = prev;
                 }
                 // SAFETY: c is a valid TCB.
                 unsafe { (*c).run_queue_next = None };
@@ -808,8 +889,35 @@ impl PerCpuScheduler
         unsafe { self.link(tcb, priority, QueueEnd::Head) }
     }
 
-    /// The shared body of [`enqueue`](Self::enqueue) and
-    /// [`enqueue_at_head`](Self::enqueue_at_head), linking at `end`.
+    /// [`enqueue`](Self::enqueue) at the end `link` names: for a fair
+    /// `priority` a wake passed ([`WakeLink::Front`]) links at the end of the
+    /// front segment of the fair queue, where it runs ahead of every other
+    /// queued fair thread and behind the threads passed before it; every other
+    /// wake, an RT or idle level's included, links at the tail.
+    ///
+    /// # Safety
+    /// As for [`enqueue`](Self::enqueue).
+    #[must_use]
+    #[track_caller]
+    pub unsafe fn enqueue_woken(
+        &self,
+        tcb: *mut ThreadControlBlock,
+        priority: u8,
+        link: WakeLink,
+    ) -> bool
+    {
+        let end = match link
+        {
+            WakeLink::Front if super::is_fair_level(priority) => QueueEnd::Front,
+            WakeLink::Front | WakeLink::Tail => QueueEnd::Tail,
+        };
+        // SAFETY: the caller's contract is this function's.
+        unsafe { self.link(tcb, priority, end) }
+    }
+
+    /// The shared body of [`enqueue`](Self::enqueue),
+    /// [`enqueue_at_head`](Self::enqueue_at_head) and
+    /// [`enqueue_front`](Self::enqueue_front), linking at `end`.
     ///
     /// # Safety
     /// As for [`enqueue`](Self::enqueue).
@@ -912,6 +1020,7 @@ impl PerCpuScheduler
         {
             QueueEnd::Tail => queue.enqueue(tcb),
             QueueEnd::Head => queue.enqueue_head(tcb),
+            QueueEnd::Front => queue.enqueue_front(tcb),
         }
         // Tag the link under the owning scheduler.lock so any subsequent enqueue
         // (this or another CPU) observes it via the guard above. `priority` is a
@@ -1163,9 +1272,13 @@ impl PerCpuScheduler
     /// return to user mode is two loads and a branch; true for any queued
     /// thread while the level is [stale](Self::level_stale).
     ///
-    /// Reads `non_empty` and `outranking` Relaxed, holding no lock. The
-    /// caller is this CPU with interrupts masked, at a return to user mode or
-    /// between two batches of a `SYS_MEMORY_ZERO` (`syscall::mem`): a link it
+    /// Reads `non_empty` and `outranking` Relaxed. Two kinds of caller read
+    /// it. `link` and `relink`, on whichever CPU makes the link or the move,
+    /// read it under this CPU's `lock` to post the preemption the link owes,
+    /// a remote one exact up to the dispatch the wake IPI covers (`link`).
+    /// The other caller is this CPU with interrupts masked and no lock, at a
+    /// return to user mode or between two batches of a `SYS_MEMORY_ZERO`
+    /// (`syscall::mem`): a link it
     /// made itself precedes the read in program order, and a link another CPU
     /// makes is followed by the wake IPI, whose own return to user mode, or
     /// the zero's test after the next batch, reads again, or, when it cleared
@@ -1430,6 +1543,25 @@ impl PerCpuScheduler
         true
     }
 
+    /// Whether a scan for a thread to move away reads the fair queue's front
+    /// segment: the segment's threads run on this CPU next while it runs a
+    /// fair thread or its idle thread and queues no RT thread, and a scan then
+    /// skips them. While an RT thread runs or waits here they wait behind it
+    /// as any queued fair thread does, and a pull may take them.
+    fn front_segment(&self) -> FrontSegment
+    {
+        let fair_rank = level_rank(syscall::PRIORITY_MIN);
+        let ranks = self.ranks();
+        if ranks.effective() <= fair_rank
+        {
+            FrontSegment::Skip
+        }
+        else
+        {
+            FrontSegment::Include
+        }
+    }
+
     /// Scan the run queues whose `non_empty` bits `within` names, from highest
     /// to lowest, and return the first queued TCB whose pointer satisfies
     /// `pred`, along with a level of the queue it is on: its RT level, or the
@@ -1438,7 +1570,9 @@ impl PerCpuScheduler
     ///
     /// Used by the cross-CPU load balancer to pick a migratable (unpinned)
     /// thread from a busier CPU's queue, over every queue, and by the RT push
-    /// over its window ([`push_window`]).
+    /// over its window ([`push_window`]). The fair queue's front segment is
+    /// read only while RT work runs or waits ahead of it
+    /// ([`front_segment`](Self::front_segment)).
     ///
     /// # Safety
     /// The caller holds `self.lock`.
@@ -1453,13 +1587,14 @@ impl PerCpuScheduler
         // SAFETY: the caller holds `self.lock` (contract), so no `&mut` to the
         // queues is live.
         let queues = unsafe { self.queues.as_ref_unchecked() };
+        let front = self.front_segment();
         let mut ne = self.non_empty.load(Ordering::Relaxed) & within;
         while ne != 0
         {
             let q = ne.ilog2() as usize;
             if let Some(tcb) = queues
                 .get(q)
-                .and_then(|queue| queue.find_first_where(&mut pred))
+                .and_then(|queue| queue.find_first_where(front, &mut pred))
             {
                 return Some((tcb, queue_level(q)));
             }
@@ -2905,5 +3040,87 @@ mod tests
                 unsafe { sched.lock.unlock_raw(flags) };
             }
         }
+    }
+    // ── Front segment ─────────────────────────────────────────────────────────
+
+    #[track_caller]
+    fn enq_front(s: &PerCpuScheduler, tcb: *mut ThreadControlBlock, prio: u8) -> bool
+    {
+        // SAFETY: single-threaded test; tcb is a live boxed TCB.
+        unsafe { s.enqueue_woken(tcb, prio, WakeLink::Front) }
+    }
+
+    /// The first queued TCB a scan for a thread to move away finds.
+    fn first_movable(s: &PerCpuScheduler) -> Option<*mut ThreadControlBlock>
+    {
+        // SAFETY: single-threaded test.
+        unsafe { s.find_runnable(u32::MAX, |_| true) }.map(|(tcb, _)| tcb)
+    }
+
+    // Defect caught (#1732): a passed thread linked at the head ahead of the
+    // threads passed before it (a later pass overtaking an earlier one), or
+    // behind a tail link; or a segment end left on a TCB a dequeue or removal
+    // took, so the next pass links after a thread no longer queued.
+    #[test]
+    fn passed_threads_run_in_pass_order_ahead_of_the_tail_links()
+    {
+        let sched = PerCpuScheduler::new();
+        let fair = syscall::PRIORITY_MIN;
+        let mut tail = make_tcb();
+        let mut first = make_tcb();
+        let mut second = make_tcb();
+        let mut third = make_tcb();
+        let (tail, first, second, third) = (
+            &raw mut *tail,
+            &raw mut *first,
+            &raw mut *second,
+            &raw mut *third,
+        );
+        assert!(enq_front(&sched, first, fair));
+        assert!(enq(&sched, tail, fair));
+        assert!(enq_front(&sched, second, fair));
+        assert_eq!(deq(&sched), first);
+        assert!(enq_front(&sched, third, fair));
+        assert!(rm(&sched, third, fair));
+        assert!(enq_front(&sched, third, fair));
+        assert_eq!(deq(&sched), second);
+        assert_eq!(deq(&sched), third);
+        assert_eq!(deq(&sched), tail);
+        assert!(deq(&sched).is_null());
+
+        // A pass into an empty queue is its tail too.
+        assert!(enq_front(&sched, first, fair));
+        assert!(enq(&sched, tail, fair));
+        assert_eq!(deq(&sched), first);
+        assert_eq!(deq(&sched), tail);
+    }
+
+    // Defect caught (#1732): a pull that takes a passed thread from the CPU it
+    // runs on next, so its call or reply waits on the puller's dispatch; or a
+    // passed thread stranded behind an RT thread that holds its CPU, which no
+    // pull may then take (a thread looping on yield at an RT level holds it
+    // for good).
+    #[test]
+    fn a_scan_skips_the_front_segment_unless_rt_work_holds_the_cpu()
+    {
+        let sched = PerCpuScheduler::new();
+        let fair = syscall::PRIORITY_MIN;
+        let mut passed = make_tcb();
+        let mut queued = make_tcb();
+        let (passed, queued) = (&raw mut *passed, &raw mut *queued);
+        assert!(enq_front(&sched, passed, fair));
+        sched.set_current_level(fair);
+        assert_eq!(first_movable(&sched), None);
+        assert!(enq(&sched, queued, fair));
+        assert_eq!(first_movable(&sched), Some(queued));
+        sched.set_current_level(RT_PRIORITY_MIN);
+        assert_eq!(first_movable(&sched), Some(passed));
+        sched.set_current_level(fair);
+        let mut rt = make_tcb();
+        let rt = &raw mut *rt;
+        assert!(enq(&sched, rt, RT_PRIORITY_MIN));
+        assert_eq!(first_movable(&sched), Some(rt));
+        assert!(rm(&sched, rt, RT_PRIORITY_MIN));
+        assert_eq!(first_movable(&sched), Some(queued));
     }
 }

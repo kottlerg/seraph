@@ -606,8 +606,7 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u16)
     // the held ws.lock.
     unsafe { crate::ipc::claim_waiter(waiter, badge) };
     // SAFETY: waiter is a valid TCB, pinned by the claim's wake_in_flight.
-    let target_cpu =
-        unsafe { crate::sched::select_target_cpu(waiter, crate::sched::WakeHint::None) };
+    let target_cpu = unsafe { crate::sched::select_target_cpu(waiter) };
 
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
@@ -810,8 +809,7 @@ pub unsafe fn waitset_add(
         // under the held ws.lock.
         unsafe { crate::ipc::claim_waiter(waiter, badge) };
         // SAFETY: waiter is a valid TCB, pinned by the claim's wake_in_flight.
-        let target_cpu =
-            unsafe { crate::sched::select_target_cpu(waiter, crate::sched::WakeHint::None) };
+        let target_cpu = unsafe { crate::sched::select_target_cpu(waiter) };
         (waiter, target_cpu)
     });
 

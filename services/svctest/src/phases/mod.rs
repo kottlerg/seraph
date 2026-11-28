@@ -138,6 +138,7 @@ pub mod discard;
 pub mod drivers;
 pub mod entropyd;
 pub mod exit_code;
+pub mod fair_load;
 pub mod fixtures;
 pub mod fs_create_open;
 pub mod fs_faults;
@@ -308,6 +309,7 @@ fn ordered() -> Vec<Phase>
     out.extend_from_slice(sessiond::phases());
     out.extend_from_slice(oom::phases());
     out.extend_from_slice(timed::phases());
+    out.extend_from_slice(fair_load::phases());
     out.extend_from_slice(logd_restart::phases());
     out.extend_from_slice(swap::phases());
     out.extend_from_slice(node_reclaim::phases());

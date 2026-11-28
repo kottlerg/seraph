@@ -1313,6 +1313,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 state: ThreadState::Created,
                 priority: creation_priority,
                 slice_remaining: quantum_ticks(creation_priority),
+                lent_turn: core::sync::atomic::AtomicU64::new(0),
                 cpu_affinity: AFFINITY_ANY,
                 preferred_cpu: 0,
                 placement: crate::sched::thread::PlacementCounts::new(),

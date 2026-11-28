@@ -22,10 +22,12 @@
 # SEND on the same endpoint, on which the logd_flush phase checks logd's
 # flush barrier, the one pwrmgr waits on before it powers off, and the
 # logd_sinks phase waits on it before its framebuffer cases and before it
-# stops the serial driver. logd.follow is the LOG_FOLLOW_AUTHORITY
+# stops the serial driver, and the logd_flood phase's probe waits on it for
+# room in its hold window. logd.follow is the LOG_FOLLOW_AUTHORITY
 # SEND|GRANT, whose subscription pool, the external sinks', the logd_follow
 # phase fills, and logd.control the LOG_CONTROL_AUTHORITY SEND the
-# logd_control phase lists and steers the sinks through; both ride after
+# logd_control phase lists and steers the sinks through, and the logd_flood
+# phase lists them through; both ride after
 # logd.flush.
 # devmgr.class.serial and devmgr.class.input are the class SENDs the
 # drivers stray-cap phase and the devmgr ordinal phase query devices on.

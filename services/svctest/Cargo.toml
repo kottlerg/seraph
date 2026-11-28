@@ -36,10 +36,12 @@ svctest-fixtures = { path = "fixtures" }
 # the pages a destroy freed.
 mem-fill = { path = "../../shared/mem-fill" }
 # `SINK_STALL_MS`: the logd_sinks phase bounds its calls and its waits by
-# logd's stall bound.
+# logd's stall bound. `text_holds`: the logd_flood phase reads which sinks
+# `SINK_LIST` reports as holding senders back.
 logd-codec = { path = "../logd/codec" }
 # `HOLD_WINDOW` and the history bounds: the logd_sinks phase sends lines past
-# svctest's hold window and past its share of logd's history.
+# svctest's hold window and past its share of logd's history, and the
+# logd_flood phase's probe keeps within that window.
 logd-slot-table = { path = "../logd/slot-table" }
 # `write_bytes` and the log-call bounds: the log_client phase logs to an
 # endpoint of its own that never answers, through this copy of the crate, so

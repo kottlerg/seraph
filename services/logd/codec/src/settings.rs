@@ -556,6 +556,27 @@ impl fmt::Display for SinkSettings
     }
 }
 
+/// Whether settings in the recipe syntax, as `SINK_LIST` reports a sink's
+/// (`services/logd/docs/ipc-interface.md` § Sink control), hold senders
+/// back: `pace=hold` with a `level` other than `off`.
+#[must_use]
+pub fn text_holds(text: &str) -> bool
+{
+    let mut hold = false;
+    let mut shown = true;
+    for item in text.split(',')
+    {
+        match item.split_once('=')
+        {
+            Some(("pace", value)) => hold = value == "hold",
+            Some(("level", value)) => shown = value != "off",
+            _ =>
+            {}
+        }
+    }
+    hold && shown
+}
+
 /// A settings key.
 #[derive(Clone, Copy)]
 enum Key
@@ -992,5 +1013,28 @@ mod tests
         {
             assert_eq!(log::parse_level(name.as_bytes()), Some(code as u64));
         }
+    }
+
+    // Defect caught: the rendered settings split on anything but `,`, or a
+    // key matched by prefix, so a `hold` sink reads as one that holds
+    // nobody and a flush answered while it stalls reads as written.
+    #[test]
+    fn text_holds_reads_pace_and_level_from_the_rendered_settings()
+    {
+        let serial = SinkKind::Serial.defaults();
+        assert!(text_holds(&serial.to_string()));
+        assert!(!text_holds(&SinkKind::Framebuffer.defaults().to_string()));
+        let skip = SinkSettings {
+            pace: Pace::Skip,
+            ..serial
+        };
+        assert!(!text_holds(&skip.to_string()));
+        let off = SinkSettings {
+            level: None,
+            ..serial
+        };
+        assert!(!text_holds(&off.to_string()));
+        assert!(!text_holds("pacer=hold,level=info"));
+        assert!(!text_holds(""));
     }
 }

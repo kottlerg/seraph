@@ -1081,7 +1081,7 @@ a producer and a consumer thread, neither pinned
 | `pulls` | Load-balancer pulls and RT pushes that moved the thread (`pull_unpinned_ready`, § Load Balancing) |
 | `sync_wakes` | Synchronous-hint wakes that reached the synchronous wake rule (§ Thread Assignment) |
 | `sync_local` | Of those, the wakes the rule placed on the waker's CPU |
-| `front_steals` | Of the pulls, those that took the thread out of its source CPU's front segment while the scan for that destination skips the segment (§ Load Balancing): none, unless the scan breaks that rule. ktest's `load_balance_handoff_steal` asserts it stays zero |
+| `front_steals` | Of the pulls, those that took the thread out of its source CPU's front segment while the scan for that destination skips the segment, by the rule as that scan read it (§ Load Balancing): none, unless the scan breaks that rule. ktest's `load_balance_handoff_steal` asserts it stays zero |
 
 The first four count a wake only when it links the thread: a wake that finds it running, already
 linked, stopped or exited counts nothing. A thread's start, an affinity migration and a requeue of

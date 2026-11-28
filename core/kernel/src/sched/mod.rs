@@ -7015,8 +7015,11 @@ unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -
     {
         run_queue::Puller::Busy
     };
+    // The front segment's rule is read once, so the scan and the witness below
+    // judge the take by the same reading of src's running level.
+    let front = src.front_segment(puller);
     // SAFETY: src's lock held (caller's contract); the predicate is read-only.
-    let pick = unsafe { src.find_runnable(queues, puller, movable) };
+    let pick = unsafe { src.find_runnable_in(queues, front, movable) };
     let Some((tcb, priority)) = pick
     else
     {
@@ -7049,10 +7052,11 @@ unsafe fn pull_under_cpu_locks(src_cpu: usize, dst_cpu: usize, rule: PullRule) -
     // affinity gate inside `relocate_ready_thread` re-reads `cpu_affinity` under
     // the candidate's `sched_lock`, which `sys_thread_set_affinity` holds across
     // its write, so a re-pin between the predicate and here refuses the move.
-    // Whether the move breaks the front segment's rule, read while tcb is
-    // still linked on src, as a diagnostic the steal stress asserts is zero.
+    // Whether the move breaks the front segment's rule as the scan read it,
+    // judged while tcb is still linked on src, as a diagnostic the steal stress
+    // asserts is zero.
     // SAFETY: src's lock is held (caller's contract); tcb is linked on src.
-    let front_steal = unsafe { src.takes_from_skipped_front(tcb, priority, puller) };
+    let front_steal = unsafe { src.takes_from_skipped_front(tcb, priority, front) };
     // SAFETY: sched_lock + both run-queue locks held.
     let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
     if moved

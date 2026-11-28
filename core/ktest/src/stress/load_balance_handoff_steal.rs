@@ -62,8 +62,9 @@
 //! of a source CPU that runs no RT work, where a passed client waits to run
 //! next (core/kernel/docs/scheduler.md § Load Balancing). The kernel counts a
 //! pull that took a thread out of such a segment (`THREAD_PLACEMENT_FRONT_STEALS`,
-//! from a walk of the segment apart from the scan); the controller asserts
-//! the sum over every client and server is `0`.
+//! from a walk of the segment apart from the scan, by the rule as the scan
+//! read it); the controller asserts the sum over every client and server is
+//! `0`.
 //!
 //! A regression surfaces as a **kernel** guard firing (the
 //! `PerCpuScheduler::enqueue` `queued_on >= 0` single-link tripwire in debug

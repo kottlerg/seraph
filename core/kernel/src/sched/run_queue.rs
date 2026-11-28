@@ -322,7 +322,7 @@ pub enum Puller
 /// Whether a scan for a thread to move away ([`PerCpuScheduler::find_runnable`])
 /// reads the fair queue's front segment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FrontSegment
+pub enum FrontSegment
 {
     /// The segment's threads run on this CPU when its running fair thread
     /// blocks, yields or expires, and the puller has work of its own: the scan
@@ -1662,7 +1662,12 @@ impl PerCpuScheduler
     /// queue, since one moved there runs at once. While an RT thread runs or
     /// waits here they wait behind it as any queued fair thread does, and a
     /// pull may take them.
-    fn front_segment(&self, puller: Puller) -> FrontSegment
+    ///
+    /// The rule reads this CPU's running level, which its `schedule` stores
+    /// after it releases `self.lock`, so two reads under the lock can differ: a
+    /// caller that judges a scan against the rule passes the scan the value it
+    /// judges by ([`find_runnable_in`](Self::find_runnable_in)).
+    pub fn front_segment(&self, puller: Puller) -> FrontSegment
     {
         let fair_rank = level_rank(syscall::PRIORITY_MIN);
         let ranks = self.ranks();
@@ -1680,11 +1685,11 @@ impl PerCpuScheduler
         }
     }
 
-    /// Whether a move of `tcb`, queued here at `priority`, to a CPU that is a
-    /// `puller` takes it out of the fair queue's front segment while a scan for
-    /// that puller skips the segment ([`front_segment`](Self::front_segment)):
-    /// a pull the rule forbids, which the `front_steals` placement counter
-    /// counts (core/kernel/docs/scheduler.md § Placement Counters).
+    /// Whether a move of `tcb`, queued here at `priority`, takes it out of the
+    /// fair queue's front segment while `front`, the rule the scan that found
+    /// it read ([`front_segment`](Self::front_segment)), skips the segment: a
+    /// pull the rule forbids, which the `front_steals` placement counter counts
+    /// (core/kernel/docs/scheduler.md § Placement Counters).
     ///
     /// # Safety
     /// The caller holds `self.lock`; `tcb` is a valid TCB.
@@ -1692,10 +1697,10 @@ impl PerCpuScheduler
         &self,
         tcb: *mut ThreadControlBlock,
         priority: u8,
-        puller: Puller,
+        front: FrontSegment,
     ) -> bool
     {
-        if queue_index(priority) != FAIR_QUEUE || self.front_segment(puller) != FrontSegment::Skip
+        if queue_index(priority) != FAIR_QUEUE || front != FrontSegment::Skip
         {
             return false;
         }
@@ -1725,6 +1730,25 @@ impl PerCpuScheduler
         &self,
         within: u32,
         puller: Puller,
+        pred: F,
+    ) -> Option<(*mut ThreadControlBlock, u8)>
+    where
+        F: FnMut(*mut ThreadControlBlock) -> bool,
+    {
+        // SAFETY: the caller holds `self.lock` (contract).
+        unsafe { self.find_runnable_in(within, self.front_segment(puller), pred) }
+    }
+
+    /// [`find_runnable`](Self::find_runnable) with the front segment read as
+    /// `front`, a value [`front_segment`](Self::front_segment) returned under
+    /// the same hold of `self.lock`.
+    ///
+    /// # Safety
+    /// The caller holds `self.lock`.
+    pub unsafe fn find_runnable_in<F>(
+        &self,
+        within: u32,
+        front: FrontSegment,
         mut pred: F,
     ) -> Option<(*mut ThreadControlBlock, u8)>
     where
@@ -1733,7 +1757,6 @@ impl PerCpuScheduler
         // SAFETY: the caller holds `self.lock` (contract), so no `&mut` to the
         // queues is live.
         let queues = unsafe { self.queues.as_ref_unchecked() };
-        let front = self.front_segment(puller);
         let mut ne = self.non_empty.load(Ordering::Relaxed) & within;
         while ne != 0
         {
@@ -3316,7 +3339,7 @@ mod tests
         let (first, second, queued) = (&raw mut *first, &raw mut *second, &raw mut *queued);
         let skipped = |tcb, puller| {
             // SAFETY: single-threaded test; tcb is a live boxed TCB.
-            unsafe { sched.takes_from_skipped_front(tcb, fair, puller) }
+            unsafe { sched.takes_from_skipped_front(tcb, fair, sched.front_segment(puller)) }
         };
         assert!(enq_front(&sched, first, fair));
         assert!(enq_front(&sched, second, fair));
@@ -3332,5 +3355,28 @@ mod tests
         assert_eq!(deq(&sched), first);
         assert_eq!(deq(&sched), second);
         assert!(!skipped(queued, Puller::Busy));
+    }
+
+    // Defect caught (#1732): the front_steals witness reading the front
+    // segment's rule again after the scan, so a level the CPU stores between
+    // the two reads (its schedule() does so outside the run-queue lock) makes
+    // it count a take the scan made under RT work.
+    #[test]
+    fn the_witness_judges_a_take_by_the_rule_the_scan_read()
+    {
+        let sched = PerCpuScheduler::new();
+        let fair = syscall::PRIORITY_MIN;
+        let mut passed = make_tcb();
+        let passed = &raw mut *passed;
+        assert!(enq_front(&sched, passed, fair));
+        sched.set_current_level(RT_PRIORITY_MIN);
+        let front = sched.front_segment(Puller::Busy);
+        assert_eq!(front, FrontSegment::Include);
+        // SAFETY: single-threaded test.
+        let pick = unsafe { sched.find_runnable_in(u32::MAX, front, |_| true) };
+        assert_eq!(pick.map(|(tcb, _)| tcb), Some(passed));
+        sched.set_current_level(fair);
+        // SAFETY: single-threaded test; passed is a live boxed TCB, still linked.
+        assert!(!unsafe { sched.takes_from_skipped_front(passed, fair, front) });
     }
 }

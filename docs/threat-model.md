@@ -235,7 +235,8 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   refuses to register a partition past that capacity (`resolve_lba`, `handle_register_partition` in
   `services/drivers/virtio/blk/src/main.rs`).
 - The FAT decoders are a pure crate, `services/fs/fat/fat-parse`: `parse_bpb_geometry` refuses a bad
-  signature, a zero divisor, a sector size other than the device's, FAT12, an inconsistent
+  signature, a zero divisor, a sector size other than the device's, a cluster size that is not a
+  power of two, FAT12, an inconsistent
   geometry, and a volume that declares more sectors than its partition holds, whose length fatfs
   reads from the block driver (`BLK_GET_GEOMETRY`), so every bound derived from the cluster count
   follows the disk; `is_data_cluster` bounds every cluster number read from disk to the data
@@ -269,9 +270,15 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   `shared/storage-statement/fuzz/storage-statement/seeds/`, and the `proofs` module of
   `shared/storage-statement/src/lib.rs` proves the line parser, the GUID, path and disk forms and
   the conflict check. CI's gating `fuzz` job runs the target, and its `kani` jobs the proofs.
-- Planned: the FAT decoders' property function, fuzz target and proof harness (`parse_bpb_geometry`,
-  `read_fat_entry`, `parse_dir_entry`; [#680](https://github.com/kottlerg/seraph/issues/680),
-  [#756](https://github.com/kottlerg/seraph/issues/756)).
+- `fat` (`xtask/fuzz/targets/src/bin/fat.rs`) drives `fatfs_parse::property::fat_holds` over a
+  sector read as sector 0, as a FAT sector and as a directory sector, from the seeds in
+  `services/fs/fat/fat-parse/fuzz/fat/seeds/`: the BPB decode and the place of each data cluster,
+  the FAT entry read and write, the short entries, the long-name runs and their encoding, the
+  removal and free-run scans, and the numeric tails. The `proofs` module of
+  `services/fs/fat/fat-parse/src/lib.rs` proves the BPB decode, the cluster places, the FAT entries,
+  the short entries and their match over every input, and, by induction, the long-name run, its
+  UTF-8 assembly and the two slot scans. CI's gating `fuzz` job runs the target, and its `kani`
+  jobs the proofs.
 
 **Gaps.**
 
@@ -294,9 +301,8 @@ use (§ Boot-Chain Signatures), so this boundary is about the parsers, not about
   defines a finer location fact first. Where the bootloader's PCI segment and devmgr's differ (a
   Device-Tree-only platform with several ECAM host bridges and no `linux,pci-domain`), no disk is
   at the location and the boot halts the same way.
-- The FAT decoders have no fuzz target or proof harness yet, and no target drives fatfs's own logic
-  over a corrupt volume (its cache, allocation and write paths): the targets drive the parser crates
-  only.
+- No target drives fatfs's own logic over a corrupt volume (its cache, allocation, chain walks and
+  write paths): the targets drive the parser crates only.
 
 ---
 

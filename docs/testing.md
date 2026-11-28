@@ -623,7 +623,12 @@ past its band fails too, since the stale baseline would let a later regression o
 through. A PR that
 moves a count on purpose rewrites the baselines of the benchmarks it moved from its own CI run
 (`cargo xtask bench-baseline --from-run <run id>`) and states the change and its reason in its
-body. The four-CPU counts are reported, not gated: the interleaving of the CPUs moves them.
+body. The four-CPU counts are reported, not gated: the interleaving of the CPUs moves them. A
+four-CPU measurement, or one of a benchmark whose window idles (below), that has a baseline and that
+no run measured fails the cell all the same: a case logs its line, or does not, whatever its count,
+so a line gone from every run is a case that failed, ended early, or counted too few of its windows
+to report ([shared/bench/README.md § Window
+rows](../shared/bench/README.md#window-rows)), which no count of it shows.
 
 The cell measures the release profile because hardware runs it, and a count is worth what it
 says about hardware. The debug profile adds debug assertions and overflow checks, and leaves out

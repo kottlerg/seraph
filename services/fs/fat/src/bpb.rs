@@ -262,8 +262,9 @@ pub fn parse_bpb(
         {
             std::os::seraph::log!(
                 warn: "invalid BPB: inconsistent geometry (no FAT copy or reserved sector, \
-                 data-region start overflows, cluster count exceeds the FAT, FAT32 root outside \
-                 the data region, or volume larger than its {partition_sectors}-sector partition)"
+                 sectors per cluster not a power of two, data-region start overflows, cluster \
+                 count exceeds the FAT, FAT32 root outside the data region, or volume larger \
+                 than its {partition_sectors}-sector partition)"
             );
             return false;
         }

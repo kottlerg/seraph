@@ -181,18 +181,6 @@ Run `git fetch origin` at the start of every step, so each step reads the curren
   procedure), a harness phase the Issue's acceptance requires, or the root `Cargo.toml` and
   `Cargo.lock` for a new dependency or host-tested crate. Anything else outside the task is a
   question.
-- A change to `.claude/CLAUDE.md`, `.claude/settings.json` or a hook needs the maintainer's
-  approval of that change, like any change to what an instruction file requires. The harness
-  does not let a spawned agent write those files, so, orchestrated, prepare the change as a patch
-  file in the scratchpad and report its path after your first push. The supervisor shows the
-  maintainer the diff and, once they approve it, applies the patch and commits it onto your
-  branch, so the PR's review and gate cover it. Keep working meanwhile: the orchestrator sends
-  you the commit, or the maintainer's refusal or requested change, and a revised patch is
-  reported the same way. When the commit arrives, or the pre-push count shows `origin/<branch>`
-  ahead, rebase your unpushed commits onto it (`git rebase origin/<branch>`). Standalone, show
-  the maintainer the diff yourself and, once they approve it, apply it and commit it onto your
-  branch. When a fact you change has a copy there, every copy lands in the same PR: run the
-  review on a head that holds the change.
 - Read every Issue item against the current code before fixing it. An item already fixed is
   ticked citing the PR that fixed it (`git log -S`, `git blame`). An item that is wrong on the
   code goes to the one you report to with the evidence (file and line); that one decides the

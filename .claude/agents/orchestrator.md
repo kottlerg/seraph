@@ -66,9 +66,7 @@ after its session ended, a history rewrite the maintainer asked for, the release
 This file applies `.claude/CLAUDE.md`, docs/conventions.md and docs/testing.md and grants no
 authority those documents reserve to the maintainer. You merge a PR that meets the merge
 condition of docs/conventions.md § Pre-merge review, on a gate you have verified yourself (§
-Merge order and the gate), without asking. A PR that needs a `.claude/CLAUDE.md`, settings or
-hook patch does not meet it until the supervisor has committed the approved patch onto its
-branch. Four steps of a
+Merge order and the gate), without asking. Four steps of a
 release each need the maintainer's approval before you carry them out: the merge of the
 release PR, the tag, the publishing of the Release, and the milestone work (§ Release
 review). One decision is the maintainer's. Ask it in your first message, with its default, and
@@ -508,14 +506,6 @@ never a worker's own (`.claude/agents/worker.md` § Review).
   the old head: `git push --force-with-lease=<branch>:<old> origin <new>:refs/heads/<branch>`.
   Do not replace the branch with a fresh one and a superseding PR, and never force-push
   `master`.
-- **`.claude/CLAUDE.md`, `.claude/settings.json` and hooks.** A change to one needs the
-  maintainer's approval of that change. The harness does not let a spawned agent write them, so
-  a worker prepares the change as a patch file and reports its path after its first push. Send
-  the supervisor the path and the PR's branch: it shows the maintainer the diff and, once they
-  approve it, applies the patch and commits it onto that branch, so the PR's review and gate
-  cover it (`.claude/skills/orchestrate/SKILL.md`, step 6). Send its answer to the worker: the
-  commit, or the maintainer's refusal or requested change. A revised patch from the worker
-  goes to the supervisor the same way and replaces the earlier one.
 - **A finding the workers cannot place** goes to the maintainer with your recommendation, in
   one line.
 

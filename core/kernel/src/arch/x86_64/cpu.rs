@@ -1151,7 +1151,7 @@ fn read_rflags() -> u64
 /// every ring-3-reachable IDT stub runs `cld` and `clac` (TF is cleared by the
 /// interrupt or trap gate), so a set bit here is a regression in that entry
 /// discipline. Called first in `syscall::dispatch` and in the exception,
-/// `#PF`, `#NM`, and IRQ handler bodies (`idt.rs`). A no-op in release builds
+/// `#PF`, and IRQ handler bodies (`idt.rs`). A no-op in release builds
 /// (the RFLAGS read is not performed).
 #[cfg(not(test))]
 #[inline]

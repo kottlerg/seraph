@@ -13,9 +13,9 @@ use alloc::vec::Vec;
 
 use crate::{
     BootDiskError, BoundDisk, GptCopy, GptEntry, GptError, GptFault, GptHeader, GptLookupError,
-    HEADER_LEN, PartitionDescriptor, PartitionLocation, ScanStop, collect_partitions, crc32,
-    find_boot_disk, header_crc, header_fields, is_block_size, lookup_on_disk, parse_entry,
-    parse_header, read_gpt, resolve_named,
+    HEADER_LEN, MAX_PARTITIONS, PartitionDescriptor, PartitionLocation, ScanStop,
+    collect_partitions, crc32, find_boot_disk, header_crc, header_fields, is_block_size,
+    lookup_on_disk, parse_entry, parse_header, read_gpt, resolve_named,
 };
 
 /// The block sizes the parser takes ([`is_block_size`]).
@@ -304,7 +304,9 @@ fn expected_entries(disk: &[u8], header: &GptHeader) -> (Vec<GptEntry>, Option<u
 /// slots before the first block past the disk's end; when its walk completes,
 /// the whole array lies inside the disk and the walk reports a CRC32 mismatch
 /// exactly when the array's CRC32 is not the header's, and when it stops, it
-/// stops at a block past the end. Returns the scan.
+/// stops at a block past the end. Those slots holding more than
+/// [`MAX_PARTITIONS`] used entries, it ends at the first past it instead,
+/// with the ones before it. Returns the scan.
 fn disk_holds(disk: &[u8], header: &GptHeader) -> crate::PartitionScan
 {
     let size = usize::try_from(header.block_size).unwrap_or(usize::MAX);
@@ -327,6 +329,18 @@ fn disk_holds(disk: &[u8], header: &GptHeader) -> crate::PartitionScan
         assert_eq!(Some(lba), expected, "the walk read out of order");
     }
     let (expected, array_crc) = expected_entries(disk, header);
+    if let Some(kept) = expected.get(..MAX_PARTITIONS)
+        && expected.len() > MAX_PARTITIONS
+    {
+        assert_eq!(
+            scan.stop,
+            Some(ScanStop::TooManyPartitions),
+            "an array of more used entries than the ceiling was not refused"
+        );
+        assert_eq!(scan.entries, kept);
+        roles_hold(&scan.entries);
+        return scan;
+    }
     match scan.stop
     {
         None | Some(ScanStop::ChecksumMismatch) =>
@@ -354,6 +368,15 @@ fn disk_holds(disk: &[u8], header: &GptHeader) -> crate::PartitionScan
         // The host's allocator does not fail the few entries of a fuzz input.
         Some(ScanStop::OutOfMemory) =>
         {}
+        // Taken above when the slots hold more used entries than the ceiling.
+        Some(ScanStop::TooManyPartitions) =>
+        {
+            assert!(
+                expected.len() > MAX_PARTITIONS,
+                "an array of {} used entries was refused",
+                expected.len()
+            );
+        }
     }
     roles_hold(&scan.entries);
     scan
@@ -370,10 +393,11 @@ fn copy_of(disk: &[u8], size: usize, lba: u64) -> Result<Vec<GptEntry>, GptFault
     let scan = disk_holds(disk, &header);
     match scan.stop
     {
-        Some(stop @ (ScanStop::ReadFailed { .. } | ScanStop::ChecksumMismatch)) =>
-        {
-            Err(GptFault::Array(stop))
-        }
+        Some(
+            stop @ (ScanStop::ReadFailed { .. }
+            | ScanStop::ChecksumMismatch
+            | ScanStop::TooManyPartitions),
+        ) => Err(GptFault::Array(stop)),
         None | Some(ScanStop::OutOfMemory) => Ok(scan.entries),
     }
 }

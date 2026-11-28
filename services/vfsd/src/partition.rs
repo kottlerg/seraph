@@ -512,9 +512,10 @@ fn read_block_sector(
 /// Read the GPT of disk `ordinal` (the ordinal only labels the log lines)
 /// and return every used partition entry, in on-disk order: the primary
 /// GPT's, or the backup's when the primary fails its checks
-/// ([`gpt::read_gpt`], UEFI 2.10 § 5.3.2). The list holds as many entries as
-/// the header's `num_parts` array has used ones; a list that runs out of
-/// memory is logged and returns the partitions before it. A disk whose
+/// ([`gpt::read_gpt`], UEFI 2.10 § 5.3.2). The list holds every used entry of
+/// the header's `num_parts` array, at most [`gpt::MAX_PARTITIONS`]: a copy
+/// whose array holds more is refused as a corrupt one is. A list that runs out
+/// of memory is logged and returns the partitions before it. A disk whose
 /// geometry cannot be read, or neither of whose GPT copies verifies, is
 /// logged and has no partitions.
 ///

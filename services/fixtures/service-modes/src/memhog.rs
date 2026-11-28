@@ -46,7 +46,7 @@ pub fn main() -> !
         std::os::seraph::log!(error: "ballast not allocated");
         syscall::thread_exit();
     };
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     std::os::seraph::log!("serving");
     serve(service, nonce, &mut fill, ipc_buf)
 }
@@ -136,17 +136,4 @@ fn serve(service: u64, nonce: u64, fill: &mut Fill, ipc_buf: *mut u64) -> !
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
     }
-}
-
-/// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame, so the fixture
-/// faults no new stack page while memory is critical.
-#[inline(never)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the frame is the touch: its array is the stack the fixture uses, written once at start"
-)]
-fn touch_stack()
-{
-    let mut probe = [0u8; STACK_TOUCH_BYTES];
-    std::hint::black_box(&mut probe);
 }

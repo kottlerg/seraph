@@ -78,7 +78,7 @@ pub fn main() -> !
         std::os::seraph::log!(error: "no service endpoint or nonce");
         syscall::thread_exit();
     }
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     std::os::seraph::log!("serving");
     serve(service, nonce, ipc_buf)
 }
@@ -313,16 +313,4 @@ fn stop_job(job: &mut Job, key: u64) -> IpcMessage
     job.stopped = true;
     std::os::seraph::log!("job {key} stopped for a stop-authority holder");
     IpcMessage::new(stop::SUCCESS)
-}
-
-/// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame.
-#[inline(never)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the frame is the touch: its array is the stack the fixture uses, written once at start"
-)]
-fn touch_stack()
-{
-    let mut probe = [0u8; STACK_TOUCH_BYTES];
-    std::hint::black_box(&mut probe);
 }

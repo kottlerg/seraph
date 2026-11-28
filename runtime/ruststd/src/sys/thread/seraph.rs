@@ -60,6 +60,10 @@ pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;
 
 const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 
+/// Pages of a demand chunk, the run memmgr backs on one demand fault
+/// (`memmgr_labels::DEMAND_CHUNK_BYTES`).
+const DEMAND_CHUNK_PAGES: u64 = ipc::memmgr_labels::DEMAND_CHUNK_BYTES / PAGE_SIZE;
+
 /// Guard pages below every spawned thread's stack: `process_abi`'s
 /// `STACK_GUARD_PAGES`, the farthest a store can land below the stack's
 /// lowest written byte, so no overflow's first store passes the guard. The
@@ -360,7 +364,11 @@ impl MappedGrant {
 /// Allocate a spawned thread's stack, guarded either way. A demand-paged
 /// process gets a guarded demand stack of the requested size (at least
 /// `DEFAULT_MIN_STACK_SIZE`, in whole pages) or `DEFAULT_DEMAND_STACK_PAGES`,
-/// whichever is larger; a process with no pager gets an eager stack, a
+/// whichever is larger, rounded up to whole demand chunks: memmgr backs a
+/// demand region a chunk at a time from its base, so the stack's top chunk,
+/// which the thread's first instruction backs, is a whole one, and a touch
+/// within it (`os::seraph::thread::MAX_STACK_TOUCH_BYTES`) takes no other
+/// chunk. A process with no pager gets an eager stack, a
 /// [`MappedGrant`] of the requested size alone above `GUARD_PAGES` guard pages,
 /// since each of its pages costs a frame at spawn.
 ///
@@ -376,7 +384,8 @@ fn alloc_stack(
     let requested_pages = floor.div_ceil(PAGE_SIZE_USIZE) as u64;
     if info.pager_endpoint_cap != 0 {
         let usable_pages =
-            crate::cmp::max(requested_pages, crate::os::seraph::DEFAULT_DEMAND_STACK_PAGES);
+            crate::cmp::max(requested_pages, crate::os::seraph::DEFAULT_DEMAND_STACK_PAGES)
+                .next_multiple_of(DEMAND_CHUNK_PAGES);
         crate::os::seraph::reserve_guarded_stack(usable_pages, GUARD_PAGES).map(StackAlloc::Demand)
     } else {
         MappedGrant::map(
@@ -1065,7 +1074,9 @@ static REGISTRY_REFUSED: crate::sync::atomic::AtomicBool =
 /// thread before its code, so the spawner never waits on procmgr, apart from
 /// `os::seraph::thread::runtime_spawn`'s, which waits for its thread to reach
 /// its wait, and whose call deadline the thread makes this call under
-/// (`SpawnArgs::registration_deadline`); a thread that procmgr cannot serve
+/// (`SpawnArgs::registration_deadline`), and that of a backed thread
+/// (`os::seraph::thread::BuilderExt::spawn_backed`), which waits for its
+/// thread's stack touch with no deadline; a thread that procmgr cannot serve
 /// yet waits here alone. Best-effort: a refusal or
 /// a failed call leaves the thread unregistered, and it runs as before,
 /// apart from a call that failed after procmgr received it, cancelled

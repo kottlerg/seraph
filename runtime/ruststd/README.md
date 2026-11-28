@@ -253,7 +253,10 @@ without a fault. On riscv64 a `call` writes nothing to the stack and a split pro
 ([docs/build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)); the guard's
 four pages are wider than that, so no overflow's first store passes it. The usable size is the
 larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64 KiB, rounded up to whole
-pages) and 512 pages (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). The spawn tops up the address space's
+pages) and 512 pages (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB), rounded up to whole demand chunks
+(`DEMAND_CHUNK_PAGES`, 16 pages): memmgr backs a demand region a chunk at a time from its base,
+so the stack's top chunk, which the thread's first instruction faults in, is a whole one
+(§ Backed thread stacks). The spawn tops up the address space's
 page-table pool for the usable pages first, as best effort: another thread's mapping can draw the
 top-up before the stack's first fault, and memmgr funds the pool itself when a fault finds it
 exhausted (memmgr's
@@ -760,6 +763,37 @@ process with no `SchedControl` cap, or a level outside the band fails the spawn.
 
 ---
 
+## Backed thread stacks
+
+A thread that has to run when memory is short, one that waits on memory pressure or acts at
+`Critical`, holds the stack pages it runs on before it is needed. A demand-paged stack takes its
+pages from memmgr when it first touches them (§ Spawned-thread stacks), and a thread that first
+runs at `Low`, or first goes deeper then, would take them at the point memory is short.
+`std::os::seraph::thread` gives the rule in one place:
+
+- `BuilderExt::spawn_backed::<BYTES, _, _>(f)` spawns `f` on a thread whose first action is a touch
+  of `BYTES` of its stack, and returns only once the touch is done; `spawn_backed_at_priority` does
+  the same at a scheduling level, as `spawn_at_priority` places a thread (§ Spawned-thread
+  priority). The spawner waits as `runtime_spawn` does (§ Runtime threads): the new thread signals
+  once its touch is done, the wait covers its registration with procmgr (§ Thread registration)
+  and has no bound of its own, and a fault that kills the thread first, a stack fault the pager
+  refuses among them, ends the process. The thread's frames down to that depth are therefore
+  charged to the process when the spawn returns.
+- `touch_stack::<BYTES>()` touches `BYTES` of the calling thread's stack below the caller's frame,
+  for a main thread at its start, and for a thread whose touch comes after other work.
+
+`BYTES` is at most `MAX_STACK_TOUCH_BYTES`, half a demand chunk (32 KiB of the 64 KiB
+`memmgr_labels::DEMAND_CHUNK_BYTES`), and a larger value fails to compile. A spawned thread's touch,
+below the frames that start the thread, lies in its stack's top chunk, which its first instruction
+backs in any case, so the touch costs no page past that chunk; the other half of the chunk is left
+for those frames. A main thread's stack is the loader's committed pages with the demand range below
+them (§ Process Entry and `StartupInfo`), whose chunks are counted from the range's base, so its
+touch can reach into the range's top chunk and the one below it, and backs each whole. The touch is
+a `BYTES` array, zeroed and kept by `black_box`, in a frame of its own; the inline stack probes
+write each of its pages in turn as the frame is made.
+
+---
+
 ## Thread capability
 
 `std::os::seraph::thread::current_thread_cap` returns the calling thread's own Thread capability:
@@ -801,25 +835,25 @@ one-way, so a declared process registers nothing.
 
 The new thread makes the call, not its spawner, so a spawner never waits on procmgr, apart from
 the spawner of one of the runtime's own threads, which waits for the thread to reach its wait,
-and whose call deadline the thread's registration takes (§ Runtime threads). Any of
+and whose call deadline the thread's registration takes (§ Runtime threads), and the spawner of a
+backed thread, which waits for the thread's stack touch with no deadline (§ Backed thread
+stacks). Any of
 procmgr's request workers serves a registration
 ([services/procmgr/README.md](../../services/procmgr/README.md) § Concurrency), so a request of
 procmgr's blocked on the same process holds one worker and the registration goes to another. Only
 while every worker is blocked does a new thread wait in its registration until one returns, before
-running any of its code. Two spawns can meet a procmgr request blocked on their process, and
-neither can deadlock, since that request does not wait on the new thread:
+running any of its code. Two processes that procmgr's requests can wait on spawn threads of their
+own, and neither spawn can deadlock with such a request:
 
-- **fatfs's release watchdog.** procmgr reads a binary through fatfs (`CREATE_FROM_FILE`), and
-  fatfs's eviction worker spawns a watchdog thread to send a client `FS_RELEASE_MEMORY` and waits
-  for it at most `RELEASE_TIMEOUT_MS` (100 ms) before it revokes the page anyway
+- **fatfs's helper threads.** procmgr reads a binary through fatfs (`CREATE_FROM_FILE`), and
+  fatfs's main thread spawns its eviction worker, its pressure and donation-end threads and its
+  `MAX_WATCHDOGS` release watchdogs backed, waiting for each one's stack touch, and so for its
+  registration, before it answers `FS_MOUNT` (`services/fs/fat/src/main.rs` module docs,
+  Helper start). No namespace path reaches a filesystem whose mount is not answered, so no
+  request of procmgr's waits on fatfs while those registrations wait on procmgr. A release's
+  `FS_RELEASE_MEMORY` later runs on a watchdog that is already registered
   ([Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md) § Driver-to-client
-  release; `services/fs/fat/src/eviction.rs`). The read procmgr waits
-  on is served by fatfs's main thread, which answers a request that finds the cache full with an
-  error at once rather than waiting for the eviction worker, so procmgr's read returns whatever the
-  watchdog does. A watchdog held in its registration past the worker's bound turns that release
-  into the worker's revoke without the client's acknowledgement, the path a client that does not
-  answer takes; it holds one of the worker's `MAX_WATCHDOGS` slots meanwhile, past which a release
-  revokes at once.
+  release; `services/fs/fat/src/eviction.rs`).
 - **logd's resync helper.** procmgr writes its log through logd, and logd's main thread spawns the
   helper that walks `QUERY_LIVE_PROCESSES` after its death queue may have dropped a post
   ([services/logd/docs/ipc-interface.md](../../services/logd/docs/ipc-interface.md) § Death-queue

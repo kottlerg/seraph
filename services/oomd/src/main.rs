@@ -68,7 +68,7 @@ fn main() -> !
     };
     let config = config();
     let _ = now_ms();
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     touch_heap();
     // A walk receives at most a page of sources' caps beside the one it
     // keeps; with this much headroom no walk grows the CSpace.
@@ -279,20 +279,6 @@ fn now_ms() -> u64
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame, so its pages
-/// are backed before memory can run out.
-#[inline(never)]
-#[expect(
-    clippy::large_stack_arrays,
-    clippy::large_stack_frames,
-    reason = "the probe exists to occupy and touch this much of the stack"
-)]
-fn touch_stack()
-{
-    let mut probe = [0u8; STACK_TOUCH_BYTES];
-    std::hint::black_box(&mut probe);
 }
 
 /// Touch [`HEAP_TOUCH_BYTES`] of heap and free them: the allocator keeps

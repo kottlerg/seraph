@@ -144,7 +144,7 @@ fn main() -> !
         std::os::seraph::log!(error: "no leader: the recipe's argv names none");
         syscall::thread_exit();
     };
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     let Some(sessiond) = Sessiond::start(endpoint, leader, ipc_buf)
     else
     {
@@ -1104,16 +1104,4 @@ fn destroy_process(handle: u64, ipc_buf: *mut u64)
             Ok(_) | Err(_) => return,
         }
     }
-}
-
-/// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame.
-#[inline(never)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the frame is the touch: its array is the stack sessiond uses, written once at start"
-)]
-fn touch_stack()
-{
-    let mut probe = [0u8; STACK_TOUCH_BYTES];
-    std::hint::black_box(&mut probe);
 }

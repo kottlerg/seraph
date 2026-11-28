@@ -2599,63 +2599,115 @@ pub mod thread {
     // restore: none
     static RUNTIME_SPAWN: Cell<bool> = Cell::new(false);
 
-    /// [`StartSignal`] state: the runtime thread has not reached its wait.
+    /// [`StartSignal`] state: the new thread has not signalled yet.
     const STARTING: u8 = 0;
-    /// [`StartSignal`] state: the runtime thread is at its wait.
-    const AT_WAIT: u8 = 1;
-    /// [`StartSignal`] state: the runtime thread's main returned or unwound
-    /// before it reached its wait.
+    /// [`StartSignal`] state: the new thread has reached the point its spawn
+    /// waits for.
+    const SENT: u8 = 1;
+    /// [`StartSignal`] state: the new thread's main returned or unwound
+    /// before it signalled.
     const ENDED: u8 = 2;
 
-    /// The new runtime thread's half of [`runtime_spawn`]'s wait. Its main
-    /// calls [`StartSignal::at_wait`] right before the wait it idles at; a
+    /// The new thread's half of [`spawn_signalled`]'s wait. Its main calls
+    /// [`StartSignal::send`] at the point its spawner waits for: a runtime
+    /// thread right before the wait it idles at ([`runtime_spawn`]), a backed
+    /// thread once its stack is touched ([`BuilderExt::spawn_backed`]). A
     /// signal dropped without that call, by a main that returned or unwound
     /// first, ends the spawner's wait with an error, so the wait ends on every
     /// path of the thread that does not end the process.
     pub(crate) struct StartSignal {
         state: crate::sync::Arc<AtomicU8>,
-        /// The spawner, parked in [`runtime_spawn`] until the state leaves
+        /// The spawner, parked in [`spawn_signalled`] until the state leaves
         /// [`STARTING`]. The handle keeps its Parker, and the Parker's
         /// notification, alive for the `unpark` that follows the store.
         spawner: crate::thread::Thread,
-        at_wait: bool,
+        sent: bool,
     }
 
     impl StartSignal {
-        /// Tell the spawner that this thread is at its wait: called right
-        /// before the thread's first blocking wait, with nothing between the
-        /// call and the wait but the call's own store and wake.
-        pub(crate) fn at_wait(mut self) {
-            self.at_wait = true;
+        /// Tell the spawner that this thread has reached the point its spawn
+        /// waits for. A runtime thread calls it right before its first
+        /// blocking wait, with nothing between the call and the wait but the
+        /// call's own store and wake.
+        pub(crate) fn send(mut self) {
+            self.sent = true;
         }
     }
 
     impl Drop for StartSignal {
         fn drop(&mut self) {
-            let state = if self.at_wait { AT_WAIT } else { ENDED };
+            let state = if self.sent { SENT } else { ENDED };
             self.state.store(state, Ordering::Release);
             self.spawner.unpark();
         }
     }
 
+    /// Spawn `main` with `builder`, handing it a [`StartSignal`], and return
+    /// once it has sent the signal. `runtime` marks the thread as one of the
+    /// runtime's own ([`runtime_spawn`]); a `level` other than 0 places it at
+    /// that scheduling level, which the caller has checked
+    /// ([`BuilderExt::spawn_at_priority`]). `what` names the thread in the
+    /// error of a main that ended before it signalled.
+    ///
+    /// The wait has no bound of its own, and it ends on every path of the
+    /// thread that does not end the process: `main` signals, or drops its
+    /// signal when it returns or unwinds. A fault that kills the thread, a
+    /// refused stack fault among them, ends the process, this thread with it
+    /// (docs/process-lifecycle.md § Exit reason).
+    fn spawn_signalled<F, T>(
+        builder: Builder,
+        runtime: bool,
+        level: u8,
+        what: &str,
+        main: F,
+    ) -> io::Result<JoinHandle<T>>
+    where
+        F: FnOnce(StartSignal) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let state = crate::sync::Arc::new(AtomicU8::new(STARTING));
+        let signal = StartSignal {
+            state: state.clone(),
+            spawner: crate::thread::current(),
+            sent: false,
+        };
+        let previous_runtime = RUNTIME_SPAWN.replace(runtime);
+        let previous_level = (level != 0).then(|| SPAWN_PRIORITY.replace(level));
+        let spawned = builder.spawn(move || main(signal));
+        if let Some(previous) = previous_level {
+            SPAWN_PRIORITY.set(previous);
+        }
+        RUNTIME_SPAWN.set(previous_runtime);
+        let handle = spawned?;
+        loop {
+            match state.load(Ordering::Acquire) {
+                SENT => return Ok(handle),
+                ENDED => {
+                    return Err(io::Error::other(crate::format!(
+                        "seraph: thread {what} ended before it signalled its spawner"
+                    )));
+                }
+                // Not signalled yet. A park may return early or spuriously,
+                // which the loop's recheck absorbs.
+                _ => crate::thread::park(),
+            }
+        }
+    }
+
     /// Spawn one of the runtime's own threads (the fs release handler, a
     /// child's death bridge), named `name`, to run `main`, and return once
-    /// it is at its wait (`main` calls [`StartSignal::at_wait`]). Every page
-    /// the thread touches on its way there, its stack's first chunk among
-    /// them, is charged to the process before this returns, so a caller that
-    /// reads its own account afterwards finds the spawn's whole charge
-    /// (runtime/ruststd/README.md § Runtime threads). The thread is not
+    /// it is at its wait (`main` calls [`StartSignal::send`] right before
+    /// it). Every page the thread touches on its way there, its stack's first
+    /// chunk among them, is charged to the process before this returns, so a
+    /// caller that reads its own account afterwards finds the spawn's whole
+    /// charge (runtime/ruststd/README.md § Runtime threads). The thread is not
     /// counted among the application's (`checkpoint::quiesce`).
     ///
     /// The wait covers the thread's registration with procmgr (README
     /// § Thread registration), which the thread makes under the caller's call
     /// deadline (`with_call_deadline`), if any, so a deadline that bounds the
     /// caller's calls bounds the wait too (README § Call deadline); the wait
-    /// has no bound of its own. It ends on every path of the thread that does
-    /// not end the process: `main` signals, or drops its signal when it
-    /// returns or unwinds. A fault that kills the thread, a refused stack
-    /// fault among them, ends the process, this thread with it
-    /// (docs/process-lifecycle.md § Exit reason).
+    /// has no bound of its own, and ends as [`spawn_signalled`]'s does.
     ///
     /// # Errors
     /// The spawn's own error, or an error when `main` returned or unwound
@@ -2664,29 +2716,7 @@ pub mod thread {
         name: &str,
         main: impl FnOnce(StartSignal) + Send + 'static,
     ) -> io::Result<JoinHandle<()>> {
-        let state = crate::sync::Arc::new(AtomicU8::new(STARTING));
-        let signal = StartSignal {
-            state: state.clone(),
-            spawner: crate::thread::current(),
-            at_wait: false,
-        };
-        let previous = RUNTIME_SPAWN.replace(true);
-        let spawned = Builder::new().name(name.into()).spawn(move || main(signal));
-        RUNTIME_SPAWN.set(previous);
-        let handle = spawned?;
-        loop {
-            match state.load(Ordering::Acquire) {
-                AT_WAIT => return Ok(handle),
-                ENDED => {
-                    return Err(io::Error::other(crate::format!(
-                        "runtime thread {name} ended before it reached its wait"
-                    )));
-                }
-                // Not at its wait yet. A park may return early or spuriously,
-                // which the loop's recheck absorbs.
-                _ => crate::thread::park(),
-            }
-        }
+        spawn_signalled(Builder::new().name(name.into()), true, 0, name, main)
     }
 
     /// Whether the spawn in progress on the current thread is the runtime's
@@ -2705,6 +2735,82 @@ pub mod thread {
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn current_thread_cap() -> u64 {
         super::current_thread_cap()
+    }
+
+    /// The most bytes of stack [`touch_stack`] and [`BuilderExt::spawn_backed`]
+    /// touch: half a demand chunk (`memmgr_labels::DEMAND_CHUNK_BYTES`,
+    /// 64 KiB). A spawned thread's demand stack ends in a whole chunk, which
+    /// the thread's first instruction backs, so a touch of at most this much
+    /// below the frames that start the thread lies within that chunk and costs
+    /// no page past it; the other half is left for those frames. A larger
+    /// touch fails to compile.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "half a demand chunk, 32 KiB, fits a usize"
+    )]
+    pub const MAX_STACK_TOUCH_BYTES: usize = (ipc::memmgr_labels::DEMAND_CHUNK_BYTES / 2) as usize;
+
+    /// Touch `BYTES` of the calling thread's stack below the caller's frame,
+    /// so the pages they lie in are backed when the call returns: a thread
+    /// that has to run when memory is short calls it before it acts, and its
+    /// frames down to that depth then take no new page from memmgr. A thread
+    /// this process spawns that has to run so gets the same touch from
+    /// [`BuilderExt::spawn_backed`] instead, before its spawn returns; this
+    /// function is for the main thread, and for a thread whose touch comes
+    /// after other work.
+    ///
+    /// A demand-paged stack is backed a demand chunk at a time, so the touch
+    /// backs every chunk the span reaches. On a spawned thread's stack, from
+    /// the frames that start the thread, that is the stack's top chunk alone.
+    /// On the main thread, whose loader-committed pages lie above its demand
+    /// range, the span can reach into the range's top chunk and the one below
+    /// it, each backed whole (runtime/ruststd/README.md § Backed thread
+    /// stacks). A `BYTES` above [`MAX_STACK_TOUCH_BYTES`] fails to compile.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[inline(never)]
+    pub fn touch_stack<const BYTES: usize>() {
+        const {
+            assert!(
+                BYTES <= MAX_STACK_TOUCH_BYTES,
+                "a stack touch past MAX_STACK_TOUCH_BYTES, half a demand chunk"
+            );
+        }
+        // The std targets emit inline stack probes, which write each page of
+        // the frame in turn as it is made; the zeroed array, which the
+        // `black_box` makes the compiler keep, writes the rest.
+        let mut probe = [0u8; BYTES];
+        crate::hint::black_box(&mut probe);
+    }
+
+    /// Refuse a spawn level of 0, and a level in a process with no
+    /// `SchedControl` cap, which has no band to place a thread in.
+    fn check_level(level: u8) -> io::Result<()> {
+        let has_sched = super::try_startup_info().is_some_and(|i| i.sched_control_cap != 0);
+        if level == 0 || !has_sched {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seraph: no priority level or no scheduling authority",
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`BuilderExt::spawn_backed`] at `level`, 0 for the process's own.
+    fn spawn_backed_at<const BYTES: usize, F, T>(
+        builder: Builder,
+        level: u8,
+        f: F,
+    ) -> io::Result<JoinHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        spawn_signalled(builder, false, level, "with a backed stack", move |started| {
+            touch_stack::<BYTES>();
+            started.send();
+            f()
+        })
     }
 
     /// Seraph-specific extensions to [`Builder`].
@@ -2727,6 +2833,48 @@ pub mod thread {
         where
             F: FnOnce() -> T + Send + 'static,
             T: Send + 'static;
+
+        /// Spawn `f` as [`Builder::spawn`] does, on a thread whose first
+        /// action is a touch of `BYTES` of its stack ([`touch_stack`]), and
+        /// return only once the touch is done. A thread that has to run when
+        /// memory is short, one that waits on memory pressure or acts at
+        /// `Critical`, is spawned this way: its stack's pages down to that
+        /// depth are charged to the process before the spawn returns, so it
+        /// takes no stack page from memmgr when it first runs, which can be
+        /// when memory is already short (runtime/ruststd/README.md § Backed
+        /// thread stacks). The touch lies within the stack's top demand chunk,
+        /// which the thread's first instruction backs in any case, so it costs
+        /// no page past that chunk; a `BYTES` above [`MAX_STACK_TOUCH_BYTES`]
+        /// fails to compile.
+        ///
+        /// The wait covers the thread's registration with procmgr
+        /// (runtime/ruststd/README.md § Thread registration) and has no bound
+        /// of its own. A fault that kills the thread before its touch is done,
+        /// a stack fault the pager refuses among them, ends the process.
+        ///
+        /// # Errors
+        /// [`Builder::spawn`]'s errors.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn spawn_backed<const BYTES: usize, F, T>(self, f: F) -> io::Result<JoinHandle<T>>
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static;
+
+        /// [`BuilderExt::spawn_backed`] with the new thread placed at
+        /// scheduling level `level`, as [`BuilderExt::spawn_at_priority`]
+        /// places it.
+        ///
+        /// # Errors
+        /// [`BuilderExt::spawn_at_priority`]'s errors.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn spawn_backed_at_priority<const BYTES: usize, F, T>(
+            self,
+            level: u8,
+            f: F,
+        ) -> io::Result<JoinHandle<T>>
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static;
     }
 
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -2736,18 +2884,32 @@ pub mod thread {
             F: FnOnce() -> T + Send + 'static,
             T: Send + 'static,
         {
-            let has_sched =
-                super::try_startup_info().is_some_and(|i| i.sched_control_cap != 0);
-            if level == 0 || !has_sched {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "seraph: no priority level or no scheduling authority",
-                ));
-            }
+            check_level(level)?;
             let previous = SPAWN_PRIORITY.replace(level);
             let spawned = self.spawn(f);
             SPAWN_PRIORITY.set(previous);
             spawned
+        }
+
+        fn spawn_backed<const BYTES: usize, F, T>(self, f: F) -> io::Result<JoinHandle<T>>
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static,
+        {
+            spawn_backed_at::<BYTES, F, T>(self, 0, f)
+        }
+
+        fn spawn_backed_at_priority<const BYTES: usize, F, T>(
+            self,
+            level: u8,
+            f: F,
+        ) -> io::Result<JoinHandle<T>>
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static,
+        {
+            check_level(level)?;
+            spawn_backed_at::<BYTES, F, T>(self, level, f)
         }
     }
 }

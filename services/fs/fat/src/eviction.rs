@@ -22,7 +22,7 @@
 //! each page's release reaches the client that read it, and waits up to
 //! [`RELEASE_TIMEOUT_MS`]
 //! for `FS_RELEASE_ACK`; with no SEND, or when it cannot derive the copy
-//! or spawn the watchdog, it sends nothing. Either way the worker then
+//! or no watchdog is idle, it sends nothing. Either way the worker then
 //! takes the per-open outstanding-page entry and, if no other path has
 //! cleaned it up meanwhile, `cap_revoke`s the per-cookie ancestor cap,
 //! drops it, and decrements the cache slot's refcount. An ack means
@@ -41,22 +41,23 @@
 //! mapped).
 //!
 //! The watchdog is fully userspace. `ipc_call` has no kernel-side
-//! timeout, so the worker spawns a child thread to issue the call
-//! and uses `Condvar::wait_timeout` to bound the wait. On timeout
-//! the orphaned child remains blocked in `ipc_call` until the
-//! client eventually replies (or forever, if the client never
-//! does); a dedicated channel-state field ensures the late reply
-//! is silently discarded rather than racing the parent's cleanup.
-//! At most [`MAX_WATCHDOGS`] watchdog threads exist at once: while that
-//! many are still blocked on clients that have not replied, a release
-//! sends nothing and goes straight to the revoke, so a client that never
-//! replies costs the fs a bounded number of threads rather than one per
-//! timeout. Releasing the blocked calls themselves needs an IPC
-//! cancellation the kernel does not offer (#31).
+//! timeout, so the worker hands the call to a watchdog thread and uses
+//! `Condvar::wait_timeout_while` to bound the wait. On timeout the watchdog
+//! remains blocked in `ipc_call` until the client eventually replies (or
+//! forever, if the client never does); its slot's state marks the call
+//! given up, so the late reply is silently discarded rather than racing
+//! the worker's cleanup. The [`MAX_WATCHDOGS`] watchdog threads are
+//! started before the driver serves ([`start_watchdogs`]) and serve one
+//! call at a time each, since a release runs when memory is short and a
+//! spawn then would take a thread's pages from memmgr: while all of them
+//! are still blocked on clients that have not replied, a release sends
+//! nothing and goes straight to the revoke, so a client that never replies
+//! costs the fs a bounded number of threads. Releasing the blocked calls
+//! themselves needs an IPC cancellation the kernel does not offer (#31).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::os::seraph::thread::BuilderExt;
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -73,14 +74,11 @@ use crate::file::{Opens, OutstandingPage};
 /// client unmapped in time.
 pub const RELEASE_TIMEOUT_MS: u64 = 100;
 
-/// Most cooperative-release watchdog threads alive at once (module docs).
-/// A tuning value that bounds no capacity: past it a release skips the
+/// Cooperative-release watchdog threads, started before the driver serves
+/// (module docs). A tuning value that bounds no capacity: with every one of
+/// them blocked on a client that has not replied, a release skips the
 /// cooperative round trip, which is advisory, and revokes at once.
 pub const MAX_WATCHDOGS: usize = 4;
-
-/// Watchdog threads alive now: incremented before a spawn, decremented when
-/// the thread's `ipc_call` returns.
-static LIVE_WATCHDOGS: AtomicUsize = AtomicUsize::new(0);
 
 /// One queued eviction: the outstanding page as it stood when queued.
 /// The worker checks it against the opens before the
@@ -230,7 +228,6 @@ fn log_outcome(req: &EvictReq, outcome: Release, owned: bool)
         Release::DeriveFailed => "release SEND derive failed; no FS_RELEASE_MEMORY sent",
         Release::Refused(_) => "FS_RELEASE_MEMORY refused",
         Release::CallFailed => "FS_RELEASE_MEMORY call failed",
-        Release::SpawnFailed => "release watchdog spawn failed; no FS_RELEASE_MEMORY sent",
         Release::WatchdogsBusy => "release watchdogs all blocked; no FS_RELEASE_MEMORY sent",
         Release::TimedOut => "FS_RELEASE_MEMORY timeout",
     };
@@ -270,12 +267,11 @@ enum Release
     Refused(u64),
     /// The `ipc_call` to the client's release endpoint failed.
     CallFailed,
-    /// No reply within `RELEASE_TIMEOUT_MS`.
+    /// No reply within `RELEASE_TIMEOUT_MS`, or no watchdog took the call
+    /// within it, which is then withdrawn unsent.
     TimedOut,
-    /// The watchdog thread could not be spawned, so nothing was sent.
-    SpawnFailed,
-    /// [`MAX_WATCHDOGS`] watchdog threads are still blocked on clients that
-    /// have not replied, so nothing was sent.
+    /// No watchdog was idle: each one started is still blocked on a client
+    /// that has not replied, so nothing was sent.
     WatchdogsBusy,
     /// The client delivered no release endpoint, so none was sent.
     NoEndpoint,
@@ -288,86 +284,195 @@ enum Release
 /// the client's release SEND that this call consumes, and wait up to
 /// `RELEASE_TIMEOUT_MS` for its reply.
 ///
-/// `ipc_call` has no kernel-side timeout, so the synchronous IPC
-/// runs on a child thread and the parent waits with
-/// `Condvar::wait_timeout`. On timeout the orphaned child is
-/// left blocked in `ipc_call`; if the client eventually replies
-/// the child observes the channel state already set and discards
-/// its own write. A truly hung client keeps the child thread blocked,
-/// the cost of cooperative release without a kernel-side
-/// IPC-cancellation primitive; [`MAX_WATCHDOGS`] bounds how many such
-/// threads exist, and past it nothing is sent.
+/// `ipc_call` has no kernel-side timeout, so the synchronous IPC runs on an
+/// idle watchdog thread ([`start_watchdogs`]) and the worker waits with
+/// `Condvar::wait_timeout_while`. On timeout the watchdog is left blocked in
+/// `ipc_call`; if the client eventually replies the watchdog finds the call
+/// given up, discards the outcome, and is idle again. A truly hung client
+/// keeps its watchdog blocked, the cost of cooperative release without a
+/// kernel-side IPC-cancellation primitive; with every watchdog blocked
+/// nothing is sent.
 fn cooperative_release(endpoint: u64, cookie: u64) -> Release
 {
-    let reserved = LIVE_WATCHDOGS
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            n.checked_add(1).filter(|&live| live <= MAX_WATCHDOGS)
-        })
-        .is_ok();
-    if !reserved
+    let Some(dog) = WATCHDOGS.iter().find(|dog| {
+        let mut st = dog.lock();
+        let idle = matches!(*st, Watch::Idle);
+        if idle
+        {
+            *st = Watch::Asked { endpoint, cookie };
+        }
+        idle
+    })
+    else
     {
         let _ = syscall::cap_delete(endpoint);
         return Release::WatchdogsBusy;
-    }
-    let chan: Arc<(Mutex<Option<Release>>, Condvar)> = Arc::new((Mutex::new(None), Condvar::new()));
-    let chan_child = chan.clone();
-    let ep = endpoint;
+    };
+    dog.cv.notify_all();
 
-    let spawned = thread::Builder::new()
-        .name("fatfs-release-watchdog".into())
-        .spawn(move || {
-            let ipc_buf = std::os::seraph::current_ipc_buf();
-            let msg = IpcMessage::builder(fs_labels::FS_RELEASE_MEMORY)
-                .word(0, cookie)
-                .build();
-            // SAFETY: `ipc_buf` is the registered IPC buffer for this
-            // thread (set in `std::thread`'s entry trampoline).
-            let result = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) };
-            let _ = syscall::cap_delete(ep);
-            LIVE_WATCHDOGS.fetch_sub(1, Ordering::AcqRel);
-            let outcome = match result
-            {
-                Ok(reply) if reply.label == fs_labels::FS_RELEASE_ACK => Release::Acked,
-                Ok(reply) => Release::Refused(reply.label),
-                Err(_) => Release::CallFailed,
-            };
-
-            let mut st = chan_child.0.lock().unwrap_or_else(PoisonError::into_inner);
-            if st.is_none()
-            {
-                *st = Some(outcome);
-            }
-            drop(st);
-            chan_child.1.notify_all();
-        });
-    if spawned.is_err()
+    let (mut st, _) = dog
+        .cv
+        .wait_timeout_while(
+            dog.lock(),
+            Duration::from_millis(RELEASE_TIMEOUT_MS),
+            |st| !matches!(*st, Watch::Answered(_)),
+        )
+        .unwrap_or_else(PoisonError::into_inner);
+    match *st
     {
-        LIVE_WATCHDOGS.fetch_sub(1, Ordering::AcqRel);
-        let _ = syscall::cap_delete(ep);
-        return Release::SpawnFailed;
+        // The watchdog has not taken the call: withdraw it, so nothing is
+        // sent and the watchdog stays idle.
+        Watch::Asked { endpoint, .. } =>
+        {
+            *st = Watch::Idle;
+            drop(st);
+            let _ = syscall::cap_delete(endpoint);
+        }
+        // Mark the call given up, so the watchdog discards its outcome when
+        // the client replies rather than racing the worker's cleanup.
+        Watch::Calling { .. } => *st = Watch::Calling { given_up: true },
+        Watch::Answered(outcome) =>
+        {
+            *st = Watch::Idle;
+            return outcome;
+        }
+        Watch::Absent | Watch::Idle =>
+        {}
+    }
+    Release::TimedOut
+}
+
+/// The state of one watchdog slot ([`WATCHDOGS`]).
+#[derive(Clone, Copy)]
+enum Watch
+{
+    /// No thread holds the slot: its spawn failed, or has not returned.
+    Absent,
+    /// Its thread waits for a call.
+    Idle,
+    /// The worker handed it a call: `FS_RELEASE_MEMORY` of `cookie` on
+    /// `endpoint`, a cap the watchdog consumes.
+    Asked
+    {
+        endpoint: u64, cookie: u64
+    },
+    /// Its thread is in the call; `given_up` once the worker has stopped
+    /// waiting for it.
+    Calling
+    {
+        given_up: bool
+    },
+    /// The call ended with this outcome, which the worker has not taken yet.
+    Answered(Release),
+}
+
+/// One watchdog slot: its state, and the Condvar both its thread and the
+/// worker wait on for the other's change of it.
+struct Watchdog
+{
+    state: Mutex<Watch>,
+    cv: Condvar,
+}
+
+impl Watchdog
+{
+    const fn new() -> Self
+    {
+        Self {
+            state: Mutex::new(Watch::Absent),
+            cv: Condvar::new(),
+        }
     }
 
-    let timeout = Duration::from_millis(RELEASE_TIMEOUT_MS);
-    let mut st = chan.0.lock().unwrap_or_else(PoisonError::into_inner);
+    fn lock(&self) -> MutexGuard<'_, Watch>
+    {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The release watchdogs (module docs), each slot held by one thread
+/// [`start_watchdogs`] started.
+static WATCHDOGS: [Watchdog; MAX_WATCHDOGS] = [const { Watchdog::new() }; MAX_WATCHDOGS];
+
+/// Start the [`MAX_WATCHDOGS`] release watchdogs, before the driver serves.
+/// Each is spawned with its stack touched
+/// (`std::os::seraph::thread::BuilderExt::spawn_backed`), so a release, which
+/// runs when memory is short, needs no thread, IPC buffer page or stack
+/// chunk then (module docs; crate docs, Helper start). A watchdog whose spawn
+/// fails leaves its slot empty, logged, and the releases make do with the
+/// others.
+pub fn start_watchdogs()
+{
+    let mut started: usize = 0;
+    for dog in &WATCHDOGS
+    {
+        let spawned = thread::Builder::new()
+            .name("fatfs-release-watchdog".into())
+            .spawn_backed::<{ crate::HELPER_STACK_TOUCH_BYTES }, _, _>(move || watchdog_loop(dog));
+        if spawned.is_ok()
+        {
+            // The thread waits for a call whatever the slot reads, so the
+            // slot is opened to the worker here, once the spawn has returned.
+            *dog.lock() = Watch::Idle;
+            started = started.saturating_add(1);
+        }
+    }
+    if started < MAX_WATCHDOGS
+    {
+        std::os::seraph::log!(
+            warn: "{} of {} release watchdogs started",
+            started,
+            MAX_WATCHDOGS
+        );
+    }
+}
+
+/// A watchdog's loop: wait for a call on `dog`, make it, and hand the
+/// worker its outcome, or discard the outcome of a call the worker gave up
+/// on; either way the slot is idle again after.
+fn watchdog_loop(dog: &Watchdog) -> !
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     loop
     {
-        if st.is_some()
+        let mut st = dog.lock();
+        let (endpoint, cookie) = loop
         {
-            break;
-        }
-        let (next_st, wr) = chan
-            .1
-            .wait_timeout(st, timeout)
-            .unwrap_or_else(PoisonError::into_inner);
-        st = next_st;
-        if wr.timed_out()
+            if let Watch::Asked { endpoint, cookie } = *st
+            {
+                break (endpoint, cookie);
+            }
+            st = dog.cv.wait(st).unwrap_or_else(PoisonError::into_inner);
+        };
+        *st = Watch::Calling { given_up: false };
+        drop(st);
+
+        let msg = IpcMessage::builder(fs_labels::FS_RELEASE_MEMORY)
+            .word(0, cookie)
+            .build();
+        // SAFETY: `ipc_buf` is the registered IPC buffer for this thread
+        // (set in `std::thread`'s entry trampoline).
+        let result = unsafe { ipc::ipc_call(endpoint, &msg, ipc_buf) };
+        let _ = syscall::cap_delete(endpoint);
+        let outcome = match result
         {
-            break;
+            Ok(reply) if reply.label == fs_labels::FS_RELEASE_ACK => Release::Acked,
+            Ok(reply) => Release::Refused(reply.label),
+            Err(_) => Release::CallFailed,
+        };
+
+        let mut st = dog.lock();
+        *st = if let Watch::Calling { given_up: true } = *st
+        {
+            Watch::Idle
         }
+        else
+        {
+            Watch::Answered(outcome)
+        };
+        drop(st);
+        dog.cv.notify_all();
     }
-    // Mark as given up so a late child reply skips its write rather than
-    // racing the parent's cleanup.
-    *st.get_or_insert(Release::TimedOut)
 }
 
 /// The release SEND the worker sends a page's `FS_RELEASE_MEMORY` on.

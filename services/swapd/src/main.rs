@@ -54,7 +54,9 @@ const WANT_BITS: u64 = 1;
 /// write-out on swapd's side.
 const WRITE_OUT_PRIORITY: u8 = 12;
 
-/// Bytes of stack swapd touches at start: more than a request's frames take.
+/// Bytes of stack each of swapd's threads touches before it acts: the main
+/// thread at start, the write-out and want threads at their spawn
+/// (`BuilderExt::spawn_backed`). More than a request's frames take.
 const STACK_TOUCH_BYTES: usize = 32 * 1024;
 
 /// Bytes of heap swapd touches at start: what the runtime's first uses of
@@ -133,7 +135,7 @@ fn main()
     let write_buf = buffer();
     let want_buf = buffer();
     let want = want_notification();
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     touch_heap();
     let used = register(memmgr, recv, want, slots, ipc_buf);
     std::os::seraph::log!("swap partition: {slots} slots of 64 KiB, memmgr uses {used}");
@@ -152,14 +154,14 @@ fn main()
     let writer = Arc::clone(&swap);
     std::thread::Builder::new()
         .name("swapd-write".into())
-        .spawn_at_priority(WRITE_OUT_PRIORITY, move || {
+        .spawn_backed_at_priority::<STACK_TOUCH_BYTES, _, _>(WRITE_OUT_PRIORITY, move || {
             write_out(&writer, pressure, write_buf)
         })
         .unwrap_or_else(|e| fail(format_args!("write-out thread not started: {e}")));
     let wanter = Arc::clone(&swap);
     std::thread::Builder::new()
         .name("swapd-want".into())
-        .spawn(move || serve_wants(&wanter, want, want_buf))
+        .spawn_backed::<STACK_TOUCH_BYTES, _, _>(move || serve_wants(&wanter, want, want_buf))
         .unwrap_or_else(|e| fail(format_args!("want thread not started: {e}")));
     serve_faults(&swap, recv, restore_buf, ipc_buf);
 }
@@ -602,20 +604,6 @@ fn write_slot(swap: &Swap, slot: u64, len: u64, buf: &mut u64) -> Transfer
 fn fail(why: std::fmt::Arguments<'_>) -> !
 {
     panic!("{why}")
-}
-
-/// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame, so its pages
-/// are backed before memory can run out.
-#[inline(never)]
-#[expect(
-    clippy::large_stack_arrays,
-    clippy::large_stack_frames,
-    reason = "the probe exists to occupy and touch this much of the stack"
-)]
-fn touch_stack()
-{
-    let mut probe = [0u8; STACK_TOUCH_BYTES];
-    std::hint::black_box(&mut probe);
 }
 
 /// Touch [`HEAP_TOUCH_BYTES`] of heap and free them: the allocator keeps

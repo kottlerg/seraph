@@ -38,7 +38,7 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::{MSG_CAP_SLOTS_MAX, PAGE_SIZE};
 
 use crate::{
-    Answer, MemLedger, SCRUB_VA, cap_badge, delete_caps, disk, evict, ledger_mut, map_self,
+    Answer, COPY_VA, MemLedger, cap_badge, delete_caps, disk, evict, ledger_mut, map_self,
     self_aspace,
 };
 
@@ -657,7 +657,7 @@ impl Dest<'_>
         dest_spans(self.offset, self.pages, self.used, count).is_some()
     }
 
-    /// Map the `count` pages after those written at the scrub window, run
+    /// Map the `count` pages after those written at the copy window, run
     /// `read` on their bytes, and unmap them. `None`, nothing left mapped,
     /// when a page cannot be mapped; else what `read` returned.
     pub(crate) fn fill<R>(
@@ -671,38 +671,38 @@ impl Dest<'_>
         let mut mapped = 0u64;
         for (cap, offset, pages) in spans
         {
-            let va = SCRUB_VA.saturating_add(mapped.saturating_mul(PAGE_SIZE));
+            let va = COPY_VA.saturating_add(mapped.saturating_mul(PAGE_SIZE));
             let cap = self.caps.get(cap).copied().unwrap_or(0);
-            // SAFETY: the scrub window is memmgr's own zone, which every use
+            // SAFETY: the copy window is memmgr's own zone, which every use
             // leaves unmapped, and the `count` pages, at most a chunk's here
             // and at most `OBJECT_READ_PAGES` for `OBJECT_READ`, lie in it.
             if unsafe { map_self(l, cap, va, offset, pages) }.is_err()
             {
                 // A failed map leaves none of its span mapped: unmap the spans
                 // before it.
-                unmap_scrub(mapped);
+                unmap_copy(mapped);
                 return None;
             }
             mapped = mapped.saturating_add(pages);
         }
         let len = usize::try_from(count.saturating_mul(PAGE_SIZE)).unwrap_or(0);
-        // SAFETY: the `count` pages at the scrub window are mapped read-write
+        // SAFETY: the `count` pages at the copy window are mapped read-write
         // above to frames of the request's caps, which nothing in memmgr
         // refers to, and the slice is not used past the unmap below.
-        let dst = unsafe { core::slice::from_raw_parts_mut(SCRUB_VA as *mut u8, len) };
+        let dst = unsafe { core::slice::from_raw_parts_mut(COPY_VA as *mut u8, len) };
         let read = read(l, dst);
-        unmap_scrub(mapped);
+        unmap_copy(mapped);
         Some(read)
     }
 }
 
-/// Unmap the first `pages` pages of the scrub window. The unmap is inline
+/// Unmap the first `pages` pages of the copy window. The unmap is inline
 /// assembly without `nomem`, so the stores made to them are made before it.
-fn unmap_scrub(pages: u64)
+fn unmap_copy(pages: u64)
 {
     if pages > 0
     {
-        // SAFETY: the scrub window is memmgr's own zone.
-        let _ = unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, pages) };
+        // SAFETY: the copy window is memmgr's own zone.
+        let _ = unsafe { syscall::mem_unmap(self_aspace(), COPY_VA, pages) };
     }
 }

@@ -17,8 +17,9 @@
 //! death relay, the fs release handler's cookie matching, fatfs's release of
 //! the open of a killed client and of one whose open reply it cannot deliver,
 //! fatfs's return of the session pages of a client that dies holding a
-//! session, memmgr's hold on a dead child's frame that a live kernel object
-//! still occupies, memmgr's hold of a child to the memory max its creator
+//! session, virtio-blk's end of the registered region of a client that dies,
+//! memmgr's hold on a dead child's frame that a live kernel object still
+//! occupies, memmgr's hold of a child to the memory max its creator
 //! set, its commitment of a heap's growth, memmgr's eviction of a child's cold
 //! pages and their restore, a child's attachment of a memory object, its call
 //! of an executable one, procmgr's snapshot of a live child, and what a mapped
@@ -35,9 +36,9 @@
 //! new role is registered alongside its phase, not in a central switch.
 //!
 //! A module's `reentry_main` diverges on a matching role, by exiting
-//! (`std::process::exit`) or, for `park-child`, `reclaim-child`, and
-//! `open-reclaim-child`, by parking until its spawner tears it down, and
-//! returns on a miss;
+//! (`std::process::exit`) or, for `park-child`, `reclaim-child`,
+//! `open-reclaim-child`, and `blk-region-child`, by parking until its
+//! spawner tears it down, and returns on a miss;
 //! `dispatch` cascades through the modules and returns to its caller only
 //! when no module took control.
 
@@ -54,6 +55,7 @@ pub fn dispatch(role: &str)
     phases::process_tree::reentry_main(role);
     phases::fs_std::reentry_main(role);
     phases::fs_opens::reentry_main(role);
+    phases::blk_regions::reentry_main(role);
     phases::fs_sessions::reentry_main(role);
     phases::fs_create_open::reentry_main(role);
     phases::exit_code::reentry_main(role);

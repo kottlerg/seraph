@@ -2922,14 +2922,17 @@ fn new_entry_rights_ceiling(kind: NewEntryKind) -> NamespaceRights
 }
 
 /// The name an `FS_CREATE` or `FS_MKDIR` carries: `label[16..32]` bytes
-/// from word 0. `None` when it is empty, longer than the message, or not a
-/// valid name (`namespace_protocol::validate_name`).
+/// from word 0. `None` when it is empty, longer than the message, not a
+/// valid name (`namespace_protocol::validate_name`), or one no long name
+/// can hold (`fat_parse::is_storable_name`).
 fn create_name(msg: &IpcMessage) -> Option<&[u8]>
 {
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
-    msg.data_bytes()
-        .get(..name_len)
-        .filter(|name| !name.is_empty() && namespace_protocol::validate_name(name).is_ok())
+    msg.data_bytes().get(..name_len).filter(|name| {
+        !name.is_empty()
+            && namespace_protocol::validate_name(name).is_ok()
+            && fat_parse::is_storable_name(name)
+    })
 }
 
 /// Write a new entry `name` of `kind` in the directory at `parent_cluster`:
@@ -3558,6 +3561,7 @@ fn handle_rename_node_cap(
 
     if namespace_protocol::validate_name(src_name).is_err()
         || namespace_protocol::validate_name(dst_name).is_err()
+        || !fat_parse::is_storable_name(dst_name)
     {
         reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
         return;

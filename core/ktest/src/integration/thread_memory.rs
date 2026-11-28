@@ -560,21 +560,23 @@ fn lent_page_refused(b: u64, th: u64, lent: u64) -> TestResult
 }
 
 /// A device page of B is refused. ktest takes a Map-only copy of the first
-/// `Mmio` it holds (a copy, so no mapping of the original is withdrawn),
+/// boot `Mmio` cap, its handle the `InitInfo` descriptor's
+/// ([`crate::unit::hw::boot_caps`]; a copy, so no mapping of the original is
+/// withdrawn),
 /// carves one page off it, or uses it whole when it is one page, and maps the
 /// page into B; with no `Mmio`, the case is skipped. `memory` is a
 /// full-rights Memory cap for the protects.
 fn device_refused(ctx: &TestContext, b: u64, th: u64, memory: u64) -> TestResult
 {
-    for slot in 1..=u64::from(crate::unit::hw::scan_bound(ctx))
+    for boot in crate::unit::hw::boot_caps(ctx, init_protocol::CapType::Mmio)
     {
-        let Ok(copy) = cap_derive(slot, RIGHTS_MMIO_MAP)
+        let Ok(copy) = cap_derive(boot.slot, RIGHTS_MMIO_MAP)
         else
         {
             continue;
         };
         // A one-page region cannot be split at its first page
-        // (`InvalidArgument`); any other refusal is a cap that is no `Mmio`.
+        // (`InvalidArgument`); any other refusal moves on to the next.
         let lo = match mmio_split(copy, 0x1000)
         {
             Ok((lo, hi)) =>

@@ -225,14 +225,8 @@ pub struct TestContext
     /// bound to an address space), and hardware access tests.
     pub aspace_cap: u64,
 
-    /// ktest's own `CSpace` capability slot, provided by the kernel.
-    ///
-    /// Used by tests that need to discover the cspace's slot capacity at
-    /// runtime via `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` so their scans
-    /// cover every slot the kernel may have populated, including those
-    /// allocated after `aspace_cap` (e.g. narrow `IoPort` caps minted
-    /// by `bind_port_range` (`src/arch/x86_64/ioport.rs`) callers such as
-    /// `serial::init` on `x86_64`).
+    /// ktest's own `CSpace` capability slot, provided by the kernel: the
+    /// `CSpace` a test copies caps into, or gives a thread it creates.
     pub cspace_cap: u64,
 
     /// ktest's own `Thread` capability slot (CONTROL right), provided by

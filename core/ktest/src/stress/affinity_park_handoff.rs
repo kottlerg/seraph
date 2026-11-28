@@ -40,9 +40,10 @@
 //! ## Pass criterion
 //!
 //! Needs 3 CPUs (skips below). Every round's affinity change and wait return
-//! `Ok`, both children report the end of each phase within its bound, and in
-//! each phase some round's wait returns on the CPU that round named (a park
-//! the waker's send woke there), so the phase reached the wake path. The
+//! `Ok`, both children report the end of each phase, neither going
+//! [`STALL_SLICES`] without finishing a round, and in each phase some round's
+//! wait returns on the CPU that round named (a park the waker's send woke
+//! there), so the phase reached the wake path. The
 //! kernel's debug assertions are the tripwires for a requeued claimed thread;
 //! the window is a few hundred instructions of the parking CPU, so a defective
 //! kernel trips them in some boots, not every one.
@@ -73,9 +74,13 @@ const AWAY_CPU: u32 = 2;
 const DELAY_STRIDE: u32 = 37;
 const DELAY_SPAN: u32 = 1024;
 
-/// Bound on a phase's wait for both children's end-of-phase reports, in
-/// slices of [`PHASE_SLICE_MS`]; applied through [`crate::scaled_bound`].
-const PHASE_SLICES: u64 = 6000;
+/// Bound on the slices of [`PHASE_SLICE_MS`] a phase may go with neither child
+/// finishing a round, applied through [`crate::scaled_bound`]: a progress bound,
+/// not one on the whole phase, so it separates a stuck child (a lost wake, a
+/// starved child) from slow rounds at any speed, icount's round-robin vCPUs
+/// included, where a vCPU that never idles holds the host thread until the next
+/// timer deadline and a busy-phase round takes milliseconds.
+const STALL_SLICES: u64 = 2000;
 const PHASE_SLICE_MS: u64 = 5;
 
 /// The worker's and the waker's level: above the spinners (the floor) and
@@ -90,6 +95,9 @@ const WAKER_DONE: u64 = 1 << 1;
 /// The round the worker is in (1-based; 0 before its first), which the waker
 /// follows.
 static ROUND: AtomicU32 = AtomicU32::new(0);
+
+/// The last round whose `go` the waker sent (0 before its first).
+static SENT: AtomicU32 = AtomicU32::new(0);
 
 /// Rounds whose wait returned on the CPU the round named.
 static MOVED: AtomicU64 = AtomicU64::new(0);
@@ -210,8 +218,9 @@ fn phases(
 }
 
 /// One phase: start the worker on [`HOME_CPU`] and the waker on `waker_cpu`,
-/// wait for both to report the phase's end, and check the children's
-/// results. `pair` holds the phase's worker and waker.
+/// wait for both to report the phase's end while either still finishes a round
+/// within [`STALL_SLICES`], and check the children's results. `pair` holds the
+/// phase's worker and waker.
 fn phase(
     ctx: &TestContext,
     index: usize,
@@ -223,6 +232,7 @@ fn phase(
 ) -> TestResult
 {
     ROUND.store(0, Ordering::Release);
+    SENT.store(0, Ordering::Release);
     MOVED.store(0, Ordering::Release);
     BAD.reset();
     // Bits a previous phase left on `go` (none: each send is waited for)
@@ -276,19 +286,30 @@ fn phase(
             .map_err(|_| "stress::affinity_park_handoff: start child failed")?;
     }
 
+    let stall_bound = crate::scaled_bound(STALL_SLICES);
     let mut reported = 0u64;
-    for _ in 0..crate::scaled_bound(PHASE_SLICES)
+    let mut progress = (0, 0);
+    let mut stalled = 0u64;
+    while reported & (WORKER_DONE | WAKER_DONE) != WORKER_DONE | WAKER_DONE
     {
-        if reported & (WORKER_DONE | WAKER_DONE) == WORKER_DONE | WAKER_DONE
+        if stalled >= stall_bound
         {
-            break;
+            crate::tally::log_cell_u64(CELL, " stalled round=", u64::from(progress.0));
+            crate::tally::log_cell_u64(CELL, " stalled sent=", u64::from(progress.1));
+            return Err("stress::affinity_park_handoff: a child stopped finishing its rounds");
         }
         reported |= notification_wait_timeout(done, PHASE_SLICE_MS)
             .map_err(|_| "stress::affinity_park_handoff: wait on done failed")?;
-    }
-    if reported & (WORKER_DONE | WAKER_DONE) != WORKER_DONE | WAKER_DONE
-    {
-        return Err("stress::affinity_park_handoff: a child never finished its rounds");
+        let now = (ROUND.load(Ordering::Acquire), SENT.load(Ordering::Acquire));
+        if now == progress
+        {
+            stalled = stalled.saturating_add(1);
+        }
+        else
+        {
+            progress = now;
+            stalled = 0;
+        }
     }
     BAD.check(
         CELL,
@@ -358,6 +379,7 @@ extern "C" fn waker_entry(arg: u64) -> !
         {
             BAD.record_error(e);
         }
+        SENT.store(round, Ordering::Release);
     }
     if let Err(e) = notification_send(done, WAKER_DONE)
     {

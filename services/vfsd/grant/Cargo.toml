@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "vfsd-grant"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The IPC error codes that tell a block driver's death apart (`Step::of`).
+syscall-abi = { path = "../../../abi/syscall" }
+# The block driver's reply codes to `BLK_RETIRE_PARTITION` (`Step::of_retire`).
+ipc = { path = "../../../shared/ipc" }
+
+[lints]
+workspace = true

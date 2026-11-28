@@ -27,8 +27,12 @@ crate::argparse::value_enum! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub enum BenchMode
     {
-        /// Instructions: boots under QEMU's icount (`run --icount`), whose counts
-        /// repeat, so the gate holds them to a fixed band.
+        /// Instructions: boots under QEMU's icount (`run --icount`). A one-CPU
+        /// count of a window that does not idle, and that no interrupt or other
+        /// thread enters, repeats, unless the path's cost depends on the order
+        /// of earlier host-timed events, so the gate holds those counts to a
+        /// fixed band; four-CPU counts are reported
+        /// (docs/testing.md § Benchmarks).
         Icount,
         /// Time on the reference host: `x86_64` boots under a native accelerator,
         /// reported against per-measurement bands and never gated.
@@ -1007,6 +1011,116 @@ pub fn regenerate(
     Ok(out)
 }
 
+/// The fewest runs a host-mode band is calibrated from: the spread of fewer
+/// p50s says too little of the host's noise to bound it.
+pub const CALIBRATION_RUNS_MIN: usize = 5;
+
+/// A host-mode band is this many times its measurement's spread over the
+/// calibration runs.
+pub const BAND_SPREADS: u64 = 3;
+
+/// The host mode's band file of `runs`, a calibration's logs, beside the
+/// `stored` bands.
+///
+/// A measurement's band is `BAND_SPREADS` times its spread: the range of its
+/// p50s over the runs, at least one count, the counter's resolution, over
+/// their median (the nearest-rank p50, as shared/bench's), in hundredths of a
+/// percent rounded up. `Rewrite::Moved` keeps every stored band of a
+/// measurement the runs made and calibrates those with none; `Rewrite::All`
+/// calibrates every measurement the runs made. Either way a band of a
+/// measured suite that no run measured goes, and the bands of a suite the runs
+/// measure nothing of stay: that suite's boot did not run.
+///
+/// # Errors
+/// What [`gather`] refuses in host mode; a `FAIL` line, or a measurement
+/// some run at its CPU count missed, as [`regenerate`] refuses them; a
+/// measurement to calibrate that fewer than `CALIBRATION_RUNS_MIN` runs
+/// made, or whose median is 0.
+pub fn calibrate_bands(
+    runs: &[RunLog],
+    stored: &BTreeMap<Key, u64>,
+    rewrite: Rewrite,
+) -> Result<String>
+{
+    let set = gather(BenchMode::Host, runs)?;
+    ensure!(
+        set.failed.is_empty(),
+        "a benchmark logged a FAIL line: {}",
+        set.failed.join(", ")
+    );
+    if let Some((key, _)) = set.measured.iter().find(|(_, m)| m.runs < m.expected)
+    {
+        bail!("{key} was not measured by every run");
+    }
+    let mut p50s: BTreeMap<&Key, Vec<u64>> = BTreeMap::new();
+    for run in runs
+    {
+        for (key, _, p50, _) in &run.lines
+        {
+            p50s.entry(key).or_default().push(*p50);
+        }
+    }
+    let measured_suites: BTreeSet<&str> = set.measured.keys().map(|k| suite_of(&k.bench)).collect();
+    let mut out: BTreeMap<Key, u64> = stored
+        .iter()
+        .filter(|(key, _)| {
+            !measured_suites.contains(suite_of(&key.bench))
+                || (rewrite == Rewrite::Moved && set.measured.contains_key(*key))
+        })
+        .map(|(key, band)| (key.clone(), *band))
+        .collect();
+    for (key, values) in &mut p50s
+    {
+        if out.contains_key(*key)
+        {
+            continue;
+        }
+        ensure!(
+            values.len() >= CALIBRATION_RUNS_MIN,
+            "{key}: {} run(s) measured it, and a band is calibrated from at least \
+             {CALIBRATION_RUNS_MIN}",
+            values.len()
+        );
+        values.sort_unstable();
+        let (Some(&low), Some(&high)) = (values.first(), values.last())
+        else
+        {
+            continue;
+        };
+        let median = values
+            .get(values.len().div_ceil(2).saturating_sub(1))
+            .copied()
+            .unwrap_or(0);
+        ensure!(
+            median > 0,
+            "{key}: its median p50 is 0, which no band is a percentage of"
+        );
+        let range = high.saturating_sub(low).max(1);
+        let band = u128::from(BAND_SPREADS)
+            .saturating_mul(u128::from(range))
+            .saturating_mul(10_000)
+            .div_ceil(u128::from(median));
+        out.insert((*key).clone(), u64::try_from(band).unwrap_or(u64::MAX));
+    }
+    Ok(write_bands(&out))
+}
+
+/// The host mode's band file of `bands`, in hundredths of a percent, one
+/// line per measurement in key order.
+pub fn write_bands(bands: &BTreeMap<Key, u64>) -> String
+{
+    let mut out = format!(
+        "# Host-mode bands, written by `cargo xtask bench-baseline --host --bands`: each\n\
+         # {BAND_SPREADS} times its measurement's spread over the calibration runs, the range of\n\
+         # their p50s over their median. Format: xtask/README.md (`cargo xtask bench-check`).\n"
+    );
+    for (key, band) in bands
+    {
+        let _ = writeln!(out, "{key} band={}.{:02}", band / 100, band % 100);
+    }
+    out
+}
+
 /// An environment file: `key<TAB>value` lines.
 pub fn write_env(pairs: &[(String, String)]) -> String
 {
@@ -1820,5 +1934,82 @@ mod tests
         .unwrap();
         assert_eq!(files.keys().collect::<Vec<_>>(), ["ktest.a", "ktest.gone"]);
         assert!(files["ktest.a"].is_some() && files["ktest.gone"].is_none());
+    }
+    /// Host-mode runs at 4 CPUs, run i reporting each `(name, p50s[i])`.
+    fn host_runs(rows: &[(&str, &[u64])]) -> Vec<RunLog>
+    {
+        let n = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+        (0..n)
+            .map(|i| {
+                let body: Vec<String> = rows
+                    .iter()
+                    .filter_map(|(name, p50s)| p50s.get(i).map(|p| line(name, 4, *p)))
+                    .collect();
+                let mut run = log(4, "off", &body);
+                run.arch = "x86_64".to_string();
+                run.accel = "kvm".to_string();
+                run
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_band_is_three_spreads_rounded_up_and_a_repeated_p50_spreads_by_one_count()
+    {
+        let runs = host_runs(&[
+            ("a", &[104, 100, 102, 101, 103]),
+            ("b", &[200, 200, 200, 200, 200]),
+        ]);
+        let text = calibrate_bands(&runs, &BTreeMap::new(), Rewrite::Moved).unwrap();
+        let bands = parse_bands(&text).unwrap();
+        // Range 4 over the median 102, three times: 11.764...%.
+        assert_eq!(bands[&key("a", "", 4)], 1177);
+        // Range 0, held to one count, over 200, three times: 1.5%.
+        assert_eq!(bands[&key("b", "", 4)], 150);
+        assert!(text.contains("ktest.a cpus=4 band=11.77\n"));
+    }
+
+    #[test]
+    fn calibration_refuses_too_few_runs_a_fail_line_and_a_measurement_a_run_missed()
+    {
+        let none = BTreeMap::new();
+        calibrate_bands(&host_runs(&[("a", &[1, 1, 1, 1])]), &none, Rewrite::Moved).unwrap_err();
+        let mut failed = host_runs(&[("a", &[1, 1, 1, 1, 1])]);
+        failed[0].failed.push("ktest.a".to_string());
+        calibrate_bands(&failed, &none, Rewrite::Moved).unwrap_err();
+        let partial = host_runs(&[("a", &[1, 1, 1, 1, 1]), ("b", &[1, 1, 1, 1])]);
+        calibrate_bands(&partial, &none, Rewrite::Moved).unwrap_err();
+        calibrate_bands(
+            &host_runs(&[("a", &[0, 0, 0, 0, 0])]),
+            &none,
+            Rewrite::Moved,
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn calibration_adds_missing_bands_or_rewrites_all_and_keeps_an_unmeasured_suite()
+    {
+        let runs = host_runs(&[("kept", &[100; 5]), ("new", &[100; 5])]);
+        let other = Key {
+            bench: "ubench.x".to_string(),
+            variant: String::new(),
+            cpus: 4,
+        };
+        let stored: BTreeMap<Key, u64> = [
+            (key("kept", "", 4), 4000),
+            (key("gone", "", 4), 4000),
+            (other.clone(), 4000),
+        ]
+        .into();
+        let moved = parse_bands(&calibrate_bands(&runs, &stored, Rewrite::Moved).unwrap()).unwrap();
+        assert_eq!(moved[&key("kept", "", 4)], 4000);
+        assert_eq!(moved[&key("new", "", 4)], 300);
+        assert_eq!(moved[&other], 4000);
+        assert!(!moved.contains_key(&key("gone", "", 4)));
+        let all = parse_bands(&calibrate_bands(&runs, &stored, Rewrite::All).unwrap()).unwrap();
+        assert_eq!(all[&key("kept", "", 4)], 300);
+        assert_eq!(all[&other], 4000);
+        assert_eq!(all.len(), 3);
     }
 }

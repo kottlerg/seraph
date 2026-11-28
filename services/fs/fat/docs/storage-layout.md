@@ -23,8 +23,10 @@ each mutation in [crash-safety.md](crash-safety.md).
   (`fat_parse::TailSet`; a directory's 65536-entry cap always leaves one
   free), with an LFN run packed in reverse-sequence order. The long name is
   the UTF-8 name encoded as UTF-16 code units (`fat_parse::encode_lfn`, at
-  most 255). The trailing `0x40` LFN sequence flag and `LDIR_Chksum`
-  computation match the Microsoft FAT specification. An insert whose slot
+  most 255); a name holding U+0000 or U+FFFF, whose code units a run takes
+  as the name's end, has no encoding. The trailing `0x40` LFN sequence
+  flag and `LDIR_Chksum` computation match the Microsoft FAT
+  specification. An insert whose slot
   run crosses the end-of-directory marker writes a new `0x00` marker into
   the slot after the run, when the directory has one, since the slots past
   the old marker may hold any bytes. A directory walk ends with `Corrupt`

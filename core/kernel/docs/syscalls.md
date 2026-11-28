@@ -2089,7 +2089,8 @@ target's remaining time slice (at most the longest slice, 20 timer ticks, that o
 [scheduler.md § Time Slice Policy](scheduler.md#time-slice-policy)), except when the
 slice expires while the target runs a preemption-disabled kernel section with interrupts enabled (a
 TLB-shootdown or drain spin, or a page-pool seeding, teardown, explicit-placement pre-grow,
-registry-walk, waiter-drain, memory-zero, or derivation-lock window between batches,
+registry-walk, waiter-drain, memory-zero, retype free-clear, or derivation-lock window
+between batches,
 `interrupt_window`):
 `timer_tick` then refills the slice without rescheduling, and `preempt_enable` does not reschedule,
 so the stop completes at the first later slice-expiry tick with preemption enabled, a further slice

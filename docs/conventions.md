@@ -277,13 +277,11 @@ checks the part of the condition a script can decide and names the rest for its 
 release PR's need of an approval included. In an orchestrated batch the orchestrator merges a PR
 that meets it, with no further decision of the maintainer. A session working alone with the
 maintainer reports that the PR meets the condition, and the maintainer's instruction to merge is
-the one decision left. Two things need the maintainer's approval whatever the gate says. A
-change to `.claude/CLAUDE.md`, to the assistant's settings, or to its hooks is applied only on
-the maintainer's own word. In § Release Production the merge of the release PR (step 3), the tag
-(step 5), the publishing of the Release (step 7), and the milestone work of step 8 each need the
-maintainer's approval of that step, and the release PR does not meet the merge condition before
-its merge is approved. Who carries an approved step out is not fixed: the orchestrator of the
-batch or a session does, or the maintainer.
+the one decision left. Whatever the gate says, in § Release Production the merge of the release PR
+(step 3), the tag (step 5), the publishing of the Release (step 7), and the milestone work of
+step 8 each need the maintainer's approval of that step, and the release PR does not meet the
+merge condition before its merge is approved. Who carries an approved step out is not fixed:
+the orchestrator of the batch or a session does, or the maintainer.
 
 Every defect a run reports is fixed or recorded as the subsections below say. A finding MUST NOT
 be waived or ruled outside the standards.
@@ -586,6 +584,11 @@ gives the PR-level linear view.
   `cargo xtask compare-images` and gives the head it ran at and the path of
   the report the command wrote; the pre-merge audit reads that report and
   checks its base, its head, its four cells, and its verdict.
+- Every PR body whose PR states a performance purpose, as
+  [testing.md](testing.md#benchmarks-bench-cell) § Benchmarks defines it, MUST carry in its
+  `## Validation` section the `cargo xtask bench-check --mode host` report of the host-mode
+  runs that section owes, with their `--runs` count and the head they ran at, and the account
+  that section requires of each measurement whose verdict is not `ok`.
 - Every PR body whose diff adds a proof harness or changes one's body, bounds or `kani::any`
   sizes MUST report, in its `## Validation` section, the local sizing run of each such harness
   that [testing.md](testing.md#bounded-verification) § Bounded verification owes: its
@@ -746,7 +749,10 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    debug-port cell (`test debug-port`, on both architectures),
    the hotplug cell (`test hotplug`, on both architectures),
    the CET cell (`test cet`, on x86_64), and the TPM cell (`test tpm`,
-   on x86_64) once each, every bounded proof (`cargo xtask kani`
+   on x86_64) once each, the host-mode boots (the release build's
+   bench-only ktest image and its ubench boot, 5 runs each on x86_64 with
+   `--timing`, [testing.md](testing.md#benchmarks-bench-cell)
+   § Benchmarks), every bounded proof (`cargo xtask kani`
    with no option, which reads no stored pass), and the fuzz campaign: a
    manual dispatch of `fuzz.yml` on `master` while the commit to be
    tagged is its head (`gh workflow run fuzz.yml --ref master`), at the
@@ -755,8 +761,9 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    contains the bump stands for the commit to be tagged when the change between the two is
    documentation or comments only, as [testing.md](testing.md#coverage-tiers)
    § Coverage tiers defines it.
-   Their report, each run's command, `--runs` count, outcome, and head, is
-   written to `target/xtask/review/release-v<X>.<Y>.<Z>/host-runs.md`, the
+   Their report, each run's command, `--runs` count, outcome, and head,
+   with the host-mode boots' `bench-check --mode host` report, which
+   blocks nothing, is written to `target/xtask/review/release-v<X>.<Y>.<Z>/host-runs.md`, the
    file the release audit reads; the release PR's body states its own local
    host runs as § PR-body checklist discipline requires.
 5. Run the release review in `audit` mode at that commit, with that report:

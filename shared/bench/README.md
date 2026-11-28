@@ -282,6 +282,6 @@ such a delay leaves a window out, and the check rests on the invariant TSC § Co
 ## Summarized By
 
 [Scheduler Internals](../../core/kernel/docs/scheduler.md),
-[core/ktest/README.md](../../core/ktest/README.md),
+[core/ktest/README.md](../../core/ktest/README.md), [Performance](../../docs/performance.md),
 [services/fixtures/fsbench/README.md](../../services/fixtures/fsbench/README.md),
 [services/ubench/README.md](../../services/ubench/README.md)

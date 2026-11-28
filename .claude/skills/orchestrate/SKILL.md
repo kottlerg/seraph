@@ -95,8 +95,7 @@ over the session's. When this session runs on a larger model, say so once and co
      that session; the spawn line then names that worktree.
 6. **Do for the orchestrator what only the top session can**: stop an agent it names and tell it
    once the stop is confirmed (a respawn into that agent's worktree waits for it), schedule
-   or cancel a tick it asks for, apply a `.claude/CLAUDE.md`, settings or hook patch on the
-   maintainer's direct word in this conversation, and make a `release-review` workflow call it
+   or cancel a tick it asks for, and make a `release-review` workflow call it
    gives you: save the report and the returned object to the paths it names, show the
    maintainer both verdict lines, and answer the orchestrator with those lines and the paths.
 7. **Wake a drifted orchestrator.** A turn of the orchestrator that ran in a worker's worktree

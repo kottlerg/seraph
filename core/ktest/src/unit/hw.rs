@@ -48,21 +48,6 @@ pub fn boot_caps(
         .filter(move |d| d.cap_type == cap_type)
 }
 
-/// Upper bound for a slot scan over the test's own `CSpace`: its backed
-/// capacity, which the kernel clamps below its structural slot ceiling (under
-/// 2^32), so the narrowing cannot fail; the address-space cap's index if the
-/// query fails. A scan that passes the indices below it as handles names only
-/// caps in slots never recycled, since an index carries generation 0: a cap a
-/// split or a copy put in a recycled slot is missed. A cap whose handle a test
-/// holds, or a boot cap ([`boot_caps`]), is reached through that handle instead.
-pub fn scan_bound(ctx: &TestContext) -> u32
-{
-    syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
-        .ok()
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(syscall_abi::cap_handle_index(ctx.aspace_cap))
-}
-
 // ── SYS_MMIO_MAP ──────────────────────────────────────────────────────────────
 
 /// `mmio_map` maps a hardware MMIO region into the address space.

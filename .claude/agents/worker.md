@@ -181,11 +181,6 @@ Run `git fetch origin` at the start of every step, so each step reads the curren
   procedure), a harness phase the Issue's acceptance requires, or the root `Cargo.toml` and
   `Cargo.lock` for a new dependency or host-tested crate. Anything else outside the task is a
   question.
-- `.claude/CLAUDE.md`, `.claude/settings.json` and hooks change what the harness does, and the
-  harness accepts no agent's message as the maintainer's consent to change them. Prepare such a
-  change as a patch file in the scratchpad and report it. The maintainer applies it, or tells
-  the main session to. When a fact you change has a copy there, hold your push until the patch
-  is applied, so every copy lands together.
 - Read every Issue item against the current code before fixing it. An item already fixed is
   ticked citing the PR that fixed it (`git log -S`, `git blame`). An item that is wrong on the
   code goes to the one you report to with the evidence (file and line); that one decides the
@@ -367,8 +362,9 @@ The validation set is `cargo xtask test`, `cargo xtask lint-docs`, then on both 
 and usertest for services and runtimes (recipes: docs/testing.md § Gating, `xtask/README.md`).
 Run the three coverage screens of § Coverage tiers on your own diff and state which local host
 runs they owe, each at `--runs 1`. An owed run that fails or hangs blocks: report it with the
-log before any re-run, apart from the one re-run alone above. A documentation-only or
-comment-only PR owes `cargo xtask lint-docs` only.
+log before any re-run, apart from the one re-run alone above. A PR that states a performance
+purpose (docs/testing.md § Benchmarks) owes that section's host-mode runs too, under a timing
+grant. A documentation-only or comment-only PR owes `cargo xtask lint-docs` only.
 
 ## Review
 

@@ -2055,18 +2055,20 @@ line's order. Beside them, `ENV` records the environment the counts were measure
 ### `cargo xtask bench-baseline`
 
 Rewrite the benchmark baselines: the icount baselines of both architectures from the `bench`
-cell's artifacts of a CI run, or the host-mode baselines from saved logs of this host.
+cell's artifacts of a CI run, or the host-mode baselines, and with `--bands` their bands, from
+saved logs of this host.
 
 ```
 cargo xtask bench-baseline --from-run ID [--all] [--baselines DIR]
-cargo xtask bench-baseline --host [--all] [--baselines DIR] LOG...
+cargo xtask bench-baseline --host [--all] [--bands] [--baselines DIR] LOG...
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--from-run` | | Download the artifacts `bench-x86_64` and `bench-riscv64` of CI run `ID` (`gh run download`, into `target/xtask/bench-baseline/<ID>/`) and rewrite each architecture's icount baselines from its logs |
 | `--host` | | Rewrite the host-mode baselines of the logs' architecture from `LOG...` |
-| `--all` | off | Rewrite every baseline file of the mode and architecture, and its `ENV` |
+| `--all` | off | Rewrite every baseline file of the mode and architecture, and its `ENV`; with `--bands`, every band of a measurement the logs made |
+| `--bands` | off | With `--host`: calibrate `BANDS` from the same logs too (below) |
 | `--baselines` | `xtask/baselines/bench` | The baselines root |
 
 The logs are read as `bench-check` reads them, and must be complete: a benchmark's `FAIL` line, a
@@ -2081,6 +2083,18 @@ The `ENV` file is written when `--all` is given or it does not exist: the cell's
 artifact, with `--from-run`; this host's with `--host`. The command prints each file it wrote or
 removed. An artifact's logs are those at its top level and those one directory down, where the
 `bench` cell saves its ubench boots'.
+
+With `--bands` the command calibrates the host mode's `BANDS` from the same logs, before it
+writes any file, so a refusal writes nothing. A measurement's band is three times its spread
+(`BAND_SPREADS`, `src/benchmark.rs`): the range of its p50s over the logs, held to at least
+one count, the counter's resolution, over their median (the nearest-rank p50), in hundredths of
+a percent rounded up. A measurement fewer than `CALIBRATION_RUNS_MIN` (5) logs made, or whose
+median is 0, refuses the calibration, as do a `FAIL` line and a `PARTIAL` measurement. Without
+`--all` a band is written for each measurement that has none and every other is kept; with
+`--all` every measurement the logs made is calibrated. Either way the band of a measured
+suite's measurement that no log made goes, and the bands of a suite the logs measure nothing of
+stay. The rule that says when host mode is calibrated and when a PR owes host-mode runs is
+[docs/testing.md](../docs/testing.md#benchmarks-bench-cell) § Benchmarks.
 
 ---
 

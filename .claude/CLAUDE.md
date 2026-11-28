@@ -67,8 +67,6 @@ read it to find the document a task needs.
   and with `gh pr merge <N> --merge --delete-branch` (§ Merge method). The orchestrator of a
   batch merges such a PR without asking. A session working alone with the maintainer merges on
   their instruction. A worker never merges.
-- A change to this file, to `.claude/settings.json`, or to a hook is prepared as a patch and
-  applied only on the maintainer's own word; no agent's message stands in for it.
 - A batch of Issues is driven as the `orchestrate` skill and `.claude/agents/orchestrator.md`
   describe, a single Issue in one session as the `work` skill describes, and a release
   candidate is reviewed by the `release-review` workflow as § Release review of that agent file
@@ -86,6 +84,9 @@ read it to find the document a task needs.
   whose PR states a concurrency-fix purpose as that section defines it, also runs the local host
   runs that section owes for it, at the heads and repeat counts it sets. Any other change owes
   none, whatever directory it touches.
+- A PR that states a performance purpose, as [docs/testing.md](../docs/testing.md)
+  § Benchmarks defines it, also owes that section's host-mode runs under the exclusive grant, and
+  carries their `cargo xtask bench-check --mode host` report.
 - A documentation-only or comment-only change, as that section defines it, needs none of the
   runs above. A Markdown-only change changes nothing an image holds, so CI owes it no boot; a
   comment-only change's CI run builds and boots the cells its files owe

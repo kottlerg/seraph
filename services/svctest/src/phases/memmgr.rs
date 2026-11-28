@@ -1197,7 +1197,7 @@ const SETTLE_QUIET: u32 = 8;
 
 /// Trigger rechecks until memmgr's deferred total falls to `target` bytes or
 /// below; panics with `what` when it does not within the poll bound.
-fn await_deferred_at_most(target: u64, what: &str)
+pub(crate) fn await_deferred_at_most(target: u64, what: &str)
 {
     // A test wait bound: it limits only how long the phase polls before it
     // fails. One recheck examines every run of a short deferred list.

@@ -207,21 +207,22 @@ fn map_all(b: u64, [w0, w1, ro, text]: [u64; 4]) -> TestResult
     mapped.map_err(|_| "integration::thread_list_pages: B text mem_map failed")
 }
 
-/// Map a device page into B when ktest holds an `Mmio` (a Map-only copy of
-/// the first one, one page carved off it, as
+/// Map a device page into B when the boot hands ktest an `Mmio` (a Map-only
+/// copy of the first boot `Mmio` cap, its handle the `InitInfo` descriptor's
+/// ([`crate::unit::hw::boot_caps`]), one page carved off it, as
 /// `crate::integration::thread_memory` does), then run the listing checks,
 /// with the device page expected when it was mapped.
 fn with_device(ctx: &TestContext, b: u64, th: u64) -> TestResult
 {
-    for slot in 1..=u64::from(crate::unit::hw::scan_bound(ctx))
+    for boot in crate::unit::hw::boot_caps(ctx, init_protocol::CapType::Mmio)
     {
-        let Ok(copy) = cap_derive(slot, RIGHTS_MMIO_MAP)
+        let Ok(copy) = cap_derive(boot.slot, RIGHTS_MMIO_MAP)
         else
         {
             continue;
         };
         // A one-page region cannot be split at its first page
-        // (`InvalidArgument`); any other refusal is a cap that is no `Mmio`.
+        // (`InvalidArgument`); any other refusal moves on to the next.
         let lo = match mmio_split(copy, PAGE)
         {
             Ok((lo, hi)) =>

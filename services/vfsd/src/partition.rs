@@ -5,7 +5,7 @@
 
 //! Disk and partition discovery: devmgr's `block` class queried at every
 //! instance ordinal, at startup from the first and before each later role
-//! lookup (a `MOUNT`, the first `GET_SWAP_PARTITION`) from the first not yet
+//! lookup (a `MOUNT`, a `GET_SWAP_PARTITION`) from the first not yet
 //! seen, block-device I/O wrapped around the pure [`gpt`]
 //! format parser on each disk found, and the probe that tells a held disk
 //! present from removed.

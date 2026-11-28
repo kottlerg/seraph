@@ -96,15 +96,19 @@ pub struct Caps
     /// `LOG_CONTROL_AUTHORITY`-badged SEND on the master log endpoint
     /// (`logd.control`), in slot 24.
     pub logd_control: u64,
+    /// The `block` class SEND on devmgr's registry endpoint
+    /// (`devmgr.class.block`), in slot 25, whose `QUERY_DEVICE` answers with a
+    /// `MOUNT_AUTHORITY`-badged whole-disk cap.
+    pub block_class: u64,
     /// `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which the recipe's
-    /// `debug_authority = yes` delivers in slot 25, after the seeds.
+    /// `debug_authority = yes` delivers in slot 26, after the seeds.
     pub debug_authority: u64,
     /// `STOP_AUTHORITY`-badged SEND on svcmgr's service endpoint, which the
-    /// recipe's `stop_authority = yes` delivers in slot 26, after the
+    /// recipe's `stop_authority = yes` delivers in slot 27, after the
     /// debug-authority slot.
     pub stop_authority: u64,
     /// A `PmuControl` copy carrying `Configure`, which the recipe's
-    /// `pmu_authority = yes` delivers in slot 27, after the stop-authority
+    /// `pmu_authority = yes` delivers in slot 28, after the stop-authority
     /// slot.
     pub pmu_authority: u64,
 }
@@ -134,7 +138,7 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    // Twenty-five seeds and the debug-, stop- and PMU-authority slots take seven rounds; an absent
+    // Twenty-six seeds and the debug-, stop- and PMU-authority slots take eight rounds; an absent
     // slot decodes as `0`, and a round that does not decode leaves every slot `0`.
     let Ok(
         [
@@ -163,11 +167,12 @@ fn request_round() -> Caps
             logd_flush,
             logd_follow,
             logd_control,
+            block_class,
             debug_authority,
             stop_authority,
             pmu_authority,
         ],
-    ) = (unsafe { ipc::bootstrap::request_slots::<28>(info.creator_endpoint, ipc_buf) })
+    ) = (unsafe { ipc::bootstrap::request_slots::<29>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
@@ -197,6 +202,7 @@ fn request_round() -> Caps
     caps.logd_flush = logd_flush;
     caps.logd_follow = logd_follow;
     caps.logd_control = logd_control;
+    caps.block_class = block_class;
     caps.debug_authority = debug_authority;
     caps.stop_authority = stop_authority;
     caps.pmu_authority = pmu_authority;

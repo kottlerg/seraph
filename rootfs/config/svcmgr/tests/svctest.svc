@@ -79,6 +79,11 @@
 # crashd.core is the LIVE_CORE_AUTHORITY SEND|GRANT on crashd's live-core
 # endpoint, through which the crashd_live_core phase asks for live cores; it
 # stays zero in a boot that stages no crashd.
+# devmgr.class.block is the block class SEND, on which devmgr answers
+# QUERY_DEVICE with a MOUNT_AUTHORITY-badged whole-disk cap; the
+# blk_regions phase registers a scratch partition through it to drive
+# virtio-blk's registered regions. It rides after logd.control, and no
+# shipped definition seeds it.
 # stop_authority = yes delivers svcmgr's STOP_AUTHORITY SEND in the slot
 # after that, through which the svcmgr_stop_service phase stops and lists
 # services and lists the stop sources. pmu_authority = yes delivers svcmgr's
@@ -106,7 +111,7 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny memmgr.swap devmgr.class.rtc svcmgr.grant crashd.core logd.flush logd.follow logd.control
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny memmgr.swap devmgr.class.rtc svcmgr.grant crashd.core logd.flush logd.follow logd.control devmgr.class.block
 debug_authority = yes
 stop_authority  = yes
 pmu_authority   = yes

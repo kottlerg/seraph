@@ -10,6 +10,8 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# `MAX_CPUS`, which sizes the receive-thread zone.
+boot-protocol = { path = "../../abi/boot-protocol" }
 # Pure bookkeeping logic (arena, free pool, process index, region intervals),
 # extracted so it is host-testable; the bin supplies the mapped storage and
 # injects memory_merge/memory_split as closures.

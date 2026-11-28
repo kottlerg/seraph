@@ -515,117 +515,164 @@ arena. Growth stops at the peak concurrent node count — freed nodes return to
 the arena's own free list and are reused — so spawn/grow/die churn leaks no
 pages. Refilling the free list can draw a pool frame and map it from inside a
 fault handler; this is bounded (one frame, plus its page-table funding, plus at
-most one deferred recheck per turn of the receive loop when a selection fails;
+most one deferred recheck per section of G when a selection fails;
 see [Reclamation](#reclamation)), with no recursion into per-process
 accounting, and never breaks the identity. For a fault in a committed region,
 the pages a growth takes are drawn from the region's metadata bound
 ([Commit](#commit)). `QUERY_POOL_STATUS` reports the metadata's pages, the arena's, the index's,
-the swap slot map's, the zero frames and the pages retyped into memmgr's own kernel objects, as
+the swap slot map's, the zero frames, the receive threads' runs and the pages retyped into memmgr's
+own kernel objects, as
 `metadata_bytes` ([`ipc-interface.md`](ipc-interface.md) § Label 6).
 
 ---
 
 ## Concurrency
 
-One receive loop owns all of memmgr's bookkeeping. memmgr's second thread,
-the compression worker of [Eviction](#eviction), owns none of it: it reads
-the pages the loop mapped for its job and writes the job's own buffer, and a
-job slot's state word, written with release and read with acquire ordering,
-hands each slot between the two. The
-bookkeeping is shaped so the SMP pager
-([#266](https://github.com/kottlerg/seraph/issues/266)), over per-thread IPC
-buffers ([IPC Design](../../../docs/ipc-design.md) § Multi-threaded servers),
-is a service-internal change rather than a rewrite of this layer:
+memmgr serves on one receive thread per CPU (§ Receive threads), and every thread reaches the
+same bookkeeping: the ledger (the arena, the free pool, the deferred list, the process index and
+every record), and the state beside it, the eviction and disk-tier state, the pressure level and
+the draw room. All of it sits behind one ledger lock, G, a ticket spin lock that spins without
+yielding (`free_pool::lock::SpinMutex`). A thread takes G for its turn's work and releases it only
+around a send: a reply sent alone, and the receive that ends the turn (§ Receive loop). G is never
+held across a receive, a reply, a wait, a sleep or a yield. A Notification send, which never
+blocks, is made under G: a limit event, a pressure broadcast, the compression worker's wake.
+Spinning is sound because no two receive threads share a CPU and no thread runs above
+`MEMMGR_PRIORITY`, so G's holder is never preempted by a thread that waits for it.
 
-- The arena, the free pool, the deferred list, and the process index are
-  plain values with no global state, mutated only through exclusive
-  references, and held together in one ledger; every growth path that needs a
-  syscall sits outside them.
-- Several ledgers can coexist, each with its own arena and free pool, so a
-  pool shard per CPU or NUMA node is one ledger per shard.
+Per-process exclusion is a stripe: one of `STRIPES` (256) ticket locks
+(`free_pool::lock::Stripes`), picked by a mix of the key of the process a request acts for
+(`free_pool::lock::acted_for`). That is the child a procmgr label names by its memmgr badge in
+`data[0]` (`PROCESS_DIED`, `DELEGATE_ASPACE`, `MAKE_RESIDENT`, `MAKE_PRIVATE`,
+`CAPTURE_CHUNKS`), and the caller's badge otherwise; a fault's badge names the faulting process.
+A thread takes its request's stripe before G and holds it until the request's reply is settled:
+delivered, or its undo run (§ Receive loop, A reply not delivered). The order is stripe, then G; a
+thread holds at most one stripe and takes none while it holds G. So no other request acting for
+that process, a fault of another of its threads or procmgr's teardown of it, runs between a
+request's effect and its undo; requests for other processes, eviction and the disk tier's labels
+can, under G.
 
-The sharded pager is design intent; not yet implemented. Its intended rules:
-each shard's ledger sits behind its own lock, taken for one request and never
-held across an IPC; a request that needs a second shard (a refill from a
-neighbour, or a record whose frames came from several shards) takes shard
-locks in ascending shard order; and the all-RAM-accounted identity is the sum
-over shards, with `pool_total` kept in one counter updated under any shard's
-lock with an atomic add.
+The values memmgr reads outside a G section are set before the receive threads start and only read
+after (its own address space cap, the bootstrap init handed it), or are atomics written only under
+G (`pool_total`, the pressure level, the draw room open, a limit event pending). The eviction and
+disk-tier state is reached through `free_pool::lock::Claim`, which checks that one holder reaches
+it at a time instead of making it so.
+
+memmgr's compression worker, of [Eviction](#eviction), owns none of the bookkeeping: it reads the
+pages a receive thread mapped for its job and writes the job's own buffer, and a job slot's state
+word, written with release and read with acquire ordering, hands each slot between the worker and
+the receive threads.
+
+A fault holds G for its whole handling, its zeroing and its map into the client included. Serving
+faults with G held for the bookkeeping alone, from per-CPU caches of chunk-sized free runs, is
+design intent ([#266](https://github.com/kottlerg/seraph/issues/266)); not yet implemented.
+
+---
+
+## Receive threads
 
 memmgr cannot use the worker-pool receive helper
-([shared/recv-pool/README.md](../../../shared/recv-pool/README.md)), which spawns
-`std` threads: memmgr is `no_std`. Its receive threads are design intent; not yet
-implemented. memmgr would create each with the raw thread syscalls, register a
-page of its own for each with `SYS_IPC_BUFFER_SET`, and keep the rules of
-[IPC Design](../../../docs/ipc-design.md) § Multi-threaded servers in its own
-code; how the threads share the ledgers is the sharding above.
+([shared/recv-pool/README.md](../../../shared/recv-pool/README.md)), which spawns `std` threads:
+memmgr is `no_std`. It creates its receive threads with the raw thread syscalls and keeps the rules
+of [IPC Design](../../../docs/ipc-design.md) § Multi-threaded servers in its own code. The main
+thread, which init creates, is CPU 0's receive thread, hard-affine to CPU 0
+(`SYS_THREAD_SET_AFFINITY`). Once its startup is done, it starts one more for each other CPU the
+kernel reports (`SystemInfoType::CpuCount`), each in that CPU's slot of the receive-thread zone
+(`THREAD_ZONE_VA`, a 64 KiB slot per CPU up to `MAX_CPUS`):
+
+- a thread retyped from a pool run at `MEMMGR_PRIORITY` under memmgr's `SchedControl` cap, and
+  hard-affine to its CPU;
+- a 48 KiB stack and an IPC buffer page, mapped from one pool run, between unmapped guard pages,
+  the page registered with `SYS_IPC_BUFFER_SET` by the thread itself.
+
+Both runs leave the pool for good and stay in `pool_total` as memmgr's metadata, as the compression
+worker's run does. A CPU whose thread cannot be created, mapped or placed (an offline CPU refuses
+the affinity) gets none: memmgr serves on the threads it has, since every thread receives on the
+one endpoint.
+
+No receive thread has a fault handler, and any receive thread's exit ends memmgr: the kernel
+records its address space's end at the first terminal end of any of its threads, so a fault of any
+receive thread is memmgr's death, a core death that powers the system off
+([docs/supervision.md](../../../docs/supervision.md) § Core Set and System Death).
+
+Every receive thread runs at `MEMMGR_PRIORITY`, above every client, with no priority inheritance
+([core/kernel/docs/scheduler.md](../../../core/kernel/docs/scheduler.md) § Priority Inversion
+Mitigation): procmgr narrows every child's band to at most `PROCMGR_PRIORITY`, so after init's reap
+no other thread runs at that level.
 
 ---
 
 ## Receive loop
 
-memmgr serves with `SYS_IPC_REPLY_RECV`: a handler leaves its reply in an `ipc::serve::Reply` slot
-and does not send it, and the reply goes out with the loop's next receive, so the receive that
-follows a reply is the one the kernel's prediction of a serving receiver reads, and a fair or
-lower-RT caller that is not pinned can be placed on memmgr's CPU (core/kernel/docs/scheduler.md §
-Thread Assignment). A turn runs from one receive's return to the next receive, in this order:
+Each receive thread serves with `SYS_IPC_REPLY_RECV`: a handler leaves its reply in the thread's
+`ipc::serve::Reply` slot, built with `Reply::pooled`, and does not send it, and the reply goes out
+with the thread's next receive, so the receive that follows a reply is the one the kernel's
+prediction of a serving receiver reads, and a fair or lower-RT caller that is not pinned can be
+placed on that thread's CPU (core/kernel/docs/scheduler.md § Thread Assignment). A turn runs from
+one receive's return to the next receive, in this order:
 
-1. **The request.** The handler applies the request and sets the reply, or a request that took no
-   effect sets its refusal.
+1. **The request.** The thread takes the request's stripe, then G (§ Concurrency). The handler
+   applies the request and sets the reply, or a request that took no effect sets its refusal.
 2. **Retire objects.** The objects the request queued are freed (§ Memory objects, Release).
-3. **Limit signals.** The limit event of each node the request's charge marked is sent
-   (§ Distribution policy).
-4. **Eviction.** The compression jobs the worker marked done are drained, and a slice of the clock
+3. **Eviction.** The compression jobs the worker marked done are drained, and a slice of the clock
    runs when one is due (§ Eviction).
-5. **`CSpace` top-up** (§ CSpace headroom).
-6. **Pressure signal.** The level and the draw room are recomputed, and every registrant signalled
+4. **`CSpace` top-up** (§ CSpace headroom).
+5. **Pressure signal.** The level and the draw room are recomputed, and every registrant signalled
    on a change (§ Memory pressure).
-7. **The receive**, which sends the reply still set, waiting a bounded time while the clock runs or
-   a job is in flight (§ Eviction); a turn whose earlier send bound a call (below) makes none, and
-   that call is the next turn's request.
+6. **The receive.** A reply with an undo is sent alone and settled first; the limit events of the
+   section are sent (below), G and then the stripe are released, and the receive sends the reply
+   still set. The main thread's receive waits a bounded time while the clock runs or a job is in
+   flight (§ Eviction), so completions drain and the clock runs with no message arriving; every
+   other thread's waits without bound.
 
-A turn that received no message (the bounded wait ended, or the receive failed) runs steps 4 to 7,
-and one whose receive failed skips step 4, so that the top-up before the retry is what refills a
-spent receive reserve (§ Reclamation).
+A turn that received no message (the bounded wait ended, or the receive failed) runs steps 3 to 6,
+and one whose receive failed skips step 3, so that the top-up before the retry is what refills a
+spent receive reserve (§ Reclamation). Every thread runs the steps after the request, so a job the
+worker finishes is drained by whichever thread next holds G.
 
-**Work in front of a reply.** Each of steps 2, 4, 5 and 6 first checks whether it has work to do,
-and a step that has sends the reply before doing it, with a receive that does not wait
-(`SYS_IPC_REPLY_RECV` at `WAIT_TRY_ONCE`), so no caller waits for a freed object's teardown, a
-drain, a clock slice, a donation or a broadcast. A plain `SYS_IPC_REPLY` would not do: a caller the
-call placed on memmgr's CPU, which memmgr outranks, would have its reply wake queued there behind
-memmgr until it parks, while the reply of a `SYS_IPC_REPLY_RECV` whose receive does not park wakes
-the caller off memmgr's CPU (core/kernel/docs/scheduler.md § Thread Assignment). A call that receive
-binds is the next turn's request, served once the turn's work is done, which it would have waited
-for in the endpoint's queue in any case. The checks are: an object queued for retirement; a job slot
-marked done, or a clock slice due (the clock runs and `SWEEP_INTERVAL_US` has passed since the
-last); the headroom or the growth budget low enough to call for a top-up; a change of the level or
-an opening of the draw room. A reply that rides the receive therefore waits behind the request's own
-handling and, past it, only these checks (an atomic load per job slot, a clock read while the clock
-runs, the three `cap_info` reads of the headroom, and the pressure computation) and step 3's sends,
-one Notification send per node of the charged chain that is at its limit or refused the charge,
-which never block. A job the worker finishes after step 4 looked is drained by the next turn: the
-receive waits a bounded time while a job is in flight. A turn that sent its reply before its work
-ends in a plain receive, or in none when that send bound a call, so after a plain receive the kernel
-predicts no serving receiver for the next caller; such turns are those that do memmgr's background
-work.
+**Sections of G.** A hold of G is a section; a thread's turn is one section, or several when it
+sends a reply alone in the middle of it. The limit event of each node a section's charges marked
+is sent at the end of that section, before G is released (§ Distribution policy), so a charge's
+event goes out before another thread's section can run. A failed selection rechecks the deferred
+list at most once per section (§ Reclamation).
+
+**Work in front of a reply.** Each of steps 2 to 5 first checks whether it has work to do, and a
+step that has sends the reply alone (`SYS_IPC_REPLY`) before doing it, with G released for the
+send and taken again after it, so no caller waits for a freed object's teardown, a drain, a clock
+slice, a donation or a broadcast. The send makes no receive: a receive that does not wait would
+find a call only when every other thread is busy, and would bind it to this thread for as long as
+the step's work lasts, when the next free thread would have taken it from the queue (IPC Design
+§ Multi-threaded servers). The checks are: an object queued for retirement; a job slot marked
+done, or a clock slice due (the clock runs and `SWEEP_INTERVAL_US` has passed since the last); the
+headroom or the growth budget low enough to call for a top-up; a change of the level or an opening
+of the draw room. A reply that rides the receive therefore waits behind the request's own handling
+and, past it, only these checks (an atomic load per job slot, a clock read while the clock runs,
+the three `cap_info` reads of the headroom, and the pressure computation) and the section's limit
+sends, one Notification send per node of the charged chain that is at its limit or refused the
+charge, which never block. A turn that sent its reply before its work ends in a plain receive, so
+after it the kernel predicts no serving receiver for the next caller; such turns are those that do
+memmgr's background work.
 
 **A reply not delivered.** The kernel wakes a caller that is gone, or whose `CSpace` cannot take a
 reply's caps, with a transfer failure instead of the reply, and moves none of the reply's caps. Each
 request whose effect would stay charged, or stranded in memmgr's `CSpace`, when its caller does not
 learn of it leaves beside its reply the undo of that effect, which runs as soon as the send that
-carried the reply returns, before memmgr reads the ledger for anything else: a grant's frames and
-runs and inner derivations (`REQUEST_MEMORY_CAPS`), a registration and its caps
-(`REGISTER_PROCESS`), a committed region (`REGISTER_REGION`), a region's growth (`EXTEND_REGION`),
-an attachment and the zero frame it took (`ATTACH_OBJECT`), a node handle (`NODE_CREATE`,
-`CREATE_SUB_NODE`), and a sealed object and its handle (`SEAL_OBJECT`). A reply whose caps memmgr
-keeps no use for, a charge-only handle (`NODE_CHARGE_HANDLE`) or the buffer a disk-tier request
-hands back (`SWAP_TAKE`, `SWAP_RESTORE`), deletes them when it is not delivered. Nothing faults in,
-maps or names what the undo takes back first: memmgr serves one message at a time, and between a
-handler and the send of its reply run only step 3's sends and the other steps' checks, since a step
-with work sends the reply first. They can count the effect: a limit event sent in that span can
-count a charge that the undo then takes back, at worst one signal more than the ledger then shows.
-The pressure step, whose broadcast reaches every registrant, reads the level and the draw room again
-after a send it made, so it signals the ledger past the undo.
+carried the reply returns, under G again: a grant's frames and runs and inner derivations
+(`REQUEST_MEMORY_CAPS`), a registration and its caps (`REGISTER_PROCESS`), a committed region
+(`REGISTER_REGION`), a region's growth (`EXTEND_REGION`), an attachment and the zero frame it took
+(`ATTACH_OBJECT`), a node handle (`NODE_CREATE`, `CREATE_SUB_NODE`), and a sealed object and its
+handle (`SEAL_OBJECT`). A reply with an undo is therefore never left to ride the receive: it is sent
+alone and settled before the thread releases G and its stripe. A reply whose caps memmgr keeps no
+use for, a charge-only handle (`NODE_CHARGE_HANDLE`) or the buffer a disk-tier request hands back
+(`SWAP_TAKE`, `SWAP_RESTORE`), deletes them when it is not delivered. Nothing faults in, maps or
+names what the undo takes back first: the thread holds the stripe of the process the request acted
+for from before the effect until the undo, so none of that process's requests runs in between; a
+registration, a node handle and a sealed object are named only by the reply that carries them; and
+the other threads' sections that run while G is released for the send (eviction, retirement, other
+processes' requests, the disk tier's labels) reach no frame of a grant before it is delivered and no
+VA of a region its process cannot fault on. They can count the effect: a limit event sent in that
+span can count a charge that the undo then takes back, at worst one signal more than the ledger then
+shows. The pressure step, whose broadcast reaches every registrant, reads the level and the draw
+room again after a send it made, so it signals the ledger past the undo.
 
 ---
 
@@ -639,9 +686,12 @@ slots for IPC capability transfer, so general allocations fail before receives d
 ([docs/capability-model.md](../../../docs/capability-model.md) § Address-space and CSpace growth
 budgets). memmgr cannot request memory from anyone else, so it funds its own slot-page pool:
 
-- Before every receive, memmgr reads its headroom (`CAP_INFO_CSPACE_CAPACITY` less
-  `CAP_INFO_CSPACE_USED` and the reserve) and its growth budget (`CAP_INFO_CSPACE_BUDGET`).
-- When the headroom falls below `CSPACE_LOW_WATER` (256 slots) plus a page, or the budget below a
+- Before every receive, a receive thread reads memmgr's headroom (`CAP_INFO_CSPACE_CAPACITY`
+  less `CAP_INFO_CSPACE_USED` and the reserve) and its growth budget (`CAP_INFO_CSPACE_BUDGET`).
+- The mark is `CSPACE_LOW_WATER` (256 slots) plus `CSPACE_IPC_RECV_RESERVE` for each receive
+  thread, since each receive in flight can land one message's caps whatever the others take; the
+  main thread also tops up before it creates each receive thread, whose cap takes a slot.
+- When the headroom falls below the mark plus a page, or the budget below a
   page, so a split could not carve an arena page (`syscall_abi::cspace_topup_pages`), it pulls a
   contiguous run of `CSPACE_TOPUP_PAGES` (16) frames from the pool, or a single frame when no such
   run is free, and donates it with augment-mode `cap_create_cspace` against its own `CSpace` cap. It
@@ -651,8 +701,8 @@ budgets). memmgr cannot request memory from anyone else, so it funds its own slo
 
 Like arena pages, donated frames leave the free pool for good and stay in `pool_total` as
 memmgr-owned metadata, so the all-RAM-accounted identity is unaffected. Nothing bounds the growth
-but the pool, so a cap memmgr kept by mistake would not wedge its receive loop; it shows instead in
-its used slots, which `QUERY_POOL_STATUS` reports in `data[19]`
+but the pool, so a cap memmgr kept by mistake would not wedge its receive threads; it shows instead
+in its used slots, which `QUERY_POOL_STATUS` reports in `data[19]`
 ([ipc-interface.md](ipc-interface.md) § Label 6).
 
 ---
@@ -700,29 +750,28 @@ Memory object of every derivation it granted. The frame is **quiescent** when al
 
 A query that fails answers no. A quiescent frame joins the free pool, and its pages are uncharged
 from the budget node they were charged to. Any other frame joins the **deferred list**: its
-descriptor node is rewritten into a run node in place, as a pooled frame's is, so reclamation
-still never allocates and cannot fail. A deferred run is owned by memmgr and counted in
-`pool_total`, lent to no process, and never granted; it keeps its budget node and stays charged
-to it until a recheck pools it (§ Distribution policy). Before every `PROCESS_DIED`,
-`RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION`, and before any selection from the free pool fails (a
-`REQUEST_MEMORY_CAPS` grant, a demand fault's run, or memmgr's own arena, index, page-table, or
-`CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run that has become
-quiescent joins the free pool (and the failed selection runs once more), and each that has not goes
-to the back of the list, so successive rechecks visit every run. Only the first of these in a turn
-of the receive loop rechecks; later ones in the same turn find the recheck done. A turn starts when
-a receive returns, with a message or with an error: it is the message's handling, if any, then the
-rest of the turn up to the next receive, the `CSpace` top-up among it (§ Receive loop). A handler's
-recheck at entry therefore always runs, and so does the top-up's before a failed receive's retry,
-which is what refills a spent receive reserve.
+descriptor node is rewritten into a run node in place, as a pooled frame's is, so reclamation still
+never allocates and cannot fail. A deferred run is owned by memmgr and counted in `pool_total`, lent
+to no process, and never granted; it keeps its budget node and stays charged to it until a recheck
+pools it (§ Distribution policy). Before every `PROCESS_DIED`, `RELEASE_MEMORY_CAPS`, and
+`UNREGISTER_REGION`, and before any selection from the free pool fails (a `REQUEST_MEMORY_CAPS`
+grant, a demand fault's run, or memmgr's own arena, index, page-table, or `CSpace` growth), memmgr
+rechecks the deferred list, oldest run first: each run that has become quiescent joins the free pool
+(and the failed selection runs once more), and each that has not goes to the back of the list, so
+successive rechecks visit every run. Only the first of these in a section of G rechecks; later ones
+in the same section find the recheck done. A section starts when a receive thread takes G: it is the
+message's handling, if any, or the rest of the turn up to the next receive, the `CSpace` top-up
+among it (§ Receive loop, Sections of G). A handler's recheck at entry therefore always runs, and so
+does the top-up's before a failed receive's retry, which is what refills a spent receive reserve.
 One recheck checks at most `DEFERRED_RECHECK_BATCH` (64) runs and spends at most
 `DEFERRED_RECHECK_WINDOWS` (256) mapping-count queries of up to 512 pages each, plus the rest of the
 run that crosses that budget, after which it stops and leaves the runs behind at the head for the
-next recheck. A turn's deferred kernel queries are therefore bounded by three per run checked plus
-256, plus the windows of the largest deferred run. No timer drives it; a run that becomes quiescent
-while no message arrives waits for the next one, or for the next retry of a failed receive. A run
-whose reaching capability, object, or mapping never goes, held by a process that never drops it,
-stays deferred for the rest of the boot, and `QUERY_POOL_STATUS` reports the deferred total (see
-[`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
+next recheck. A section's deferred kernel queries are therefore bounded by three per run checked
+plus 256, plus the windows of the largest deferred run. No timer drives it; a run that becomes
+quiescent while no message arrives waits for the next one, or for the next retry of a failed
+receive. A run whose reaching capability, object, or mapping never goes, held by a process that
+never drops it, stays deferred for the rest of the boot, and `QUERY_POOL_STATUS` reports the
+deferred total (see [`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
 
 memmgr does not revoke its intermediary's derivations before pooling: a revoke reaches no mapping
 already made, and it would cut off every holder below the intermediary, a holder of a derivation
@@ -1373,7 +1422,7 @@ registration replaces the first and memmgr deletes the cap the first carried. `P
 deletes the cap before it takes the process's frames back, since the cap keeps the Notification,
 and the frame it was retyped from, alive ([Reclamation](#reclamation)).
 
-Near the end of each turn of its receive loop, after the `CSpace` top-up and before the receive
+Near the end of each turn of a receive thread, after the `CSpace` top-up and before the receive
 (§ Receive loop), memmgr recomputes the
 level and the draw room ([Commit](#commit), Overcommit), and sends each registrant, in one send,
 its level bits on a change of the level and its draw-room bits on an opening of the draw room. The
@@ -1439,8 +1488,9 @@ every frame an eviction frees past the restore headroom goes to the next admissi
 draining the pool makes before any victim faults. Eviction makes room for the processes that run
 while memory is low; at `CRITICAL` only a restore or a committed draw evicts, for itself (Direct
 reclaim, below), and the pool is otherwise left to the out-of-memory path (crashd's hold of a
-declined fault, oomd's stop of a job). While the level reads `LOW` or `CRITICAL`, the receive loop
-waits for a message a bounded time and, at most once per sweep interval, runs a slice of the clock:
+declined fault, oomd's stop of a job). While the level reads `LOW` or `CRITICAL`, the main receive
+thread waits for a message a bounded time and a receive thread, at most once per sweep interval,
+runs a slice of the clock:
 a hand walks the eligible regions of each process in turn, a bounded number of steps a slice
 ([docs/limits.md](../../../docs/limits.md) § memmgr gives the interval and the bounds). It takes
 the processes in the order of their badges, which no lookup of the process index changes, so a pass
@@ -1533,9 +1583,9 @@ admission runs, and each victim kept leaves more free pages than it took. Only a
 committed draw ([Commit](#commit), Overcommit) reclaim directly: a first touch of an unbacked page
 of an uncommitted region grows its node's charge, and at the growth floor that growth stays the
 out-of-memory path's, while a restore returns pages its node is charged for already and a committed
-draw takes pages its commitment was charged and promised. Compression in the loop costs a restore's
-turn at most that bound's compressions, on a fault that would otherwise be declined; background
-eviction compresses in the worker, so its latency lands on no fault or grant.
+draw takes pages its commitment was charged and promised. Compression in a receive thread costs a
+restore's turn at most that bound's compressions, on a fault that would otherwise be declined;
+background eviction compresses in the worker, so its latency lands on no fault or grant.
 
 **Restore headroom.** While chunks of uncommitted regions are swapped, a charge to a node outside
 the reserve leaves a restore headroom H free above the reserve R: their swapped pages, and at most
@@ -1559,19 +1609,19 @@ sixty-fourth of the pool, so `LOW`'s threshold stays above `CRITICAL`'s. `QUERY_
 the host-tested `free-pool` function `budget::growth_floor`.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr, at the top of the
-fair class (`ipc::sched_policy::MEMMGR_WORKER_PRIORITY`), below the receive loop's priority. It
-touches no ledger state: it waits on a Notification, takes each job the loop posted, compresses
-the chunk from the slot's input window into the slot's own output buffer in memmgr's image, and
-marks the slot done. A slot's state word, written with release and read with acquire ordering,
-hands the slot's buffer from one thread to the other. The loop drains the done slots at each turn:
-it unmaps the input window, takes exactly the store pages the stream needs from the free pool,
-writes the stream into them through the stream window, and swaps the chunk. No Notification can
-wake a receive on an endpoint, so while a job is in flight the loop's receive waits a bounded time
-([docs/limits.md](../../../docs/limits.md) § memmgr), and a receive with no job in flight and no
-reclaim waits for a message as before. The compressor is LZ4-class, `no_std`, and written in the
-tree (`memmgr-free-pool`'s `compress.rs`), as is the stream format (`store.rs`): each backed page
-as a two-byte header and the page compressed, raw, or, for an all-zero page, nothing. When memmgr
-cannot start the worker at boot it evicts nothing.
+fair class (`ipc::sched_policy::MEMMGR_WORKER_PRIORITY`), below the receive threads' priority. It
+touches no ledger state: it waits on a Notification, takes each job a receive thread posted,
+compresses the chunk from the slot's input window into the slot's own output buffer in memmgr's
+image, and marks the slot done. A slot's state word, written with release and read with acquire
+ordering, hands the slot's buffer from one thread to the other. A receive thread drains the done
+slots at each turn: it unmaps the input window, takes exactly the store pages the stream needs from
+the free pool, writes the stream into them through the stream window, and swaps the chunk. No
+Notification can wake a receive on an endpoint, so while a job is in flight the main thread's
+receive waits a bounded time ([docs/limits.md](../../../docs/limits.md) § memmgr), and a receive
+with no job in flight and no reclaim waits for a message as before. The compressor is LZ4-class,
+`no_std`, and written in the tree (`memmgr-free-pool`'s `compress.rs`), as is the stream format
+(`store.rs`): each backed page as a two-byte header and the page compressed, raw, or, for an
+all-zero page, nothing. When memmgr cannot start the worker at boot it evicts nothing.
 
 **Accounting.** The identity `system_ram == kernel_reserved + pool_total` holds across eviction and
 restore, with `pool_total = free + deferred + Σ records + metadata + store`, where `store` is the
@@ -1644,12 +1694,12 @@ the slot's bytes into the swap service's buffer, a Memory cap the request carrie
 itself at a window of its own address space. No memmgr frame leaves memmgr, and memmgr writes the
 swap service's buffer through its own mapping, which neither faults nor blocks: a revoke of the cap
 does not withdraw a mapping ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md)
-§ `SYS_CAP_REVOKE`). One `SWAP_TAKE`'s time in memmgr's loop is bounded by that walk, one copy of at
-most a chunk's bytes, one seal of them, and one copy of the sealed bytes, the order of a chunk's
-restore. The chunk is then writing: its store runs, or a raw chunk's runs, stay on its entry until
-`SWAP_DONE` ends the write. A written chunk is on disk and those runs return to the free pool, a raw
-chunk's pages then counting as swapped; an unwritten one is compressed, or raw, again on them. A
-fault on a writing chunk restores it from its store runs, or maps a raw chunk's runs back, and
+§ `SYS_CAP_REVOKE`). One `SWAP_TAKE`'s time in a memmgr receive thread is bounded by that walk, one
+copy of at most a chunk's bytes, one seal of them, and one copy of the sealed bytes, the order of a
+chunk's restore. The chunk is then writing: its store runs, or a raw chunk's runs, stay on its entry
+until `SWAP_DONE` ends the write. A written chunk is on disk and those runs return to the free pool,
+a raw chunk's pages then counting as swapped; an unwritten one is compressed, or raw, again on them.
+A fault on a writing chunk restores it from its store runs, or maps a raw chunk's runs back, and
 cancels the write; its slot is freed only at `SWAP_DONE`, so a late write never lands on a slot
 taken since.
 

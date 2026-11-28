@@ -9,9 +9,9 @@
 //! of its completions, and the restore a fault or a make-resident request
 //! makes.
 //!
-//! The receive loop owns the ledger alone. The worker is a raw thread of
+//! The receive threads own the ledger, under G. The worker is a raw thread of
 //! memmgr that touches no ledger state: it reads a victim chunk through its
-//! job slot's input window, which the loop mapped, compresses it into the
+//! job slot's input window, which a receive thread mapped, compresses it into the
 //! slot's output buffer, and marks the slot done. A slot's state word orders
 //! the hand-offs: the loop writes a job's fields, then publishes it with a
 //! release store of [`POSTED`]; the worker reads it after an acquire load and
@@ -30,6 +30,7 @@ use core::sync::atomic::{AtomicU8, AtomicU16, AtomicUsize, Ordering};
 
 use free_pool::chunk::{ChunkEntry, ChunkState};
 use free_pool::compress::{HASH_ENTRIES, HashTable, PAGE_BYTES};
+use free_pool::lock::{Claim, Claimed};
 use free_pool::store::{Decoder, PageReader, RawPages, encode_chunk, store_pages};
 use free_pool::{
     CHUNK_BYTES, COLD_SWEEPS, ClockHand, DEMAND_CHUNK_PAGES, DemandRegion, Fit, FrameDesc, FreeRun,
@@ -38,7 +39,7 @@ use free_pool::{
 use syscall_abi::PAGE_SIZE;
 
 use crate::{
-    Answer, COPY_VA, COPY_WINDOW_PAGES, FaultDecline, FaultTarget, MemLedger, coalesce,
+    Answer, COPY_VA, COPY_WINDOW_PAGES, FaultDecline, FaultTarget, Held, MemLedger, coalesce,
     current_pressure, ensure_slots, insert_run, map_client_chunk, map_self, pool_total_pages,
     quiescent, recheck_deferred, release_unmapped_chunk, return_taken, select, self_aspace,
 };
@@ -98,8 +99,8 @@ const SWEEP_SLICE_STEPS: u64 = 512;
 /// a bounded share of its CPU. A tuning value that bounds no capacity.
 const SWEEP_INTERVAL_US: u64 = 10_000;
 
-/// Milliseconds the receive loop waits for a message while it reclaims or a
-/// job is in flight, so it drains completions and runs slices when no
+/// Milliseconds the main receive thread waits for a message while memmgr
+/// reclaims or a job is in flight, so it drains completions and runs slices when no
 /// message arrives.
 pub(crate) const RECLAIM_WAIT_MS: u64 = 2;
 
@@ -127,16 +128,16 @@ static BACKED: [AtomicU16; JOB_SLOTS] = [const { AtomicU16::new(0) }; JOB_SLOTS]
 static RESULT: [AtomicUsize; JOB_SLOTS] = [const { AtomicUsize::new(NO_GAIN) }; JOB_SLOTS];
 
 /// Each slot's output buffer: a job slot's is the worker's while the slot is
-/// posted and the loop's while it is done; the synchronous slot's is the
-/// loop's. Each side reaches only the buffer of the slot it holds
+/// posted and G's holder's while it is done; the synchronous slot's is G's
+/// holder's. Each side reaches only the buffer of the slot it holds
 /// ([`out_buf`]), never the array whole.
 static mut OUT: [[u8; OUT_BYTES]; SLOTS] = [[0; OUT_BYTES]; SLOTS];
 
 /// The compressor's hash table, the worker's alone.
 static mut TABLE: HashTable = [0; HASH_ENTRIES];
 
-/// The synchronous slot's hash table, the loop's alone.
-static mut SYNC_TABLE: HashTable = [0; HASH_ENTRIES];
+/// The synchronous slot's hash table, reached only by G's holder.
+static SYNC_TABLE: Claim<HashTable> = Claim::new([0; HASH_ENTRIES]);
 
 /// The worker's stack.
 #[repr(C, align(16))]
@@ -153,9 +154,9 @@ struct Job
     page_base: u64,
 }
 
-/// The loop's state of eviction: each slot's job, the worker's Notification
+/// memmgr's state of eviction: each slot's job, the worker's Notification
 /// (0 while no worker runs), the clock's hand, when the last slice ran, and
-/// the victims kept for direct reclaim. The loop's alone.
+/// the victims kept for direct reclaim. Reached only by G's holder.
 struct Evictor
 {
     jobs: [Option<Job>; JOB_SLOTS],
@@ -165,24 +166,19 @@ struct Evictor
     cache: [Option<Victim>; VICTIM_CACHE],
 }
 
-static mut EVICTOR: Evictor = Evictor {
+static EVICTOR: Claim<Evictor> = Claim::new(Evictor {
     jobs: [None; JOB_SLOTS],
     notify: 0,
     hand: ClockHand::START,
     last_slice_us: 0,
     cache: [None; VICTIM_CACHE],
-};
+});
 
-#[expect(
-    static_mut_refs,
-    reason = "`EVICTOR` is reached only through this accessor, by the receive loop, the one \
-              thread that touches it, and each caller holds one `&mut` at a time"
-)]
-fn evictor() -> &'static mut Evictor
+/// The eviction state, claimed until the guard drops; G's holder alone calls
+/// it, and no caller holds the guard across another call.
+fn evictor() -> Claimed<'static, Evictor>
 {
-    // SAFETY: the receive loop is the only thread that reaches `EVICTOR`, and
-    // no caller holds the reference across another call of this accessor.
-    unsafe { &mut EVICTOR }
+    EVICTOR.claim()
 }
 
 /// The output buffer of slot `slot`, below [`SLOTS`], reached alone.
@@ -190,7 +186,7 @@ fn out_buf(slot: usize) -> *mut [u8; OUT_BYTES]
 {
     debug_assert!(slot < SLOTS);
     // A pointer to one element of `OUT`, made with no reference to the
-    // array, so the worker's buffer and the loop's never alias.
+    // array, so the worker's buffer and G's holder's never alias.
     addr_of_mut!(OUT)
         .cast::<[u8; OUT_BYTES]>()
         .wrapping_add(slot.min(SLOTS - 1))
@@ -438,15 +434,16 @@ fn slice_due() -> Option<u64>
 /// as many as there are free slots;
 /// otherwise it finds the chunks idle for [`RECLAIM_IDLE_SWEEPS`]. The rest
 /// it finds are kept for direct reclaim ([`keep_victims`]).
-pub(crate) fn turn(l: &mut MemLedger, answer: &mut Answer)
+pub(crate) fn turn(held: &mut Held, answer: &mut Answer)
 {
     let done = done_jobs();
     let any_done = done.contains(&true);
     let slice = slice_due();
     if any_done || slice.is_some()
     {
-        answer.flush(l);
+        answer.flush(held);
     }
+    let l: &mut MemLedger = held;
     if any_done
     {
         drain(l, done);
@@ -547,7 +544,8 @@ fn still_victim(l: &MemLedger, v: &Victim, idle: u8, need: Need) -> bool
 /// needs are not crowded out by those it does not.
 fn keep_victims(l: &MemLedger, found: &[Victim], opens: impl Fn(&MemLedger, NodeIdx) -> bool)
 {
-    let cache = &mut evictor().cache;
+    let mut evictor = evictor();
+    let cache = &mut evictor.cache;
     for kept in cache.iter_mut()
     {
         if kept.is_some_and(|v| !still_victim(l, &v, RECLAIM_IDLE_SWEEPS, Need::Frames))
@@ -582,7 +580,8 @@ fn keep_victims(l: &MemLedger, found: &[Victim], opens: impl Fn(&MemLedger, Node
 /// only a committed draw may take is kept for one. `None` when none is left.
 fn take_victim(l: &MemLedger, need: Need, spare: Option<(NodeIdx, u64)>) -> Option<Victim>
 {
-    let cache = &mut evictor().cache;
+    let mut evictor = evictor();
+    let cache = &mut evictor.cache;
     let mut best: Option<(usize, u8)> = None;
     for (i, kept) in cache.iter_mut().enumerate()
     {
@@ -721,7 +720,7 @@ fn post(l: &mut MemLedger, v: &Victim, slot: usize)
     let _ = syscall::notification_send(evictor().notify, 1);
 }
 
-/// Evict the victim `v` now, in the loop's turn, through the synchronous
+/// Evict the victim `v` now, in the calling thread's turn, through the synchronous
 /// slot (services/memmgr/docs/memory-pool.md § Eviction, Direct reclaim):
 /// pass it over when its pages were accessed since the sweep that aged it
 /// ([`accessed_since_sweep`]), else unmap it and map it at the slot's input
@@ -742,10 +741,11 @@ fn evict_now(l: &mut MemLedger, v: &Victim)
         return;
     };
     let backed = l.chunk_at(job.reg, job.page_base).backed();
-    // SAFETY: the synchronous slot's buffer is the loop's alone.
+    // SAFETY: the synchronous slot's buffer is G's holder's alone, and this
+    // thread holds G (the caller's `l` is G's).
     let out = unsafe { &mut *out_buf(SYNC_SLOT) };
-    // SAFETY: the synchronous slot's table is the loop's alone.
-    let table = unsafe { &mut *addr_of_mut!(SYNC_TABLE) };
+    let mut table = SYNC_TABLE.claim();
+    let table = &mut *table;
     // SAFETY: `begin` mapped each backed page of the chunk at its offset in
     // the slot's input window, and the process's mappings of them are gone,
     // so nothing writes them until the window is unmapped below.
@@ -1000,7 +1000,7 @@ fn write_stream(l: &mut MemLedger, runs: &[FreeRun], slot: usize, len: usize) ->
         return false;
     };
     // SAFETY: the slot is done, or is the synchronous slot, so its output
-    // buffer is the loop's.
+    // buffer is G's holder's.
     let out = unsafe { &*out_buf(slot) };
     let room = usize::try_from(pages.saturating_mul(PAGE_SIZE)).unwrap_or(0);
     let src = out.get(..len).filter(|src| src.len() <= room);

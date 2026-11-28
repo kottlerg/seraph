@@ -615,7 +615,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[17] | `uncommitted_free_bytes` — the free pages outside `promised`, which every admission but a commitment's reads and the pressure level is computed from: the lesser of `data[3]` plus `data[15]` less `data[8]`, and `data[3]`; `data[3]` less `data[8]` while `data[15]` is `0` ([`memory-pool.md`](memory-pool.md#commit) § Commit, Promised) |
 | data[18] | `committed_swapped_bytes` — the part of `data[8]` the evicted chunks of committed regions hold for their restores: the subset of `data[10]` in committed regions, which `promised` holds again once a chunk holds no frame of its own ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit); the rest of `data[8]` is the commitments' pages never backed or discarded and their page-table and metadata bounds |
 | data[19] | `cspace_used_slots` — the used slots of memmgr's own `CSpace` (`CAP_INFO_CSPACE_USED`), a count, not bytes: the caps memmgr holds, its free runs' and grants' among them, so a cap it kept by mistake raises it for good ([`memory-pool.md`](memory-pool.md#cspace-headroom) § CSpace headroom; § Capability Transfer) |
-| data[20] | `metadata_bytes` — subset of `pool_total_bytes` memmgr holds as its own metadata, charged to no node: its arena's pages, its process index's and its swap slot map's, the zero frames it keeps, and the pages it retyped into its own page tables, `CSpace` growth and eviction worker ([`memory-pool.md`](memory-pool.md#metadata-arena) § Metadata Arena); none goes back to the free runs but a zero frame a refused request took |
+| data[20] | `metadata_bytes` — subset of `pool_total_bytes` memmgr holds as its own metadata, charged to no node: its arena's pages, its process index's and its swap slot map's, the zero frames it keeps, its receive threads' runs, and the pages it retyped into its own page tables, `CSpace` growth and eviction worker ([`memory-pool.md`](memory-pool.md#metadata-arena) § Metadata Arena); none goes back to the free runs but a zero frame a refused request took |
 | data[21] | `held_bytes` — subset of `pool_total_bytes` the frame records of processes and memory objects hold, each charged to a budget node: grants and page-table donations, the runs backing regions, a copy a make-private drew, and an object's frames; a run on the deferred list or in the store is not counted ([`memory-pool.md`](memory-pool.md#per-process-tracking) § Per-Process Tracking) |
 | data[22] | `draw_short` — 1 while a committed draw has found too few free pages since the draw room (`data[16]`) last opened, which keeps memmgr evicting for frames until it opens again, and 0 from the turn that ends with it open; read with `data[16]` in the one reply. It is that latch alone: with it 0, memmgr may still evict while `data[3]` is below `data[8]` ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 
@@ -2110,15 +2110,16 @@ of its caps. An attached cap therefore never outlives the call that carried it u
 ownership of it, so no client can grow memmgr's `CSpace` by attaching caps. memmgr funds that growth
 from its own pool before every receive ([`memory-pool.md`](memory-pool.md#cspace-headroom) § CSpace
 headroom), so caps it kept would cost the pool a slot page per `CSPACE_SLOTS_PER_PAGE` of them
-rather than wedge its receive loop; `QUERY_POOL_STATUS` `data[19]` counts its used slots, which
+rather than wedge its receive threads; `QUERY_POOL_STATUS` `data[19]` counts its used slots, which
 svctest's stray-cap flood reads around each case.
 
 ---
 
 ## Out-of-Order and Reordered Calls
 
-memmgr serialises all incoming calls on a single thread; there is no
-ordering hazard between concurrent callers. Within a single caller,
+memmgr serves on one receive thread per CPU, under one ledger lock and a per-process stripe lock
+([`memory-pool.md`](memory-pool.md#concurrency) § Concurrency); calls for one process do not run
+at once, so there is no ordering hazard between concurrent callers of it. Within a single caller,
 the kernel guarantees that `REQUEST_MEMORY_CAPS` and `RELEASE_MEMORY_CAPS`
 execute in the order the caller issued them.
 

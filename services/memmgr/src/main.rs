@@ -18,6 +18,7 @@
     reason = "targets 64-bit only; u64/usize conversions lossless"
 )]
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use free_pool::{
     ArenaLayout, Attachment, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Evict,
     Fit, FrameDesc, FreeRun, Grant, LEAF_TABLE_PAGES, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID,
@@ -27,6 +28,8 @@ use free_pool::{
     chunk::table_height, chunk_count, chunk_for, commit::grow_need, commit::regrow_need,
     fault_window, leaf_windows, pending_from, region_grants, reserve_pages,
 };
+
+use free_pool::lock::{Once, SpinGuard, SpinMutex, StripeGuard, Stripes};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
 use syscall_abi::{
@@ -149,6 +152,9 @@ const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 //                                                            a chunk's stream
 //   swap window        [disk::SWAP_WINDOW_VA, + 64 KiB)  a swap service's
 //                                                            buffer
+//   receive threads     [THREAD_ZONE_VA, THREAD_ZONE_END)   a slot per CPU:
+//                                                            a stack and an
+//                                                            IPC buffer page
 //   swap slot map       [disk::SWAP_SLOTS_VA, + 2 GiB)     slot words
 //   phys-table scratch  [PHYS_TABLE_TEMP_VA, + 8 GiB)      one page, per-boot drawn
 //   process index       [PROCESS_INDEX_VA, PROCESS_INDEX_END)  bucket heads
@@ -180,6 +186,34 @@ const COPY_VA: u64 = 0x0000_0001_0000_0000;
 /// keeps, since a plain `mem_unmap` leaves page tables in place. Every copy
 /// maps at most a chunk's run or `OBJECT_READ_PAGES`, which the window holds.
 const COPY_WINDOW_PAGES: u64 = LEAF_TABLE_PAGES;
+
+/// Base of the receive-thread zone: one slot of [`THREAD_SLOT_PAGES`] for
+/// each CPU, slot `c` for the receive thread hard-affine to CPU `c`
+/// ([`start_receive_thread`]), apart from slot 0: CPU 0's is the main
+/// thread, whose stack and IPC page init placed. A slot holds, from its base,
+/// an unmapped guard page, the thread's stack, a guard page, its IPC buffer
+/// page, and a guard page. Deterministic: nothing but memmgr can read
+/// memmgr's address space.
+const THREAD_ZONE_VA: u64 = 0x0000_0001_4000_0000;
+
+/// Pages of one receive thread's slot of the zone.
+const THREAD_SLOT_PAGES: u64 = 16;
+
+/// Stack pages of a receive thread: the main thread's (`stack_pages!`
+/// above), since every receive thread runs the same handlers.
+const RECEIVE_STACK_PAGES: u64 = 12;
+
+/// Pages of the run a receive thread's slot maps: its stack and its IPC
+/// buffer page.
+const RECEIVE_RUN_PAGES: u64 = RECEIVE_STACK_PAGES + 1;
+
+/// Exclusive end of the receive-thread zone: a slot for every CPU the kernel
+/// can bring up (512 MiB of VA).
+const THREAD_ZONE_END: u64 = THREAD_ZONE_VA + THREAD_SLOTS * THREAD_SLOT_PAGES * PAGE_SIZE;
+
+/// Slots of the receive-thread zone: one for every CPU the kernel can bring
+/// up.
+const THREAD_SLOTS: u64 = boot_protocol::MAX_CPUS as u64;
 
 /// Degraded-fallback scratch VA in memmgr's address space for mapping the
 /// bootstrap phys-table memory cap, and the base of its per-boot draw
@@ -240,7 +274,9 @@ const _: () = {
     assert!(COPY_VA.is_multiple_of(COPY_WINDOW_PAGES * PAGE_SIZE));
     assert!(COPY_VA + COPY_WINDOW_PAGES * PAGE_SIZE <= evict::EVICT_ZONE_VA);
     assert!(evict::EVICT_ZONE_END <= disk::SWAP_WINDOW_VA);
-    assert!(disk::SWAP_WINDOW_END <= disk::SWAP_SLOTS_VA);
+    assert!(disk::SWAP_WINDOW_END <= THREAD_ZONE_VA);
+    assert!(THREAD_ZONE_VA.is_multiple_of(PAGE_SIZE) && THREAD_ZONE_END <= disk::SWAP_SLOTS_VA);
+    assert!(RECEIVE_STACK_PAGES + 4 <= THREAD_SLOT_PAGES);
     assert!(disk::SWAP_SLOTS_END <= PHYS_TABLE_TEMP_VA);
     assert!(PHYS_TABLE_TEMP_VA + (1 << (PHYS_TABLE_TEMP_SLOTS_LOG2 + 12)) <= PROCESS_INDEX_VA);
     assert!(PROCESS_INDEX_END <= META_ARENA_BASE_DEFAULT);
@@ -347,41 +383,58 @@ const LAYOUT_DEFAULT: ArenaLayout = ArenaLayout {
 };
 
 // All bookkeeping (arena, free pool, deferred list, process index) lives in
-// one ledger so it never lands on a syscall stack frame. Only the receive
-// loop's thread reaches it, and owns it exclusively: memmgr's other thread,
-// the compression worker (`evict.rs`), touches none of memmgr's statics but
-// its own, so the `static mut` access is sound. Each handler
-// takes the ledger once, through `ledger_mut()`, and passes it down; nothing
-// takes it twice at a time.
-static mut LEDGER: MemLedger = Ledger::new(
+// one ledger so it never lands on a syscall stack frame. The ledger lock G
+// owns it: a receive thread reaches it only through the guard it takes
+// ([`lock_ledger`]), so no two threads reach it at once and no reference to
+// it lives across a release of G ([`release_for`])
+// (services/memmgr/docs/memory-pool.md § Concurrency). The compression worker
+// (`evict.rs`) touches none of it.
+static LEDGER: SpinMutex<MemLedger> = SpinMutex::new(Ledger::new(
     MappedSlots {
         layout: LAYOUT_DEFAULT,
     },
     INDEX_WORDS,
     SWAP_SLOT_WORDS,
-);
+));
+
+/// The per-process stripe locks: a request takes the stripe of the process it
+/// acts for before G and keeps it until its reply is settled
+/// ([`Answer::settle`]), so no request acting for that process runs between
+/// the reply's effect and its undo (services/memmgr/docs/memory-pool.md
+/// § Concurrency).
+static STRIPES: Stripes = Stripes::new();
+
+/// G, held by this thread: the way to the ledger.
+type Held = SpinGuard<'static, MemLedger>;
+
+/// Take G for a section of a turn, which starts the section's one deferred
+/// recheck ([`recheck_deferred`]).
+fn lock_ledger() -> Held
+{
+    let held = LEDGER.lock();
+    begin_section();
+    held
+}
+
+/// Run `f` with G released, after sending the limit events of the section
+/// it ends ([`signal_limits`]), and take G again for a new section. G is
+/// never held across a receive, a reply, a wait or a yield, which `f` makes.
+fn release_for<R>(held: &mut Held, f: impl FnOnce() -> R) -> R
+{
+    signal_limits(held);
+    let r = held.unlocked(f);
+    begin_section();
+    r
+}
 
 /// memmgr's own `AddressSpace` cap, for arena and index page maps and their
-/// page-table funding. Set once at boot.
-static mut SELF_ASPACE: u64 = 0;
-
-#[expect(
-    static_mut_refs,
-    reason = "`LEDGER` is reached only through this accessor, by the receive loop's thread \
-              alone, so the one `&mut` each handler takes is never aliased"
-)]
-fn ledger_mut() -> &'static mut MemLedger
-{
-    // SAFETY: only the receive loop's thread reaches the ledger; each handler
-    // holds the only reference it takes for the handler's duration.
-    unsafe { &mut LEDGER }
-}
+/// page-table funding. Set once at boot, before any other thread starts, and
+/// only read after.
+static SELF_ASPACE: AtomicU64 = AtomicU64::new(0);
 
 fn self_aspace() -> u64
 {
-    // SAFETY: only the receive loop's thread reaches this; written once in
-    // `ledger_init`.
-    unsafe { SELF_ASPACE }
+    SELF_ASPACE.load(Ordering::Acquire)
 }
 
 /// Record memmgr's own `AddressSpace` cap and draw the arena base (ASLR,
@@ -397,10 +450,9 @@ fn ledger_init(self_aspace_cap: u64)
                 .saturating_add((r & ((1 << META_ARENA_SLOTS_LOG2) - 1)) << 12),
             Err(_) => META_ARENA_BASE_DEFAULT,
         };
-    // SAFETY: only the receive loop's thread reaches this; called once before
-    // any other ledger use.
-    unsafe { SELF_ASPACE = self_aspace_cap };
-    let l = ledger_mut();
+    SELF_ASPACE.store(self_aspace_cap, Ordering::Release);
+    let mut held = LEDGER.lock();
+    let l = &mut *held;
     *l = Ledger::new(
         MappedSlots {
             layout: ArenaLayout {
@@ -438,7 +490,7 @@ fn coalesce(l: &mut MemLedger)
 /// its `memmgr_errors` code. Every pool draw comes through here (a grant, a
 /// demand fault, and memmgr's own arena, index, page-table and `CSpace`
 /// growth), so a failed selection first rechecks the deferred runs, unless
-/// this turn of the receive loop already has, and, when one moved to the
+/// this section of G already has, and, when one moved to the
 /// pool, selects once more (services/memmgr/docs/memory-pool.md
 /// § Reclamation).
 fn select(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
@@ -472,7 +524,7 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 /// chunks are swapped, the restore headroom (`free_pool::growth_floor`,
 /// `free_pool::budget::admit`; services/memmgr/docs/memory-pool.md
 /// § Distribution policy, § Commit). A refusal first rechecks the deferred
-/// runs, unless this turn of the receive loop already has, and, when one moved
+/// runs, unless this section of G already has, and, when one moved
 /// to the pool, which releases its charge and adds free pages, admits once
 /// more. Every charge to a process is admitted here, by [`admissible`] or by
 /// [`admit_commit`] before its run leaves the pool: a grant here, a demand
@@ -566,10 +618,15 @@ fn admissible(l: &mut MemLedger, rec: NodeIdx, want: u64) -> Result<u64, ChargeE
     r
 }
 
-/// The budget node whose chain the limit events of this turn are checked
-/// on, and the most pages a charge to it was refused this turn
-/// ([`signal_limits`]); `None` while the turn has admitted nothing.
-static mut LIMIT_CHECK: Option<(NodeIdx, u64)> = None;
+/// The budget node whose chain the limit events of this section of a turn
+/// are checked on ([`NODE_NULL`] while the section has admitted nothing),
+/// and the most pages a charge to it was refused in the section
+/// ([`signal_limits`]). Written and read only under G, which orders every
+/// access, so each pair of accesses reads the pair one holder wrote.
+static LIMIT_NODE: AtomicU64 = AtomicU64::new(NODE_NULL);
+
+/// The refused pages of [`LIMIT_NODE`]'s check.
+static LIMIT_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Note an admission for the budget node of `rec`, of which `refused`
 /// pages were refused (`0` for an admission that passed), so the turn's
@@ -590,35 +647,35 @@ fn note_admission(l: &MemLedger, rec: NodeIdx, refused: u64)
 /// `refused` pages refused at it.
 fn note_limit_check(node: NodeIdx, refused: u64)
 {
-    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
-    let prior = unsafe { LIMIT_CHECK };
-    let refused = match prior
+    let refused = if LIMIT_NODE.load(Ordering::Relaxed) == node
     {
-        Some((n, r)) if n == node => r.max(refused),
-        _ => refused,
-    };
-    // SAFETY: as above.
-    unsafe { LIMIT_CHECK = Some((node, refused)) };
-}
-
-/// Send the limit event of each node on the chain this turn marked
-/// ([`note_limit_check`]) that is at its max or whose max refused the
-/// turn's charge, to its registered Notification
-/// (services/memmgr/docs/memory-pool.md § Distribution policy). Run after every
-/// request, so a charge that brings a subtree to its max, a refused charge,
-/// and a max set at or below the usage each signal once. A send never
-/// blocks; one that fails (a cap the holder revoked) is dropped.
-fn signal_limits()
-{
-    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
-    let Some((node, refused)) = (unsafe { LIMIT_CHECK })
+        LIMIT_REFUSED.load(Ordering::Relaxed).max(refused)
+    }
     else
     {
-        return;
+        refused
     };
-    // SAFETY: as above.
-    unsafe { LIMIT_CHECK = None };
-    ledger_mut().for_each_limit(node, refused, |cap, bits| {
+    LIMIT_NODE.store(node, Ordering::Relaxed);
+    LIMIT_REFUSED.store(refused, Ordering::Relaxed);
+}
+
+/// Send the limit event of each node on the chain this section of a turn
+/// marked ([`note_limit_check`]) that is at its max or whose max refused the
+/// section's charge, to its registered Notification
+/// (services/memmgr/docs/memory-pool.md § Distribution policy). Run at the
+/// end of every section ([`release_for`]), so a charge that brings a subtree
+/// to its max, a refused charge, and a max set at or below the usage each
+/// signal once. A send never blocks; one that fails (a cap the holder revoked)
+/// is dropped.
+fn signal_limits(l: &MemLedger)
+{
+    let node = LIMIT_NODE.swap(NODE_NULL, Ordering::Relaxed);
+    if node == NODE_NULL
+    {
+        return;
+    }
+    let refused = LIMIT_REFUSED.load(Ordering::Relaxed);
+    l.for_each_limit(node, refused, |cap, bits| {
         let _ = syscall::notification_send(cap, bits);
     });
 }
@@ -626,8 +683,8 @@ fn signal_limits()
 // ── Deferred reclamation ─────────────────────────────────────────────────────
 
 /// Deferred runs one recheck checks ([`recheck_deferred`]). With
-/// [`DEFERRED_RECHECK_WINDOWS`] it bounds the work of a turn's one recheck in
-/// the receive loop every process shares. A tuning value that bounds no
+/// [`DEFERRED_RECHECK_WINDOWS`] it bounds the work of a section's one recheck
+/// under G, which every process's requests share. A tuning value that bounds no
 /// capacity: a run not pooled goes to the back of the list, so successive
 /// rechecks visit every run in turn.
 const DEFERRED_RECHECK_BATCH: u64 = 64;
@@ -685,37 +742,34 @@ fn unmapped(cap: u64, pages: u64) -> bool
     true
 }
 
-/// Whether this turn of the receive loop has run its deferred recheck. A
-/// turn starts when a receive returns, received or failed: it is the
-/// message's handling, if any, then the `CSpace` top-up before the next
-/// receive. A handler's own recheck therefore comes first in its turn, and
-/// the top-up before a failed receive's retry can recheck. Only the receive
-/// loop's thread reaches it, so a plain static suffices.
-static mut RECHECKED_THIS_TURN: bool = false;
+/// Whether this section of a turn has run its deferred recheck. A section is
+/// one hold of G ([`lock_ledger`], [`release_for`]): a turn's handling of
+/// its message, or a step of its tail after a reply was sent, or the top-up
+/// before a failed receive's retry. A handler's own recheck therefore comes
+/// first in its section, and the top-up before a failed receive's retry can
+/// recheck. Written and read only under G.
+static RECHECKED_THIS_SECTION: AtomicBool = AtomicBool::new(false);
 
-/// Start a turn of the receive loop, when a receive returns: its first
+/// Start a section of a turn, when G is taken: its first
 /// [`recheck_deferred`] runs.
-fn begin_turn()
+fn begin_section()
 {
-    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
-    unsafe { RECHECKED_THIS_TURN = false };
+    RECHECKED_THIS_SECTION.store(false, Ordering::Relaxed);
 }
 
 /// Move the deferred runs that have become [`quiescent`] to the free pool:
 /// at most [`DEFERRED_RECHECK_BATCH`] runs and [`DEFERRED_RECHECK_WINDOWS`]
 /// mapping windows (plus the rest of the run that crosses them), and only
-/// the first time in a turn of the receive loop, so one turn's rechecks are
-/// bounded whatever number of its selections fail. Returns the pages moved;
-/// the caller coalesces.
+/// the first time in a section of a turn ([`begin_section`]), so the
+/// rechecks of one hold of G, which every other receive thread may wait on,
+/// are bounded whatever number of its selections fail. Returns the pages
+/// moved; the caller coalesces.
 fn recheck_deferred(l: &mut MemLedger) -> u64
 {
-    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
-    if unsafe { RECHECKED_THIS_TURN }
+    if RECHECKED_THIS_SECTION.swap(true, Ordering::Relaxed)
     {
         return 0;
     }
-    // SAFETY: as above.
-    unsafe { RECHECKED_THIS_TURN = true };
     let budget = RecheckBudget {
         runs: DEFERRED_RECHECK_BATCH,
         cost: DEFERRED_RECHECK_WINDOWS,
@@ -1528,7 +1582,13 @@ fn request_target(
 /// its own budget node, or with `REQUEST_CHARGE_NODE` to the node of the node
 /// handle in `caps[0]` (services/memmgr/docs/ipc-interface.md § Label 1). A
 /// cap in `caps[0]` is deleted on every path.
-fn handle_request_memory_caps(req: &IpcMessage, caps: &[u64], answer: &mut Answer, service_ep: u64)
+fn handle_request_memory_caps(
+    l: &mut MemLedger,
+    req: &IpcMessage,
+    caps: &[u64],
+    answer: &mut Answer,
+    service_ep: u64,
+)
 {
     let arg = req.word(0);
     // `data[0]` packs `want_pages` in its low half and the flags in its high
@@ -1546,7 +1606,6 @@ fn handle_request_memory_caps(req: &IpcMessage, caps: &[u64], answer: &mut Answe
         return;
     }
 
-    let l = ledger_mut();
     let Some((rec, charge)) = request_target(l, req.badge, flags, charge_badge)
     else
     {
@@ -1661,11 +1720,10 @@ fn handle_request_memory_caps(req: &IpcMessage, caps: &[u64], answer: &mut Answe
     answer.set_undoable(builder.build(), Undo::Grant { rec, grant, inner });
 }
 
-fn handle_release_memory_caps(req: &IpcMessage, answer: &mut Answer)
+fn handle_release_memory_caps(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
     // Any inner caps the caller handed back were deleted by `dispatch`: a
     // release names regions by the region id of their grant, never by cap.
-    let l = ledger_mut();
     let Some(rec) = l.find(req.badge)
     else
     {
@@ -1714,6 +1772,7 @@ fn budget_parent(l: &MemLedger, badge: u64) -> Option<NodeIdx>
 }
 
 fn handle_register_process(
+    l: &mut MemLedger,
     req: &IpcMessage,
     caps: &[u64],
     answer: &mut Answer,
@@ -1747,7 +1806,6 @@ fn handle_register_process(
         return;
     }
 
-    let l = ledger_mut();
     // The new process's budget node: under the node of the process whose
     // memmgr badge `data[2]` names, or top-level for 0, or with
     // `REGISTER_CHARGE_NODE` under the node the handle in `caps[0]` names,
@@ -1913,7 +1971,7 @@ fn record_handle(l: &mut MemLedger, rec: NodeIdx, service_ep: u64) -> Option<u64
     syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, key).ok()
 }
 
-fn handle_process_died(req: &IpcMessage, answer: &mut Answer, procmgr_badge: u64)
+fn handle_process_died(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
     {
@@ -1961,7 +2019,6 @@ fn handle_process_died(req: &IpcMessage, answer: &mut Answer, procmgr_badge: u64
     // dead process owns is signalled on its donation-end registration before
     // the states go: their charge stays on the nodes until each holder
     // releases its grants.
-    let l = ledger_mut();
     if let Some(rec) = l.find(dead_badge)
     {
         l.for_each_owned_donation_end(rec, |cap, bits| {
@@ -1989,7 +2046,13 @@ fn handle_process_died(req: &IpcMessage, answer: &mut Answer, procmgr_badge: u64
 
 /// Procmgr-only: take permanent ownership of the Memory caps in `caps` (every
 /// cap the message carried) and add them to the free pool.
-fn handle_donate_memory_caps(badge: u64, caps: &[u64], answer: &mut Answer, procmgr_badge: u64)
+fn handle_donate_memory_caps(
+    l: &mut MemLedger,
+    badge: u64,
+    caps: &[u64],
+    answer: &mut Answer,
+    procmgr_badge: u64,
+)
 {
     // Caller (procmgr's init reap) is permanently transferring init's
     // reclaimed Memory caps into memmgr's pool (the donated set is specified
@@ -2012,7 +2075,6 @@ fn handle_donate_memory_caps(badge: u64, caps: &[u64], answer: &mut Answer, proc
         answer.set_status(memmgr_errors::UNAUTHORIZED);
         return;
     }
-    let l = ledger_mut();
     let mut accepted_caps: u32 = 0;
     let mut accepted_pages: u64 = 0;
     for &slot in caps
@@ -2093,10 +2155,9 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 /// held on the deferred list while another process can still reach it;
 /// `largest_free` is the largest single free run, the most one contiguous
 /// grant can take. The identity facts arrive verbatim from the kernel.
-fn handle_query_pool_status(answer: &mut Answer, boot: &InitBootstrap)
+fn handle_query_pool_status(l: &mut MemLedger, answer: &mut Answer, boot: &InitBootstrap)
 {
     let pool_total_bytes = pool_total_pages().saturating_mul(PAGE_SIZE);
-    let l = ledger_mut();
     let free_bytes = l.pool.free_pages().saturating_mul(PAGE_SIZE);
     let deferred_bytes = l.deferred.pages().saturating_mul(PAGE_SIZE);
     let largest_bytes = l.pool.largest_pages(&l.arena).saturating_mul(PAGE_SIZE);
@@ -2142,9 +2203,8 @@ fn handle_query_pool_status(answer: &mut Answer, boot: &InitBootstrap)
 /// swapped pages are the node's own
 /// (services/memmgr/docs/ipc-interface.md § Label 10). Attributed by
 /// `req.badge`; an unknown badge is `INVALID_ARGUMENT`. Read-only.
-fn handle_query_memory_usage(req: &IpcMessage, answer: &mut Answer)
+fn handle_query_memory_usage(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
-    let l = ledger_mut();
     let Some((rec, node)) = l
         .find(req.badge)
         .and_then(|rec| l.budget(rec).map(|node| (rec, node)))
@@ -2174,7 +2234,7 @@ fn handle_query_memory_usage(req: &IpcMessage, answer: &mut Answer)
 /// services/memmgr/docs/memory-pool.md § Commit), and a reply that does not
 /// reach the caller unregisters it again, as a grant whose reply fails is
 /// rolled back, so a caller whose call was interrupted repeats it.
-fn handle_register_region(req: &IpcMessage, answer: &mut Answer)
+fn handle_register_region(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
     let va_base = req.word(0);
     let len = req.word(1);
@@ -2203,7 +2263,6 @@ fn handle_register_region(req: &IpcMessage, answer: &mut Answer)
         Commit::Committed
     };
 
-    let l = ledger_mut();
     let Some(rec) = l.find(req.badge)
     else
     {
@@ -2315,11 +2374,10 @@ fn committed_region(l: &MemLedger, rec: NodeIdx, va_base: u64) -> Option<(NodeId
 /// ([`regrow_need`]), and the region's chunk table gains the levels the new
 /// length needs. A reply that does not reach the caller undoes the growth, so a
 /// caller whose call was interrupted repeats it.
-fn handle_extend_region(req: &IpcMessage, answer: &mut Answer)
+fn handle_extend_region(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
     let va_base = req.word(0);
     let new_len = req.word(1);
-    let l = ledger_mut();
     let Some((rec, (reg, len, high))) = l
         .find(req.badge)
         .and_then(|rec| committed_region(l, rec, va_base).map(|r| (rec, r)))
@@ -2400,11 +2458,10 @@ fn handle_extend_region(req: &IpcMessage, answer: &mut Answer)
 /// region's page-table reservation stay (`free_pool::Ledger::shrink_region`).
 /// A repeat finds the region at the new
 /// length and succeeds, so an interrupted call is safe to repeat.
-fn handle_shrink_region(req: &IpcMessage, answer: &mut Answer)
+fn handle_shrink_region(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
     let va_base = req.word(0);
     let new_len = req.word(1);
-    let l = ledger_mut();
     let Some((rec, (reg, len, _))) = l
         .find(req.badge)
         .and_then(|rec| committed_region(l, rec, va_base).map(|r| (rec, r)))
@@ -2452,11 +2509,10 @@ fn handle_shrink_region(req: &IpcMessage, answer: &mut Answer)
 /// promises the pages again (`free_pool::Ledger::discard_range`). The next
 /// fault on a page of them backs it with a zeroed run. A repeat finds nothing
 /// to take and succeeds, so an interrupted call is safe to repeat.
-fn handle_discard_range(req: &IpcMessage, answer: &mut Answer)
+fn handle_discard_range(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
     let va = req.word(0);
     let len = req.word(1);
-    let l = ledger_mut();
     // Check the range before the unmap, so a refused call unmaps nothing.
     let Some(rec) = l
         .find(req.badge)
@@ -2520,7 +2576,12 @@ const MAKE_RESIDENT_VISITS: u32 = 64;
 /// swap service has had time to restore it. Word 2 is where the walk stopped,
 /// past every chunk it posted, from which a sender that will wait no longer
 /// asks again, leaving the posted chunks not present.
-fn handle_make_resident(req: &IpcMessage, answer: &mut Answer, procmgr_badge: u64)
+fn handle_make_resident(
+    l: &mut MemLedger,
+    req: &IpcMessage,
+    answer: &mut Answer,
+    procmgr_badge: u64,
+)
 {
     if req.badge != procmgr_badge
     {
@@ -2528,7 +2589,6 @@ fn handle_make_resident(req: &IpcMessage, answer: &mut Answer, procmgr_badge: u6
         return;
     }
     let (va, len) = (req.word(1), req.word(2));
-    let l = ledger_mut();
     let (Some(rec), Some(end)) = (l.find(req.word(0)), va.checked_add(len))
     else
     {
@@ -2673,7 +2733,7 @@ const MAKE_PRIVATE_VISITS: u32 = 1024;
 /// passed over. The walk stops after [`MAKE_PRIVATE_PAGES`] copies or
 /// [`MAKE_PRIVATE_VISITS`] visits; the reply's word 0 is where it stopped, the
 /// range's end when it is all done, and the sender asks again from there.
-fn handle_make_private(req: &IpcMessage, answer: &mut Answer, procmgr_badge: u64)
+fn handle_make_private(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
     {
@@ -2681,7 +2741,6 @@ fn handle_make_private(req: &IpcMessage, answer: &mut Answer, procmgr_badge: u64
         return;
     }
     let (va, len) = (req.word(1), req.word(2));
-    let l = ledger_mut();
     let (Some(rec), Some(end)) = (l.find(req.word(0)), va.checked_add(len))
     else
     {
@@ -2825,12 +2884,11 @@ fn make_page_private(
 /// registration plus
 /// the frames [`handle_fault`] mapped. Reply: [`memmgr_errors::SUCCESS`], or
 /// `INVALID_ARGUMENT` (unknown badge or no exact-match region).
-fn handle_unregister_region(req: &IpcMessage, answer: &mut Answer)
+fn handle_unregister_region(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
     let va_base = req.word(0);
     let len = req.word(1);
 
-    let l = ledger_mut();
     let Some(rec) = l.find(req.badge)
     else
     {
@@ -2866,7 +2924,13 @@ fn handle_unregister_region(req: &IpcMessage, answer: &mut Answer)
 /// [`handle_fault`] can map backing frames into it. Keyed by the child's
 /// memmgr badge in `data[0]`; the cap arrives in `caps[0]`, which [`dispatch`]
 /// passes as `caps` (it has already deleted any cap after it).
-fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], answer: &mut Answer, procmgr_badge: u64)
+fn handle_delegate_aspace(
+    l: &mut MemLedger,
+    req: &IpcMessage,
+    caps: &[u64],
+    answer: &mut Answer,
+    procmgr_badge: u64,
+)
 {
     if req.badge != procmgr_badge
     {
@@ -2881,7 +2945,6 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], answer: &mut Answer, p
         answer.set_status(memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    let l = ledger_mut();
     let Some(rec) = l.find(child_badge)
     else
     {
@@ -3098,7 +3161,7 @@ fn select_fault_run(
 /// its zero frame, read-only, and a write to a private one gives the page a
 /// copy of its own, or for the zero object backs the span as in any committed
 /// region ([`attachment_fault`]).
-fn handle_fault(req: &IpcMessage, answer: &mut Answer)
+fn handle_fault(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
     if req.word(0) != syscall_abi::FAULT_KIND_VM
     {
@@ -3108,7 +3171,6 @@ fn handle_fault(req: &IpcMessage, answer: &mut Answer)
     let va = req.word(1);
     let page_base = va & !(PAGE_SIZE - 1);
 
-    let l = ledger_mut();
     let Some(rec) = l.find_front(req.badge)
     else
     {
@@ -3931,38 +3993,38 @@ unsafe fn copy_page(l: &mut MemLedger, src_va: u64, dst: u64) -> Result<(), i64>
 /// This is the `pool_total` of the all-RAM-accounted identity
 /// (`system_ram == kernel_reserved + pool_total`). Surfaced in the
 /// `DONATE_MEMORY_CAPS` reply (`word(2)`) so callers can read it without a separate
-/// IPC. Only the receive loop's thread reaches it, so a plain static suffices. The `u64` matches
-/// that reply word, and 2^64 pages exceed any physical address space, so the
-/// saturating add never clamps.
-static mut POOL_TOTAL_PAGES: u64 = 0;
+/// IPC. Written and read only under G. The `u64` matches that reply word,
+/// and 2^64 pages exceed any physical address space, so the saturating add
+/// never clamps.
+static POOL_TOTAL_PAGES: AtomicU64 = AtomicU64::new(0);
 
 fn pool_total_pages() -> u64
 {
-    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
-    unsafe { POOL_TOTAL_PAGES }
+    POOL_TOTAL_PAGES.load(Ordering::Relaxed)
 }
 
 fn pool_total_add(pages: u64)
 {
     let total = pool_total_pages().saturating_add(pages);
-    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
-    unsafe {
-        POOL_TOTAL_PAGES = total;
-    }
+    POOL_TOTAL_PAGES.store(total, Ordering::Relaxed);
 }
 
 // ── Memory pressure ──────────────────────────────────────────────────────────
 
-/// The pressure level memmgr last signalled. Only the receive loop's
-/// thread reaches it, so a plain static suffices.
-static mut PRESSURE: PressureLevel = PressureLevel::Normal;
+/// The pressure level memmgr last signalled, as its wire value
+/// ([`pressure_wire`]). Written and read only under G.
+static PRESSURE: AtomicU64 = AtomicU64::new(memmgr_labels::PRESSURE_NORMAL);
 
-/// The pressure level [`signal_pressure`] last computed, at the top of this
-/// turn of the receive loop.
+/// The pressure level [`signal_pressure`] last computed, at the end of the
+/// last turn that ran it.
 fn current_pressure() -> PressureLevel
 {
-    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
-    unsafe { PRESSURE }
+    match PRESSURE.load(Ordering::Relaxed)
+    {
+        memmgr_labels::PRESSURE_LOW => PressureLevel::Low,
+        memmgr_labels::PRESSURE_CRITICAL => PressureLevel::Critical,
+        _ => PressureLevel::Normal,
+    }
 }
 
 /// The wire value of `level` (`QUERY_POOL_STATUS` `data[7]`).
@@ -3976,9 +4038,9 @@ const fn pressure_wire(level: PressureLevel) -> u64
     }
 }
 
-/// Whether the draw room memmgr last read was open ([`draw_open`]). Only the
-/// receive loop's thread reaches it, so a plain static suffices.
-static mut DRAW_OPEN: bool = true;
+/// Whether the draw room memmgr last read was open ([`draw_open`]). Written
+/// and read only under G.
+static DRAW_OPEN: AtomicBool = AtomicBool::new(true);
 
 /// The pages a committed draw for a budget node outside the system reserve may
 /// take from the free pool now, those above the growth floor while a swap
@@ -4000,7 +4062,7 @@ fn draw_open(l: &MemLedger) -> bool
 }
 
 /// Recompute the pressure level from the free pages outside `promised`, and
-/// the draw room, after a turn of the receive loop, and, when the level
+/// the draw room, after a receive thread's turn, and, when the level
 /// changed or the draw room opened ([`draw_open`]), send every registrant the
 /// bits it registered for what happened, its level bits for the change and
 /// its draw-room bits for the opening ([`PressureBits::for_signal`])
@@ -4008,29 +4070,30 @@ fn draw_open(l: &MemLedger) -> bool
 /// send never blocks, so no client can hold memmgr here; a send that fails (a
 /// cap the client revoked) is dropped. The walk visits every record, which
 /// costs a turn only on such a change.
-fn signal_pressure(answer: &mut Answer)
+fn signal_pressure(held: &mut Held, answer: &mut Answer)
 {
-    let l = ledger_mut();
-    let prev = current_pressure();
-    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
-    let was_open = unsafe { DRAW_OPEN };
-    let mut level = l.pressure_level(prev, pool_total_pages());
-    let mut open = draw_open(l);
+    let mut prev = current_pressure();
+    let mut was_open = DRAW_OPEN.load(Ordering::Relaxed);
+    let mut level = held.pressure_level(prev, pool_total_pages());
+    let mut open = draw_open(held);
     if level != prev || (open && !was_open)
     {
-        // A broadcast is due: the reply goes first, and the level and the
-        // draw room are read again past the undo its failure ran.
-        answer.flush(l);
-        level = l.pressure_level(prev, pool_total_pages());
-        open = draw_open(l);
+        // A broadcast is due: the reply goes first, and everything is read
+        // again past the undo its failure ran and what other receive threads
+        // recorded while the flush released G.
+        answer.flush(held);
+        prev = current_pressure();
+        was_open = DRAW_OPEN.load(Ordering::Relaxed);
+        level = held.pressure_level(prev, pool_total_pages());
+        open = draw_open(held);
     }
+    let l: &mut MemLedger = held;
     if open
     {
         // A committed draw short from here on is noted again.
         l.clear_short_draw();
     }
-    // SAFETY: as above.
-    unsafe { DRAW_OPEN = open };
+    DRAW_OPEN.store(open, Ordering::Relaxed);
     let signal = PressureSignal {
         level: level != prev,
         draw_room: open && !was_open,
@@ -4039,8 +4102,7 @@ fn signal_pressure(answer: &mut Answer)
     {
         return;
     }
-    // SAFETY: as above.
-    unsafe { PRESSURE = level };
+    PRESSURE.store(pressure_wire(level), Ordering::Relaxed);
     l.for_each_pressure(signal, |cap, bits| {
         let _ = syscall::notification_send(cap, bits);
     });
@@ -4054,7 +4116,7 @@ fn signal_pressure(answer: &mut Answer)
 /// registration replaces the caller's earlier one, whose cap is deleted, so
 /// a client holds one slot of memmgr's `CSpace` however often it registers.
 /// A refused cap is deleted.
-fn handle_register_pressure(req: &IpcMessage, caps: &[u64], answer: &mut Answer)
+fn handle_register_pressure(l: &mut MemLedger, req: &IpcMessage, caps: &[u64], answer: &mut Answer)
 {
     let Some(&cap) = caps.first()
     else
@@ -4063,7 +4125,6 @@ fn handle_register_pressure(req: &IpcMessage, caps: &[u64], answer: &mut Answer)
         return;
     };
     let bits = PressureBits::from_words(req.word(0), req.word(1));
-    let l = ledger_mut();
     let rec = l.find(req.badge);
     let Some(prior) = rec
         .zip(bits)
@@ -4109,9 +4170,8 @@ fn charge_handle_of(l: &MemLedger, badge: u64) -> Option<(NodeIdx, NodeHandle)>
 /// sub-node first to its current max, which keeps its bound on the reserve.
 /// Lowering it reclaims and kills nothing; a max at or below the usage
 /// signals the node's limit event ([`signal_limits`]).
-fn handle_node_set_max(req: &IpcMessage, answer: &mut Answer)
+fn handle_node_set_max(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
-    let l = ledger_mut();
     let Some((_, s)) = handle_of(l, req.badge)
     else
     {
@@ -4144,9 +4204,8 @@ const _: () = assert!(
 /// `NODE_WEIGHT_MIN..=NODE_WEIGHT_MAX` is refused. The floor reserves no free
 /// page: it keeps eviction off the subtree's pages, and admission is
 /// unchanged.
-fn handle_node_set_reclaim(req: &IpcMessage, answer: &mut Answer)
+fn handle_node_set_reclaim(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
-    let l = ledger_mut();
     let weight = u32::try_from(req.word(1))
         .ok()
         .filter(|w| (memmgr_labels::NODE_WEIGHT_MIN..=memmgr_labels::NODE_WEIGHT_MAX).contains(w));
@@ -4175,9 +4234,8 @@ fn handle_node_set_reclaim(req: &IpcMessage, answer: &mut Answer)
 /// § Label 19). The sub-node's handle state is owned by the owner of the
 /// handle's state, or by the caller, and goes when that process does or on
 /// `NODE_RELEASE`. A reply that does not reach the caller releases it.
-fn handle_create_sub_node(req: &IpcMessage, answer: &mut Answer, service_ep: u64)
+fn handle_create_sub_node(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer, service_ep: u64)
 {
-    let l = ledger_mut();
     let (owner, parent) = if req.label & 0xFFFF == memmgr_labels::NODE_CREATE
     {
         match handle_of(l, req.badge)
@@ -4259,9 +4317,8 @@ fn handle_create_sub_node(req: &IpcMessage, answer: &mut Answer, service_ep: u64
 /// `NODE_QUERY_USAGE`: reply the own pages, max and subtree pages of the
 /// handle's node, its floor and weight, and its subtree's evictable resident
 /// pages (services/memmgr/docs/ipc-interface.md § Label 16).
-fn handle_node_query_usage(req: &IpcMessage, answer: &mut Answer)
+fn handle_node_query_usage(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
-    let l = ledger_mut();
     let found = charge_handle_of(l, req.badge).and_then(|(_, s)| {
         Some((
             free_pool::budget::node(&l.arena, s.node)?,
@@ -4291,7 +4348,13 @@ fn handle_node_query_usage(req: &IpcMessage, answer: &mut Answer)
 /// registration goes; it replaces the earlier registration, whose cap is
 /// deleted (services/memmgr/docs/ipc-interface.md § Label 17). A refused cap
 /// is deleted.
-fn handle_node_register_limit(req: &IpcMessage, caps: &[u64], answer: &mut Answer, service_ep: u64)
+fn handle_node_register_limit(
+    l: &mut MemLedger,
+    req: &IpcMessage,
+    caps: &[u64],
+    answer: &mut Answer,
+    service_ep: u64,
+)
 {
     let &[cap, by_cap] = caps
     else
@@ -4303,7 +4366,6 @@ fn handle_node_register_limit(req: &IpcMessage, caps: &[u64], answer: &mut Answe
     let by_badge =
         cap_badge(service_ep, by_cap).filter(|b| b & memmgr_labels::NODE_HANDLE_TAG == 0);
     let bits = req.word(0);
-    let l = ledger_mut();
     let by = by_badge.and_then(|b| l.find(b));
     let target = handle_of(l, req.badge).map(|(h, _)| h);
     let (Some(h), Some(by)) = (target, by)
@@ -4362,9 +4424,8 @@ fn cap_badge(service_ep: u64, cap: u64) -> Option<u64>
 /// is refused from then on, and delete its limit cap
 /// (services/memmgr/docs/ipc-interface.md § Label 18). Refused for a
 /// process's own node, whose state goes with the process.
-fn handle_node_release(req: &IpcMessage, answer: &mut Answer)
+fn handle_node_release(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
-    let l = ledger_mut();
     let Some((h, s)) = handle_of(l, req.badge)
     else
     {
@@ -4397,9 +4458,13 @@ fn handle_node_release(req: &IpcMessage, answer: &mut Answer)
 /// charge-only, which names the same handle state and is refused once it
 /// goes (services/memmgr/docs/ipc-interface.md § Label 33). A reply that does
 /// not reach the caller deletes the cap.
-fn handle_node_charge_handle(req: &IpcMessage, answer: &mut Answer, service_ep: u64)
+fn handle_node_charge_handle(
+    l: &mut MemLedger,
+    req: &IpcMessage,
+    answer: &mut Answer,
+    service_ep: u64,
+)
 {
-    let l = ledger_mut();
     let Some((_, s)) = charge_handle_of(l, req.badge)
     else
     {
@@ -4421,7 +4486,12 @@ fn handle_node_charge_handle(req: &IpcMessage, answer: &mut Answer, service_ep: 
 /// holds grants charged to ends, in place of its earlier registration, whose
 /// cap is deleted (services/memmgr/docs/ipc-interface.md § Label 34). A
 /// refused cap is deleted.
-fn handle_register_donation_end(req: &IpcMessage, caps: &[u64], answer: &mut Answer)
+fn handle_register_donation_end(
+    l: &mut MemLedger,
+    req: &IpcMessage,
+    caps: &[u64],
+    answer: &mut Answer,
+)
 {
     let Some(&cap) = caps.first()
     else
@@ -4430,7 +4500,6 @@ fn handle_register_donation_end(req: &IpcMessage, caps: &[u64], answer: &mut Ans
         return;
     };
     let bits = req.word(0);
-    let l = ledger_mut();
     let rec = l.find(req.badge);
     let Some(rec) = rec.filter(|_| bits != 0 && is_notify_cap(cap))
     else
@@ -4520,14 +4589,13 @@ fn admit_attach(l: &mut MemLedger, rec: NodeIdx, len: u64, share: Share)
 /// until the object retires ([`retire_objects`]). A reply that does not reach
 /// the caller undoes the seal (`free_pool::Ledger::unseal_object`), so a
 /// caller whose call was interrupted repeats it.
-fn handle_seal_object(req: &IpcMessage, answer: &mut Answer, service_ep: u64)
+fn handle_seal_object(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer, service_ep: u64)
 {
     if req.badge & PHYS_CLASS_BADGE_BIT != 0
     {
         answer.set_status(memmgr_errors::UNAUTHORIZED);
         return;
     }
-    let l = ledger_mut();
     let count = req.word(0) as usize;
     let Some(rec) = l.find(req.badge).filter(|_| {
         count != 0
@@ -4704,13 +4772,14 @@ fn unseal(l: &mut MemLedger, rec: NodeIdx, obj: NodeIdx)
 /// death, the last attachment's unregistering or its process's death) leaves
 /// the view behind, and an object's frames stay until the turn that dropped
 /// it ends.
-fn retire_objects(l: &mut MemLedger, answer: &mut Answer)
+fn retire_objects(held: &mut Held, answer: &mut Answer)
 {
-    if l.retiring_object().is_none()
+    if held.retiring_object().is_none()
     {
         return;
     }
-    answer.flush(l);
+    answer.flush(held);
+    let l: &mut MemLedger = held;
     let mut any = false;
     while let Some((obj, own_va, pages)) = l.retiring_object()
     {
@@ -4737,7 +4806,13 @@ fn retire_objects(l: &mut MemLedger, answer: &mut Answer)
 /// ([`map_origin`]). A reply that does not reach the caller
 /// detaches the region again, so a caller whose call was interrupted repeats
 /// it.
-fn handle_attach_object(req: &IpcMessage, caps: &[u64], answer: &mut Answer, service_ep: u64)
+fn handle_attach_object(
+    l: &mut MemLedger,
+    req: &IpcMessage,
+    caps: &[u64],
+    answer: &mut Answer,
+    service_ep: u64,
+)
 {
     // The handle's badge, read first, which deletes the cap.
     let handle = caps.first().map(|&cap| cap_badge(service_ep, cap));
@@ -4767,7 +4842,6 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], answer: &mut Answer, ser
         answer.set_status(memmgr_errors::INVALID_ARGUMENT);
         return;
     }
-    let l = ledger_mut();
     let Some(rec) = l.find(req.badge)
     else
     {
@@ -4925,15 +4999,22 @@ fn drop_zero_frame(l: &mut MemLedger, zero: NodeIdx)
 
 /// Hand a memory-object label (`SEAL_OBJECT` to `OBJECT_RELEASE`,
 /// `OBJECT_READ`, `FILL_REGION`) to its handler, as [`route`] does.
-fn route_object(opcode: u64, req: &IpcMessage, kept: &[u64], answer: &mut Answer, service_ep: u64)
+fn route_object(
+    l: &mut MemLedger,
+    opcode: u64,
+    req: &IpcMessage,
+    kept: &[u64],
+    answer: &mut Answer,
+    service_ep: u64,
+)
 {
     match opcode
     {
-        memmgr_labels::SEAL_OBJECT => handle_seal_object(req, answer, service_ep),
-        memmgr_labels::ATTACH_OBJECT => handle_attach_object(req, kept, answer, service_ep),
-        memmgr_labels::OBJECT_READ => object::handle_object_read(req, kept, answer, service_ep),
-        memmgr_labels::FILL_REGION => object::handle_fill_region(req, kept, answer, service_ep),
-        _ => handle_object_release(req, answer),
+        memmgr_labels::SEAL_OBJECT => handle_seal_object(l, req, answer, service_ep),
+        memmgr_labels::ATTACH_OBJECT => handle_attach_object(l, req, kept, answer, service_ep),
+        memmgr_labels::OBJECT_READ => object::handle_object_read(l, req, kept, answer, service_ep),
+        memmgr_labels::FILL_REGION => object::handle_fill_region(l, req, kept, answer, service_ep),
+        _ => handle_object_release(l, req, answer),
     }
 }
 
@@ -4941,9 +5022,8 @@ fn route_object(opcode: u64, req: &IpcMessage, kept: &[u64], answer: &mut Answer
 /// so every handle to it is refused from then on; its frames are freed, pooled
 /// or deferred, once no region attaches it
 /// (services/memmgr/docs/ipc-interface.md § Label 29).
-fn handle_object_release(req: &IpcMessage, answer: &mut Answer)
+fn handle_object_release(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer)
 {
-    let l = ledger_mut();
     let Some(obj) = l.find_object(req.badge)
     else
     {
@@ -5073,35 +5153,42 @@ impl Undo
 }
 
 /// A turn's answer to the caller of its request: the reply its handler sets,
-/// which the receive loop sends with its next receive (`SYS_IPC_REPLY_RECV`),
-/// or before a step of the turn's tail that has work to do ([`Self::flush`],
-/// [`ipc::serve::Reply::flush`]), and the [`Undo`] of the request's effect,
-/// run as soon as the send reports the reply undelivered
-/// (services/memmgr/docs/memory-pool.md § Receive loop). Only the receive
-/// loop's thread holds it; a handler sets at most one reply.
+/// which the receive thread sends with its next receive (`SYS_IPC_REPLY_RECV`),
+/// or alone before a step of the turn's tail that has work to do
+/// ([`Self::flush`]), the [`Undo`] of the request's effect, run as soon as
+/// the send reports the reply undelivered, and the stripe of the process the
+/// request acts for, held until the reply is settled
+/// (services/memmgr/docs/memory-pool.md § Receive loop, § Concurrency). One
+/// per receive thread, which alone sends through it; a handler sets at most
+/// one reply.
 struct Answer
 {
     reply: ipc::serve::Reply,
     undo: Option<Undo>,
+    /// The stripe the turn's request took before G ([`STRIPES`]), released
+    /// once its reply is settled.
+    stripe: Option<StripeGuard<'static>>,
     /// memmgr's service endpoint, on which every receive waits.
     ep: u64,
-    /// memmgr's registered IPC buffer page ([`Self::new`]'s contract).
+    /// This thread's registered IPC buffer page ([`Self::new`]'s contract).
     ipc_buf: *mut u64,
 }
 
 impl Answer
 {
-    /// An empty answer, sent through `ipc_buf` by receives on `ep`.
+    /// An empty answer, sent through `ipc_buf` by receives on `ep`, which
+    /// memmgr's other receive threads share.
     ///
     /// # Safety
-    /// `ipc_buf` must point to memmgr's 4 KiB-aligned IPC buffer page as
-    /// registered via `syscall::ipc_buffer_set`, on the receive loop's thread,
-    /// the only one that sends through the answer.
+    /// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer
+    /// page as registered via `syscall::ipc_buffer_set`, and the answer must
+    /// stay on that thread, the only one that sends through it.
     const unsafe fn new(ep: u64, ipc_buf: *mut u64) -> Self
     {
         Self {
-            reply: ipc::serve::Reply::new(),
+            reply: ipc::serve::Reply::pooled(),
             undo: None,
+            stripe: None,
             ep,
             ipc_buf,
         }
@@ -5147,37 +5234,49 @@ impl Answer
     }
 
     /// Send the reply now, when one is set, before a step of the turn's tail
-    /// that has work to do ([`ipc::serve::Reply::flush`]): with a receive that
-    /// does not wait, whose reply wake the kernel places off memmgr's CPU, so
-    /// the caller waits for none of that work even when the call placed it
-    /// there. A call that receive binds is the next turn's request
-    /// ([`Self::next_request`]). The undo runs here on `l`, the caller's
-    /// reference to the ledger, when the reply is not delivered.
-    fn flush(&mut self, l: &mut MemLedger)
+    /// that has work to do: alone (`SYS_IPC_REPLY`, [`ipc::serve::Reply::pooled`]),
+    /// so a call waiting on the endpoint stays queued for a free receive
+    /// thread, and with G released for the send ([`release_for`]). The undo
+    /// runs here, under G again, when the reply is not delivered, and the
+    /// stripe is released once it is settled.
+    fn flush(&mut self, held: &mut Held)
     {
         if !self.reply.is_set()
         {
             return;
         }
-        // SAFETY: ipc_buf is memmgr's registered IPC buffer page, and this is
-        // the receive loop's thread (Self::new's contract).
-        unsafe { self.reply.flush(self.ep, self.ipc_buf) };
-        self.settle(l);
+        let (reply, ep, ipc_buf) = (&mut self.reply, self.ep, self.ipc_buf);
+        // SAFETY: ipc_buf is this thread's registered IPC buffer page, and
+        // this is the answer's own thread (Self::new's contract).
+        release_for(held, || unsafe { reply.flush(ep, ipc_buf) });
+        self.settle(held);
     }
 
-    /// The next request, into `req`: the call a flush bound, or else the
-    /// next call on memmgr's endpoint, waiting up to `timeout_ms`
-    /// milliseconds (`0`: without bound), after sending the reply, when one
-    /// is still set, with the receive, which reads the call into `req` in
-    /// place. Its undo runs on return when the reply was not delivered, before
-    /// memmgr serves anything else.
+    /// End the turn and take the next request, into `req`: the next call on
+    /// memmgr's endpoint, waiting up to `timeout_ms` milliseconds (`0`:
+    /// without bound). A reply with an undo is sent and settled first, under
+    /// G ([`Self::flush`]); G and then the stripe are released; a reply still
+    /// set, which has no undo, goes with the receive.
     ///
     /// # Errors
     /// [`ipc::serve::next_request_timeout`]'s.
-    fn next_request(&mut self, timeout_ms: u64, req: &mut IpcMessage) -> Result<(), i64>
+    fn next_request(
+        &mut self,
+        mut held: Held,
+        timeout_ms: u64,
+        req: &mut IpcMessage,
+    ) -> Result<(), i64>
     {
+        if self.undo.is_some()
+        {
+            self.flush(&mut held);
+        }
+        signal_limits(&held);
+        // G before the stripe: the reverse of the order they are taken in.
+        drop(held);
+        self.stripe = None;
         // SAFETY: as in flush.
-        let got = unsafe {
+        unsafe {
             ipc::serve::next_request_timeout(
                 self.ep,
                 &mut self.reply,
@@ -5185,14 +5284,11 @@ impl Answer
                 timeout_ms,
                 req,
             )
-        };
-        // No reference to the ledger is held across the receive.
-        self.settle(ledger_mut());
-        got
+        }
     }
 
     /// After a send: run the undo of a reply that was not delivered, and drop
-    /// it otherwise.
+    /// it otherwise; then release the request's stripe.
     fn settle(&mut self, l: &mut MemLedger)
     {
         if let Some(undo) = self.undo.take()
@@ -5200,16 +5296,29 @@ impl Answer
         {
             undo.run(l);
         }
+        self.stripe = None;
     }
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────────
 
 /// General-allocation headroom of memmgr's own `CSpace` below which it tops
-/// the slot-page pool up from its own pool. Every grant splits a frame and
-/// derives an inner, each a slot, so a burst of requests draws slots fast;
-/// the mark covers a full reply's worth of grants many times over.
+/// the slot-page pool up from its own pool, before the slots of the receives
+/// in flight ([`cspace_low_water`]). Every grant splits a frame and derives
+/// an inner, each a slot, so a burst of requests draws slots fast; the mark
+/// covers a full reply's worth of grants many times over.
 const CSPACE_LOW_WATER: u64 = 256;
+
+/// The headroom [`hold_cspace_headroom`] keeps: [`CSPACE_LOW_WATER`], and a
+/// message's caps for every receive thread, since each receive in flight may
+/// land one message's caps in memmgr's `CSpace` whatever the others take.
+fn cspace_low_water() -> u64
+{
+    CSPACE_LOW_WATER.saturating_add(
+        syscall_abi::CSPACE_IPC_RECV_RESERVE
+            .saturating_mul(RECEIVE_THREADS.load(Ordering::Relaxed)),
+    )
+}
 
 /// Pool pages one top-up donates (`CSPACE_SLOTS_PER_PAGE` slots each).
 const CSPACE_TOPUP_PAGES: u32 = 16;
@@ -5238,18 +5347,31 @@ fn cspace_headroom(self_cspace: u64) -> u64
 /// for this memory, which is why it funds itself from its own pool. A
 /// failed top-up (no contiguous run, or the augment refused) is retried
 /// before the next receive; a refused augment returns the frame to the pool.
-fn hold_cspace_headroom(self_cspace: u64, answer: &mut Answer)
+fn hold_cspace_headroom(held: &mut Held, self_cspace: u64, answer: &mut Answer)
 {
-    // Every grant's split takes a body from the arena as well as a slot, and
-    // the arena draws whole pages from the same growth budget, so a page of it
-    // is held beyond the slots (`syscall_abi::cspace_topup_pages`).
-    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
-    if syscall_abi::cspace_topup_pages(cspace_headroom(self_cspace), budget, CSPACE_LOW_WATER) == 0
+    if !cspace_short(self_cspace)
     {
         return;
     }
-    answer.flush(ledger_mut());
-    let l = ledger_mut();
+    answer.flush(held);
+    top_up_cspace(held, self_cspace);
+}
+
+/// Whether memmgr's own `CSpace` `self_cspace` is below the headroom
+/// [`hold_cspace_headroom`] keeps. Every grant's split takes a body from the
+/// arena as well as a slot, and the arena draws whole pages from the same
+/// growth budget, so a page of it is held beyond the slots
+/// (`syscall_abi::cspace_topup_pages`).
+fn cspace_short(self_cspace: u64) -> bool
+{
+    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
+    syscall_abi::cspace_topup_pages(cspace_headroom(self_cspace), budget, cspace_low_water()) != 0
+}
+
+/// Grow memmgr's own `CSpace` `self_cspace` by a run from its pool
+/// ([`hold_cspace_headroom`]).
+fn top_up_cspace(l: &mut MemLedger, self_cspace: u64)
+{
     let Ok(grant) =
         select(l, CSPACE_TOPUP_PAGES, Fit::Contiguous).or_else(|_| select(l, 1, Fit::Contiguous))
     else
@@ -5277,9 +5399,8 @@ fn hold_cspace_headroom(self_cspace: u64, answer: &mut Answer)
     }
 }
 
-fn ingest_pool(boot: &InitBootstrap)
+fn ingest_pool(l: &mut MemLedger, boot: &InitBootstrap)
 {
-    let l = ledger_mut();
     for i in 0..boot.memory_count
     {
         let cap_slot = boot.memory_base.saturating_add(i);
@@ -5317,9 +5438,8 @@ fn ingest_pool(boot: &InitBootstrap)
 /// The owner records (procmgr, memmgr-self, init-self) must already exist.
 /// Frames carry [`FRAME_VA_UNMAPPED`]: memmgr did not map them, and they sit
 /// on the record's frame list, which no `UNREGISTER_REGION` touches.
-fn ingest_in_use(boot: &InitBootstrap)
+fn ingest_in_use(l: &mut MemLedger, boot: &InitBootstrap)
 {
-    let l = ledger_mut();
     for entry in boot.in_use.iter().take(boot.in_use_count)
     {
         let badge = match entry.kind
@@ -5359,9 +5479,8 @@ fn ingest_in_use(boot: &InitBootstrap)
 /// Each takes a top-level reserve budget node with no max: they are the core
 /// the system reserve is kept for (services/memmgr/docs/memory-pool.md
 /// § Distribution policy).
-fn insert_boot_records(procmgr_badge: u64) -> bool
+fn insert_boot_records(l: &mut MemLedger, procmgr_badge: u64) -> bool
 {
-    let l = ledger_mut();
     [procmgr_badge, MEMMGR_SELF_BADGE, INIT_SELF_BADGE]
         .into_iter()
         .all(|badge| {
@@ -5411,12 +5530,12 @@ fn contract_cap_count(opcode: u64, attached: usize) -> usize
     }
 }
 
-fn dispatch(req: &IpcMessage, answer: &mut Answer, boot: &InitBootstrap)
+fn dispatch(l: &mut MemLedger, req: &IpcMessage, answer: &mut Answer, boot: &InitBootstrap)
 {
     // Every cap a message carries has landed in memmgr's CSpace. Delete each
     // one the label's contract does not hand to its handler before the
     // handler runs, so no client can grow memmgr's CSpace by attaching caps
-    // until its receive loop wedges, and so no handler can delete a slot that
+    // until its receive threads wedge, and so no handler can delete a slot that
     // was freed here and reused since. Handlers see only the caps their
     // contract keeps.
     let attached = req.caps();
@@ -5428,7 +5547,7 @@ fn dispatch(req: &IpcMessage, answer: &mut Answer, boot: &InitBootstrap)
     if req.label == syscall_abi::FAULT_LABEL
     {
         delete_caps(attached);
-        handle_fault(req, answer);
+        handle_fault(l, req, answer);
         return;
     }
     let opcode = req.label & 0xFFFF;
@@ -5454,42 +5573,49 @@ fn dispatch(req: &IpcMessage, answer: &mut Answer, boot: &InitBootstrap)
         answer.set_status(memmgr_errors::UNAUTHORIZED);
         return;
     }
-    route(opcode, req, kept, answer, boot);
+    route(l, opcode, req, kept, answer, boot);
 }
 
 /// Hand a budget-node request to its label's handler, with the caps its
 /// contract keeps ([`route`]).
-fn route_node(opcode: u64, req: &IpcMessage, kept: &[u64], answer: &mut Answer, service_ep: u64)
+fn route_node(
+    l: &mut MemLedger,
+    opcode: u64,
+    req: &IpcMessage,
+    kept: &[u64],
+    answer: &mut Answer,
+    service_ep: u64,
+)
 {
     match opcode
     {
         memmgr_labels::NODE_SET_MAX =>
         {
-            handle_node_set_max(req, answer);
+            handle_node_set_max(l, req, answer);
         }
         memmgr_labels::NODE_CREATE | memmgr_labels::CREATE_SUB_NODE =>
         {
-            handle_create_sub_node(req, answer, service_ep);
+            handle_create_sub_node(l, req, answer, service_ep);
         }
         memmgr_labels::NODE_QUERY_USAGE =>
         {
-            handle_node_query_usage(req, answer);
+            handle_node_query_usage(l, req, answer);
         }
         memmgr_labels::NODE_REGISTER_LIMIT =>
         {
-            handle_node_register_limit(req, kept, answer, service_ep);
+            handle_node_register_limit(l, req, kept, answer, service_ep);
         }
         memmgr_labels::NODE_RELEASE =>
         {
-            handle_node_release(req, answer);
+            handle_node_release(l, req, answer);
         }
         memmgr_labels::NODE_SET_RECLAIM =>
         {
-            handle_node_set_reclaim(req, answer);
+            handle_node_set_reclaim(l, req, answer);
         }
         memmgr_labels::NODE_CHARGE_HANDLE =>
         {
-            handle_node_charge_handle(req, answer, service_ep);
+            handle_node_charge_handle(l, req, answer, service_ep);
         }
         _ =>
         {
@@ -5500,93 +5626,100 @@ fn route_node(opcode: u64, req: &IpcMessage, kept: &[u64], answer: &mut Answer, 
 
 /// Hand a request a client sent to its label's handler, with the caps its
 /// contract keeps ([`dispatch`]).
-fn route(opcode: u64, req: &IpcMessage, kept: &[u64], answer: &mut Answer, boot: &InitBootstrap)
+fn route(
+    l: &mut MemLedger,
+    opcode: u64,
+    req: &IpcMessage,
+    kept: &[u64],
+    answer: &mut Answer,
+    boot: &InitBootstrap,
+)
 {
     match opcode
     {
         memmgr_labels::REQUEST_MEMORY_CAPS =>
         {
-            handle_request_memory_caps(req, kept, answer, boot.service_ep);
+            handle_request_memory_caps(l, req, kept, answer, boot.service_ep);
         }
         memmgr_labels::RELEASE_MEMORY_CAPS =>
         {
-            handle_release_memory_caps(req, answer);
+            handle_release_memory_caps(l, req, answer);
         }
         memmgr_labels::REGISTER_PROCESS =>
         {
-            handle_register_process(req, kept, answer, boot.service_ep, boot.procmgr_badge);
+            handle_register_process(l, req, kept, answer, boot.service_ep, boot.procmgr_badge);
         }
         memmgr_labels::PROCESS_DIED =>
         {
-            handle_process_died(req, answer, boot.procmgr_badge);
+            handle_process_died(l, req, answer, boot.procmgr_badge);
         }
         memmgr_labels::DONATE_MEMORY_CAPS =>
         {
-            handle_donate_memory_caps(req.badge, kept, answer, boot.procmgr_badge);
+            handle_donate_memory_caps(l, req.badge, kept, answer, boot.procmgr_badge);
         }
         memmgr_labels::QUERY_POOL_STATUS =>
         {
-            handle_query_pool_status(answer, boot);
+            handle_query_pool_status(l, answer, boot);
         }
         memmgr_labels::REGISTER_REGION =>
         {
-            handle_register_region(req, answer);
+            handle_register_region(l, req, answer);
         }
         memmgr_labels::UNREGISTER_REGION =>
         {
-            handle_unregister_region(req, answer);
+            handle_unregister_region(l, req, answer);
         }
         memmgr_labels::DELEGATE_ASPACE =>
         {
-            handle_delegate_aspace(req, kept, answer, boot.procmgr_badge);
+            handle_delegate_aspace(l, req, kept, answer, boot.procmgr_badge);
         }
         memmgr_labels::QUERY_MEMORY_USAGE =>
         {
-            handle_query_memory_usage(req, answer);
+            handle_query_memory_usage(l, req, answer);
         }
         memmgr_labels::REGISTER_PRESSURE =>
         {
-            handle_register_pressure(req, kept, answer);
+            handle_register_pressure(l, req, kept, answer);
         }
         memmgr_labels::EXTEND_REGION =>
         {
-            handle_extend_region(req, answer);
+            handle_extend_region(l, req, answer);
         }
         memmgr_labels::SHRINK_REGION =>
         {
-            handle_shrink_region(req, answer);
+            handle_shrink_region(l, req, answer);
         }
         memmgr_labels::DISCARD_RANGE =>
         {
-            handle_discard_range(req, answer);
+            handle_discard_range(l, req, answer);
         }
         memmgr_labels::MAKE_RESIDENT
         | memmgr_labels::MAKE_PRIVATE
         | memmgr_labels::CAPTURE_CHUNKS
         | memmgr_labels::MARK_CHECKPOINT =>
         {
-            route_procmgr(opcode, req, kept, answer, boot);
+            route_procmgr(l, opcode, req, kept, answer, boot);
         }
         memmgr_labels::NODE_SET_MAX..=memmgr_labels::NODE_RELEASE
         | memmgr_labels::CREATE_SUB_NODE
         | memmgr_labels::NODE_SET_RECLAIM
         | memmgr_labels::NODE_CHARGE_HANDLE =>
         {
-            route_node(opcode, req, kept, answer, boot.service_ep);
+            route_node(l, opcode, req, kept, answer, boot.service_ep);
         }
         memmgr_labels::REGISTER_DONATION_END =>
         {
-            handle_register_donation_end(req, kept, answer);
+            handle_register_donation_end(l, req, kept, answer);
         }
         memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED =>
         {
-            disk::route(opcode, req, kept, answer, boot.service_ep);
+            disk::route(l, opcode, req, kept, answer, boot.service_ep);
         }
         memmgr_labels::SEAL_OBJECT..=memmgr_labels::OBJECT_RELEASE
         | memmgr_labels::OBJECT_READ
         | memmgr_labels::FILL_REGION =>
         {
-            route_object(opcode, req, kept, answer, boot.service_ep);
+            route_object(l, opcode, req, kept, answer, boot.service_ep);
         }
         _ =>
         {
@@ -5599,6 +5732,7 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], answer: &mut Answer, boot:
 /// `MAKE_PRIVATE`, `CAPTURE_CHUNKS`, `MARK_CHECKPOINT`) to its handler,
 /// which checks the badge.
 fn route_procmgr(
+    l: &mut MemLedger,
     opcode: u64,
     req: &IpcMessage,
     kept: &[u64],
@@ -5609,13 +5743,13 @@ fn route_procmgr(
     let procmgr_badge = boot.procmgr_badge;
     match opcode
     {
-        memmgr_labels::MAKE_RESIDENT => handle_make_resident(req, answer, procmgr_badge),
-        memmgr_labels::MAKE_PRIVATE => handle_make_private(req, answer, procmgr_badge),
+        memmgr_labels::MAKE_RESIDENT => handle_make_resident(l, req, answer, procmgr_badge),
+        memmgr_labels::MAKE_PRIVATE => handle_make_private(l, req, answer, procmgr_badge),
         memmgr_labels::MARK_CHECKPOINT =>
         {
-            object::handle_mark_checkpoint(req, kept, answer, procmgr_badge, boot.service_ep);
+            object::handle_mark_checkpoint(l, req, kept, answer, procmgr_badge, boot.service_ep);
         }
-        _ => capture::handle_capture_chunks(req, kept, answer, procmgr_badge, boot.service_ep),
+        _ => capture::handle_capture_chunks(l, req, kept, answer, procmgr_badge, boot.service_ep),
     }
 }
 
@@ -5654,21 +5788,24 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
     // The disk tier's per-boot key, drawn before any request can use it.
     disk::init();
 
-    ingest_pool(&boot);
+    // The main thread holds G through the rest of startup; the other receive
+    // threads, started last, wait for it.
+    let mut held = lock_ledger();
+    let l: &mut MemLedger = &mut held;
+    ingest_pool(l, &boot);
 
     // The procmgr_badge cap doubles as the auth gate for the procmgr-only
     // labels (`REGISTER_PROCESS`, `PROCESS_DIED`, `DONATE_MEMORY_CAPS`,
     // `DELEGATE_ASPACE`); each code path still checks the message badge
     // against `boot.procmgr_badge` independently of the record.
-    if !insert_boot_records(boot.procmgr_badge)
+    if !insert_boot_records(l, boot.procmgr_badge)
     {
         // No RAM for the boot records — fatal; refuse to enter dispatch.
         syscall::thread_exit();
     }
-    ingest_in_use(&boot);
+    ingest_in_use(l, &boot);
     // The object zone's one free span, once the arena holds the slot it takes.
     // Without it every seal is refused `QUOTA`, as with no span left.
-    let l = ledger_mut();
     let _ = ensure_slots(l, 1)
         && l.give_object_va(
             OBJECT_ZONE_VA,
@@ -5682,59 +5819,211 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
     // The compression worker, at the fair class's top under memmgr's own
     // `SchedControl` cap. Without it memmgr evicts nothing and serves as
     // before (services/memmgr/docs/memory-pool.md § Eviction).
-    let _ = evict::start_worker(ledger_mut(), startup.self_cspace, sched_control);
+    let _ = evict::start_worker(l, startup.self_cspace, sched_control);
 
+    // The main thread is CPU 0's receive thread; each other CPU gets its own
+    // (services/memmgr/docs/memory-pool.md § Receive threads). The threads
+    // read the bootstrap from `BOOT`, set before any of them starts.
+    let _ = syscall::thread_set_affinity(startup.self_thread, 0);
+    let _ = BOOT.set(boot);
+    start_receive_threads(l, startup.self_cspace, sched_control);
+    drop(held);
+    let Some(boot) = BOOT.get()
+    else
+    {
+        syscall::thread_exit();
+    };
+    serve(evict::RECLAIM_WAIT_MS, ipc_buf, boot)
+}
+
+/// The bootstrap init handed memmgr, which every receive thread reads: set by
+/// the main thread once, before the other receive threads start.
+static BOOT: Once<InitBootstrap> = Once::new();
+
+/// Receive threads serving memmgr's endpoint, the main thread included; read
+/// for the `CSpace` mark ([`cspace_low_water`]).
+static RECEIVE_THREADS: AtomicU64 = AtomicU64::new(1);
+
+/// Start a receive thread for each CPU but CPU 0, whose is the main thread
+/// ([`start_receive_thread`]). A CPU whose thread cannot be started is
+/// served by the others: every thread receives on the one endpoint.
+fn start_receive_threads(l: &mut MemLedger, self_cspace: u64, sched: u64)
+{
+    let cpus = syscall::system_info(syscall_abi::SystemInfoType::CpuCount as u64).unwrap_or(1);
+    let Ok(thread_bytes) =
+        syscall::system_info(syscall_abi::SystemInfoType::ThreadRetypeBytes as u64)
+    else
+    {
+        return;
+    };
+    let Ok(thread_pages) = u32::try_from(thread_bytes.div_ceil(PAGE_SIZE))
+    else
+    {
+        return;
+    };
+    for cpu in 1..cpus.min(THREAD_SLOTS)
+    {
+        if start_receive_thread(l, self_cspace, sched, cpu, thread_pages)
+        {
+            RECEIVE_THREADS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Start the receive thread of CPU `cpu`, below the zone's slot count, in
+/// its slot of the receive-thread zone ([`THREAD_ZONE_VA`]): a run of
+/// `thread_pages` pages from the pool retyped into the thread, at
+/// `ipc::sched_policy::MEMMGR_PRIORITY` under memmgr's `SchedControl` cap
+/// `sched`, hard-affine to the CPU, and a run mapped as its stack and its IPC
+/// buffer page. Both runs leave the pool for good and stay in `pool_total` as
+/// memmgr's metadata. The thread has no fault handler: its fault, like any
+/// exit of a receive thread, ends memmgr. `false` when it cannot start.
+fn start_receive_thread(
+    l: &mut MemLedger,
+    self_cspace: u64,
+    sched: u64,
+    cpu: u64,
+    thread_pages: u32,
+) -> bool
+{
+    let Ok(cpu_id) = u32::try_from(cpu)
+    else
+    {
+        return false;
+    };
+    let slot = THREAD_ZONE_VA.saturating_add(cpu.saturating_mul(THREAD_SLOT_PAGES * PAGE_SIZE));
+    let stack = slot.saturating_add(PAGE_SIZE);
+    let top = stack.saturating_add(RECEIVE_STACK_PAGES * PAGE_SIZE);
+    let ipc_page = top.saturating_add(PAGE_SIZE);
+    let Ok(grant) = u32::try_from(RECEIVE_RUN_PAGES)
+        .map_err(|_| memmgr_errors::QUOTA)
+        .and_then(|pages| select(l, pages, Fit::Contiguous))
+    else
+    {
+        return false;
+    };
+    let (run, run_pages, phys) = grant.entries[0];
+    // SAFETY: the stack and the IPC page lie in CPU `cpu`'s slot of the
+    // receive-thread zone, which nothing maps before this thread's start.
+    let mapped = unsafe { map_self(l, run, stack, 0, RECEIVE_STACK_PAGES) }.is_ok()
+        && unsafe { map_self(l, run, ipc_page, RECEIVE_STACK_PAGES, 1) }.is_ok();
+    if !mapped
+    {
+        // SAFETY: as above; the slot holds nothing memmgr runs on yet.
+        let _ = unsafe { syscall::mem_unmap(self_aspace(), stack, RECEIVE_STACK_PAGES) };
+        return_taken(l, run, run_pages, phys);
+        return false;
+    }
+    l.add_own_pages(u64::from(run_pages));
+    if cspace_short(self_cspace)
+    {
+        top_up_cspace(l, self_cspace);
+    }
+    let Ok(grant) = select(l, thread_pages, Fit::Contiguous)
+    else
+    {
+        return false;
+    };
+    let (outer, taken, phys) = grant.entries[0];
+    let Ok(thread) = syscall::cap_create_thread(
+        outer,
+        self_aspace(),
+        self_cspace,
+        sched,
+        ipc::sched_policy::MEMMGR_PRIORITY,
+    )
+    else
+    {
+        return_taken(l, outer, taken, phys);
+        return false;
+    };
+    // The thread holds its own reference on the run, which leaves the pool.
+    l.add_own_pages(u64::from(taken));
+    let _ = syscall::cap_delete(outer);
+    // An offline CPU is refused: its thread is never started.
+    if syscall::thread_set_affinity(thread, cpu_id).is_err()
+    {
+        let _ = syscall::cap_delete(thread);
+        return false;
+    }
+    // SAFETY: `receive_entry` is an `extern "C" fn(u64) -> !` that never
+    // returns; `top` tops the stack mapped above, which nothing else uses; no
+    // TLS block is set, and memmgr reads none.
+    let configured = unsafe {
+        syscall::thread_configure(thread, receive_entry as *const () as u64, top, ipc_page)
+    };
+    configured.is_ok() && syscall::thread_start(thread).is_ok()
+}
+
+/// A receive thread other than the main one: register its IPC buffer page,
+/// `ipc_page`, and serve.
+extern "C" fn receive_entry(ipc_page: u64) -> !
+{
+    // SAFETY: `ipc_page` is this thread's IPC buffer page, mapped in its slot
+    // of the receive-thread zone for it alone (`start_receive_thread`).
+    if unsafe { syscall::ipc_buffer_set(ipc_page) }.is_err()
+    {
+        syscall::thread_exit();
+    }
+    let Some(boot) = BOOT.get()
+    else
+    {
+        syscall::thread_exit();
+    };
+    serve(0, ipc_page as *mut u64, boot)
+}
+
+/// A receive thread's loop (services/memmgr/docs/memory-pool.md
+/// § Receive loop): a turn runs from one receive's return to the next
+/// receive, its request's handling, if any, under its stripe and G, then the
+/// tail under G, whose steps each send the reply first, alone, when they have
+/// work to do; a reply still set rides the next receive. The first turn has
+/// no receive before it. While eviction runs, a receive waits
+/// `reclaim_wait_ms` milliseconds at most, so completions drain and the clock
+/// runs with no message arriving: the main thread's
+/// (`evict::RECLAIM_WAIT_MS`); every other thread's is `0` and its receive
+/// waits without bound.
+fn serve(reclaim_wait_ms: u64, ipc_buf: *mut u64, boot: &'static InitBootstrap) -> !
+{
     // memmgr has no log channel; on persistent recv failure its signals are
     // the kernel's rate-limited pre-allocate diagnostic and the loud
     // EXIT_RECV_WEDGE death itself.
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
-    // SAFETY: ipc_buf is memmgr's registered IPC buffer page, and this thread
-    // is the receive loop, the only one that sends through the answer.
+    // SAFETY: ipc_buf is this thread's registered IPC buffer page, and the
+    // answer stays on this thread, the only one that sends through it.
     let mut answer = unsafe { Answer::new(boot.service_ep, ipc_buf) };
-    // A turn runs from one receive's return to the next receive
-    // (services/memmgr/docs/memory-pool.md § Receive loop): the message's
-    // handling, if any, then the tail, whose steps each send the reply first,
-    // with a receive that does not wait, when they have work to do; a reply
-    // still set rides the next receive, and a call the earlier send bound is
-    // the next request. The first turn has no receive before it.
     // The request buffer every receive reads into, valid while `has_req`.
     let mut req = IpcMessage::new(0);
     let mut has_req = false;
     let mut received = false;
     loop
     {
+        // The stripe of the process the request acts for, before G.
+        answer.stripe = has_req.then(|| STRIPES.lock(stripe_key(&req, boot.procmgr_badge)));
+        let mut held = lock_ledger();
         if has_req
         {
-            dispatch(&req, &mut answer, &boot);
-            retire_objects(ledger_mut(), &mut answer);
-            signal_limits();
+            dispatch(&mut held, &req, &mut answer, boot);
+            retire_objects(&mut held, &mut answer);
         }
         // A failed receive's turn is the top-up alone, before the retry.
         if received
         {
-            evict::turn(ledger_mut(), &mut answer);
+            evict::turn(&mut held, &mut answer);
         }
-        hold_cspace_headroom(startup.self_cspace, &mut answer);
+        hold_cspace_headroom(&mut held, boot.self_cspace, &mut answer);
         // After the top-up, which draws on the free pool too, so the level a
         // registrant reads is the one the next receive starts from.
-        signal_pressure(&mut answer);
-        // While the clock runs or a compression job is in flight, a receive
-        // that waits a bounded time, so the loop drains completions and runs
-        // the clock with no message arriving; else one that waits for a
-        // message (services/memmgr/docs/memory-pool.md § Eviction).
+        signal_pressure(&mut held, &mut answer);
         let wait = if evict::in_flight() || evict::clocking()
         {
-            evict::RECLAIM_WAIT_MS
+            reclaim_wait_ms
         }
         else
         {
             0
         };
-        let got = answer.next_request(wait, &mut req);
-        // A failed receive ends its turn too, so the top-up before the retry
-        // can recheck the deferred list: that top-up is what refills a spent
-        // receive reserve.
-        begin_turn();
+        let got = answer.next_request(held, wait, &mut req);
         received = true;
         has_req = match got
         {
@@ -5753,4 +6042,23 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
             }
         };
     }
+}
+
+/// The key of the stripe a request takes ([`STRIPES`]): the process it acts
+/// for. That is the child a procmgr label names by its memmgr badge in
+/// `data[0]` (`PROCESS_DIED`, `DELEGATE_ASPACE`, `MAKE_RESIDENT`,
+/// `MAKE_PRIVATE`, `CAPTURE_CHUNKS`), and the caller's badge otherwise, a
+/// fault delivery's, which names the faulting process, included.
+fn stripe_key(req: &IpcMessage, procmgr_badge: u64) -> u64
+{
+    let names_child = req.label != syscall_abi::FAULT_LABEL
+        && matches!(
+            req.label & 0xFFFF,
+            memmgr_labels::PROCESS_DIED
+                | memmgr_labels::DELEGATE_ASPACE
+                | memmgr_labels::MAKE_RESIDENT
+                | memmgr_labels::MAKE_PRIVATE
+                | memmgr_labels::CAPTURE_CHUNKS
+        );
+    free_pool::lock::acted_for(req.badge, procmgr_badge, names_child.then(|| req.word(0)))
 }

@@ -23,8 +23,8 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, PAGE_SIZE};
 use crate::capture::Dest;
 use crate::{
     Answer, COPY_VA, COPY_WINDOW_PAGES, FaultDecline, MemLedger, back_span_with, cap_badge,
-    delete_caps, ensure_committed_slots, fault_target, ledger_mut, map_self,
-    release_unmapped_chunk, self_aspace,
+    delete_caps, ensure_committed_slots, fault_target, map_self, release_unmapped_chunk,
+    self_aspace,
 };
 
 const _: () = assert!(FILL_CHUNKS as u64 == memmgr_labels::FILL_CHUNKS);
@@ -43,6 +43,7 @@ const READ_WORDS: usize = 2;
 /// report the object's pages and whether it carries the checkpoint mark.
 /// Deletes every cap before the reply, whatever it is.
 pub(crate) fn handle_object_read(
+    l: &mut MemLedger,
     req: &IpcMessage,
     caps: &[u64],
     answer: &mut Answer,
@@ -54,7 +55,7 @@ pub(crate) fn handle_object_read(
         Some((&cap, dest)) => (cap_badge(service_ep, cap), dest),
         None => (None, caps),
     };
-    let served = read(req, handle, dest);
+    let served = read(l, req, handle, dest);
     delete_caps(dest);
     match served
     {
@@ -68,9 +69,13 @@ pub(crate) fn handle_object_read(
 
 /// The reply to the `OBJECT_READ` `req`, whose object handle's badge is
 /// `handle` and whose destination caps are `caps`, or its error label.
-fn read(req: &IpcMessage, handle: Option<u64>, caps: &[u64]) -> Result<IpcMessage, u64>
+fn read(
+    l: &mut MemLedger,
+    req: &IpcMessage,
+    handle: Option<u64>,
+    caps: &[u64],
+) -> Result<IpcMessage, u64>
 {
-    let l = ledger_mut();
     let obj = handle
         .filter(|b| b & memmgr_labels::OBJECT_HANDLE_TAG != 0)
         .and_then(|b| l.find_object(b))
@@ -150,6 +155,7 @@ fn copy_pages(l: &MemLedger, obj: NodeIdx, first: u64, dst: &mut [u8])
 /// is `caps[0]`, a SEND on `service_ep` read and deleted first, and reply
 /// the pages backed.
 pub(crate) fn handle_fill_region(
+    l: &mut MemLedger,
     req: &IpcMessage,
     caps: &[u64],
     answer: &mut Answer,
@@ -157,7 +163,7 @@ pub(crate) fn handle_fill_region(
 )
 {
     let handle = caps.first().and_then(|&cap| cap_badge(service_ep, cap));
-    match fill_region(req, handle)
+    match fill_region(l, req, handle)
     {
         Ok(pages) =>
         {
@@ -184,9 +190,8 @@ struct Filled
 /// check every chunk first, then back each named page that holds no data
 /// ([`fill_path`]); returns the pages backed, or the error label, the pages
 /// backed before a failure staying backed, so a repeat backs the rest.
-fn fill_region(req: &IpcMessage, handle: Option<u64>) -> Result<u64, u64>
+fn fill_region(l: &mut MemLedger, req: &IpcMessage, handle: Option<u64>) -> Result<u64, u64>
 {
-    let l = ledger_mut();
     let rec = l.find(req.badge).ok_or(memmgr_errors::INVALID_ARGUMENT)?;
     let obj = handle
         .filter(|b| b & memmgr_labels::OBJECT_HANDLE_TAG != 0)
@@ -397,6 +402,7 @@ fn decline_label((reason, _): (FaultDecline, u64)) -> u64
 /// endpoint `service_ep` whose badge names the record that sealed it. Both
 /// caps are read and deleted first.
 pub(crate) fn handle_mark_checkpoint(
+    l: &mut MemLedger,
     req: &IpcMessage,
     caps: &[u64],
     answer: &mut Answer,
@@ -411,7 +417,6 @@ pub(crate) fn handle_mark_checkpoint(
         answer.set_status(memmgr_errors::UNAUTHORIZED);
         return;
     }
-    let l = ledger_mut();
     let obj = handle
         .filter(|b| b & memmgr_labels::OBJECT_HANDLE_TAG != 0)
         .and_then(|b| l.find_object(b));

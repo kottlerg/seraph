@@ -6,7 +6,7 @@
 //! Memory-pressure levels: how close the free pool's pages outside `promised`
 //! (`services/memmgr/docs/memory-pool.md` § Commit) are to the floor growth
 //! outside the system reserve must leave ([`growth_floor`]), with hysteresis so a pool that hovers at a threshold does not flip the
-//! level on every turn of memmgr's receive loop. memmgr signals every
+//! level on every turn of a memmgr receive thread. memmgr signals every
 //! registered process when the level changes
 //! (`services/memmgr/docs/memory-pool.md` § Memory pressure).
 
@@ -58,7 +58,7 @@ pub struct PressureBits
     pub draw_room: u32,
 }
 
-/// What one turn of memmgr's receive loop signals to the registrants: a
+/// What one turn of a memmgr receive thread signals to the registrants: a
 /// change of the level, an opening of the draw room, or both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PressureSignal

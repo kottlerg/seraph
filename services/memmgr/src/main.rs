@@ -2990,13 +2990,19 @@ fn select_fault_run(
 {
     if let Some(reg) = target.committed
     {
-        // The chunk the fault backs, which its own draw does not evict and
-        // which a declined draw is noted for.
-        let chunk = l
+        // The chunk the fault backs, which its own draw does not evict.
+        let spare = l
             .region_for(target.rec, target.page_base)
             .map(|(_, region)| (reg, chunk_for(&region, target.page_base).0));
         // The span is a preference: the draw evicts only for the faulting page.
-        let room = evict::draw_room(l, target.rec, u64::from(span_pages), 1, chunk);
+        let room = evict::draw_room(
+            l,
+            target.rec,
+            u64::from(span_pages),
+            1,
+            spare,
+            (reg, target.page_base),
+        );
         // At most `span_pages`, so it fits a `u32`.
         let pages = u32::try_from(room).unwrap_or(span_pages);
         if pages == 0
@@ -4006,8 +4012,9 @@ fn signal_pressure(answer: &mut Answer)
     }
     if open
     {
-        // A declined draw memmgr could not name ends with the opening once no
-        // named one is left; a named one ends only when it is served.
+        // A declined draw past the ledger's table ends with the opening once
+        // no named one is left; a named one ends only when a run covers its
+        // page.
         l.note_draw_open();
     }
     // SAFETY: as above.

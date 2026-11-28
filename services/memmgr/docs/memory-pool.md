@@ -1129,18 +1129,19 @@ Kernel-origin fault message); with no swap slot registered that is a pool with n
 The draw room is open at a demand chunk's pages or more, room for any one committed draw, and memmgr
 signals its opening to every `REGISTER_PRESSURE` registrant that gave bits for it ([Memory
 pressure](#memory-pressure), Signal); crashd holds a commit overrun until then ([crashd Operation §
-Hold](../../crashd/docs/operation.md#hold)). memmgr names each draw it declined by its chunk and
-keeps it until a draw for that chunk finds its frames or the chunk ends, cut by `SHRINK_REGION`, its
-region unregistered or its process gone. An opening of the draw room does not end one: a reserve
-node's draw takes any free page, so it can take the room back below a demand chunk before crashd
-reads it, and the held fault, the only draw short, would then wait with nothing evicting for it. The
-ledger names `SHORT_DRAWS` declined draws at once; one past them, or one whose chunk memmgr cannot
-name, holds until no named one is left and the draw room opens. A thread whose draw is declined and
-that never draws again (killed with its process alive) keeps memmgr evicting for frames until its
-process ends, but only while the free frames stand at or below the growth floor and the band:
-eviction for it stops once they pass that. The admission and draw rules and A are the host-tested
-`free-pool` ledger's (`promise_free`, `uncommitted_free`, `draw_room`, `frames_short`,
-`note_short_draw` and `allowance`).
+Hold](../../crashd/docs/operation.md#hold)). memmgr names each draw it declined by its faulting page
+and keeps it until a run is recorded over that page, by a fault's backing or a restore, or the page
+ends, cut by `SHRINK_REGION`, its region unregistered or its process gone. A run over another page
+of the chunk serves no other thread's draw, since a fault's span is clamped to the pages found. An
+opening of the draw room does not end one either: a reserve node's draw takes any free page, so it
+can take the room back below a demand chunk before crashd reads it, and the held fault, the only
+draw short, would then wait with nothing evicting for it. The ledger names `SHORT_DRAWS` declined
+draws at once; one past them holds until no named one is left and the draw room opens. A thread
+whose draw is declined and that never draws again (killed with its process alive) keeps memmgr
+evicting for frames until its process ends, but only while the free frames stand at or below the
+growth floor and the band: eviction for it stops once they pass that. The admission and draw rules
+and A are the host-tested `free-pool` ledger's (`promise_free`, `uncommitted_free`, `draw_room`,
+`frames_short`, `note_short_draw` and `allowance`).
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops

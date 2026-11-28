@@ -1178,12 +1178,10 @@ pub(crate) fn restore(
 {
     let backed = l.chunk_at(reg, page_base).backed();
     let pages = u64::from(backed.count_ones());
-    let (chunk_base, _) = chunk_for(region, page_base);
     let (admitted, short) = if l.is_committed(reg)
     {
-        // The chunk is evicted, so no victim: naming it spares nothing.
         (
-            draw_room(l, rec, pages, pages, Some((reg, chunk_base))) >= pages,
+            draw_room(l, rec, pages, pages, None, (reg, page_base)) >= pages,
             FaultDecline::CommitOverrun,
         )
     }
@@ -1198,6 +1196,7 @@ pub(crate) fn restore(
     // Read after the admission, whose direct reclaim changes the chunk
     // tables: the chunk itself stays compressed, since it is no victim.
     let entry = l.chunk_at(reg, page_base);
+    let (chunk_base, _) = chunk_for(region, page_base);
     let mut runs = [FrameDesc::default(); CHUNK_RUNS];
     let n = select_restore_runs(l, backed, chunk_base, &mut runs)?;
     let runs = runs.get(..n).unwrap_or(&[]);
@@ -1266,31 +1265,32 @@ fn admit_restore(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> bool
 /// one once the restore headroom is full), any for a reserve node, until the
 /// draw fits or
 /// [`MAX_SYNC_VICTIMS`] have been tried (services/memmgr/docs/memory-pool.md
-/// § Commit, Overcommit); `chunk`, a region and the base of a chunk of it,
-/// names the chunk the draw backs, which is never taken. With no swap slot
-/// registered the draw always fits while a page is free. Returns the pages
-/// the draw may take; 0 makes it a commit overrun, and memmgr then evicts for
-/// frames in the background until a draw for that chunk fits or the chunk
-/// ends ([`frames_short`], [`free_pool::Ledger::note_short_draw`]).
+/// § Commit, Overcommit); `spare`, a region and the base of a chunk of it,
+/// names the chunk a fault backs, which is never taken. `page`, a region of
+/// `rec` and a page of it, names the faulting page the draw is for. With no
+/// swap slot registered the draw always fits while a page is free. Returns
+/// the pages the draw may take; 0 makes it a commit overrun, and memmgr then
+/// evicts for frames in the background until a run is recorded over that
+/// page or the page ends ([`frames_short`],
+/// [`free_pool::Ledger::note_short_draw`]).
 pub(crate) fn draw_room(
     l: &mut MemLedger,
     rec: NodeIdx,
     want: u64,
     least: u64,
-    chunk: Option<(NodeIdx, u64)>,
+    spare: Option<(NodeIdx, u64)>,
+    page: (NodeIdx, u64),
 ) -> u64
 {
     let floor = draw_floor(l, rec);
     let need = if floor == 0 { Need::Frames } else { Need::Draw };
-    if !reclaim(l, need, chunk, |l| l.draw_room(floor) >= least)
+    if !reclaim(l, need, spare, |l| l.draw_room(floor) >= least)
     {
-        // The draw is short: memmgr evicts for frames until it is served.
-        l.note_short_draw(rec, chunk);
+        // The draw is short: memmgr evicts for frames until a run is
+        // recorded over the page.
+        let (reg, va) = page;
+        l.note_short_draw(rec, reg, va);
         return 0;
-    }
-    if let Some(chunk) = chunk
-    {
-        l.serve_short_draw(rec, chunk);
     }
     l.draw_room(floor).min(want)
 }

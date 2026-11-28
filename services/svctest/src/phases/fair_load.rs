@@ -9,13 +9,16 @@
 //! level: [`LOAD_THREADS`] CPU-bound threads, as many threads that call logd
 //! in a loop, and both.
 //!
-//! Under the CPU-bound load nine timed calls in ten complete within
-//! [`TIMED_BOUND`], every one within [`SLOWEST_BOUND`], and their median stays
-//! within [`MEDIAN_FACTOR`] times the quiet median
-//! (core/kernel/docs/scheduler.md § Service Call Latency). timed's request
-//! path blocks only in IPC, the precondition of that bound; logd's waits on
-//! its own state lock mid-request, so its calls, and every call under the
-//! other two loads, are logged and not judged.
+//! The bound a timed call under the CPU-bound load meets is the one
+//! core/kernel/docs/scheduler.md § Service Call Latency derives: timed's
+//! request work, two switches and the RT work on the two CPUs, tens of
+//! microseconds. The phase checks it with margins for the host, which the
+//! kernel does not bound: nine timed calls in ten within [`TIMED_BOUND`], every
+//! one within [`SLOWEST_BOUND`], and their median within [`MEDIAN_FACTOR`]
+//! times the quiet median; each run logs the median, p90, p99 and slowest
+//! call. timed's request path blocks only in IPC, the precondition of that
+//! bound; logd's waits on its own state lock mid-request, so its calls, and
+//! every call under the other two loads, are logged and not judged.
 
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
@@ -54,17 +57,16 @@ const SETTLE: Duration = Duration::from_millis(300);
 /// The probe's last call under a load starts this long before the load ends.
 const MARGIN: Duration = Duration::from_millis(300);
 
-/// The bound on nine timed calls in ten under the CPU-bound load: a fifth of
-/// the default level's slice. The bound the kernel gives this probe is two
-/// switches, timed's request work and the RT work on the two CPUs, tens of
-/// microseconds; the margin is for the host preempting a vCPU.
+/// The threshold for nine timed calls in ten under the CPU-bound load, a
+/// fifth of the default level's slice: a margin over the derived bound of tens
+/// of microseconds for the host preempting a vCPU, not the bound itself.
 const TIMED_BOUND: Duration = Duration::from_millis(2);
 
-/// The bound on every timed call under the CPU-bound load: half the default
-/// level's slice, so a call that waited out the second half of a spinner's
-/// slice fails, and with a call every 10 ms a probe that waits behind the
-/// spinners does so on many calls. Above [`TIMED_BOUND`] by room for one
-/// call the host delays past it (2.8 ms once on riscv64 under TCG in CI).
+/// The threshold for every timed call under the CPU-bound load, half the
+/// default level's slice: a margin, not the bound. A call that waited out a
+/// spinner's slice, the delay the bound removes, still fails it, while one
+/// call the host delays past [`TIMED_BOUND`] (2.8 ms once on riscv64 under
+/// TCG in CI) does not.
 const SLOWEST_BOUND: Duration = Duration::from_millis(5);
 
 /// The bound on the median timed call under the CPU-bound load, as a

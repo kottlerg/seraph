@@ -870,8 +870,8 @@ carried caps:
 - `INVALID_ARGUMENT`: `CREATE_OPEN_EXISTING` without `CREATE_OPEN`; or, with
   `CREATE_OPEN`, no `caps[0]` or one on another endpoint. `INVALID_BADGE`:
   a `caps[0]` on the driver's endpoint that names no live session.
-- `IO_ERROR`: an empty name, one longer than the message, an invalid name
-  (one `namespace_protocol::validate_name` refuses), or one no FAT long
+- `INVALID_ARGUMENT`: an empty name, one longer than the message, an invalid
+  name (one `namespace_protocol::validate_name` refuses), or one no FAT long
   name can hold (holding U+FFFF, or longer than 255 UTF-16 code units).
 - With `CREATE_OPEN`, the open's refusals as `FS_OPEN` lists them (`LIMIT`,
   `OUT_OF_MEMORY`, `INVALID_ARGUMENT`, `TOO_MANY_OPEN`, `IO_ERROR`), and
@@ -983,9 +983,9 @@ Both names share the data area after the two length words, so
 (`MAX_NAME_LEN`, 255 bytes, per
 [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)):
 a pair of individually valid names can exceed it, and a client MUST NOT
-send such a pair. The server replies `IO_ERROR` to a zero length, or to
-lengths whose sum exceeds the name bytes the message carries after the two
-length words.
+send such a pair. The server replies `INVALID_ARGUMENT` to a zero length, or
+to lengths whose sum exceeds the name bytes the message carries after the
+two length words.
 
 **Reply (success)**: `label = 0`, empty body.
 
@@ -1016,11 +1016,12 @@ the source's 8.3 slot, as `FS_REMOVE` does:
   driver replies `IO_ERROR` without undoing anything and drops the
   source's node. Both names may remain.
 
-**Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
-occupied), `NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name or
-a destination no FAT long name can hold, as `FS_CREATE` refuses them, a
-failed block access, or a corrupt directory),
-`PERMISSION_DENIED`, `INVALID_BADGE` (the badge is not a directory node).
+**Errors**: `INVALID_ARGUMENT` (malformed name lengths, an invalid source or
+destination name, or a destination no FAT long name can hold, as `FS_CREATE`
+refuses them), `NOT_FOUND` (source missing), `EXISTS` (destination
+occupied), `NO_SPACE`, `IO_ERROR` (a failed block access, or a corrupt
+directory), `PERMISSION_DENIED`, `INVALID_BADGE` (the badge is not a
+directory node). None of the `INVALID_ARGUMENT` refusals writes anything.
 
 ---
 

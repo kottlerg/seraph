@@ -3042,7 +3042,7 @@ fn create_entry_common(
     let Some(name) = create_name(msg)
     else
     {
-        reply_err(ipc::fs_errors::IO_ERROR, reply);
+        reply_err(ipc::fs_errors::INVALID_ARGUMENT, reply);
         return;
     };
     // The node's slot is taken before the entry is written, so a full node
@@ -3258,7 +3258,7 @@ fn prepare_create_open<'a>(
     let Some(name) = create_name(msg)
     else
     {
-        open.refuse(ipc::fs_errors::IO_ERROR, reply);
+        open.refuse(ipc::fs_errors::INVALID_ARGUMENT, reply);
         return None;
     };
     let id = record_open(session, open, opens, cache, ipc_buf, reply)?;
@@ -3555,15 +3555,17 @@ fn handle_rename_node_cap(
     })
     else
     {
-        reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
+        reply_err_now(ipc::fs_errors::INVALID_ARGUMENT, reply, service, ipc_buf);
         return;
     };
 
+    // A source no long name can hold names no entry, so it is answered
+    // `NOT_FOUND` by the lookup below.
     if namespace_protocol::validate_name(src_name).is_err()
         || namespace_protocol::validate_name(dst_name).is_err()
         || !fat_parse::is_storable_name(dst_name)
     {
-        reply_err_now(ipc::fs_errors::IO_ERROR, reply, service, ipc_buf);
+        reply_err_now(ipc::fs_errors::INVALID_ARGUMENT, reply, service, ipc_buf);
         return;
     }
 

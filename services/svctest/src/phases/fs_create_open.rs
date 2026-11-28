@@ -14,9 +14,9 @@
 //! asks to open it (`CREATE_OPEN_EXISTING`), and then opens it unless the
 //! directory's cap lacks `LOOKUP` (`PERMISSION_DENIED`), a directory of that
 //! name is `IS_A_DIRECTORY`, a request with no session cap or with
-//! the second flag alone is `INVALID_ARGUMENT`, a name no FAT long name can
-//! hold (U+FFFF) is `IO_ERROR` with no entry made, and in a session whose node is
-//! at its max a create, and an open of an existing file, are `LIMIT` and make
+//! the second flag alone is `INVALID_ARGUMENT`, every invalid name
+//! ([`INVALID_NAMES`]) is `INVALID_ARGUMENT` with no entry made, and in a
+//! session whose node is at its max a create, and an open of an existing file, are `LIMIT` and make
 //! no entry. Three children drive std's create: a `fs-create-open-full` child
 //! ([`full_session_main`]) fills its node to its max and its session with the
 //! `/data` driver to its pages, and its `File::create` and `create_new` fail
@@ -41,6 +41,7 @@ use crate::ipc_util::fs::{
 };
 use crate::ipc_util::ns::ns_lookup;
 use crate::phases::budget;
+use crate::phases::fs_ipc::{INVALID_NAMES, listing};
 use crate::phases::fs_sessions::{
     AT_MAX_NO_LIMIT, AT_MAX_PAGES, ESP_PROBE, NO_MAX, SESSION_MAX, at_max_fill, at_max_touch_stack,
     charge_handle, sub_node,
@@ -82,9 +83,6 @@ const LIMITED: &str = "co-limit.bin";
 const NO_SESSION: &str = "co-none.bin";
 /// The name a create with `CREATE_OPEN_EXISTING` alone tries.
 const EXISTING_ALONE: &str = "co-alone.bin";
-/// A valid name no FAT long name can hold: its U+FFFF is the code unit a
-/// long name's slots take as its end.
-const UNSTORABLE: &str = "co-\u{FFFF}.bin";
 /// A directory a create that opens an existing file meets.
 const DIR: &str = "co-dir";
 /// The bytes the phase writes through a new file's open cap.
@@ -179,8 +177,30 @@ fn create_open(
     ipc_buf: *mut u64,
 ) -> Result<(u64, u64), u64>
 {
-    let label = fs_labels::FS_CREATE | flags | ((name.len() as u64) << 16);
-    let mut builder = IpcMessage::builder(label).bytes(0, name.as_bytes());
+    create_open_raw(
+        dir,
+        name.as_bytes(),
+        name.len() as u64,
+        flags,
+        caps,
+        ipc_buf,
+    )
+}
+
+/// [`create_open`] of the bytes `name_bytes`, the request claiming `len`
+/// name bytes.
+fn create_open_raw(
+    dir: u64,
+    name_bytes: &[u8],
+    len: u64,
+    flags: u64,
+    caps: &[u64],
+    ipc_buf: *mut u64,
+) -> Result<(u64, u64), u64>
+{
+    let name = String::from_utf8_lossy(name_bytes);
+    let label = fs_labels::FS_CREATE | flags | (len << 16);
+    let mut builder = IpcMessage::builder(label).bytes(0, name_bytes);
     for &cap in caps
     {
         builder = builder.cap(cap);
@@ -382,22 +402,24 @@ fn raw_creates(svctest: u64, session: u64, ipc_buf: *mut u64)
         "{EXISTING_ALONE} was created"
     );
 
-    // A name no long name can hold is refused as an invalid name, by a
-    // create that opens and by a mkdir, and makes no entry.
+    // Every invalid name is refused by a create that opens, whether or not
+    // it would open an existing file, and makes no entry.
+    let before = listing(svctest, ipc_buf);
+    for &(what, name, len) in INVALID_NAMES
+    {
+        for flags in [OPEN, OPEN_EXISTING]
+        {
+            assert_eq!(
+                create_open_raw(svctest, name, len, flags, &[session_copy(session)], ipc_buf).err(),
+                Some(fs_errors::INVALID_ARGUMENT),
+                "a create that opens {what} (flags {flags:#x})"
+            );
+        }
+    }
     assert_eq!(
-        create_in(svctest, UNSTORABLE, OPEN, session, ipc_buf).err(),
-        Some(fs_errors::IO_ERROR),
-        "a create that opens a name holding U+FFFF"
-    );
-    assert_eq!(
-        fs_mkdir(svctest, UNSTORABLE.as_bytes(), ipc_buf).err(),
-        Some(fs_errors::IO_ERROR),
-        "a mkdir of a name holding U+FFFF"
-    );
-    assert_eq!(
-        entry_size(svctest, UNSTORABLE, ipc_buf),
-        None,
-        "a name holding U+FFFF was created"
+        listing(svctest, ipc_buf),
+        before,
+        "a create that opens an invalid name changed the directory"
     );
 }
 

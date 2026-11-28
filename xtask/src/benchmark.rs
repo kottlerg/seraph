@@ -28,9 +28,10 @@ crate::argparse::value_enum! {
     pub enum BenchMode
     {
         /// Instructions: boots under QEMU's icount (`run --icount`). A one-CPU
-        /// count of a window that does not idle repeats, unless the path's cost
-        /// depends on the order of earlier host-timed events, so the gate holds
-        /// those counts to a fixed band; four-CPU counts are reported
+        /// count of a window that does not idle, and that no interrupt or other
+        /// thread enters, repeats, unless the path's cost depends on the order
+        /// of earlier host-timed events, so the gate holds those counts to a
+        /// fixed band; four-CPU counts are reported
         /// (docs/testing.md § Benchmarks).
         Icount,
         /// Time on the reference host: `x86_64` boots under a native accelerator,

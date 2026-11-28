@@ -694,9 +694,9 @@ args! {
         /// QEMU's `-icount shift=0,sleep=on,align=off`, so the guest's clock
         /// and cycle counters advance one tick per retired instruction while a
         /// vCPU runs, the measure `bench-check --mode icount` compares, which
-        /// repeats for a one-CPU window that does not idle unless its cost
-        /// depends on the order of earlier host-timed events (docs/testing.md
-        /// § Benchmarks), and follow the host's time while every vCPU idles, so a
+        /// repeats for a one-CPU window that does not idle and that no interrupt
+        /// or other thread enters, unless its cost depends on the order of
+        /// earlier host-timed events (docs/testing.md § Benchmarks), and follow the host's time while every vCPU idles, so a
         /// device completion ends an idle as it would on hardware. Always
         /// TCG; on `x86_64` the CPU model drops x2APIC, whose timer QEMU's icount
         /// cannot serve, so the kernel runs its xAPIC paths.

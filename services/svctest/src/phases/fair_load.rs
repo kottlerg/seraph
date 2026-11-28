@@ -9,8 +9,9 @@
 //! level: [`LOAD_THREADS`] CPU-bound threads, as many threads that call logd
 //! in a loop, and both.
 //!
-//! Under the CPU-bound load every timed call completes within [`TIMED_BOUND`]
-//! and their median stays within [`MEDIAN_FACTOR`] times the quiet median
+//! Under the CPU-bound load nine timed calls in ten complete within
+//! [`TIMED_BOUND`], every one within [`SLOWEST_BOUND`], and their median stays
+//! within [`MEDIAN_FACTOR`] times the quiet median
 //! (core/kernel/docs/scheduler.md § Service Call Latency). timed's request
 //! path blocks only in IPC, the precondition of that bound; logd's waits on
 //! its own state lock mid-request, so its calls, and every call under the
@@ -53,11 +54,18 @@ const SETTLE: Duration = Duration::from_millis(300);
 /// The probe's last call under a load starts this long before the load ends.
 const MARGIN: Duration = Duration::from_millis(300);
 
-/// The bound on each timed call under the CPU-bound load: a fifth of the
-/// default level's slice. The bound the kernel gives this probe is two
-/// switches and timed's request work, tens of microseconds; the margin is
-/// for the host preempting a vCPU.
+/// The bound on nine timed calls in ten under the CPU-bound load: a fifth of
+/// the default level's slice. The bound the kernel gives this probe is two
+/// switches, timed's request work and the RT work on the two CPUs, tens of
+/// microseconds; the margin is for the host preempting a vCPU.
 const TIMED_BOUND: Duration = Duration::from_millis(2);
+
+/// The bound on every timed call under the CPU-bound load: half the default
+/// level's slice, so a call that waited out the second half of a spinner's
+/// slice fails, and with a call every 10 ms a probe that waits behind the
+/// spinners does so on many calls. Above [`TIMED_BOUND`] by room for one
+/// call the host delays past it (2.8 ms once on riscv64 under TCG in CI).
+const SLOWEST_BOUND: Duration = Duration::from_millis(5);
 
 /// The bound on the median timed call under the CPU-bound load, as a
 /// multiple of the quiet median.
@@ -123,21 +131,28 @@ fn fair_load_phase(_: &Caps)
     }
 }
 
-/// Fail the phase unless every timed call under the CPU-bound load took at
-/// most [`TIMED_BOUND`] and their median at most [`MEDIAN_FACTOR`] times
-/// `quiet_median`.
+/// Fail the phase unless nine timed calls in ten under the CPU-bound load took
+/// at most [`TIMED_BOUND`], every one at most [`SLOWEST_BOUND`], and their
+/// median at most [`MEDIAN_FACTOR`] times `quiet_median`.
 fn judge(timed: &[Duration], quiet_median: Duration)
 {
     assert!(
         !timed.is_empty(),
         "fair_load: no timed call under the CPU-bound load"
     );
+    let p90 = quantile(timed, 90);
+    assert!(
+        p90 <= TIMED_BOUND,
+        "fair_load: the p90 timed call under the CPU-bound load took {} us, past {} us",
+        p90.as_micros(),
+        TIMED_BOUND.as_micros()
+    );
     let slowest = quantile(timed, 100);
     assert!(
-        slowest <= TIMED_BOUND,
+        slowest <= SLOWEST_BOUND,
         "fair_load: a timed call under the CPU-bound load took {} us, past {} us",
         slowest.as_micros(),
-        TIMED_BOUND.as_micros()
+        SLOWEST_BOUND.as_micros()
     );
     let median = quantile(timed, 50);
     assert!(

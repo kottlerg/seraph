@@ -222,8 +222,9 @@ services/svctest/
         │                      #   after the RTC driver's restart serves the wall clock; the
         │                      #   RTC driver's create refused under memory pressure, retried
         ├── fair_load.rs       # timed and logd calls with no load, then under seven CPU-bound
-        │                      #   fair threads (each timed call within 2 ms, the median within
-        │                      #   10 times the quiet one), seven logd callers, and both, logged
+        │                      #   fair threads (nine timed calls in ten within 2 ms, each
+        │                      #   within 5 ms, the median within 10 times the quiet one),
+        │                      #   seven logd callers, and both, logged
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
         │                      #   fall-through, remount, a mapped page across the unmount,
         │                      #   a killed fs driver, its death's reason from a worker's exit

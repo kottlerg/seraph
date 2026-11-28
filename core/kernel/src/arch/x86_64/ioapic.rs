@@ -97,9 +97,10 @@
 //! entry's asserts and negates and an edge entry's edges alike, holding none pending (82093AA
 //! § 3.2.4), so an assertion still held at the unmask is delivered then, and an edge that
 //! arrived while the entry was masked is lost. A delivery a CPU accepted while its line was being released leaves Remote
-//! IRR set, which stays set when the line is routed again, on another vector, before that
-//! delivery's EOI; [`route`] clears it before it programs the entry again
-//! ([`remote_irr_clear`]).
+//! IRR set until its EOI. The release's mask clears the bit where the I/O APIC lists it
+//! read/write (§ Kept entries); where it is read-only, the bit stays set when the line is
+//! routed again, on another vector, before that delivery's EOI, and [`route`] clears it
+//! before it programs the entry again ([`remote_irr_clear`]).
 //!
 //! # Modification notes
 //! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_ROUTE`, through

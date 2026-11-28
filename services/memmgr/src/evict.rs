@@ -370,8 +370,8 @@ fn reclaiming(l: &MemLedger) -> bool
 
 /// Whether memmgr evicts in the background for free frames
 /// ([`free_pool::Ledger::frames_short`]): the free pool does not cover
-/// `promised`, or a committed draw declined is not yet served
-/// ([`draw_room`]), and the free frames stand at or below
+/// `promised`, or a committed draw found too few free pages since the draw
+/// room last opened ([`draw_room`]), and the free frames stand at or below
 /// the growth floor and the hysteresis band, or a demand chunk when the band
 /// is less, so the eviction opens the draw room
 /// (`ipc::memmgr_labels::QUERY_POOL_STATUS` `data[16]`). The frames then go
@@ -1181,7 +1181,7 @@ pub(crate) fn restore(
     let (admitted, short) = if l.is_committed(reg)
     {
         (
-            draw_room(l, rec, pages, pages, None, (reg, page_base)) >= pages,
+            draw_room(l, rec, pages, pages, None) >= pages,
             FaultDecline::CommitOverrun,
         )
     }
@@ -1266,30 +1266,25 @@ fn admit_restore(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> bool
 /// draw fits or
 /// [`MAX_SYNC_VICTIMS`] have been tried (services/memmgr/docs/memory-pool.md
 /// § Commit, Overcommit); `spare`, a region and the base of a chunk of it,
-/// names the chunk a fault backs, which is never taken. `page`, a region of
-/// `rec` and a page of it, names the faulting page the draw is for. With no
-/// swap slot registered the draw always fits while a page is free. Returns
-/// the pages the draw may take; 0 makes it a commit overrun, and memmgr then
-/// evicts for frames in the background until a run is recorded over that
-/// page or the page ends ([`frames_short`],
-/// [`free_pool::Ledger::note_short_draw`]).
+/// names the chunk a fault backs, which is never taken. With no swap slot
+/// registered the draw always fits while a page is free. Returns the pages
+/// the draw may take; 0 makes it a commit overrun, and memmgr then evicts for
+/// frames in the background until the draw room opens ([`frames_short`]).
 pub(crate) fn draw_room(
     l: &mut MemLedger,
     rec: NodeIdx,
     want: u64,
     least: u64,
     spare: Option<(NodeIdx, u64)>,
-    page: (NodeIdx, u64),
 ) -> u64
 {
     let floor = draw_floor(l, rec);
     let need = if floor == 0 { Need::Frames } else { Need::Draw };
     if !reclaim(l, need, spare, |l| l.draw_room(floor) >= least)
     {
-        // The draw is short: memmgr evicts for frames until a run is
-        // recorded over the page.
-        let (reg, va) = page;
-        l.note_short_draw(rec, reg, va);
+        // The draw is short: memmgr evicts for frames until the draw room
+        // opens.
+        l.note_short_draw();
         return 0;
     }
     l.draw_room(floor).min(want)

@@ -2061,7 +2061,9 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 /// outside `promised`, the part of `promised` the evicted chunks of
 /// committed regions hold, the used slots of memmgr's own `CSpace`, a
 /// count, which a cap memmgr kept by mistake raises for good, memmgr's
-/// metadata pages and the pages the frame records hold, one snapshot so the
+/// metadata pages and the pages the frame records hold, and whether a
+/// committed draw found too few free pages since the draw room last opened,
+/// so memmgr evicts for frames until it opens, one snapshot so the
 /// pool's accounts sum (services/memmgr/docs/ipc-interface.md § Label 6).
 /// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
 /// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
@@ -2103,6 +2105,7 @@ fn handle_query_pool_status(answer: &mut Answer, boot: &InitBootstrap)
         syscall::cap_info(boot.self_cspace, syscall_abi::CAP_INFO_CSPACE_USED).unwrap_or(0),
         l.metadata_pages().saturating_mul(PAGE_SIZE),
         l.held_pages().saturating_mul(PAGE_SIZE),
+        u64::from(l.draw_short()),
     ];
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .words(0, &words)
@@ -2995,14 +2998,7 @@ fn select_fault_run(
             .region_for(target.rec, target.page_base)
             .map(|(_, region)| (reg, chunk_for(&region, target.page_base).0));
         // The span is a preference: the draw evicts only for the faulting page.
-        let room = evict::draw_room(
-            l,
-            target.rec,
-            u64::from(span_pages),
-            1,
-            spare,
-            (reg, target.page_base),
-        );
+        let room = evict::draw_room(l, target.rec, u64::from(span_pages), 1, spare);
         // At most `span_pages`, so it fits a `u32`.
         let pages = u32::try_from(room).unwrap_or(span_pages);
         if pages == 0
@@ -4012,10 +4008,8 @@ fn signal_pressure(answer: &mut Answer)
     }
     if open
     {
-        // A declined draw past the ledger's table ends with the opening once
-        // no named one is left; a named one ends only when a run covers its
-        // page.
-        l.note_draw_open();
+        // A committed draw short from here on is noted again.
+        l.clear_short_draw();
     }
     // SAFETY: as above.
     unsafe { DRAW_OPEN = open };

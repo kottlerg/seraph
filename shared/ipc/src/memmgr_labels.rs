@@ -263,6 +263,12 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 /// * `data[21]` — `held_bytes`: the pages the frame records of processes
 ///   and memory objects hold, each charged to a budget node; a run on the
 ///   deferred list or in the store is not counted.
+/// * `data[22]` — `draw_short`: 1 while a committed draw has found too few
+///   free pages since the draw room (`data[16]`) last opened, so memmgr
+///   evicts for frames until it opens again; 0 from the turn that ends with
+///   it open. Read with `data[16]` in one reply: a room short with this 0
+///   has no eviction under way for a committed draw, which crashd's hold
+///   reads to re-ask a held commit overrun.
 ///
 /// The pages in no account are `data[2]` less `data[3]`, `data[4]`,
 /// `data[9]`, `data[20]` and `data[21]`. memmgr keeps each page it owns
@@ -271,7 +277,7 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
 /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-/// "dark" memory. `data[3]` to `data[21]` are appended fields — readers
+/// "dark" memory. `data[3]` to `data[22]` are appended fields — readers
 /// needing only the identity may ignore them.
 pub const QUERY_POOL_STATUS: u64 = 6;
 /// Register a demand-paged anonymous region for the calling process.

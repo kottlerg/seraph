@@ -116,7 +116,10 @@ the earliest hold's deadline, and receives from the crash endpoint without block
 set names it. When the endpoints or the wait set cannot be made, or the process has no pressure
 registration, it logs a warning and runs with no hold. It reads memmgr's level and draw room when
 the Notification has signalled since its last read, and the draw room again for each fault of code
-7 or 11 that reaches it, since memmgr signals the draw room's opening and not its closing. It takes
+7 or 11 that reaches it and each held commit overrun that reaches its slot, since memmgr signals
+the draw room's opening and not its closing. The draw room's read carries, in the same reply,
+whether memmgr evicts for a committed draw found short since the room last opened
+(`QUERY_POOL_STATUS` `data[22]`), which it takes as so while memmgr does not answer. It takes
 the level as `CRITICAL`, and the draw room as short, while memmgr does not answer. Every receive it
 makes, from the crash endpoint, the live-core endpoint and the slots' endpoints, goes through one
 receive guard ([docs/ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy): a
@@ -163,7 +166,16 @@ A holdable fault that arrives:
 When the memory a held fault waits for is there, the level below `CRITICAL` or the draw room open,
 crashd receives each such held fault that has arrived from its endpoint without blocking and resumes
 it, logging `resumed after <ms> ms: <back>`; the thread retries its access, which faults into memmgr
-again. A fault that has not arrived yet stays held, and is resumed when it arrives. When a hold's
+again. A fault that has not arrived yet stays held, and is resumed when it arrives. memmgr evicts
+for a commit overrun until the draw room next opens, and another draw can close the room again
+before crashd reads it, which would leave the held fault waiting on a room nothing opens. So after
+each read, every held commit overrun that has arrived while the room reads short and memmgr not
+evicting is re-asked: crashd resumes it, logging `re-asked after <ms> ms: no commit draw room and
+memmgr not evicting`, and its thread faults into memmgr again, which backs it or declines it again
+and evicts. Each is re-asked at once, since one memmgr backs leaves nothing to read the room again
+for the others. A fault of code 7 is not re-asked: memmgr's decline of it starts no such eviction.
+crashd keeps a re-asked fault's slot for its repeat until its hold's deadline, and the repeat is
+held there again, with no line of its own, to that deadline. When a hold's
 deadline passes first, crashd receives that fault, logs `hold timed out after <ms> ms` as a warning,
 and reports and declines it as [Per Fault](#per-fault) does, from the message it kept. A receive
 that finds nothing after the fault arrived frees the slot with no answer, logged `withdrawn after

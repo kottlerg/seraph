@@ -617,6 +617,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[19] | `cspace_used_slots` — the used slots of memmgr's own `CSpace` (`CAP_INFO_CSPACE_USED`), a count, not bytes: the caps memmgr holds, its free runs' and grants' among them, so a cap it kept by mistake raises it for good ([`memory-pool.md`](memory-pool.md#cspace-headroom) § CSpace headroom; § Capability Transfer) |
 | data[20] | `metadata_bytes` — subset of `pool_total_bytes` memmgr holds as its own metadata, charged to no node: its arena's pages, its process index's and its swap slot map's, the zero frames it keeps, and the pages it retyped into its own page tables, `CSpace` growth and eviction worker ([`memory-pool.md`](memory-pool.md#metadata-arena) § Metadata Arena); none goes back to the free runs but a zero frame a refused request took |
 | data[21] | `held_bytes` — subset of `pool_total_bytes` the frame records of processes and memory objects hold, each charged to a budget node: grants and page-table donations, the runs backing regions, a copy a make-private drew, and an object's frames; a run on the deferred list or in the store is not counted ([`memory-pool.md`](memory-pool.md#per-process-tracking) § Per-Process Tracking) |
+| data[22] | `draw_short` — 1 while a committed draw has found too few free pages since the draw room (`data[16]`) last opened, so memmgr evicts for frames until it opens again, and 0 from the turn that ends with it open; read with `data[16]` in the one reply, so a reader that finds the room short and this 0 knows that no eviction is under way for a committed draw ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -677,7 +678,7 @@ the pages in no account do not rise while it loses none; a reader that finds
 them above an earlier read once eviction has settled (`data[9]` and `data[10]`
 zero) has found pages memmgr lost. Each of the five accounts is kept as a
 running sum, so the reply costs no walk.
-`data[3]` to `data[21]` are appended after the identity terms;
+`data[3]` to `data[22]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`
@@ -2001,7 +2002,7 @@ not executable, is declined with code 4.
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents) or to copy an attachment's object page into it, or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
 | 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Committed fault declines); for a fault on a chunk memmgr is evicting, holds raw or evicted, in either kind of region, the page-table funding the map of the chunk's runs needs would, past what a committed region's page-table reservation still holds; a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
-| 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the growth floor, for a process outside the system reserve, while a swap service has registered swap slots) even after memmgr evicted victims in its turn; only registered swap slots, or memmgr's own metadata taking free pages without admission, make it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it until the draw room opens (`QUERY_POOL_STATUS` `data[16]`) |
+| 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the growth floor, for a process outside the system reserve, while a swap service has registered swap slots) even after memmgr evicted victims in its turn; only registered swap slots, or memmgr's own metadata taking free pages without admission, make it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it until the draw room opens (`QUERY_POOL_STATUS` `data[16]`), and re-asks it while the room reads short and `data[22]` 0 |
 | 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost, detail 2 when the swap service could not read the chunk's slot (swapd forwards a held fault with it) and the chunk stays on disk; memmgr itself produces details 0 and 1 only |
 
 Each demand run is recorded on its chunk in the region's chunk table, so

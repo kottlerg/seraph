@@ -311,25 +311,6 @@ enum Take
     Every,
 }
 
-/// The declined committed draws the ledger names at once
-/// ([`Ledger::note_short_draw`]): twice the faults crashd holds at once
-/// (`oom_hold::SLOTS`), each a thread waiting for its draw. A draw declined
-/// past them is noted without its page, and memmgr evicts for frames for it
-/// until no named draw is left and the draw room opens; the bound limits no
-/// draw or process.
-pub const SHORT_DRAWS: usize = 32;
-
-/// A committed draw memmgr declined for want of free frames, a commit overrun
-/// ([`Ledger::note_short_draw`]): the draw for the page at `page` of region
-/// `reg` of the record `rec`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ShortDraw
-{
-    rec: NodeIdx,
-    reg: NodeIdx,
-    page: u64,
-}
-
 /// The bookkeeping state.
 pub struct Ledger<S, W>
 {
@@ -361,15 +342,10 @@ pub struct Ledger<S, W>
     /// The subset of `swapped_pages` in the chunks of committed regions,
     /// which `promised` holds again ([`commit::allowance`]).
     committed_swapped: u64,
-    /// The committed draws declined and not yet served, each until a run is
-    /// recorded over its page or the page ends with its region or record
-    /// ([`Self::note_short_draw`]), which make memmgr evict for frames
-    /// ([`Self::frames_short`]).
-    short_draws: [Option<ShortDraw>; SHORT_DRAWS],
-    /// Whether a committed draw was declined that `short_draws` does not
-    /// name, which holds until none is named and the draw room opens
-    /// ([`Self::note_draw_open`]).
-    short_unnamed: bool,
+    /// Whether a committed draw found too few free pages since the draw room
+    /// last opened ([`Self::note_short_draw`], [`Self::clear_short_draw`]),
+    /// which makes memmgr evict for frames ([`Self::frames_short`]).
+    short_draw: bool,
     /// Evictions begun ([`Ledger::begin_evict`]), a count that only moves up,
     /// wrapping: every eviction, background or direct, ending compressed, raw
     /// or cancelled, starts there.
@@ -419,8 +395,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             slots: SwapSlots::new(swap_words),
             disk_pages: 0,
             committed_swapped: 0,
-            short_draws: [None; SHORT_DRAWS],
-            short_unnamed: false,
+            short_draw: false,
             evictions: 0,
             zero_frames: NODE_NULL,
             zero_frame_count: 0,
@@ -638,91 +613,46 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// Whether memmgr evicts in the background for free frames
     /// (`services/memmgr/docs/memory-pool.md` § Eviction, Selection): the
     /// committed draws are short, the free pool not covering `promised` or a
-    /// committed draw declined and not yet served ([`Self::note_short_draw`]),
-    /// and the free frames stand at or below the growth floor `floor` and the
-    /// hysteresis band `band`. Any evictable idle chunk is then a victim, a
-    /// committed one included, since the draws need free frames alone, so
-    /// write-out has chunks to take and frames come back for the committed
-    /// draws. While the free pool covers `promised` only the growth floor
-    /// keeps a draw short ([`Self::draw_room`]), and a frame eviction frees
-    /// above it can go to the next admission as well, which a process draining
-    /// the pool makes first; so eviction waits for a declined draw, and ends
-    /// when every declined draw is served. An opening of the draw room alone
-    /// does not end it: a reserve node's draw can take the room back before
-    /// the declined draw is made again.
+    /// committed draw having found too few free pages since the draw room last
+    /// opened ([`Self::note_short_draw`]), and the free frames stand at or
+    /// below the growth floor `floor` and the hysteresis band `band`. Any
+    /// evictable idle chunk is then a victim, a committed one included, since
+    /// the draws need free frames alone, so write-out has chunks to take and
+    /// frames come back for the committed draws. While the free pool covers
+    /// `promised` only the growth floor keeps a draw short
+    /// ([`Self::draw_room`]), and a frame eviction frees above it can go to
+    /// the next admission as well, which a process draining the pool makes
+    /// first; so eviction waits for a draw that found too few, and ends when
+    /// the draw room opens.
     #[must_use]
     pub fn frames_short(&self, floor: u64, band: u64) -> bool
     {
         let free = self.pool.free_pages();
-        (free < self.promised || self.draws_short()) && free <= floor.saturating_add(band)
+        (free < self.promised || self.short_draw) && free <= floor.saturating_add(band)
     }
 
-    /// Whether a declined committed draw is not yet served
-    /// ([`Self::note_short_draw`]).
-    fn draws_short(&self) -> bool
+    /// Whether a committed draw found too few free pages since the draw room
+    /// last opened ([`Self::note_short_draw`]): memmgr evicts for frames
+    /// until it opens (`ipc::memmgr_labels::QUERY_POOL_STATUS` `data[22]`).
+    #[must_use]
+    pub const fn draw_short(&self) -> bool
     {
-        self.short_unnamed || self.short_draws.iter().any(Option::is_some)
+        self.short_draw
     }
 
-    /// Record that the committed draw of `rec` for the page at `page` of its
-    /// region `reg`, the faulting page of a fault or of a restore, found too
-    /// few free pages and was declined, so memmgr evicts for frames
-    /// ([`Self::frames_short`]) until a run is recorded over that page
-    /// ([`Self::back_chunk`], [`Self::restore_chunk`]) or the page ends: cut
-    /// off its region ([`Self::shrink_region`]), its region removed or its
-    /// record ended. A run over another page of the chunk serves no other
-    /// thread's draw, since a fault's run need not cover its whole chunk. A
-    /// draw already named is named once. One past [`SHORT_DRAWS`] named draws
-    /// is noted unnamed, which holds until no draw is named and the draw room
-    /// opens ([`Self::note_draw_open`]).
-    pub fn note_short_draw(&mut self, rec: NodeIdx, reg: NodeIdx, page: u64)
+    /// Record that a committed draw found too few free pages, so memmgr
+    /// evicts for frames until the draw room opens ([`Self::frames_short`]).
+    pub fn note_short_draw(&mut self)
     {
-        let draw = ShortDraw { rec, reg, page };
-        if self.short_draws.contains(&Some(draw))
-        {
-            return;
-        }
-        match self.short_draws.iter_mut().find(|d| d.is_none())
-        {
-            Some(free) => *free = Some(draw),
-            None => self.short_unnamed = true,
-        }
+        self.short_draw = true;
     }
 
-    /// Serve each declined draw of `rec` for a page of its region `reg` that
-    /// the run `frame` covers ([`Self::note_short_draw`]).
-    fn serve_short_draws(&mut self, rec: NodeIdx, reg: NodeIdx, frame: &FrameDesc)
+    /// Record that the draw room opened, room for any one committed draw
+    /// (`ipc::memmgr_labels::QUERY_POOL_STATUS` `data[16]`): a committed
+    /// draw short since is noted again ([`Self::note_short_draw`]).
+    pub fn clear_short_draw(&mut self)
     {
-        let end = frame
-            .va
-            .saturating_add(u64::from(frame.page_count).saturating_mul(PAGE_SIZE));
-        self.end_short_draws(|d| {
-            d.rec == rec && d.reg == reg && d.page >= frame.va && d.page < end
-        });
-    }
-
-    /// Forget each declined draw `ends` names, its page gone or backed.
-    fn end_short_draws(&mut self, ends: impl Fn(&ShortDraw) -> bool)
-    {
-        for slot in &mut self.short_draws
-        {
-            if slot.as_ref().is_some_and(&ends)
-            {
-                *slot = None;
-            }
-        }
-    }
-
-    /// Record that the draw room is open, room for any one committed draw
-    /// (`ipc::memmgr_labels::QUERY_POOL_STATUS` `data[16]`): an unnamed
-    /// declined draw ([`Self::note_short_draw`]) ends once no draw is named.
-    /// A named one ends only when it is served or its chunk ends.
-    pub fn note_draw_open(&mut self)
-    {
-        if self.short_draws.iter().all(Option::is_none)
-        {
-            self.short_unnamed = false;
-        }
+        self.short_draw = false;
     }
 
     /// The free pages outside `promised` that a charge to a node outside the
@@ -2977,8 +2907,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// tables of the pages cut stay in the address space until the region is
     /// unregistered, and a regrowth up to the largest length the region has had
     /// adds no reservation ([`commit::regrow_need`]). Their mappings gone, the
-    /// pages cut keep no run deferred. A declined draw for a page cut ends
-    /// ([`Self::note_short_draw`]). A `new_len` equal to the length changes
+    /// pages cut keep no run deferred. A `new_len` equal to the length changes
     /// nothing.
     ///
     /// # Errors
@@ -3061,9 +2990,6 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             .saturating_sub(released.run_pages.saturating_add(released.swapped));
         let unpromised = cut.pages.saturating_sub(released.run_pages);
         let meta = cut.meta.min(c.meta_left);
-        // A declined draw for a page cut ends with it.
-        let top = new_region.va_base.saturating_add(new_len);
-        self.end_short_draws(|d| d.reg == reg && d.page >= top);
         node.region = new_region;
         self.arena.set_node(reg, Node::Region(node));
         self.set_commitment(
@@ -3547,7 +3473,6 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             budget::charge(&mut self.arena, charged, u64::from(frame.page_count));
         }
-        self.serve_short_draws(rec, reg, &frame);
         Ok(())
     }
 
@@ -4085,10 +4010,6 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             self.drop_disk(disk, pages);
         }
         self.put_chunk(rec, reg, node, height, index, resident);
-        for run in runs
-        {
-            self.serve_short_draws(rec, reg, run);
-        }
         if self.commit_at(node.commit).is_some()
         {
             self.promised = self.promised.saturating_sub(pages);
@@ -4769,8 +4690,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Unlink the region in slot `reg` from `rec`'s region list and free its
     /// slot and its chunk table, taking each run of the table back, pooled or
-    /// deferred as `quiescent` decides, and end each declined draw for a page
-    /// of it ([`Self::note_short_draw`]). memmgr unmaps the region first, so the
+    /// deferred as `quiescent` decides. memmgr unmaps the region first, so the
     /// region's own mappings do not keep a run deferred. Returns the region,
     /// or `None`, changing nothing, when `reg` is not one of `rec`'s regions.
     pub fn remove_region(
@@ -4799,7 +4719,6 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 }
                 self.release_region(&have, rec, r.budget, quiescent);
                 self.arena.free(cur);
-                self.end_short_draws(|d| d.reg == reg);
                 return Some(have.region);
             }
             prev = cur;
@@ -4973,8 +4892,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Take back every frame of `rec`, on its frame list and in its regions'
     /// chunk tables, pooled or deferred as `quiescent` decides, and free every
-    /// region slot and table node, leaving both lists empty, and end each
-    /// declined draw of `rec` ([`Self::note_short_draw`]).
+    /// region slot and table node, leaving both lists empty.
     pub fn reclaim_all(&mut self, rec: NodeIdx, mut quiescent: impl FnMut(&FreeRun) -> bool)
     {
         self.return_frames_where(rec, |_| true, Take::Every, &mut quiescent);
@@ -4993,7 +4911,6 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
         r.region_head = NODE_NULL;
         self.set_record(rec, r);
-        self.end_short_draws(|d| d.rec == rec);
     }
 
     /// Check deferred runs within `budget`, charging each `cost`, and move
@@ -7343,201 +7260,14 @@ mod tests
         assert_eq!(l.draw_room(floor), 0);
         assert!(l.restore_fits(16, reserve));
         // With the frames covering `promised`, memmgr evicts for frames only
-        // once a draw was declined, and until a run covers its page.
+        // once a draw found too few, and until the draw room opens.
         assert!(!l.frames_short(floor, 16));
-        l.note_short_draw(rec, reg, BASE + c * CHUNK);
+        l.note_short_draw();
         assert!(l.frames_short(floor, 16));
         assert!(!l.frames_short(floor - 1, 0));
-        back_whole(&mut l, rec, reg, c);
-        assert!(l.pool.free_pages() >= promised(&l));
+        l.clear_short_draw();
         assert!(!l.frames_short(floor, 16));
         l.remove_region(rec, reg, pool_all).unwrap();
-    }
-
-    /// A pool of 1000 pages with swap slots registered: a process (badge 1)
-    /// outside the reserve whose committed region of 32 chunks at `BASE` has
-    /// drawn to the end of its draw room, the free frames at a growth floor of
-    /// 616 pages and covering `promised`, after a second process (badge 2)
-    /// backed a chunk of its own. Returns the ledger, the first record and its
-    /// region, the floor, and the first chunk of the region left unbacked.
-    fn drawn_to_floor() -> (Ledger<VecStore, VecWords>, NodeIdx, NodeIdx, u64, u64)
-    {
-        let mut l = roomy_ledger(1000);
-        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
-        let hog = l.insert_process(2, NodeSpec::TOP).unwrap();
-        register_slots(&mut l, 625);
-        let reg = l
-            .add_region(rec, region(BASE, 32 * CHUNK), Commit::Committed)
-            .unwrap();
-        let hog_reg = l
-            .add_region(hog, region(BASE, CHUNK), Commit::Uncommitted)
-            .unwrap();
-        back_whole(&mut l, hog, hog_reg, 0);
-        // A reserve of 600 pages and a restore headroom of a chunk.
-        let floor = 616;
-        let mut c = 0;
-        while l.draw_room(floor) >= 16
-        {
-            back_whole(&mut l, rec, reg, c);
-            c += 1;
-        }
-        assert_eq!(l.pool.free_pages(), floor);
-        assert!(l.pool.free_pages() >= promised(&l));
-        assert!(!l.frames_short(floor, 16));
-        (l, rec, reg, floor, c)
-    }
-
-    /// Declined at an empty draw room, the draw for the first page of chunk
-    /// `c` is noted, the second process ends and the draw room opens to a
-    /// demand chunk, which memmgr signals.
-    fn declined_then_opened(
-        l: &mut Ledger<VecStore, VecWords>,
-        rec: NodeIdx,
-        reg: NodeIdx,
-        floor: u64,
-        c: u64,
-    )
-    {
-        assert_eq!(l.draw_room(floor), 0);
-        l.note_short_draw(rec, reg, BASE + c * CHUNK);
-        assert!(l.frames_short(floor, 16));
-        l.remove_process(2, pool_all, |_| {}).unwrap();
-        assert_eq!(l.draw_room(floor), 16);
-        l.note_draw_open();
-    }
-
-    /// Back `pages` pages of the region `reg` of `rec` at `va` with a run
-    /// from the pool.
-    fn back_at(l: &mut Ledger<VecStore, VecWords>, rec: NodeIdx, reg: NodeIdx, va: u64, pages: u32)
-    {
-        let (cap, got, phys) = take(l, pages, crate::Fit::Contiguous);
-        l.back_chunk(rec, reg, frame(cap, got, phys, va)).unwrap();
-    }
-
-    #[test]
-    fn a_declined_draw_keeps_eviction_past_an_opening_a_reserve_draw_closes_to_15()
-    {
-        let (mut l, rec, reg, floor, c) = drawn_to_floor();
-        declined_then_opened(&mut l, rec, reg, floor, c);
-        // The opening alone does not serve the declined draw.
-        assert!(l.frames_short(floor, 16));
-        // A reserve node's draw takes a page before the declined draw is made
-        // again: the room is short of the demand chunk crashd resumes at, and
-        // memmgr still evicts for frames.
-        take(&mut l, 1, crate::Fit::Contiguous);
-        assert_eq!(l.draw_room(floor), 15);
-        assert!(l.pool.free_pages() >= promised(&l));
-        assert!(l.frames_short(floor, 16));
-    }
-
-    #[test]
-    fn a_declined_draw_keeps_eviction_past_an_opening_a_reserve_draw_closes_to_0()
-    {
-        let (mut l, rec, reg, floor, c) = drawn_to_floor();
-        declined_then_opened(&mut l, rec, reg, floor, c);
-        take(&mut l, 16, crate::Fit::Contiguous);
-        assert_eq!(l.draw_room(floor), 0);
-        assert!(l.pool.free_pages() >= promised(&l));
-        assert!(l.frames_short(floor, 16));
-    }
-
-    #[test]
-    fn a_declined_draw_ends_when_a_run_covers_its_page()
-    {
-        let (mut l, rec, reg, floor, c) = drawn_to_floor();
-        declined_then_opened(&mut l, rec, reg, floor, c);
-        // A second thread's draw for another page of the same chunk, and the
-        // first noted again, which is named once.
-        let first = BASE + c * CHUNK;
-        let second = first + 5 * PAGE_SIZE;
-        l.note_short_draw(rec, reg, second);
-        l.note_short_draw(rec, reg, first);
-        // A run over the first page serves the first draw alone, and one over
-        // the pages between serves neither.
-        back_at(&mut l, rec, reg, first, 1);
-        assert!(l.pool.free_pages() >= promised(&l));
-        assert!(l.frames_short(l.pool.free_pages(), 16));
-        back_at(&mut l, rec, reg, first + PAGE_SIZE, 4);
-        assert!(l.frames_short(l.pool.free_pages(), 16));
-        back_at(&mut l, rec, reg, second, 1);
-        assert!(l.pool.free_pages() >= promised(&l));
-        assert!(!l.frames_short(l.pool.free_pages(), 16));
-    }
-
-    #[test]
-    fn a_declined_restore_ends_when_the_restore_records_its_runs()
-    {
-        let (mut l, rec, reg, floor, _) = drawn_to_floor();
-        let free = l.pool.free_pages();
-        assert_eq!(free, floor);
-        // Chunk 0 is evicted, and the restore of its fifth page is declined.
-        swap_out(&mut l, rec, reg, 0, 1, 2);
-        l.note_short_draw(rec, reg, BASE + 4 * PAGE_SIZE);
-        assert!(l.frames_short(free, 16));
-        let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
-        assert_eq!(
-            l.restore_chunk(rec, reg, BASE, &[frame(cap, pages, phys, BASE)]),
-            Ok(2)
-        );
-        assert_eq!(l.pool.free_pages(), free);
-        assert!(l.pool.free_pages() >= promised(&l));
-        assert!(!l.frames_short(free, 16));
-    }
-
-    #[test]
-    fn a_declined_draw_ends_with_its_record()
-    {
-        let (mut l, rec, reg, floor, c) = drawn_to_floor();
-        declined_then_opened(&mut l, rec, reg, floor, c);
-        take(&mut l, 16, crate::Fit::Contiguous);
-        let free = l.pool.free_pages();
-        assert!(l.frames_short(free, 16));
-        l.remove_process(1, pool_all, |_| {}).unwrap();
-        assert!(!l.frames_short(l.pool.free_pages(), 16));
-    }
-
-    #[test]
-    fn a_declined_draw_ends_with_its_region_or_a_cut_of_its_page()
-    {
-        let (mut l, rec, reg, floor, c) = drawn_to_floor();
-        // A cut past the page ends its draw; one above it does not.
-        let page = BASE + c * CHUNK + 3 * PAGE_SIZE;
-        l.note_short_draw(rec, reg, page);
-        l.shrink_region(rec, reg, (c + 1) * CHUNK, pool_all)
-            .unwrap();
-        assert!(l.frames_short(floor, 16));
-        l.shrink_region(rec, reg, c * CHUNK, pool_all).unwrap();
-        let free = l.pool.free_pages();
-        assert!(!l.frames_short(free, 16));
-        // Unregistering the region ends a draw for any page of it.
-        l.note_short_draw(rec, reg, BASE);
-        assert!(l.frames_short(free, 16));
-        l.remove_region(rec, reg, pool_all).unwrap();
-        assert!(!l.frames_short(l.pool.free_pages(), 16));
-    }
-
-    #[test]
-    fn a_declined_draw_past_the_table_holds_until_it_drains_and_the_room_opens()
-    {
-        let (mut l, rec, reg, _, c) = drawn_to_floor();
-        // The pages of chunks `c` to `c + 2`, the last named one past the table.
-        let first = BASE + c * CHUNK;
-        let count = u64::try_from(SHORT_DRAWS).unwrap();
-        for i in 0..=count
-        {
-            l.note_short_draw(rec, reg, first + i * PAGE_SIZE);
-        }
-        // An opening while named draws are left does not end the unnamed one.
-        l.note_draw_open();
-        back_whole(&mut l, rec, reg, c);
-        back_whole(&mut l, rec, reg, c + 1);
-        back_whole(&mut l, rec, reg, c + 2);
-        let free = l.pool.free_pages();
-        assert!(free >= promised(&l));
-        assert!(l.frames_short(free, 16));
-        // With no named draw left, the opening ends it.
-        l.note_draw_open();
-        assert!(!l.frames_short(free, 16));
     }
 
     #[test]

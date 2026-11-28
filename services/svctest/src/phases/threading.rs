@@ -11,9 +11,10 @@
 //! `notify_all` and `Once` completion waking every queued waiter, a timed
 //! `Condvar` waiter leaving the middle of the queue, `Condvar::wait_timeout`,
 //! sustained contended handoffs of `Mutex`, `Condvar`, and `RwLock`,
-//! spawn-time placement through `BuilderExt::spawn_at_priority`, and the
-//! byte heap's lock contended by a strict-priority thread against a
-//! fair-class holder on the same CPU.
+//! spawn-time placement through `BuilderExt::spawn_at_priority`, the stack
+//! touch of `std::os::seraph::thread::touch_stack` and the backed spawn of
+//! `BuilderExt::spawn_backed`, and the byte heap's lock contended by a
+//! strict-priority thread against a fair-class holder on the same CPU.
 
 use std::cell::Cell;
 use std::io;
@@ -81,6 +82,14 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "spawn_at_priority",
             run: spawn_at_priority_phase,
+        },
+        Phase {
+            name: "touch_stack",
+            run: touch_stack_phase,
+        },
+        Phase {
+            name: "spawn_backed",
+            run: spawn_backed_phase,
         },
         Phase {
             name: "heap_lock_priority_contention",
@@ -846,6 +855,177 @@ pub fn spawn_at_priority_phase(_: &Caps)
         .expect("spawn_at_priority(5) within the band failed");
     assert_eq!(within.join().expect("level-5 child panicked"), 5);
     std::os::seraph::log!("spawn_at_priority phase passed");
+}
+
+/// Bytes of a spawned thread's stack in use when the [`touch_stack_phase`]
+/// reads its charge: within the stack's top demand chunk, which the thread's
+/// first instruction backs, so a `MAX_STACK_TOUCH_BYTES` touch from there
+/// reaches into the chunk below it.
+const TOUCH_DEPTH: usize = 40 * 1024;
+
+/// Pages of a demand chunk, the run memmgr backs on one demand fault.
+const CHUNK_PAGES: u64 = ipc::memmgr_labels::DEMAND_CHUNK_BYTES / syscall_abi::PAGE_SIZE;
+
+/// The calling process's charge (`QUERY_MEMORY_USAGE` `data[0]`), in pages.
+fn charge(what: &str) -> u64
+{
+    crate::phases::budget::memory_usage()
+        .unwrap_or_else(|| panic!("{what}: QUERY_MEMORY_USAGE failed"))
+        .0
+}
+
+/// Run `f` below a frame of `BYTES` of stack, which the frame's stack probes
+/// write as it is made.
+#[inline(never)]
+fn below<const BYTES: usize, R, F: FnOnce() -> R>(f: F) -> R
+{
+    let mut pad = [0u8; BYTES];
+    std::hint::black_box(&mut pad);
+    let ret = f();
+    std::hint::black_box(&mut pad);
+    ret
+}
+
+/// `std::os::seraph::thread::touch_stack` backs the stack below its caller:
+/// a spawned thread [`TOUCH_DEPTH`] into its demand-paged stack, inside the
+/// top chunk, touches `MAX_STACK_TOUCH_BYTES` and its charge rises by at
+/// least the chunk below; work at the touched depth after it takes nothing
+/// more. A touch that wrote nothing below its caller leaves the first two
+/// reads equal.
+pub fn touch_stack_phase(_: &Caps)
+{
+    const TOUCH: usize = std::os::seraph::thread::MAX_STACK_TOUCH_BYTES;
+    assert_ne!(
+        std::os::seraph::startup_info().pager_endpoint_cap,
+        0,
+        "touch_stack: svctest has no pager, so no demand-paged stack"
+    );
+    let (before, touched, worked) = thread::spawn(|| {
+        below::<TOUCH_DEPTH, _, _>(|| {
+            let before = charge("touch_stack: before the touch");
+            std::os::seraph::thread::touch_stack::<TOUCH>();
+            let touched = charge("touch_stack: after the touch");
+            below::<TOUCH, _, _>(|| ());
+            let worked = charge("touch_stack: after the work");
+            (before, touched, worked)
+        })
+    })
+    .join()
+    .expect("touch_stack: the thread panicked");
+    std::os::seraph::log!(
+        "touch_stack: charge {:#x} pages before the touch, {:#x} after it, {:#x} after the work",
+        before,
+        touched,
+        worked
+    );
+    assert!(
+        touched >= before.saturating_add(CHUNK_PAGES),
+        "touch_stack: the touch backed fewer than a chunk's {CHUNK_PAGES} pages"
+    );
+    assert!(
+        worked <= touched,
+        "touch_stack: work at the touched depth took pages"
+    );
+    std::os::seraph::log!("touch_stack phase passed");
+}
+
+/// `BuilderExt::spawn_backed` returns only once the new thread holds its
+/// touched stack: the spawner's charge after the spawn already counts the
+/// stack's top chunk, and the thread's work down to the touched depth takes
+/// nothing more. A spawn that returned before the thread ran would miss the
+/// chunk whenever the thread had not run yet, so the check catches a missing
+/// wait only some of the time. `spawn_backed_at_priority` refuses as
+/// `spawn_at_priority` does, and a refusal or a placed spawn leaves the next
+/// plain spawn at the process's level.
+pub fn spawn_backed_phase(_: &Caps)
+{
+    const TOUCH: usize = std::os::seraph::thread::MAX_STACK_TOUCH_BYTES;
+    // A bound on the thread's work, generous on slow TCG.
+    const BOUND: Duration = Duration::from_mins(1);
+    assert_ne!(
+        std::os::seraph::startup_info().pager_endpoint_cap,
+        0,
+        "spawn_backed: svctest has no pager, so no demand-paged stack"
+    );
+
+    // A joined thread's stack is reclaimed by its join, so no earlier thread's
+    // reclaim lands between the reads.
+    thread::spawn(|| ())
+        .join()
+        .expect("spawn_backed: the first thread panicked");
+    let go = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let before = charge("spawn_backed: before the spawn");
+    let child = {
+        let (go, done, stop) = (Arc::clone(&go), Arc::clone(&done), Arc::clone(&stop));
+        thread::Builder::new()
+            .name("svctest-backed".into())
+            .spawn_backed::<TOUCH, _, _>(move || {
+                while !go.load(Ordering::Acquire)
+                {
+                    thread::yield_now();
+                }
+                below::<TOUCH, _, _>(|| ());
+                done.store(true, Ordering::Release);
+                // Alive until the last read, so nothing of it is reclaimed
+                // before then.
+                while !stop.load(Ordering::Acquire)
+                {
+                    thread::yield_now();
+                }
+                3u32
+            })
+            .expect("spawn_backed: the spawn failed")
+    };
+    let spawned = charge("spawn_backed: after the spawn");
+    go.store(true, Ordering::Release);
+    let start = Instant::now();
+    while !done.load(Ordering::Acquire)
+    {
+        assert!(
+            start.elapsed() < BOUND,
+            "spawn_backed: the thread did not work to its touched depth within {BOUND:?}"
+        );
+        thread::yield_now();
+    }
+    let worked = charge("spawn_backed: after the thread's work");
+    stop.store(true, Ordering::Release);
+    assert_eq!(child.join().expect("spawn_backed: the thread panicked"), 3);
+    std::os::seraph::log!(
+        "spawn_backed: charge {:#x} pages before the spawn, {:#x} after it, {:#x} after the \
+         thread's work",
+        before,
+        spawned,
+        worked
+    );
+    assert!(
+        spawned >= before.saturating_add(CHUNK_PAGES),
+        "spawn_backed: the spawn returned with fewer than a chunk's {CHUNK_PAGES} pages charged"
+    );
+    assert!(
+        worked <= spawned,
+        "spawn_backed: the thread's work at its touched depth took pages"
+    );
+
+    match thread::Builder::new().spawn_backed_at_priority::<TOUCH, _, _>(0, || ())
+    {
+        Err(e) => assert_eq!(
+            e.kind(),
+            io::ErrorKind::InvalidInput,
+            "spawn_backed_at_priority(0) refused with the wrong kind: {e}"
+        ),
+        Ok(_) => panic!("spawn_backed_at_priority(0) spawned a thread"),
+    }
+    let placed = thread::Builder::new()
+        .spawn_backed_at_priority::<TOUCH, _, _>(5, || 5u32)
+        .expect("spawn_backed_at_priority(5) within the band failed");
+    assert_eq!(placed.join().expect("level-5 backed child panicked"), 5);
+    let plain = thread::Builder::new()
+        .spawn(|| 7u32)
+        .expect("plain spawn after the backed spawns failed: stale spawn level");
+    assert_eq!(plain.join().expect("plain child panicked"), 7);
+    std::os::seraph::log!("spawn_backed phase passed");
 }
 
 /// Pin the calling thread to `cpu` and yield, so the pin takes effect before

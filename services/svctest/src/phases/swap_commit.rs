@@ -435,7 +435,7 @@ fn write_past_draw_room(query: u64) -> (u64, Lines)
          writer's {pages} committed: the grants would leave free frames above the growth floor"
     );
     let mut hog = super::swap::Hog::new();
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     // From here until the grants are returned the pool stands at the floor:
     // svctest allocates nothing new.
     let filled = hog.fill_to_floor();
@@ -484,19 +484,6 @@ fn write_past_draw_room(query: u64) -> (u64, Lines)
          while the writer ran"
     );
     (pages, lines)
-}
-
-/// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame, so the phase
-/// faults no new stack page while the pool stands at the floor.
-#[inline(never)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the frame is the touch: its array is the stack the window may use, written once before it"
-)]
-fn touch_stack()
-{
-    let mut probe = [0u8; STACK_TOUCH_BYTES];
-    std::hint::black_box(&mut probe);
 }
 
 // ── The write part, child side ───────────────────────────────────────────────

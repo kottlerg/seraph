@@ -84,7 +84,7 @@ const AT_MAX_GRANTS: u32 = 1024;
 /// Bytes of stack the at-max child touches before its fill, beside the depth
 /// its open of [`ESP_PROBE`] reaches, so that the create grows no stack once
 /// the node is at its max.
-const AT_MAX_STACK_TOUCH: usize = 6 * 1024;
+pub(super) const AT_MAX_STACK_TOUCH: usize = 6 * 1024;
 /// At-max child exit code: the read open of [`ESP_PROBE`] before the fill
 /// failed.
 const AT_MAX_NO_WARMUP: i32 = 2;
@@ -757,7 +757,7 @@ fn create_at_max_main() -> !
         Ok(file) => drop(file),
         Err(_) => exit(AT_MAX_NO_WARMUP),
     }
-    at_max_touch_stack();
+    std::os::seraph::thread::touch_stack::<AT_MAX_STACK_TOUCH>();
     at_max_fill();
     match crate::phases::memmgr::try_request_contiguous(1)
     {
@@ -811,14 +811,4 @@ pub(super) fn at_max_fill()
         }
     }
     exit(AT_MAX_FILL_FAILED);
-}
-
-/// Write [`AT_MAX_STACK_TOUCH`] bytes of the calling thread's stack, so that
-/// memmgr backs them now.
-#[inline(never)]
-pub(super) fn at_max_touch_stack()
-{
-    let mut pad = [0u8; AT_MAX_STACK_TOUCH];
-    pad.fill(1);
-    std::hint::black_box(&mut pad);
 }

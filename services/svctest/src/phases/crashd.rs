@@ -535,20 +535,6 @@ fn wait_within(child: &mut Child, what: &str, bound: Duration) -> ExitStatus
     }
 }
 
-/// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame, so the window
-/// faults no new stack page of the phase.
-#[inline(never)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the frame is the touch: its array is the stack the window may use, written once \
-              before it"
-)]
-fn touch_stack()
-{
-    let mut probe = [0u8; STACK_TOUCH_BYTES];
-    std::hint::black_box(&mut probe);
-}
-
 /// The crash service's hold of a fault memmgr declined for want of memory
 /// (services/crashd/docs/operation.md § Hold). A fixture writes the pages of a
 /// demand region while a filler keeps the pool full down to the growth floor:
@@ -583,7 +569,7 @@ fn check_oom_hold()
         u64::try_from(toucher_bound.saturating_add(OOM_WAIT).as_millis()).unwrap_or(u64::MAX);
     // A fault the hold resumes.
     let mut toucher = start_toucher();
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     let mut filler = start_filler(RESUME_FILL_MS);
     toucher
         .stdin
@@ -617,7 +603,7 @@ fn check_oom_hold()
     // A fault the hold times out on.
     let before = cores();
     let mut toucher = start_toucher();
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     let mut filler = start_filler(timeout_fill_ms);
     toucher
         .stdin
@@ -843,7 +829,7 @@ fn check_spawn_charge()
         .name("crashd_live_core_spawn".into())
         .spawn_at_priority(SPAWN_CHECK_LEVEL, move || {
             pin(cpu);
-            touch_stack();
+            std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
             spawn_and_read(&spin)
         })
         .expect("crashd_live_core: spawn: the check's thread");
@@ -1072,18 +1058,10 @@ impl<R: Send + 'static> Account<R>
             .unwrap_or_else(|e| panic!("crashd_live_core: {what}: the account SEND ({e})"));
         let stop = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, ACCOUNT_STOP_BADGE)
             .unwrap_or_else(|e| panic!("crashd_live_core: {what}: the account's stop SEND ({e})"));
-        let (started_tx, started) = std::sync::mpsc::channel::<()>();
         let server = std::thread::Builder::new()
             .name("crashd_live_core_account".into())
-            .spawn(move || {
-                touch_stack();
-                let _ = started_tx.send(());
-                serve(ep)
-            })
+            .spawn_backed::<STACK_TOUCH_BYTES, _, _>(move || serve(ep))
             .unwrap_or_else(|e| panic!("crashd_live_core: {what}: the account thread ({e})"));
-        started
-            .recv()
-            .unwrap_or_else(|_| panic!("crashd_live_core: {what}: the account thread ended"));
         Self {
             ep,
             send,

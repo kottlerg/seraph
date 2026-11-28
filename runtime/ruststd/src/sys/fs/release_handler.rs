@@ -434,7 +434,7 @@ fn handler_main(state: &ReleaseState, started: crate::os::seraph::thread::StartS
         // The thread trampoline failed to register an IPC buffer; we
         // cannot service receive-and-reply traffic. Park instead of
         // spinning.
-        started.at_wait();
+        started.send();
         loop
         {
             let _ = syscall::thread_yield();
@@ -443,7 +443,7 @@ fn handler_main(state: &ReleaseState, started: crate::os::seraph::thread::StartS
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     let mut slot = Reply::new();
-    started.at_wait();
+    started.send();
     loop
     {
         // SAFETY: `ipc_buf` is the registered IPC buffer for this

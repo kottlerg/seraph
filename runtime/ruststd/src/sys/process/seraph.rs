@@ -1495,7 +1495,7 @@ struct BridgeHandles {
 }
 
 fn bridge_main(h: BridgeHandles, started: crate::os::seraph::thread::StartSignal) {
-    started.at_wait();
+    started.send();
     let payload = loop {
         match syscall::event_recv(h.death_eq) {
             Ok(p) => break p,

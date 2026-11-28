@@ -252,7 +252,7 @@ fn stop_case(caps: &Caps, fixture: u64, config: oomd_policy::Config, before: Lin
         );
         Toucher::start(phase)
     });
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     let pages = hog_call(fixture, phase);
     // crashd holds the toucher's fault for its stall alone, so the write
     // waits for oomd to have stopped every program, which leaves only the
@@ -358,7 +358,7 @@ fn no_stop_case(
         .iter()
         .find(|c| c.name == "memhog")
         .map_or(0, |c| c.key);
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     let pages = hog_call(fixture, phase);
     let _ = syscall::thread_sleep(watch_ms);
     let level = std::os::seraph::memory_pressure();
@@ -458,7 +458,7 @@ pub(super) fn critical_window(caps: &Caps, phase: &str, hold: Duration, during: 
             );
         (cap, key)
     });
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     let _ = hog_call(fixture, phase);
     await_level(MemoryPressure::Critical, phase, "after the fill");
     during();
@@ -901,17 +901,4 @@ impl Toucher
             ),
         }
     }
-}
-
-/// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame, so the phase
-/// faults no new stack page while the pool is full.
-#[inline(never)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the frame is the touch: its array is the stack the window may use, written once before it"
-)]
-fn touch_stack()
-{
-    let mut probe = [0u8; STACK_TOUCH_BYTES];
-    std::hint::black_box(&mut probe);
 }

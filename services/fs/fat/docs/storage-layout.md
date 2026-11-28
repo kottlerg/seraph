@@ -128,18 +128,22 @@ each mutation in [crash-safety.md](crash-safety.md).
   `FS_UNMOUNT` sweep them too
   ([fs-driver-protocol.md § Label 23](../../docs/fs-driver-protocol.md#label-23-fs_session)),
   and an `FS_CLOSE` that empties a session whose liveness cap is gone ends that session.
-* **Helper start** (`src/main.rs`): the eviction worker, the pressure thread and the donation-end
-  thread act when memory is short, and the first touch of a thread's demand-paged stack takes pages
-  from memmgr. Each therefore touches `HELPER_STACK_TOUCH_BYTES` (32 KiB) of its stack as its first
-  action, within the stack's first demand chunk, and reports that it has started; the driver
-  enters its dispatch loop, and so answers `FS_MOUNT`, only once every helper it started has
-  reported. A helper starts acting with the pages it runs on already held, and a charge to the
-  driver after its mount is a page it uses, never a helper's stack. A helper whose spawn failed
-  is not waited for.
+* **Helper start** (`src/main.rs`): the eviction worker, the pressure thread, the donation-end
+  thread and the `MAX_WATCHDOGS` (4) release watchdogs act when memory is short, and the first
+  touch of a thread's demand-paged stack takes pages from memmgr. Each is therefore spawned through
+  std's `BuilderExt::spawn_backed`
+  ([ruststd § Backed thread stacks](../../../../runtime/ruststd/README.md#backed-thread-stacks)),
+  which has the thread touch `HELPER_STACK_TOUCH_BYTES` (32 KiB) of its stack as its first action,
+  within the stack's first demand chunk, and returns only once the touch is done; the driver
+  enters its dispatch loop, and so answers `FS_MOUNT`, only once every spawn has returned. A
+  helper starts acting with the pages it runs on already held, and a charge to the driver after
+  its mount is a page it uses, never a helper's stack or thread. A helper whose spawn failed is
+  not waited for.
 * **Eviction worker** (`src/eviction.rs`): the read-side cooperative release. It sends
   `FS_RELEASE_MEMORY`, waits up to 100 ms for the ack, then revokes the page's caps and drops the
-  slot. The send runs on a watchdog thread, which a client that never replies leaves blocked; with
-  `MAX_WATCHDOGS` (4) such threads alive, the worker revokes without sending. Reuse of the slot is
+  slot. The send runs on an idle one of the watchdog threads started at helper start, which a
+  client that never replies leaves blocked; with all of them blocked, the worker revokes without
+  sending. Reuse of the slot is
   then subject to the page cache's mapping check above. Outstanding write paths return their caps
   before reply, so they create no eviction pressure.
 

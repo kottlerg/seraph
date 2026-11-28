@@ -72,7 +72,7 @@ pub fn fill(arg: Option<&str>) -> !
     {
         exit(FILL_BALLAST_FAILED);
     };
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     say("filling");
     match fill.to_critical()
     {
@@ -131,7 +131,7 @@ pub fn touch(arg: Option<&str>) -> !
     {
         exit(TOUCH_SETUP_FAILED);
     }
-    touch_stack();
+    std::os::seraph::thread::touch_stack::<STACK_TOUCH_BYTES>();
     say("ready");
     line.clear();
     if stdin.lock().read_line(&mut line).is_err()
@@ -184,16 +184,4 @@ fn say(line: &str)
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
-}
-
-/// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame.
-#[inline(never)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the frame is the touch: its array is the stack the window may use, written once before it"
-)]
-fn touch_stack()
-{
-    let mut probe = [0u8; STACK_TOUCH_BYTES];
-    std::hint::black_box(&mut probe);
 }

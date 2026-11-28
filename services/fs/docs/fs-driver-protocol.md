@@ -609,7 +609,8 @@ a SEND get the cooperative path: the driver waits up to
 `cap_revoke`s the parent Memory cap and deletes it whether or not the
 ack came. Opens that omitted the SEND (opt-out) skip straight to the
 revoke on every eviction, and so does an open whose SEND the driver
-cannot copy or whose watchdog it cannot start. The driver sends no
+cannot copy, or whose release finds none of the driver's watchdog threads
+idle. The driver sends no
 release for a page the client's own release or `FS_CLOSE` has already
 removed from its open. See
 [`runtime/ruststd/src/sys/fs/release_handler.rs`](../../../runtime/ruststd/src/sys/fs/release_handler.rs)

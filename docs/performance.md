@@ -89,12 +89,15 @@ caveat of § Method.
 
 A budget is a relation between rows of one run in one mode, so it holds on any host and in either
 mode; a budget with a value states it as a ratio to `ktest.null_syscall_roundtrip` in the same run.
-Each relation below holds in the icount baselines of both architectures, unless the table limits it,
-and in the host-mode baselines wherever host mode resolves it: two host-mode rows whose p50s differ
-by less than the larger of their bands (`xtask/baselines/bench/host/x86_64/BANDS`) differ by noise,
-and their relation is judged in icount mode alone. A change that breaks one MUST say so in its PR
-body, with the Issue that the relation serves; the review of a performance PR checks the relations
-against its host-mode report and its CI run's icount report.
+Host mode reads a relation through the bands (`xtask/baselines/bench/host/x86_64/BANDS`): two rows
+whose p50s differ by less than the larger of their bands are equal within noise, so a `≤` between
+them holds there, and a `<` between them is judged in icount mode alone. Icount mode judges a
+relation on its rows' one-CPU lines (§ Method), which every `<` below has; a relation between
+rows that exist only at 4 CPUs is judged in host mode. Each relation below holds in the host-mode
+baselines read that way and in the icount baselines of both architectures, unless the table limits
+it. A change that breaks one MUST say so in its PR body, with the Issue that the relation serves;
+the review of a performance PR checks the relations against its host-mode report and its CI run's
+icount report.
 
 | Budget | Serves |
 |---|---|

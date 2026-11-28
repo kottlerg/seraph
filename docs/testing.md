@@ -724,33 +724,34 @@ reader who wants the region's cost alone subtracts it, which under icount leaves
 region's instructions only for a window on one CPU that does not idle and that no interrupt or
 other thread enters.
 
-Icount counts instructions, not time: a change that costs cycles without instructions (a cache
-miss, a TLB flush, a contended line) does not move them. Time is measured in host mode, on the
-reference host: the release build's bench-only ktest image and its ubench boot, each booted
-under KVM at 4 CPUs with `--timing` under the exclusive grant (`cargo xtask run --arch x86_64
---cpus 4 --runs 5 --timing`, the ubench boot with `--display framebuffer`), and
-`cargo xtask bench-check --mode host` over their logs, which reports each measurement's lowest
-p50 against its baseline under `xtask/baselines/bench/host/x86_64/` and its band in `BANDS`
-there. Host mode gates nothing: no CI runner is the reference host, and the time one session
-reads bounds no other host's, so its report is evidence that a PR's body accounts for, not a
-check its CI run makes. riscv64 has no host mode: the reference host has no riscv64 KVM and no
-riscv64 hardware.
+Icount counts instructions, not time: a change that costs cycles without instructions (a cache miss,
+a TLB flush, a contended line) does not move them. Time is measured in host mode, on the reference
+host: the release build's bench-only ktest image and its ubench boot, each booted under KVM at 4
+CPUs with `--timing` under the exclusive grant (`cargo xtask run --arch x86_64 --cpus 4 --runs 5
+--timing --save-logs <dir>/ktest`, the ubench boot with `--display framebuffer` and `--save-logs
+<dir>/ubench`, since both name their logs by architecture, CPU count and run), and `cargo xtask
+bench-check --mode host <dir>/ktest/*.log <dir>/ubench/*.log`, which reports each measurement's
+lowest p50 against its baseline under `xtask/baselines/bench/host/x86_64/` and its band in `BANDS`
+there. Host mode gates nothing: no CI runner is the reference host, and the time one session reads
+bounds no other host's, so its report is evidence that a PR's body accounts for, not a check its CI
+run makes. riscv64 has no host mode: the reference host has no riscv64 KVM and no riscv64 hardware.
 
-A PR states a performance purpose when its body states that its purpose is to make a
-benchmarked path faster, or rests a claim on the time a benchmark measures. Such a PR, unless
-its changes outside Markdown are all inert, owes the host-mode runs above, 5 of each boot, at a
-head that covers the merge head (Coverage tiers, When the runs are owed), and its body carries
-their `bench-check --mode host` report with that head. Each measurement whose verdict is not
-`ok` is accounted for in the body: one with no baseline or no band (`NEW`, `NO-BAND`), or one
-the PR moved on purpose, has its baseline, and its band if it had none, written from those logs
-(`cargo xtask bench-baseline --host --bands`), with the reason; for one the PR did not mean to
-move, the PR boots its merge base the same way under the same grant and reports both sets, so
-that a drift of the stored baseline since it was taken is told apart from the PR's own change.
-Any other PR owes no host-mode run. The release host runs take the same report once per release
-candidate (Coverage tiers, Release host runs), so a time that PRs with no performance purpose
-moved is seen before the tag. The bands and the baselines are calibrated together, from 10 runs
-of each boot (`cargo xtask bench-baseline --host --all --bands`), and again when the reference
-host, its kernel or its QEMU changes, as `bench-check`'s `WARNING:` lines show.
+A PR states a performance purpose when its body states that its purpose is to make a benchmarked
+path faster, or rests a claim on the time a benchmark measures. Such a PR, unless its changes
+outside Markdown are all inert, owes the host-mode runs above, 5 of each boot, at a head that covers
+the merge head (Coverage tiers, When the runs are owed), and its body carries their `bench-check
+--mode host` report with that head. Each measurement whose verdict is not `ok` is accounted for in
+the body: one with no baseline or no band (`NEW`, `NO-BAND`), or one the PR moved on purpose, has
+its baseline, and its band if it had none, written from those logs (`cargo xtask bench-baseline
+--host --bands`), with the reason, and a file the command rewrote only for a measurement the PR did
+not mean to move is restored before the commit; for such a measurement, the PR boots its merge base
+the same way under the same grant and reports both sets, so that a drift of the stored baseline
+since it was taken is told apart from the PR's own change. Any other PR owes no host-mode run. The
+release host runs take the same report once per release candidate (Coverage tiers, Release host
+runs), so a time that PRs with no performance purpose moved is seen before the tag. The bands and
+the baselines are calibrated together, from 10 runs of each boot (`cargo xtask bench-baseline --host
+--all --bands`), and again when the reference host, its kernel or its QEMU changes, as
+`bench-check`'s `WARNING:` lines show.
 
 ### Crash reports
 
@@ -2125,7 +2126,8 @@ git diff -W "$B" <head> -- core/kernel/src/arch/x86_64/ core/kernel/src/mm/stack
 git diff -W "$B" <head> -- services/acpid/src/platform.rs | grep -E "^\+\+\+ |\bnotify\b"
 ```
 
-**Repeat count.** Every owed run, local or release, runs once (`--runs 1`); nothing raises the
+**Repeat count.** Every owed run, local or release, runs once (`--runs 1`), apart from the
+host-mode runs of [Benchmarks](#benchmarks-bench-cell), 5 of each boot; nothing else raises the
 count. A PR states a concurrency-fix purpose when its body states that its purpose is the fix of a
 concurrency defect in the scheduling, wake, or cross-CPU signalling mechanisms. Such a PR, unless
 its changes outside Markdown are all inert, owes the whole boundary set, whether or not its diff
@@ -2157,7 +2159,8 @@ coverage of the runs that surface owes, and those runs MUST be run again at a he
 body MUST report each run it owes with its `--runs` count, its outcome, and the head it ran at, or
 state that none is owed and why: that its changes outside Markdown are all inert, or that its
 non-inert lines change none of the CPU-count, memory, and device surfaces and it states no
-concurrency-fix purpose as Repeat count defines it. A PR whose lines are inert by Identical images
+concurrency-fix purpose as Repeat count defines it and no performance purpose as
+[Benchmarks](#benchmarks-bench-cell) defines it. A PR whose lines are inert by Identical images
 above quotes the command's verdict line and gives the head it ran at.
 
 **Hangs at oversubscription.** A boundary run the PR does not owe, that is, one whose surface the

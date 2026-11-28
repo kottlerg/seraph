@@ -546,9 +546,8 @@ and is created at boot. Init splits it into the baseline band
 remainder (`[29, PRIORITY_MAX]`) that never leaves init and is unreachable after its reap
 (see § SbiControl above).
 Every spawned process receives a band via `ProcessInfo.sched_control_cap`:
-procmgr fans its baseline out per child at create time — a plain `cap_copy`
-for a full-width band, or copy-then-`SYS_SCHED_SPLIT` to mint a narrowed
-`[1, band_max]` when the spawner requested one (the create label's
+procmgr fans its baseline out per child at create time — copy-then-`SYS_SCHED_SPLIT` to mint
+`[1, band_max]`, the spawner's own band when it requested none (the create label's
 `CREATE_BAND_MAX` field, validated against the spawner's own band; see
 [services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md)). The
 per-service level assignments live in `shared/ipc`'s `sched_policy` module

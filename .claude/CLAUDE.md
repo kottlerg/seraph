@@ -84,6 +84,9 @@ read it to find the document a task needs.
   whose PR states a concurrency-fix purpose as that section defines it, also runs the local host
   runs that section owes for it, at the heads and repeat counts it sets. Any other change owes
   none, whatever directory it touches.
+- A PR that states a performance purpose, as [docs/testing.md](../docs/testing.md)
+  § Benchmarks defines it, also owes that section's host-mode runs under the exclusive grant, and
+  carries their `cargo xtask bench-check --mode host` report.
 - A documentation-only or comment-only change, as that section defines it, needs none of the
   runs above. A Markdown-only change changes nothing an image holds, so CI owes it no boot; a
   comment-only change's CI run builds and boots the cells its files owe

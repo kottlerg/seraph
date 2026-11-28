@@ -48,9 +48,10 @@ pub const SERIAL_WRITE_BYTES: u64 = 1;
 /// driver answers once the UART reports its transmitter empty (LSR TEMT:
 /// the transmit FIFO and the shift register), so nothing of the write is
 /// left in the UART when a power-off cuts it. A zero-length write with the
-/// flag is a barrier for everything written before it. logd sets it on
-/// every serial write, so a line is on the line before logd's caller goes
-/// on. The virtio-console driver answers every write once the device has
+/// flag is a barrier for everything written before it. logd's writer sends
+/// each line as plain chunks and sets the flag only on the zero-length
+/// barrier that ends the line, so the line is on the wire before logd moves
+/// on to the next. The virtio-console driver answers every write once the device has
 /// taken it, and needs no flag.
 pub const SERIAL_WRITE_SENT: u64 = 1 << 32;
 

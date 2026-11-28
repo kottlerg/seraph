@@ -469,8 +469,13 @@ serial console.
 live in `/config/svcmgr/tests/` (svcmgr does not read it) and are staged
 into `/config/svcmgr/services/` only for test boots — `crasher` is
 co-staged with `svctest` (per [testing.md](../../../docs/testing.md#gating)).
-Every other recipe in `/config/svcmgr/tests/` is `restart = never`,
-`critical = no`, staged only by the test command that uses it. The rest
+Every recipe in `/config/svcmgr/tests/` is `critical = no` and staged
+only by the test command that uses it. `crasher` and `stopsrc` are
+`restart = always`; `crasher-boot`, `crasher-worker`, `crashd`, `memhog`,
+`oomd`, `reserve-creator` and `sessiond` are `restart = on_failure`; the
+others (`svctest`, `usertest`, `ubench`, `crasher-once`, `debug-echo`,
+`gdb-target`, `hotplug-check`, `hotplug-check-disk` and `reboot`) are
+`restart = never`. The services outside `tests/`
 ship in `/config/svcmgr/services/` and load on every boot, except
 that the functional harness boots drop `terminal` (per
 [testing.md](../../../docs/testing.md#one-shutdown-invoking-harness-per-boot)

@@ -1,6 +1,6 @@
 # bench baseline, written by `cargo xtask bench-baseline`
 # Format: xtask/README.md (`cargo xtask bench-check`).
-procs=1 pages=16 cpus=1 unit=cycles p50=920930
-procs=1 pages=16 cpus=4 unit=cycles p50=987022
-procs=2 pages=16 cpus=4 unit=cycles p50=1909851
-procs=4 pages=16 cpus=4 unit=cycles p50=3806430
+procs=1 pages=16 cpus=1 unit=cycles p50=739687
+procs=1 pages=16 cpus=4 unit=cycles p50=805787
+procs=2 pages=16 cpus=4 unit=cycles p50=1553013
+procs=4 pages=16 cpus=4 unit=cycles p50=3095124

@@ -28,7 +28,8 @@ run docs/testing.md § Coverage tiers owes (each boundary run, the memory variat
 cell: the storage cells 4kn, second-disk, shared-line, and oversize-block, no-iommu, framebuffer,
 debug-port, and hotplug, per architecture, and cet and tpm on x86_64), with its `--runs` count, its
 outcome, and the head it ran at (a run not owed that HANGs or fails as that section allows, with the
-link to its record), or that none is owed and why>
+link to its record), or that none is owed and why; for a PR that states a performance purpose,
+the `bench-check --mode host` report of its host-mode runs (docs/testing.md § Benchmarks)>
 
 ## Notes
 <design tradeoffs; follow-ups filed as Issues; anything reviewers should see>

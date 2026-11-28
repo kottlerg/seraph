@@ -123,6 +123,9 @@ pub struct Mount
     /// names the partition, which [`VfsdRootBackend::holds_partition`]
     /// matches.
     pub first_lba: u64,
+    /// The mounted partition's length in blocks, with `first_lba` the range
+    /// a restart registers again for its new driver.
+    pub length_lba: u64,
 }
 
 /// Why [`VfsdRootBackend::begin_unmount`] refused a node.
@@ -1060,6 +1063,7 @@ mod tests
             partition: cap + 400,
             disk: 1,
             first_lba: cap + 500,
+            length_lba: cap + 600,
         }
     }
 

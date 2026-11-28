@@ -39,6 +39,7 @@ members = [
     "services/entropyd",
     "services/vfsd",
     "services/vfsd/gpt",
+    "services/vfsd/grant",
     "services/vfsd/root-backend",
     "services/vfsd/swap",
     "services/drivers/cmos",

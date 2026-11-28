@@ -22,6 +22,7 @@ vfsd/
 │                            # src/lib.rs, docs/testing.md § Bounded verification) and fuzz
 │                            # inputs (fuzz/gpt/), the fuzz target `gpt` (docs/testing.md
 │                            # § Fuzzing)
+├── grant/                   # `vfsd-grant` crate: pure host-tested cut-off of a partition grant
 ├── root-backend/            # `vfsd-root-backend` crate: VfsdRootBackend (NamespaceBackend impl)
 ├── swap/                    # `vfsd-swap` crate: pure host-tested swap-partition hand-out
 ├── src/
@@ -65,8 +66,9 @@ vfsd/
   multi-threaded recv so independent requests proceed while one waits on
   a driver spawn; no service-endpoint request waits on another's IPC (a
   `GET_SWAP_PARTITION` waits at most for the discovery lock and the swap
-  lock, held across a discovery of new disks and one call to the block
-  driver; none of devmgr, memmgr and the block drivers calls vfsd), so the thread count
+  lock, held across a discovery of new disks and two calls to the block
+  driver, `BLK_RETIRE_PARTITION` and `REGISTER_PARTITION`; none of devmgr,
+  memmgr and the block drivers calls vfsd), so the thread count
   is a concurrency knob, not a correctness bound. `MOUNT` mounts the root or the data role at a
   path, resolved as the self-mount resolves it, gated on the
   `MOUNT_AUTHORITY` badge bit; root, `/esp`, and the data paths are
@@ -80,11 +82,12 @@ vfsd/
   [`docs/namespace-composition.md`](docs/namespace-composition.md#unmount).
 - **Swap-partition hand-out** — `GET_SWAP_PARTITION`, gated on the
   `SWAP_AUTHORITY` badge bit, hands the swap service a raw partition cap
-  on the `SERAPH_SWAP` partition, which vfsd never mounts. The first
-  request looks the partition up and registers it, so vfsd's startup does
-  not depend on one; each later request revokes the cap handed out before,
-  so one holder at a time reaches the partition. The hand-out's decisions
-  are the host-tested `vfsd-swap` crate. See
+  on the `SERAPH_SWAP` partition, which vfsd never mounts. Each request
+  cuts off the grant handed out before (revoke, retire, delete), then looks
+  the partition up and registers it as a new grant, so vfsd's startup does
+  not depend on one and one holder at a time reaches the partition. The
+  hand-out's decisions are the host-tested `vfsd-swap` crate, the cut-off
+  the `vfsd-grant` crate. See
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md) and
   [`docs/storage.md`](../../docs/storage.md).
 - **System-root cap delivery** — vfsd does not push a system-root
@@ -144,7 +147,7 @@ vfsd/
   for every block device (`QUERY_DEVICE` on the `block` class SEND at instance ordinals 0,
   1, …, passing a `WITHDRAWN` one, until another reply is not
   `SUCCESS`), and again from the first ordinal not yet queried before
-  each runtime role lookup (a `MOUNT`, the first `GET_SWAP_PARTITION`),
+  each runtime role lookup (a `MOUNT`, a `GET_SWAP_PARTITION`),
   asks devmgr where each new disk's device sits (`QUERY_DEVICE_LOCATION`
   on the same SEND: the PCI function devmgr bound its driver to, kept with
   the disk and logged; the boot-disk identification reads it),
@@ -203,7 +206,7 @@ devmgr discovers storage hardware, spawns block device drivers, and
 publishes their endpoints in the device registry. vfsd queries the
 registry at startup, once per instance ordinal, to obtain the
 `MOUNT_AUTHORITY`-badged whole-disk cap on every virtio-blk instance.
-For each mount, and for the swap partition on the first
+For each mount, and for the swap partition on each
 `GET_SWAP_PARTITION`, vfsd sends `REGISTER_PARTITION` on the cap of the disk
 that holds the partition, and that virtio-blk instance mints and returns
 a partition-badged cap. See

@@ -9,6 +9,11 @@ publish.workspace = true
 
 [dependencies]
 gpt = { path = "../gpt", package = "vfsd-gpt" }
+grant = { path = "../grant", package = "vfsd-grant" }
+
+[dev-dependencies]
+# The block driver's reply codes, for the model of its retire.
+ipc = { path = "../../../shared/ipc" }
 
 [lints]
 workspace = true

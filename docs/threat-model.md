@@ -555,9 +555,16 @@ describes the remapping units truly.
   ([device-management.md](device-management.md) § Message-Signaled Interrupts). Message-signaled
   interrupts are not yet validated on hardware
   ([#924](https://github.com/kottlerg/seraph/issues/924)).
-- The approved DMA mapping strategy of [#772](https://github.com/kottlerg/seraph/issues/772) lets a
-  block device reach a registered client region from its registration to its unregistration, not
-  only during one request; design intent, not yet implemented.
+- A block device reaches a registered client region from its registration to its unregistration,
+  not only during one request
+  ([services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md) § DMA
+  Discipline).
+- A client that lent a DMA-capable driver a Memory capability can revoke every derivation of it,
+  devmgr's copy for a standing mapping included, and release the frames, which memmgr may then
+  hand out while the mapping stands: for one request on the per-transfer path, and for a
+  registered block region from the release until the region's next transfer or its
+  unregistration ([device-management.md](device-management.md) § DMA-Safe Teardown;
+  [#1731](https://github.com/kottlerg/seraph/issues/1731)).
 
 ---
 

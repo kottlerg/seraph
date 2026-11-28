@@ -46,11 +46,14 @@ use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP, RIGHTS_MEM_WRITE};
 ///
 /// A device's driver maps its own rings and buffers once at setup and, for a
 /// block device, the one client-lent buffer of its single in-flight request
-/// (`services/drivers/virtio/blk/README.md`): three for virtio-blk, two for
-/// virtio-input. Sixteen leaves room for a multi-queue device without
-/// letting one driver grow devmgr's table without bound; `docs/limits.md`
-/// classifies it.
-pub const MAX_MAPPINGS_PER_DEVICE: usize = 16;
+/// and each buffer a client registers
+/// (`services/drivers/virtio/blk/README.md` § DMA Discipline): virtio-blk
+/// holds at most 35, two at setup, one for a request and its 32 regions
+/// (`MAX_REGIONS`); virtio-input holds two. Forty-eight leaves room past
+/// that without letting one driver grow devmgr's table without bound, and
+/// with [`MAX_RESERVED_RANGES_PER_DEVICE`] stays under iommu-core's 64
+/// ranges per domain; `docs/limits.md` classifies it.
+pub const MAX_MAPPINGS_PER_DEVICE: usize = 48;
 
 /// Firmware-reserved ranges one device's domain maps at once, after
 /// [`reserved_ranges`] merges the ones that touch.

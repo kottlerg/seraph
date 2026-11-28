@@ -6,14 +6,17 @@
 //! RAM block device behind the `fs_faults` phase's own fatfs: a FAT16 volume
 //! just past FAT12's cluster count, formatted at run time and held sparsely,
 //! served over the `BLK_GET_GEOMETRY`, `BLK_READ_INTO_MEMORY`, and
-//! `BLK_WRITE_FROM_MEMORY` requests fatfs issues, with block faults armed by
-//! sector and attempt, or every request failed at once ([`RamDisk::fail_all`]).
+//! `BLK_WRITE_FROM_MEMORY` requests fatfs issues, and over the registered-region
+//! labels (`BLK_REGISTER_REGION`, `BLK_READ_REGION`, `BLK_WRITE_REGION`,
+//! `BLK_UNREGISTER_REGION`; [`Regions`]), with block faults
+//! armed by sector and attempt, or every request failed at once ([`RamDisk::fail_all`]).
 //! The device keeps a log of the reads and of the writes it served
 //! ([`RamDisk::take_reads`], [`RamDisk::take_writes`]).
 //!
 //! A request carries up to [`RUN_PAGES`] pages of Memory cap, the run fill
 //! fatfs issues for a sequential read, and the server maps and copies as many
-//! pages as the request's sectors span.
+//! pages as the request's sectors span; a region transfer moves as many sectors
+//! at most, from any sector-aligned offset in its region.
 //!
 //! The device can also go away: a request carrying [`GONE_BADGE`] revokes
 //! every capability derived from the block endpoint, fatfs's among them, and
@@ -61,6 +64,11 @@ const MAX_SECTORS_PER_REQUEST: usize = RUN_PAGES * SECTORS_PER_PAGE;
 pub const STOP_BADGE: u64 = 0x5_70B;
 /// Badge of the phase's SEND that takes the device away.
 pub const GONE_BADGE: u64 = 0x60E;
+/// Badge bit of a region cap the device mints, as virtio-blk's region badges
+/// carry it, with the region's slot below it.
+const REGION_BADGE: u64 = 1 << 62;
+/// Regions the device holds at once: virtio-blk's bound for one partition.
+const MAX_REGIONS: usize = 4;
 
 /// A fault the device applies to one request.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -73,7 +81,8 @@ pub enum Fault
     /// A read is reported failed and fills nothing.
     FailRead,
     /// A read is reported failed, fills nothing, and keeps the page cap it
-    /// carried: the device deletes it, and the reply carries no cap.
+    /// carried: the device deletes it, and the reply carries no cap. A region
+    /// read is only reported failed: the region keeps its cap.
     LoseCap,
 }
 
@@ -291,18 +300,141 @@ impl RamDisk
     }
 }
 
+/// A region the device holds: the Memory cap it was registered with, its
+/// length, whether the device may write it, the root of its region caps and
+/// the parent of its liveness Notification.
+struct Region
+{
+    memory: u64,
+    len: u64,
+    writable: bool,
+    root: u64,
+    liveness: u64,
+}
+
+/// The regions registered with the device, by slot, the slot being the low
+/// bits of the region's badge. The fake keeps no sole-reference binding: a
+/// region stands until it is unregistered or the server stops.
+#[derive(Default)]
+struct Regions
+{
+    slots: [Option<Region>; MAX_REGIONS],
+}
+
+impl Regions
+{
+    /// The region a request's badge names.
+    fn get(&self, badge: u64) -> Option<&Region>
+    {
+        if badge & REGION_BADGE == 0
+        {
+            return None;
+        }
+        let slot = usize::try_from(badge & !REGION_BADGE).ok()?;
+        self.slots.get(slot)?.as_ref()
+    }
+
+    /// `BLK_REGISTER_REGION` with `memory` and the access word `access`: the
+    /// reply label and, on success, the region cap and the liveness cap. The
+    /// device keeps `memory` on success; the caller deletes it otherwise.
+    fn register(&mut self, ep: u64, memory: u64, access: u64) -> (u64, Option<(u64, u64)>)
+    {
+        let writable = match access
+        {
+            blk_labels::REGION_DEVICE_READS => false,
+            blk_labels::REGION_DEVICE_READS_WRITES => true,
+            _ => return (blk_errors::INVALID_MEMORY_CAP, None),
+        };
+        let len = syscall::cap_info(memory, syscall::CAP_INFO_MEMORY_SIZE).unwrap_or(0);
+        if memory == 0 || len == 0
+        {
+            return (blk_errors::INVALID_MEMORY_CAP, None);
+        }
+        let Some(slot) = self.slots.iter().position(Option::is_none)
+        else
+        {
+            return (blk_errors::REGION_LIMIT, None);
+        };
+        let badge = REGION_BADGE | slot as u64;
+        let root = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, badge)
+            .expect("fs_faults block server: region root derivation failed");
+        let region_cap = syscall::cap_derive(root, syscall::RIGHTS_EP_SEND)
+            .expect("fs_faults block server: region cap derivation failed");
+        let liveness = std::os::seraph::object_slab_retype(
+            std::os::seraph::NOTIFICATION_RETYPE_BYTES,
+            |slab| syscall::cap_create_notification(slab).ok(),
+        )
+        .expect("fs_faults block server: liveness notification creation failed");
+        let child = syscall::cap_derive(liveness, 0)
+            .expect("fs_faults block server: liveness cap derivation failed");
+        if let Some(free) = self.slots.get_mut(slot)
+        {
+            *free = Some(Region {
+                memory,
+                len,
+                writable,
+                root,
+                liveness,
+            });
+        }
+        (blk_errors::SUCCESS, Some((region_cap, child)))
+    }
+
+    /// `BLK_UNREGISTER_REGION` on `badge`: revoke every copy of the
+    /// region's caps and delete the device's. The reply label.
+    fn unregister(&mut self, badge: u64) -> u64
+    {
+        if self.get(badge).is_none()
+        {
+            return blk_errors::OUT_OF_BOUNDS;
+        }
+        let slot = usize::try_from(badge & !REGION_BADGE).expect("region slot checked by get");
+        if let Some(region) = self.slots.get_mut(slot).and_then(Option::take)
+        {
+            Self::release(&region);
+        }
+        blk_errors::SUCCESS
+    }
+
+    /// Revoke and delete a region's caps.
+    fn release(region: &Region)
+    {
+        let _ = syscall::cap_revoke_all(region.root);
+        let _ = syscall::cap_delete(region.root);
+        let _ = syscall::cap_revoke_all(region.liveness);
+        let _ = syscall::cap_delete(region.liveness);
+        let _ = syscall::cap_delete(region.memory);
+    }
+
+    /// Release every region, as the server stops.
+    fn clear(&mut self)
+    {
+        for region in self.slots.iter_mut().filter_map(Option::take)
+        {
+            Self::release(&region);
+        }
+    }
+}
+
 /// Serve the block requests fatfs sends on `ep` until a message carrying
 /// [`STOP_BADGE`] or [`GONE_BADGE`]; the latter first revokes every
 /// capability derived from `ep`. Each request's Memory cap is mapped, for as
 /// many pages as the request spans (at most [`RUN_PAGES`]), at a scratch
-/// range for the copy, unmapped, and moved back in the reply.
+/// range for the copy, unmapped, and moved back in the reply; a region
+/// transfer maps the pages of its region it spans the same way.
 pub fn serve(ep: u64, disk: &SharedDisk)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let aspace = std::os::seraph::startup_info().self_aspace;
-    let va = std::os::seraph::reserve_pages(RUN_PAGES as u64)
-        .expect("fs_faults block server: reserve_pages failed")
-        .va_start();
+    // One page past a run, for a region transfer that starts inside a page.
+    let va = std::os::seraph::reserve_pages(
+        (RUN_PAGES as u64)
+            .checked_add(1)
+            .expect("a run's pages plus one fit"),
+    )
+    .expect("fs_faults block server: reserve_pages failed")
+    .va_start();
+    let mut regions = Regions::default();
     loop
     {
         // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
@@ -316,6 +448,7 @@ pub fn serve(ep: u64, disk: &SharedDisk)
             {
                 syscall::cap_revoke_all(ep).expect("fs_faults block server: revoke of the device");
             }
+            regions.clear();
             // SAFETY: as above.
             let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(0), ipc_buf) };
             return;
@@ -324,6 +457,10 @@ pub fn serve(ep: u64, disk: &SharedDisk)
         for &extra in msg.caps().iter().skip(1)
         {
             let _ = syscall::cap_delete(extra);
+        }
+        if region_request(ep, disk, aspace, va, &mut regions, &msg, cap)
+        {
+            continue;
         }
         let label = match msg.label & 0xFFFF
         {
@@ -356,6 +493,7 @@ pub fn serve(ep: u64, disk: &SharedDisk)
                 msg.word(0),
                 msg.word(1),
                 Direction::Read,
+                None,
             ),
             blk_labels::BLK_WRITE_FROM_MEMORY => transfer(
                 disk,
@@ -365,6 +503,7 @@ pub fn serve(ep: u64, disk: &SharedDisk)
                 msg.word(0),
                 msg.word(1),
                 Direction::Write,
+                None,
             ),
             _ => blk_errors::DEVICE_STATUS_UNSUPP,
         };
@@ -376,6 +515,72 @@ pub fn serve(ep: u64, disk: &SharedDisk)
         // SAFETY: as above.
         let _ = unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) };
     }
+}
+
+/// Serve a registered-region request `msg` (`BLK_REGISTER_REGION`,
+/// `BLK_READ_REGION`, `BLK_WRITE_REGION`, `BLK_UNREGISTER_REGION`), which
+/// carried `cap` in `caps[0]` (`0` for none), and reply to it: the device
+/// keeps a registered region's Memory cap and deletes every other. Returns
+/// `false` for any other label, `cap` then left to the caller.
+///
+/// Kept out of line so its reply messages take no room in [`serve`]'s frame.
+#[inline(never)]
+fn region_request(
+    ep: u64,
+    disk: &SharedDisk,
+    aspace: u64,
+    va: u64,
+    regions: &mut Regions,
+    msg: &IpcMessage,
+    cap: u64,
+) -> bool
+{
+    let label = msg.label & 0xFFFF;
+    let current = msg.word(0) == u64::from(ipc::BLK_LABELS_VERSION);
+    if label == blk_labels::BLK_REGISTER_REGION
+    {
+        let (status, caps) = if current
+        {
+            regions.register(ep, cap, msg.word(1))
+        }
+        else
+        {
+            (blk_errors::LABEL_VERSION_MISMATCH, None)
+        };
+        let mut reply = IpcMessage::builder(status);
+        if let Some((region_cap, liveness_cap)) = caps
+        {
+            reply = reply.cap(region_cap).cap(liveness_cap);
+        }
+        else if cap != 0
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        // SAFETY: `serve`'s thread, whose registered IPC buffer page this is.
+        let _ = unsafe { ipc::ipc_reply(&reply.build(), std::os::seraph::current_ipc_buf()) };
+        return true;
+    }
+    let status = match label
+    {
+        blk_labels::BLK_READ_REGION =>
+        {
+            region_transfer(disk, aspace, va, regions, msg, Direction::Read)
+        }
+        blk_labels::BLK_WRITE_REGION =>
+        {
+            region_transfer(disk, aspace, va, regions, msg, Direction::Write)
+        }
+        blk_labels::BLK_UNREGISTER_REGION if current => regions.unregister(msg.badge),
+        blk_labels::BLK_UNREGISTER_REGION => blk_errors::LABEL_VERSION_MISMATCH,
+        _ => return false,
+    };
+    if cap != 0
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    // SAFETY: as above.
+    let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(status), std::os::seraph::current_ipc_buf()) };
+    true
 }
 
 /// The reply label for a request whose Memory cap the block server's map
@@ -396,10 +601,61 @@ fn map_refusal_label(error: i64) -> u64
     }
 }
 
+/// A `BLK_READ_REGION` or `BLK_WRITE_REGION` request `msg` on the region its
+/// badge names: `data[1]` LBA, `data[2]` count, `data[3]` byte offset in the
+/// region. Returns the reply label, with virtio-blk's checks: the offset a
+/// sector multiple, the run inside the region, a read into a writable region.
+fn region_transfer(
+    disk: &SharedDisk,
+    aspace: u64,
+    va: u64,
+    regions: &Regions,
+    msg: &IpcMessage,
+    direction: Direction,
+) -> u64
+{
+    if msg.word(0) != u64::from(ipc::BLK_LABELS_VERSION)
+    {
+        return blk_errors::LABEL_VERSION_MISMATCH;
+    }
+    let Some(region) = regions.get(msg.badge)
+    else
+    {
+        return blk_errors::OUT_OF_BOUNDS;
+    };
+    let (count, offset) = (msg.word(2), msg.word(3));
+    let end = count
+        .checked_mul(SECTOR as u64)
+        .and_then(|bytes| bytes.checked_add(offset));
+    if !offset.is_multiple_of(SECTOR as u64)
+        || end.is_none_or(|end| end > region.len)
+        || (direction == Direction::Read && !region.writable)
+    {
+        return blk_errors::INVALID_MEMORY_CAP;
+    }
+    let mut memory = region.memory;
+    transfer(
+        disk,
+        aspace,
+        va,
+        &mut memory,
+        msg.word(1),
+        count,
+        direction,
+        Some(offset),
+    )
+}
+
 /// Copy `count` sectors at `lba` between the disk and the pages `*cap` names,
-/// in `direction`, unless an armed fault says otherwise. Returns the reply
-/// label; `*cap` is 0 when the fault deleted the cap, so the reply carries
-/// none.
+/// from byte `at` of them for a region transfer and from the start
+/// otherwise, in `direction`, unless an armed fault says otherwise. Returns
+/// the reply label; `*cap` is 0 when the fault deleted the cap, so the reply
+/// carries none, which a region transfer's fault never does.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the server's scratch range, the cap and the request's words; a struct would only \
+              rename them for this one private call"
+)]
 fn transfer(
     disk: &SharedDisk,
     aspace: u64,
@@ -408,6 +664,7 @@ fn transfer(
     lba: u64,
     count: u64,
     direction: Direction,
+    at: Option<u64>,
 ) -> u64
 {
     let (Ok(lba), Ok(count)) = (usize::try_from(lba), usize::try_from(count))
@@ -433,6 +690,10 @@ fn transfer(
     {
         return blk_errors::DEVICE_STATUS_IOERR;
     }
+    if fault == Some(Fault::LoseCap) && at.is_some()
+    {
+        return blk_errors::DEVICE_STATUS_IOERR;
+    }
     if fault == Some(Fault::LoseCap)
     {
         let _ = syscall::cap_delete(*cap);
@@ -444,13 +705,26 @@ fn transfer(
         Direction::Read => syscall::MAP_WRITABLE,
         Direction::Write => syscall::MAP_READ,
     };
-    let pages = count.div_ceil(SECTORS_PER_PAGE);
-    // SAFETY: `va` is the block server's own reservation of `RUN_PAGES`
+    let at = at.unwrap_or(0);
+    let first_page = at / 4096;
+    let Ok(in_page) = usize::try_from(at % 4096)
+    else
+    {
+        return blk_errors::INVALID_MEMORY_CAP;
+    };
+    let pages = count
+        .checked_mul(SECTOR)
+        .and_then(|bytes| bytes.checked_add(in_page))
+        .expect("fs_faults block server: transfer span overflowed")
+        .div_ceil(4096);
+    // SAFETY: `va` is the block server's own reservation of `RUN_PAGES + 1`
     // pages from the per-process arena, used only by this thread for one copy
     // at a time: VA no Rust object or IPC page occupies; `pages` of them,
-    // at most `RUN_PAGES`, are mapped.
-    let mapped =
-        unsafe { std::os::seraph::mem_map_funded(*cap, aspace, va, 0, pages as u64, prot) };
+    // at most `RUN_PAGES + 1` (a run of sectors from inside a page), are
+    // mapped.
+    let mapped = unsafe {
+        std::os::seraph::mem_map_funded(*cap, aspace, va, first_page, pages as u64, prot)
+    };
     if let Err(e) = mapped
     {
         // A map refused part-way can leave the pages before the failing one
@@ -470,6 +744,7 @@ fn transfer(
     {
         let offset = i
             .checked_mul(SECTOR)
+            .and_then(|bytes| bytes.checked_add(in_page))
             .expect("sector copy offset overflowed");
         let page = va
             .checked_add(offset as u64)
